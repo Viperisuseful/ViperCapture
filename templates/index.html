@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Local Screenshot API</title>
+    <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+    <main class="layout">
+        <section class="card">
+            <header class="card-header">
+                <h1 class="card-title">Local Screenshot API</h1>
+                <p class="card-subtitle">Capture full-page screenshots with your existing FastAPI + Playwright service.</p>
+            </header>
+            <div class="card-body">
+                <form id="captureForm">
+                    <div class="field">
+                        <label for="url">URL</label>
+                        <input id="url" name="url" type="url" placeholder="https://example.com" required />
+                    </div>
+
+                    <div class="field">
+                        <label for="filenameTemplate">Filename Template</label>
+                        <input id="filenameTemplate" name="filename_template" type="text" value="{host}_{date}_{time}.png" />
+                        <p class="field-help">Use placeholders: <strong>{host}</strong>, <strong>{date}</strong>, <strong>{time}</strong>.</p>
+                    </div>
+
+                    <div class="grid">
+                        <div class="field">
+                            <label for="width">Viewport Width</label>
+                            <input id="width" name="width" type="number" min="1" value="1920" required />
+                        </div>
+                        <div class="field">
+                            <label for="height">Viewport Height</label>
+                            <input id="height" name="height" type="number" min="1" value="1080" required />
+                        </div>
+                        <div class="field">
+                            <label for="deviceScale">Device Scale Factor</label>
+                            <input id="deviceScale" name="device_scale_factor" type="number" min="1" max="4" step="0.1" value="2" required />
+                        </div>
+                        <div class="field">
+                            <label for="wait">Wait (seconds)</label>
+                            <input id="wait" name="wait" type="number" min="0" step="1" value="4" required />
+                        </div>
+                        <div class="field">
+                            <label for="authUsername">Basic Auth Username (optional)</label>
+                            <input id="authUsername" name="auth_username" type="text" autocomplete="off" />
+                        </div>
+                        <div class="field">
+                            <label for="authPassword">Basic Auth Password (optional)</label>
+                            <input id="authPassword" name="auth_password" type="password" autocomplete="off" />
+                        </div>
+                    </div>
+
+                    <label class="checkbox" for="darkMode">
+                        <input id="darkMode" name="dark_mode" type="checkbox" />
+                        Capture with dark mode
+                    </label>
+
+                    <div class="actions">
+                        <button class="primary" id="captureBtn" type="submit">Capture Screenshot</button>
+                        <button class="secondary" id="downloadBtn" type="button" disabled>Download PNG</button>
+                        <button class="secondary" id="openFolderBtn" type="button">Open File Location</button>
+                    </div>
+
+                    <label class="checkbox" for="openAfterDownload">
+                        <input id="openAfterDownload" name="open_after_download" type="checkbox" />
+                        Open file location after download
+                    </label>
+
+                    <p id="status" class="status"></p>
+                </form>
+            </div>
+        </section>
+
+        <section class="card preview-wrap">
+            <header class="card-header">
+                <h2 class="card-title">Preview</h2>
+                <p class="card-subtitle">The latest capture appears here and can be downloaded as a PNG file.</p>
+            </header>
+            <div class="preview">
+                <p id="placeholder" class="placeholder">Enter a URL and click “Capture Screenshot” to generate your first preview.</p>
+                <img id="previewImage" alt="Screenshot preview" />
+            </div>
+        </section>
+
+        <section class="card history-card">
+            <header class="card-header">
+                <h2 class="card-title">Capture History</h2>
+                <p class="card-subtitle">Recent captures with thumbnails and one-click re-download.</p>
+            </header>
+            <div class="card-body">
+                <div id="historyEmpty" class="history-empty">No captures yet.</div>
+                <div id="historyList" class="history-list"></div>
+            </div>
+        </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
