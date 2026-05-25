@@ -5,9 +5,13 @@ SHOT — Screenshot Tool launcher
 Run this directly with Python or via run.bat.
 Handles venv setup, dependency install, browser install,
 server startup, and opening your browser automatically.
+
+On subsequent runs, dependency checks are skipped unless
+requirements.txt has changed (hash-stamped in .venv/).
 """
 
 from __future__ import annotations
+import hashlib
 import os
 import sys
 import subprocess
@@ -16,11 +20,13 @@ import time
 import webbrowser
 from pathlib import Path
 
-ROOT        = Path(__file__).parent.resolve()
-VENV_PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
-HOST        = "127.0.0.1"
-PORT        = 8000
-URL         = f"http://{HOST}:{PORT}/"
+ROOT             = Path(__file__).parent.resolve()
+VENV_PYTHON      = ROOT / ".venv" / "Scripts" / "python.exe"
+HOST             = "127.0.0.1"
+PORT             = 8000
+URL              = f"http://{HOST}:{PORT}/"
+DEPS_STAMP       = ROOT / ".venv" / ".deps_stamp"
+PLAYWRIGHT_STAMP = ROOT / ".venv" / ".playwright_stamp"
 
 
 # ── Helpers ───────────────────────────────────────────────────
@@ -48,6 +54,12 @@ def wait_and_exit(code: int = 0) -> None:
     sys.exit(code)
 
 
+def _req_hash() -> str:
+    """MD5 of requirements.txt — used to detect changes between runs."""
+    req = ROOT / "requirements.txt"
+    return hashlib.md5(req.read_bytes()).hexdigest() if req.exists() else ""
+
+
 # ── Setup steps ───────────────────────────────────────────────
 
 def ensure_venv() -> None:
@@ -58,8 +70,7 @@ def ensure_venv() -> None:
     """
     if not VENV_PYTHON.exists():
         print("  [1/3] Creating Python environment (first run only)...")
-        run(sys.executable, "-m", "venv", ROOT / ".venv",
-            label="venv creation")
+        run(sys.executable, "-m", "venv", ROOT / ".venv", label="venv creation")
 
     this = Path(sys.executable).resolve()
     want = VENV_PYTHON.resolve()
@@ -70,17 +81,36 @@ def ensure_venv() -> None:
 
 
 def ensure_deps() -> None:
-    print("  [2/3] Checking Python packages...")
+    """
+    Install packages from requirements.txt.
+    Skipped on subsequent runs unless requirements.txt has changed.
+    """
+    current_hash = _req_hash()
+    if DEPS_STAMP.exists() and DEPS_STAMP.read_text().strip() == current_hash:
+        print("  [2/3] Python packages already up to date — skipping.")
+        return
+
+    print("  [2/3] Installing Python packages...")
     run(sys.executable, "-m", "pip", "install", "--upgrade", "pip", "-q",
         label="pip upgrade")
     run(sys.executable, "-m", "pip", "install", "-r", ROOT / "requirements.txt",
         label="pip install")
+    DEPS_STAMP.write_text(current_hash)
 
 
 def ensure_playwright() -> None:
-    print("  [3/3] Checking Playwright browser (Chromium)...")
+    """
+    Install Playwright's Chromium browser.
+    Skipped on subsequent runs (stamp file present).
+    """
+    if PLAYWRIGHT_STAMP.exists():
+        print("  [3/3] Playwright browser already installed — skipping.")
+        return
+
+    print("  [3/3] Installing Playwright browser (Chromium)...")
     run(sys.executable, "-m", "playwright", "install", "chromium",
         label="playwright install")
+    PLAYWRIGHT_STAMP.write_text("ok")
 
 
 # ── Main ──────────────────────────────────────────────────────

@@ -1,6 +1,7 @@
 /* ============================================================
    SHOT — Screenshot Tool UI
    Warm darkroom aesthetic · JetBrains Mono · Amber accent
+   No-scroll layout: everything visible in one viewport.
    ============================================================ */
 
 /* ── Reset ── */
@@ -30,13 +31,18 @@
   --r-lg:          10px;
 }
 
-html { color-scheme: dark; }
+html {
+  color-scheme: dark;
+  height: 100%;
+  overflow: hidden;
+}
 
 body {
   font-family: var(--mono);
   background: var(--bg);
   color: var(--text);
-  min-height: 100vh;
+  height: 100%;
+  overflow: hidden;
   font-size: 13px;
   line-height: 1.55;
   -webkit-font-smoothing: antialiased;
@@ -54,12 +60,13 @@ body {
 }
 
 /* ============================================================
-   APP SHELL
+   APP SHELL — fixed 100vh, no page scroll
    ============================================================ */
 .app {
   display: flex;
   flex-direction: column;
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
 }
 
 /* ============================================================
@@ -70,25 +77,23 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 0 24px;
-  height: 52px;
+  padding: 0 20px;
+  height: 44px;
   border-bottom: 1px solid var(--border);
   background: var(--s0);
-  position: sticky;
-  top: 0;
-  z-index: 200;
   flex-shrink: 0;
+  z-index: 200;
 }
 
 .brand {
   display: flex;
   align-items: baseline;
-  gap: 9px;
+  gap: 8px;
 }
 
 .brand-name {
   font-family: var(--display);
-  font-size: 2rem;
+  font-size: 1.85rem;
   letter-spacing: 0.1em;
   color: var(--accent);
   line-height: 1;
@@ -96,100 +101,108 @@ body {
 
 .brand-sep {
   color: var(--faint);
-  font-size: 1.1rem;
+  font-size: 1rem;
   font-weight: 300;
 }
 
 .brand-sub {
-  font-size: 0.68rem;
+  font-size: 0.65rem;
   letter-spacing: 0.14em;
   text-transform: uppercase;
   color: var(--dim);
   font-weight: 400;
 }
 
-/* Status sits in the header, top-right */
 .status-text {
-  font-size: 0.75rem;
+  font-size: 0.72rem;
   color: var(--dim);
   transition: color 0.2s;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 360px;
+  max-width: 320px;
 }
 .status-text.is-loading { color: var(--accent); }
 .status-text.is-error   { color: var(--danger); }
 .status-text.is-success { color: var(--success); }
 
 /* ============================================================
-   WORKSPACE (sidebar + preview)
+   WORKSPACE — fills remaining height, never scrolls
    ============================================================ */
 .workspace {
   display: grid;
-  grid-template-columns: 320px 1fr;
+  grid-template-columns: 268px 1fr;
   flex: 1;
   min-height: 0;
   overflow: hidden;
 }
 
 /* ============================================================
-   CONTROLS PANEL (left sidebar)
+   CONTROLS PANEL — left sidebar, no overflow/scroll
    ============================================================ */
 .controls-panel {
   background: var(--s0);
   border-right: 1px solid var(--border);
-  overflow-y: auto;
-  padding: 22px 18px 32px;
-  scrollbar-width: thin;
-  scrollbar-color: var(--border-hi) transparent;
+  overflow: hidden;          /* intentionally no scroll */
+  display: flex;
+  flex-direction: column;
 }
-.controls-panel::-webkit-scrollbar { width: 4px; }
-.controls-panel::-webkit-scrollbar-track { background: transparent; }
-.controls-panel::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 2px; }
+
+/* ── Form fills the whole panel ── */
+form {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  overflow: hidden;
+  padding: 14px 16px 16px;
+}
+
+.form-body {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.form-actions {
+  margin-top: auto;
+  padding-top: 14px;
+}
 
 /* ── Fields ── */
-.field { margin-bottom: 18px; }
-.field-hero { margin-bottom: 22px; }
+.field { /* no bottom margin — gap on form-body handles spacing */ }
+.field-hero { /* URL gets slightly more weight via font size */ }
+
 .field-row {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 10px;
-  margin-bottom: 18px;
+  gap: 8px;
 }
-.field-row .field { margin-bottom: 0; }
+.field-row .field { margin: 0; }
 
 .field-label {
   display: block;
-  font-size: 0.69rem;
+  font-size: 0.66rem;
   font-weight: 600;
   letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--dim);
-  margin-bottom: 7px;
+  margin-bottom: 5px;
 }
 .unit {
   font-weight: 400;
   text-transform: lowercase;
   letter-spacing: 0;
   color: var(--faint);
-  margin-left: 3px;
+  margin-left: 2px;
 }
 
-.field-help {
-  margin-top: 6px;
-  font-size: 0.69rem;
+.field-hint {
+  margin-top: 4px;
+  font-size: 0.63rem;
   color: var(--faint);
-  line-height: 1.5;
+  line-height: 1.4;
   font-weight: 300;
-}
-.field-help code {
-  font-family: var(--mono);
-  background: var(--s3);
-  color: var(--accent);
-  padding: 1px 5px;
-  border-radius: 3px;
-  font-size: 0.66rem;
 }
 
 /* ── Inputs ── */
@@ -202,10 +215,10 @@ input[type="password"] {
   border: 1px solid var(--border);
   color: var(--text);
   font-family: var(--mono);
-  font-size: 0.82rem;
+  font-size: 0.8rem;
   font-weight: 400;
   border-radius: var(--r);
-  padding: 8px 10px;
+  padding: 7px 9px;
   outline: none;
   transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
   -webkit-appearance: none;
@@ -220,7 +233,49 @@ input:focus {
 input[type="number"]::-webkit-inner-spin-button,
 input[type="number"]::-webkit-outer-spin-button { opacity: 0.35; }
 
-/* ── Segmented control (Sharpness) ── */
+/* ── Resolution presets ── */
+.preset-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+}
+
+.preset-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  padding: 6px 4px;
+  background: var(--s1);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  font-family: var(--mono);
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+}
+.preset-btn:hover:not(.preset-active) {
+  border-color: var(--border-hi);
+  background: var(--s2);
+}
+.preset-btn.preset-active {
+  border-color: var(--accent);
+  background: var(--accent-subtle);
+}
+.preset-name {
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: 0.03em;
+}
+.preset-btn.preset-active .preset-name { color: var(--accent); }
+.preset-size {
+  font-size: 0.55rem;
+  color: var(--faint);
+  font-weight: 300;
+  letter-spacing: 0.02em;
+}
+
+/* ── Segmented control (Image Quality) ── */
 .seg-control {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -236,7 +291,7 @@ input[type="number"]::-webkit-outer-spin-button { opacity: 0.35; }
   flex-direction: column;
   align-items: center;
   gap: 2px;
-  padding: 8px 4px;
+  padding: 6px 4px;
   border: none;
   background: transparent;
   color: var(--dim);
@@ -253,27 +308,37 @@ input[type="number"]::-webkit-outer-spin-button { opacity: 0.35; }
   background: var(--accent);
   color: #000;
 }
-.seg-val  { font-size: 0.9rem; font-weight: 600; line-height: 1; }
-.seg-desc { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.1em; opacity: 0.75; }
+.seg-val  { font-size: 0.88rem; font-weight: 600; line-height: 1; }
+.seg-desc { font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.1em; opacity: 0.75; }
 
-/* ── Toggle switches ── */
-.toggle-group {
-  border: 1px solid var(--border);
-  border-radius: var(--r);
-  overflow: hidden;
+/* ── Bottom row: Wait + Toggle side by side ── */
+.bottom-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
 }
-.toggle-row {
+
+.field-wait {
+  width: 86px;
+  flex-shrink: 0;
+}
+
+/* Standalone toggle (single, no group wrapper) */
+.toggle-standalone {
+  flex: 1;
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 10px 12px;
-  cursor: pointer;
-  border-bottom: 1px solid var(--border);
+  gap: 8px;
+  padding: 0 10px;
+  height: 33px;           /* matches input height */
   background: var(--s1);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  cursor: pointer;
+  user-select: none;
   transition: background 0.12s;
 }
-.toggle-row:last-child { border-bottom: none; }
-.toggle-row:hover { background: var(--s2); }
+.toggle-standalone:hover { background: var(--s2); }
 
 .toggle-wrap { position: relative; flex-shrink: 0; }
 .toggle-input {
@@ -281,10 +346,10 @@ input[type="number"]::-webkit-outer-spin-button { opacity: 0.35; }
 }
 .toggle-track {
   display: block;
-  width: 32px; height: 17px;
+  width: 30px; height: 16px;
   background: var(--s3);
   border: 1px solid var(--border-hi);
-  border-radius: 9px;
+  border-radius: 8px;
   position: relative;
   transition: background 0.18s, border-color 0.18s;
 }
@@ -292,7 +357,7 @@ input[type="number"]::-webkit-outer-spin-button { opacity: 0.35; }
   content: '';
   position: absolute;
   top: 2px; left: 2px;
-  width: 11px; height: 11px;
+  width: 10px; height: 10px;
   background: var(--dim);
   border-radius: 50%;
   transition: transform 0.18s, background 0.18s;
@@ -302,7 +367,7 @@ input[type="number"]::-webkit-outer-spin-button { opacity: 0.35; }
   border-color: var(--accent);
 }
 .toggle-input:checked + .toggle-track::after {
-  transform: translateX(15px);
+  transform: translateX(14px);
   background: #000;
 }
 .toggle-input:focus-visible + .toggle-track {
@@ -310,76 +375,20 @@ input[type="number"]::-webkit-outer-spin-button { opacity: 0.35; }
 }
 
 .toggle-label {
-  font-size: 0.78rem;
+  font-size: 0.72rem;
   color: var(--text);
   user-select: none;
   flex: 1;
 }
-.toggle-hint {
-  font-size: 0.66rem;
-  color: var(--faint);
-  margin-left: auto;
-  white-space: nowrap;
-}
-
-/* ── Auth section (collapsible) ── */
-.auth-details {
-  margin-bottom: 20px;
-  border: 1px solid var(--border);
-  border-radius: var(--r);
-  overflow: hidden;
-}
-.auth-summary {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 10px 12px;
-  background: var(--s1);
-  cursor: pointer;
-  list-style: none;
-  user-select: none;
-  transition: background 0.12s;
-}
-.auth-summary::-webkit-details-marker { display: none; }
-.auth-summary:hover { background: var(--s2); }
-.auth-details[open] .auth-summary {
-  border-bottom: 1px solid var(--border);
-}
-.auth-summary-label {
-  font-size: 0.8rem;
-  color: var(--dim);
-}
-.auth-details[open] .auth-summary-label {
-  color: var(--text);
-}
-.auth-summary-toggle {
-  font-size: 0.65rem;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--faint);
-}
-.auth-summary-toggle::after { content: 'Expand'; }
-.auth-details[open] .auth-summary-toggle::after { content: 'Collapse'; }
-
-.auth-fields {
-  padding: 14px 12px;
-  background: var(--s0);
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-.auth-fields .field { margin-bottom: 0; }
 
 /* ── Capture button ── */
-.form-actions { margin-top: 10px; }
-
 .btn-capture {
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 8px;
   width: 100%;
-  padding: 12px 20px;
+  padding: 11px 20px;
   background: var(--accent);
   color: #000;
   border: none;
@@ -411,7 +420,7 @@ input[type="number"]::-webkit-outer-spin-button { opacity: 0.35; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* ============================================================
-   PREVIEW PANEL (right)
+   PREVIEW PANEL — right side, fills remaining space
    ============================================================ */
 .preview-panel {
   display: flex;
@@ -419,6 +428,7 @@ input[type="number"]::-webkit-outer-spin-button { opacity: 0.35; }
   background: var(--bg);
   overflow: hidden;
   position: relative;
+  min-width: 0;
 }
 
 .preview-viewport {
@@ -427,7 +437,7 @@ input[type="number"]::-webkit-outer-spin-button { opacity: 0.35; }
   place-items: center;
   overflow: hidden;
   position: relative;
-  min-height: 480px;
+  min-height: 0;
   background:
     radial-gradient(ellipse 70% 60% at 50% 50%, #1a150e 0%, var(--bg) 100%);
 }
@@ -468,8 +478,8 @@ input[type="number"]::-webkit-outer-spin-button { opacity: 0.35; }
 }
 .empty-reticle {
   position: relative;
-  width: 60px; height: 60px;
-  margin: 0 auto 18px;
+  width: 56px; height: 56px;
+  margin: 0 auto 16px;
 }
 .reticle-ring {
   position: absolute;
@@ -482,31 +492,31 @@ input[type="number"]::-webkit-outer-spin-button { opacity: 0.35; }
   background: var(--border-hi);
 }
 .reticle-cross-h {
-  width: 16px; height: 1px;
+  width: 14px; height: 1px;
   top: 50%; left: 50%;
   transform: translate(-50%, -50%);
 }
 .reticle-cross-v {
-  height: 16px; width: 1px;
+  height: 14px; width: 1px;
   top: 50%; left: 50%;
   transform: translate(-50%, -50%);
 }
 .empty-title {
-  font-size: 0.88rem;
+  font-size: 0.85rem;
   font-weight: 500;
   color: var(--dim);
-  margin-bottom: 6px;
+  margin-bottom: 5px;
   letter-spacing: 0.04em;
 }
 .empty-hint {
-  font-size: 0.72rem;
+  font-size: 0.7rem;
   color: var(--faint);
   font-weight: 300;
 }
 
 #previewImage {
   max-width: 100%;
-  max-height: calc(100vh - 260px);
+  max-height: 100%;
   display: none;
   border-radius: 4px;
   box-shadow:
@@ -521,14 +531,14 @@ input[type="number"]::-webkit-outer-spin-button { opacity: 0.35; }
 .preview-footer {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 9px 16px;
+  gap: 10px;
+  padding: 8px 14px;
   border-top: 1px solid var(--border);
   background: var(--s0);
   flex-shrink: 0;
 }
 .preview-fname {
-  font-size: 0.68rem;
+  font-size: 0.66rem;
   color: var(--faint);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -536,7 +546,7 @@ input[type="number"]::-webkit-outer-spin-button { opacity: 0.35; }
   flex: 1;
   font-weight: 300;
 }
-.preview-btns { display: flex; gap: 8px; flex-shrink: 0; }
+.preview-btns { display: flex; gap: 7px; flex-shrink: 0; }
 
 .btn {
   display: inline-flex;
@@ -546,9 +556,9 @@ input[type="number"]::-webkit-outer-spin-button { opacity: 0.35; }
   border-radius: var(--r);
   font-family: var(--mono);
   font-weight: 500;
-  font-size: 0.75rem;
+  font-size: 0.72rem;
   cursor: pointer;
-  padding: 7px 12px;
+  padding: 6px 11px;
   transition: border-color 0.12s, color 0.12s, background 0.12s;
   letter-spacing: 0.04em;
 }
@@ -575,102 +585,92 @@ input[type="number"]::-webkit-outer-spin-button { opacity: 0.35; }
 }
 
 /* ============================================================
-   FILMSTRIP (history)
+   FILMSTRIP — hidden until first capture, then slides in
    ============================================================ */
 .filmstrip {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid transparent;
   background: var(--s0);
-  padding: 12px 20px 16px;
   flex-shrink: 0;
+  overflow: hidden;
+  max-height: 0;
+  transition: max-height 0.35s ease, border-color 0.35s ease, padding 0.35s ease;
+  padding: 0 20px;
+}
+
+.filmstrip.has-captures {
+  max-height: 90px;
+  border-top-color: var(--border);
+  padding: 8px 20px 10px;
 }
 
 .filmstrip-header {
   display: flex;
   align-items: center;
-  gap: 14px;
-  margin-bottom: 10px;
+  gap: 12px;
+  margin-bottom: 7px;
 }
 .filmstrip-label {
   font-family: var(--display);
-  font-size: 0.85rem;
+  font-size: 0.8rem;
   letter-spacing: 0.18em;
   color: var(--faint);
 }
 .filmstrip-hint {
-  font-size: 0.68rem;
+  font-size: 0.65rem;
   color: var(--faint);
   font-weight: 300;
 }
 
 .filmstrip-track {
   display: flex;
-  gap: 8px;
+  gap: 6px;
   overflow-x: auto;
-  padding-bottom: 4px;
   scrollbar-width: thin;
   scrollbar-color: var(--border-hi) transparent;
 }
-.filmstrip-track::-webkit-scrollbar { height: 3px; }
+.filmstrip-track::-webkit-scrollbar { height: 2px; }
 .filmstrip-track::-webkit-scrollbar-track { background: transparent; }
 .filmstrip-track::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 2px; }
 
-/* History items */
+/* Compact thumbnail-only history cards */
 .history-item {
+  position: relative;
   flex-shrink: 0;
-  width: 150px;
+  width: 72px;
   background: var(--s1);
   border: 1px solid var(--border);
-  border-radius: var(--r);
+  border-radius: calc(var(--r) - 1px);
   overflow: hidden;
-  transition: border-color 0.15s, transform 0.15s;
   cursor: default;
+  transition: border-color 0.15s;
 }
-.history-item:hover { border-color: var(--border-hi); transform: translateY(-2px); }
+.history-item:hover { border-color: var(--border-hi); }
 
 .history-thumb {
   width: 100%;
-  height: 84px;
+  height: 44px;
   object-fit: cover;
   display: block;
-  border-bottom: 1px solid var(--border);
   background: var(--s2);
 }
 
-.history-meta { padding: 7px 8px; }
-
-.history-name {
-  font-size: 0.65rem;
-  color: var(--text);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  margin-bottom: 3px;
-  font-weight: 500;
-}
-.history-time {
-  font-size: 0.6rem;
-  color: var(--faint);
-  margin-bottom: 7px;
-  font-weight: 300;
-}
+/* Overlay re-download button — only visible on hover */
 .history-dl-btn {
-  width: 100%;
-  padding: 5px 8px;
-  font-size: 0.65rem;
-  font-family: var(--mono);
-  font-weight: 500;
-  background: var(--s2);
-  color: var(--dim);
-  border: 1px solid var(--border);
-  border-radius: calc(var(--r) - 1px);
-  cursor: pointer;
-  transition: color 0.12s, border-color 0.12s;
-  letter-spacing: 0.04em;
-}
-.history-dl-btn:hover {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1rem;
+  background: rgba(0, 0, 0, 0.55);
   color: var(--accent);
-  border-color: var(--accent);
+  border: none;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s;
+  backdrop-filter: blur(2px);
 }
+.history-item:hover .history-dl-btn { opacity: 1; }
 
 /* ============================================================
    RESPONSIVE
@@ -680,16 +680,19 @@ input[type="number"]::-webkit-outer-spin-button { opacity: 0.35; }
   .controls-panel {
     border-right: none;
     border-bottom: 1px solid var(--border);
-    max-height: 60vh;
+    max-height: 55vh;
+    overflow-y: auto;    /* allow scroll on small screens */
   }
-  .preview-viewport { min-height: 300px; }
-  #previewImage { max-height: 55vh; }
   .brand-sub { display: none; }
 }
 
 @media (max-width: 500px) {
-  .app-header { padding: 0 14px; }
-  .controls-panel { padding: 16px 14px 28px; }
-  .filmstrip { padding: 10px 14px 14px; }
-  .preview-footer { padding: 8px 12px; }
+  .app-header { padding: 0 12px; }
+  .filmstrip { padding: 8px 12px 10px; }
+  .preview-footer { padding: 7px 10px; }
+}
+
+/* Safety valve: very short viewports can scroll inside the controls panel */
+@media (max-height: 560px) {
+  .controls-panel { overflow-y: auto; }
 }

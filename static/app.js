@@ -1,23 +1,24 @@
 /* ── Element refs ──────────────────────────────────────────── */
-const form             = document.getElementById("captureForm");
-const captureBtn       = document.getElementById("captureBtn");
-const captureBtnLabel  = captureBtn.querySelector(".capture-label");
-const downloadBtn      = document.getElementById("downloadBtn");
-const openFolderBtn    = document.getElementById("openFolderBtn");
-const previewImage     = document.getElementById("previewImage");
+const form              = document.getElementById("captureForm");
+const captureBtn        = document.getElementById("captureBtn");
+const captureBtnLabel   = captureBtn.querySelector(".capture-label");
+const downloadBtn       = document.getElementById("downloadBtn");
+const openFolderBtn     = document.getElementById("openFolderBtn");
+const previewImage      = document.getElementById("previewImage");
 const previewPlaceholder = document.getElementById("previewPlaceholder");
-const previewFname     = document.getElementById("previewFilename");
-const historyList      = document.getElementById("historyList");
-const filmstripHint    = document.getElementById("filmstripHint");
+const previewFname      = document.getElementById("previewFilename");
+const historyList       = document.getElementById("historyList");
+const filmstripHint     = document.getElementById("filmstripHint");
+const filmstripSection  = document.getElementById("filmstripSection");
 const openAfterDownload = document.getElementById("openAfterDownload");
-const statusEl         = document.getElementById("status");
+const statusEl          = document.getElementById("status");
 
 let latestBlob      = null;
 let latestObjectUrl = null;
 let latestFilename  = "screenshot.png";
 const captureHistory = [];
 
-/* ── Segmented sharpness control ───────────────────────────── */
+/* ── Segmented quality control ──────────────────────────────── */
 const sharpnessControl = document.getElementById("sharpnessControl");
 const deviceScaleInput = document.getElementById("deviceScale");
 
@@ -27,6 +28,20 @@ sharpnessControl.querySelectorAll(".seg-btn").forEach((btn) => {
       .forEach((b) => b.classList.remove("seg-active"));
     btn.classList.add("seg-active");
     deviceScaleInput.value = btn.dataset.value;
+  });
+});
+
+/* ── Resolution presets ─────────────────────────────────────── */
+const widthInput  = document.getElementById("width");
+const heightInput = document.getElementById("height");
+
+document.querySelectorAll(".preset-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    widthInput.value  = btn.dataset.w;
+    heightInput.value = btn.dataset.h;
+    document.querySelectorAll(".preset-btn")
+      .forEach((b) => b.classList.remove("preset-active"));
+    btn.classList.add("preset-active");
   });
 });
 
@@ -99,10 +114,16 @@ const renderHistory = () => {
     ? `${captureHistory.length} capture${captureHistory.length === 1 ? "" : "s"}`
     : "No captures yet";
 
+  // Slide in filmstrip after first capture
+  if (captureHistory.length > 0) {
+    filmstripSection.classList.add("has-captures");
+  }
+
   captureHistory.forEach((entry) => {
     const card = document.createElement("article");
     card.className = "history-item";
     card.setAttribute("role", "listitem");
+    card.title = entry.filename;
 
     const thumb = document.createElement("img");
     thumb.className = "history-thumb";
@@ -110,28 +131,16 @@ const renderHistory = () => {
     thumb.alt = entry.filename;
     thumb.loading = "lazy";
 
-    const meta = document.createElement("div");
-    meta.className = "history-meta";
-
-    const name = document.createElement("p");
-    name.className = "history-name";
-    name.title = entry.filename;
-    name.textContent = entry.filename;
-
-    const time = document.createElement("p");
-    time.className = "history-time";
-    time.textContent = entry.capturedAt;
-
     const dlBtn = document.createElement("button");
     dlBtn.className = "history-dl-btn";
     dlBtn.type = "button";
-    dlBtn.textContent = "⬇ Re-download";
+    dlBtn.title = `Re-download ${entry.filename}`;
+    dlBtn.textContent = "⬇";
     dlBtn.addEventListener("click", () =>
       triggerDownload(entry.blob, entry.objectUrl, entry.filename)
     );
 
-    meta.append(name, time, dlBtn);
-    card.append(thumb, meta);
+    card.append(thumb, dlBtn);
     historyList.appendChild(card);
   });
 };
@@ -145,17 +154,11 @@ form.addEventListener("submit", async (e) => {
   const filenameTemplate = String(data.get("filename_template") || "{host}_{date}_{time}.png");
   const params           = new URLSearchParams();
 
-  params.set("url",                url);
-  params.set("width",              String(data.get("width")               || "1920"));
-  params.set("height",             String(data.get("height")              || "1080"));
-  params.set("device_scale_factor",String(data.get("device_scale_factor") || "2"));
-  params.set("wait",               String(data.get("wait")                || "4"));
-  params.set("dark_mode",          data.get("dark_mode") ? "true" : "false");
-
-  const authUser = String(data.get("auth_username") || "").trim();
-  const authPass = String(data.get("auth_password") || "").trim();
-  if (authUser) params.set("auth_username", authUser);
-  if (authPass) params.set("auth_password", authPass);
+  params.set("url",                 url);
+  params.set("width",               String(data.get("width")               || "1920"));
+  params.set("height",              String(data.get("height")              || "1080"));
+  params.set("device_scale_factor", String(data.get("device_scale_factor") || "2"));
+  params.set("wait",                String(data.get("wait")                || "4"));
 
   setLoading(true);
   setStatus("Taking screenshot…", "loading");
@@ -175,17 +178,17 @@ form.addEventListener("submit", async (e) => {
     if (latestObjectUrl) URL.revokeObjectURL(latestObjectUrl);
     latestObjectUrl = URL.createObjectURL(latestBlob);
 
-    previewImage.src              = latestObjectUrl;
-    previewImage.style.display    = "block";
-    previewPlaceholder.style.display = "none";
-    previewFname.textContent      = latestFilename;
-    previewFname.title            = latestFilename;
-    downloadBtn.disabled          = false;
+    previewImage.src                  = latestObjectUrl;
+    previewImage.style.display        = "block";
+    previewPlaceholder.style.display  = "none";
+    previewFname.textContent          = latestFilename;
+    previewFname.title                = latestFilename;
+    downloadBtn.disabled              = false;
 
     captureHistory.unshift({
-      blob: latestBlob,
-      objectUrl: latestObjectUrl,
-      filename:  latestFilename,
+      blob:       latestBlob,
+      objectUrl:  latestObjectUrl,
+      filename:   latestFilename,
       capturedAt: new Date().toLocaleString(),
     });
     if (captureHistory.length > 20) {
