@@ -1,102 +1,194 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Local Screenshot API</title>
-    <link rel="stylesheet" href="/static/style.css" />
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SHOT — Screenshot Tool</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=JetBrains+Mono:wght@300;400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
-    <main class="layout">
-        <section class="card">
-            <header class="card-header">
-                <h1 class="card-title">Local Screenshot API</h1>
-                <p class="card-subtitle">Capture full-page screenshots with your existing FastAPI + Playwright service.</p>
-            </header>
-            <div class="card-body">
-                <form id="captureForm">
-                    <div class="field">
-                        <label for="url">URL</label>
-                        <input id="url" name="url" type="url" placeholder="https://example.com" required />
-                    </div>
+  <div class="grain" aria-hidden="true"></div>
 
-                    <div class="field">
-                        <label for="filenameTemplate">Filename Template</label>
-                        <input id="filenameTemplate" name="filename_template" type="text" value="{host}_{date}_{time}.png" />
-                        <p class="field-help">Use placeholders: <strong>{host}</strong>, <strong>{date}</strong>, <strong>{time}</strong>.</p>
-                    </div>
+  <div class="app">
 
-                    <div class="grid">
-                        <div class="field">
-                            <label for="width">Viewport Width</label>
-                            <input id="width" name="width" type="number" min="1" value="1920" required />
-                        </div>
-                        <div class="field">
-                            <label for="height">Viewport Height</label>
-                            <input id="height" name="height" type="number" min="1" value="1080" required />
-                        </div>
-                        <div class="field">
-                            <label for="deviceScale">Device Scale Factor</label>
-                            <input id="deviceScale" name="device_scale_factor" type="number" min="1" max="4" step="0.1" value="2" required />
-                        </div>
-                        <div class="field">
-                            <label for="wait">Wait (seconds)</label>
-                            <input id="wait" name="wait" type="number" min="0" step="1" value="4" required />
-                        </div>
-                        <div class="field">
-                            <label for="authUsername">Basic Auth Username (optional)</label>
-                            <input id="authUsername" name="auth_username" type="text" autocomplete="off" />
-                        </div>
-                        <div class="field">
-                            <label for="authPassword">Basic Auth Password (optional)</label>
-                            <input id="authPassword" name="auth_password" type="password" autocomplete="off" />
-                        </div>
-                    </div>
+    <!-- ── HEADER ────────────────────────────────────── -->
+    <header class="app-header">
+      <div class="brand">
+        <span class="brand-name">SHOT</span>
+        <span class="brand-sep">/</span>
+        <span class="brand-sub">Webpage Screenshot Tool</span>
+      </div>
+      <span id="status" class="status-text" role="status" aria-live="polite"></span>
+    </header>
 
-                    <label class="checkbox" for="darkMode">
-                        <input id="darkMode" name="dark_mode" type="checkbox" />
-                        Capture with dark mode
-                    </label>
+    <!-- ── MAIN WORKSPACE ────────────────────────────── -->
+    <div class="workspace">
 
-                    <div class="actions">
-                        <button class="primary" id="captureBtn" type="submit">Capture Screenshot</button>
-                        <button class="secondary" id="downloadBtn" type="button" disabled>Download PNG</button>
-                        <button class="secondary" id="openFolderBtn" type="button">Open File Location</button>
-                    </div>
+      <!-- LEFT: Controls -->
+      <aside class="controls-panel">
+        <form id="captureForm" novalidate>
 
-                    <label class="checkbox" for="openAfterDownload">
-                        <input id="openAfterDownload" name="open_after_download" type="checkbox" />
-                        Open file location after download
-                    </label>
+          <div class="field field-hero">
+            <label for="url" class="field-label">Website URL</label>
+            <input
+              id="url" name="url" type="url"
+              placeholder="https://example.com"
+              autocomplete="off"
+              spellcheck="false"
+              required
+            />
+          </div>
 
-                    <p id="status" class="status"></p>
-                </form>
+          <div class="field">
+            <label for="filenameTemplate" class="field-label">Save As</label>
+            <input id="filenameTemplate" name="filename_template" type="text"
+              value="{host}_{date}_{time}.png" spellcheck="false" />
+            <p class="field-help">
+              Use <code>{host}</code> for the site name, <code>{date}</code> for today's date,
+              <code>{time}</code> for the current time.
+            </p>
+          </div>
+
+          <div class="field-row">
+            <div class="field">
+              <label for="width" class="field-label">Width <span class="unit">px</span></label>
+              <input id="width" name="width" type="number" min="1" value="1920" required />
+              <p class="field-help">How wide the simulated browser window is.</p>
             </div>
-        </section>
-
-        <section class="card preview-wrap">
-            <header class="card-header">
-                <h2 class="card-title">Preview</h2>
-                <p class="card-subtitle">The latest capture appears here and can be downloaded as a PNG file.</p>
-            </header>
-            <div class="preview">
-                <p id="placeholder" class="placeholder">Enter a URL and click “Capture Screenshot” to generate your first preview.</p>
-                <img id="previewImage" alt="Screenshot preview" />
+            <div class="field">
+              <label for="height" class="field-label">Height <span class="unit">px</span></label>
+              <input id="height" name="height" type="number" min="1" value="1080" required />
+              <p class="field-help">How tall the simulated browser window is.</p>
             </div>
-        </section>
+          </div>
 
-        <section class="card history-card">
-            <header class="card-header">
-                <h2 class="card-title">Capture History</h2>
-                <p class="card-subtitle">Recent captures with thumbnails and one-click re-download.</p>
-            </header>
-            <div class="card-body">
-                <div id="historyEmpty" class="history-empty">No captures yet.</div>
-                <div id="historyList" class="history-list"></div>
+          <div class="field">
+            <label class="field-label">Sharpness</label>
+            <div class="seg-control" id="sharpnessControl" role="group" aria-label="Sharpness level">
+              <button type="button" class="seg-btn" data-value="1">
+                <span class="seg-val">1×</span>
+                <span class="seg-desc">Normal</span>
+              </button>
+              <button type="button" class="seg-btn seg-active" data-value="2">
+                <span class="seg-val">2×</span>
+                <span class="seg-desc">Sharp</span>
+              </button>
+              <button type="button" class="seg-btn" data-value="4">
+                <span class="seg-val">4×</span>
+                <span class="seg-desc">Ultra</span>
+              </button>
             </div>
-        </section>
-    </main>
+            <input type="hidden" id="deviceScale" name="device_scale_factor" value="2" />
+            <p class="field-help">2× is sharp enough for most uses. 4× is huge but very crisp — use it for high-DPI or print work.</p>
+          </div>
 
-    <script src="/static/app.js"></script>
+          <div class="field">
+            <label for="wait" class="field-label">
+              Extra wait time <span class="unit">seconds</span>
+            </label>
+            <input id="wait" name="wait" type="number" min="0" step="1" value="4" required />
+            <p class="field-help">
+              Extra time to wait after the page finishes loading. Helpful for pages that animate in, or load images lazily.
+            </p>
+          </div>
+
+          <div class="field">
+            <p class="field-label">Options</p>
+            <div class="toggle-group">
+              <label class="toggle-row" for="darkMode">
+                <span class="toggle-wrap">
+                  <input id="darkMode" name="dark_mode" type="checkbox" class="toggle-input" />
+                  <span class="toggle-track" aria-hidden="true"></span>
+                </span>
+                <span class="toggle-label">Dark mode</span>
+                <span class="toggle-hint">Screenshot looks like night browsing</span>
+              </label>
+              <label class="toggle-row" for="openAfterDownload">
+                <span class="toggle-wrap">
+                  <input id="openAfterDownload" name="open_after_download" type="checkbox" class="toggle-input" />
+                  <span class="toggle-track" aria-hidden="true"></span>
+                </span>
+                <span class="toggle-label">Open folder after saving</span>
+              </label>
+            </div>
+          </div>
+
+          <details class="auth-details">
+            <summary class="auth-summary">
+              <span class="auth-summary-label">🔐 Password-protected site?</span>
+              <span class="auth-summary-toggle"></span>
+            </summary>
+            <div class="auth-fields">
+              <p class="field-help" style="margin-bottom: 12px;">
+                Only needed if the website shows a browser login popup (not a regular login form).
+              </p>
+              <div class="field">
+                <label for="authUsername" class="field-label">Site Username</label>
+                <input id="authUsername" name="auth_username" type="text"
+                  placeholder="username" autocomplete="off" />
+              </div>
+              <div class="field" style="margin-bottom: 0;">
+                <label for="authPassword" class="field-label">Site Password</label>
+                <input id="authPassword" name="auth_password" type="password"
+                  placeholder="password" autocomplete="off" />
+              </div>
+            </div>
+          </details>
+
+          <div class="form-actions">
+            <button class="btn-capture" id="captureBtn" type="submit">
+              <span class="capture-icon" aria-hidden="true">◉</span>
+              <span class="capture-label">Take Screenshot</span>
+            </button>
+          </div>
+
+        </form>
+      </aside>
+
+      <!-- RIGHT: Preview -->
+      <main class="preview-panel" id="previewPanel">
+        <div class="preview-viewport" id="previewViewport">
+          <div id="previewPlaceholder" class="preview-empty">
+            <div class="empty-reticle" aria-hidden="true">
+              <div class="reticle-ring"></div>
+              <div class="reticle-cross-h"></div>
+              <div class="reticle-cross-v"></div>
+            </div>
+            <p class="empty-title">No screenshot yet</p>
+            <p class="empty-hint">Enter a URL on the left and hit Take Screenshot</p>
+          </div>
+          <img id="previewImage" alt="Screenshot preview" />
+        </div>
+
+        <footer class="preview-footer">
+          <span id="previewFilename" class="preview-fname" title=""></span>
+          <div class="preview-btns">
+            <button class="btn btn-download" id="downloadBtn" type="button" disabled>
+              ⬇ Download
+            </button>
+            <button class="btn btn-folder" id="openFolderBtn" type="button">
+              📁 Open Folder
+            </button>
+          </div>
+        </footer>
+      </main>
+
+    </div><!-- /.workspace -->
+
+    <!-- ── FILMSTRIP (History) ────────────────────────── -->
+    <section class="filmstrip" aria-label="Capture history">
+      <div class="filmstrip-header">
+        <span class="filmstrip-label">CAPTURE HISTORY</span>
+        <span class="filmstrip-hint" id="filmstripHint">No captures yet</span>
+      </div>
+      <div id="historyList" class="filmstrip-track" role="list"></div>
+    </section>
+
+  </div><!-- /.app -->
+
+  <script src="/static/app.js"></script>
 </body>
 </html>
