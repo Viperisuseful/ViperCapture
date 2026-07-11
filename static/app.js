@@ -4,6 +4,7 @@ const captureBtn        = document.getElementById("captureBtn");
 const captureBtnLabel   = captureBtn.querySelector(".capture-label");
 const downloadBtn       = document.getElementById("downloadBtn");
 const openFolderBtn     = document.getElementById("openFolderBtn");
+const previewPanel      = document.getElementById("previewPanel");
 const previewImage      = document.getElementById("previewImage");
 const previewPlaceholder = document.getElementById("previewPlaceholder");
 const previewFname      = document.getElementById("previewFilename");
@@ -12,38 +13,129 @@ const filmstripHint     = document.getElementById("filmstripHint");
 const filmstripSection  = document.getElementById("filmstripSection");
 const openAfterDownload = document.getElementById("openAfterDownload");
 const statusEl          = document.getElementById("status");
+const densityHint       = document.getElementById("densityHint");
+const captchaDialog     = document.getElementById("captchaDialog");
+const captchaProvider   = document.getElementById("captchaProvider");
+
+let maxScreenshotPixels = 50_000_000;
+
+const appConfig = fetch("/app-config")
+  .then((res) => {
+    if (!res.ok) throw new Error("Config unavailable");
+    return res.json();
+  })
+  .catch(() => ({ server_saves: false }));
+
+appConfig.then(({ server_saves: serverSaves, max_screenshot_pixels: maxPixels }) => {
+  const parsedLimit = Number(maxPixels);
+  if (Number.isFinite(parsedLimit) && parsedLimit > 0) maxScreenshotPixels = parsedLimit;
+  document.documentElement.dataset.mode = serverSaves ? "local" : "hosted";
+  openFolderBtn.hidden = !serverSaves;
+  openAfterDownload.closest(".toggle-standalone").hidden = !serverSaves;
+  syncScaleAvailability();
+});
 
 let latestBlob      = null;
 let latestObjectUrl = null;
 let latestFilename  = "screenshot.png";
 const captureHistory = [];
 
+const captchaProviderNames = {
+  cloudflare: "Cloudflare Turnstile",
+  recaptcha: "Google reCAPTCHA",
+  hcaptcha: "hCaptcha",
+};
+
+const confirmCaptchaCapture = (provider) => new Promise((resolve) => {
+  captchaProvider.textContent = captchaProviderNames[provider] || "A captcha";
+  captchaDialog.returnValue = "cancel";
+  captchaDialog.addEventListener(
+    "close",
+    () => resolve(captchaDialog.returnValue === "proceed"),
+    { once: true },
+  );
+  captchaDialog.showModal();
+});
+
 /* ── Segmented quality control ──────────────────────────────── */
 const sharpnessControl = document.getElementById("sharpnessControl");
 const deviceScaleInput = document.getElementById("deviceScale");
+const scaleButtons = [...sharpnessControl.querySelectorAll(".seg-btn")];
 
-sharpnessControl.querySelectorAll(".seg-btn").forEach((btn) => {
+const selectScale = (selectedButton) => {
+  scaleButtons.forEach((button) => {
+    const active = button === selectedButton;
+    button.classList.toggle("seg-active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+  deviceScaleInput.value = selectedButton.dataset.value;
+};
+
+scaleButtons.forEach((btn) => {
   btn.addEventListener("click", () => {
-    sharpnessControl.querySelectorAll(".seg-btn")
-      .forEach((b) => b.classList.remove("seg-active"));
-    btn.classList.add("seg-active");
-    deviceScaleInput.value = btn.dataset.value;
+    selectScale(btn);
   });
 });
 
 /* ── Resolution presets ─────────────────────────────────────── */
 const widthInput  = document.getElementById("width");
 const heightInput = document.getElementById("height");
+const presetButtons = [...document.querySelectorAll(".preset-btn")];
 
-document.querySelectorAll(".preset-btn").forEach((btn) => {
+const syncActivePreset = () => {
+  presetButtons.forEach((btn) => {
+    const active = btn.dataset.w === widthInput.value && btn.dataset.h === heightInput.value;
+    btn.classList.toggle("preset-active", active);
+    btn.setAttribute("aria-pressed", String(active));
+  });
+};
+
+const syncScaleAvailability = () => {
+  const basePixels = Number(widthInput.value) * Number(heightInput.value);
+  let hasUnavailableOption = false;
+
+  scaleButtons.forEach((button) => {
+    const scale = Number(button.dataset.value);
+    const available = Number.isFinite(basePixels)
+      && basePixels > 0
+      && basePixels * scale * scale <= maxScreenshotPixels;
+    button.disabled = !available;
+    button.title = available
+      ? ""
+      : `Exceeds this server's ${Math.floor(maxScreenshotPixels / 1_000_000)} MP output limit`;
+    hasUnavailableOption ||= !available;
+  });
+
+  const activeButton = scaleButtons.find((button) => button.classList.contains("seg-active"));
+  if (activeButton?.disabled) {
+    const fallback = [...scaleButtons].reverse().find((button) => !button.disabled);
+    if (fallback) selectScale(fallback);
+  }
+
+  densityHint.textContent = hasUnavailableOption
+    ? "Higher density is limited at this size"
+    : "2× works for most captures";
+};
+
+presetButtons.forEach((btn) => {
   btn.addEventListener("click", () => {
     widthInput.value  = btn.dataset.w;
     heightInput.value = btn.dataset.h;
-    document.querySelectorAll(".preset-btn")
-      .forEach((b) => b.classList.remove("preset-active"));
-    btn.classList.add("preset-active");
+    syncActivePreset();
+    syncScaleAvailability();
   });
 });
+
+widthInput.addEventListener("input", () => {
+  syncActivePreset();
+  syncScaleAvailability();
+});
+heightInput.addEventListener("input", () => {
+  syncActivePreset();
+  syncScaleAvailability();
+});
+
+syncScaleAvailability();
 
 /* ── Status helper ─────────────────────────────────────────── */
 const setStatus = (message, type = "") => {
@@ -53,11 +145,11 @@ const setStatus = (message, type = "") => {
 
 /* ── Loading state ─────────────────────────────────────────── */
 const setLoading = (loading) => {
-  const panel = document.querySelector(".preview-panel");
-  panel.classList.toggle("is-loading", loading);
+  previewPanel.classList.toggle("is-loading", loading);
   captureBtn.classList.toggle("is-loading", loading);
+  captureBtn.setAttribute("aria-busy", String(loading));
   captureBtn.disabled = loading;
-  captureBtnLabel.textContent = loading ? "Taking screenshot…" : "Take Screenshot";
+  captureBtnLabel.textContent = loading ? "Loading page" : "Capture page";
   if (loading) downloadBtn.disabled = true;
 };
 
@@ -103,8 +195,8 @@ const saveScreenshotToAppFolder = async (blob, filename) => {
 
 /* ── Open captures folder ──────────────────────────────────── */
 const openFileLocation = async () => {
-  const res = await fetch("/open-captures-folder", { method: "POST" });
-  if (!res.ok) throw new Error("Couldn't open the captures folder");
+  const res = await fetch("/open-downloads-folder", { method: "POST" });
+  if (!res.ok) throw new Error("Couldn't open the Downloads folder");
 };
 
 /* ── Render history filmstrip ──────────────────────────────── */
@@ -135,7 +227,7 @@ const renderHistory = () => {
     dlBtn.className = "history-dl-btn";
     dlBtn.type = "button";
     dlBtn.title = `Re-download ${entry.filename}`;
-    dlBtn.textContent = "⬇";
+    dlBtn.textContent = "Save";
     dlBtn.addEventListener("click", () =>
       triggerDownload(entry.blob, entry.objectUrl, entry.filename)
     );
@@ -158,24 +250,49 @@ form.addEventListener("submit", async (e) => {
   params.set("width",               String(data.get("width")               || "1920"));
   params.set("height",              String(data.get("height")              || "1080"));
   params.set("device_scale_factor", String(data.get("device_scale_factor") || "2"));
-  params.set("wait",                String(data.get("wait")                || "4"));
+  params.set("wait",                String(data.get("wait")                || "1"));
 
   setLoading(true);
-  setStatus("Taking screenshot…", "loading");
+  setStatus("Loading and scrolling the page before capture.", "loading");
 
   try {
-    const res = await fetch(`/screenshot?${params}`);
+    let res = await fetch(`/screenshot?${params}`);
+
+    if (res.status === 409) {
+      let detail = null;
+      try { detail = (await res.json())?.detail; } catch {}
+
+      if (detail?.code === "captcha_detected") {
+        setLoading(false);
+        setStatus("Captcha detected. Waiting for your choice.", "error");
+
+        const proceed = await confirmCaptchaCapture(detail.provider);
+        if (!proceed) {
+          downloadBtn.disabled = !latestBlob;
+          setStatus("Capture canceled.");
+          return;
+        }
+
+        params.set("proceed_on_captcha", "true");
+        setLoading(true);
+        setStatus("Reloading the page and capturing the result.", "loading");
+        res = await fetch(`/screenshot?${params}`);
+      }
+    }
 
     if (!res.ok) {
       let msg = `Request failed (${res.status})`;
-      try { const b = await res.json(); if (b?.detail) msg = b.detail; } catch {}
+      try {
+        const body = await res.json();
+        if (typeof body?.detail === "string") msg = body.detail;
+        else if (body?.detail?.message) msg = body.detail.message;
+      } catch {}
       throw new Error(msg);
     }
 
     latestBlob     = await res.blob();
     latestFilename = formatFilename(url, filenameTemplate);
 
-    if (latestObjectUrl) URL.revokeObjectURL(latestObjectUrl);
     latestObjectUrl = URL.createObjectURL(latestBlob);
 
     previewImage.src                  = latestObjectUrl;
@@ -189,7 +306,6 @@ form.addEventListener("submit", async (e) => {
       blob:       latestBlob,
       objectUrl:  latestObjectUrl,
       filename:   latestFilename,
-      capturedAt: new Date().toLocaleString(),
     });
     if (captureHistory.length > 20) {
       const removed = captureHistory.pop();
@@ -197,10 +313,17 @@ form.addEventListener("submit", async (e) => {
     }
 
     renderHistory();
-    setStatus("Screenshot captured.", "success");
+    setStatus("Capture ready to download.", "success");
+
+    if (window.matchMedia("(max-width: 61.25rem)").matches) {
+      previewPanel.scrollIntoView({
+        behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+        block: "start",
+      });
+    }
 
   } catch (err) {
-    latestBlob = null;
+    downloadBtn.disabled = !latestBlob;
     setStatus(err.message || "Something went wrong — check the URL and try again", "error");
   } finally {
     setLoading(false);
@@ -213,12 +336,18 @@ downloadBtn.addEventListener("click", async () => {
 
   triggerDownload(latestBlob, latestObjectUrl, latestFilename);
 
+  const { server_saves: serverSaves } = await appConfig;
+  if (!serverSaves) {
+    setStatus("Downloaded to your device.", "success");
+    return;
+  }
+
   try {
     await saveScreenshotToAppFolder(latestBlob, latestFilename);
     if (openAfterDownload.checked) await openFileLocation();
-    setStatus("Saved to captures folder.", "success");
+    setStatus("Downloaded. A local copy was saved in captures.", "success");
   } catch (err) {
-    setStatus(err.message || "Downloaded but couldn't save to the captures folder", "error");
+    setStatus(err.message || "Downloaded, but the local copy could not be saved", "error");
   }
 });
 
@@ -226,14 +355,13 @@ downloadBtn.addEventListener("click", async () => {
 openFolderBtn.addEventListener("click", async () => {
   try {
     await openFileLocation();
-    setStatus("Opened captures folder.", "success");
+    setStatus("Opened Downloads folder.", "success");
   } catch (err) {
-    setStatus(err.message || "Couldn't open the folder", "error");
+    setStatus(err.message || "Couldn't open the Downloads folder", "error");
   }
 });
 
 /* ── Cleanup on unload ─────────────────────────────────────── */
 window.addEventListener("beforeunload", () => {
-  if (latestObjectUrl) URL.revokeObjectURL(latestObjectUrl);
   captureHistory.forEach((e) => { if (e.objectUrl) URL.revokeObjectURL(e.objectUrl); });
 });

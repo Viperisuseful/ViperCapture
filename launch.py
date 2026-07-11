@@ -12,6 +12,7 @@ requirements.txt has changed (hash-stamped in .venv/).
 
 from __future__ import annotations
 import hashlib
+from importlib.metadata import version
 import os
 import sys
 import subprocess
@@ -21,7 +22,7 @@ import webbrowser
 from pathlib import Path
 
 ROOT             = Path(__file__).parent.resolve()
-VENV_PYTHON      = ROOT / ".venv" / "Scripts" / "python.exe"
+VENV_PYTHON      = ROOT / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 HOST             = "127.0.0.1"
 PORT             = 8000
 URL              = f"http://{HOST}:{PORT}/"
@@ -50,7 +51,8 @@ def run(*cmd: str | Path, label: str = "") -> None:
 
 
 def wait_and_exit(code: int = 0) -> None:
-    input("\n  Press Enter to close...")
+    if sys.stdin.isatty():
+        input("\n  Press Enter to close...")
     sys.exit(code)
 
 
@@ -101,16 +103,22 @@ def ensure_deps() -> None:
 def ensure_playwright() -> None:
     """
     Install Playwright's Chromium browser.
-    Skipped on subsequent runs (stamp file present).
+    Skipped when the installed browser matches the Playwright package version.
     """
-    if PLAYWRIGHT_STAMP.exists():
+    playwright_version = version("playwright")
+    if (
+        PLAYWRIGHT_STAMP.exists()
+        and PLAYWRIGHT_STAMP.read_text().strip() == playwright_version
+    ):
         print("  [3/3] Playwright browser already installed — skipping.")
         return
 
     print("  [3/3] Installing Playwright browser (Chromium)...")
-    run(sys.executable, "-m", "playwright", "install", "chromium",
-        label="playwright install")
-    PLAYWRIGHT_STAMP.write_text("ok")
+    command = [sys.executable, "-m", "playwright", "install", "--only-shell"]
+    if sys.platform.startswith("linux"):
+        command.append("--with-deps")
+    run(*command, "chromium", label="playwright install")
+    PLAYWRIGHT_STAMP.write_text(playwright_version)
 
 
 # ── Main ──────────────────────────────────────────────────────

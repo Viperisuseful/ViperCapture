@@ -1,16 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PYTHON_BIN="${PYTHON:-python}"
+PYTHON_BIN="${PYTHON:-python3}"
 
-"${PYTHON_BIN}" -m venv .venv
-
-if [[ "${OS:-}" == "Windows_NT" ]]; then
-    source .venv/Scripts/activate
-else
-    source .venv/bin/activate
+if [[ ! -x .venv/bin/python ]]; then
+    "${PYTHON_BIN}" -m venv .venv
 fi
 
-pip install --upgrade pip
-pip install -r requirements.txt
-playwright install chromium
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m playwright install --with-deps --only-shell chromium
