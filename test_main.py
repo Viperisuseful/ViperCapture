@@ -64,29 +64,67 @@ class CaptureLimitsTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(endless.height_reads, 3)
             self.assertEqual(endless.scrolls[-1], 0)
 
-    async def test_captcha_blocks_unless_explicitly_allowed(self):
+    async def test_detector_v2_blocks_only_page_level_challenges(self):
         class Page:
-            def __init__(self, provider):
-                self.provider = provider
+            def __init__(self, result):
+                self.result = result
                 self.script = ""
 
-            async def evaluate(self, script):
+            async def evaluate(self, script, _argument=None):
                 self.script = script
-                return self.provider
+                return self.result
 
-        page = Page("cloudflare")
+        challenge = {
+            "provider": "cloudflare",
+            "kind": "blocking_interstitial",
+            "confidence": 0.98,
+            "signals": ["challenge_form", "viewport_obstruction"],
+        }
+        page = Page(challenge)
         with self.assertRaises(HTTPException) as raised:
             await main._check_captcha(page, False)
 
         self.assertEqual(raised.exception.status_code, 409)
         self.assertEqual(
             raised.exception.detail,
-            {"code": "captcha_detected", "provider": "cloudflare"},
+            {
+                "code": "captcha_detected",
+                **challenge,
+                "message": "Cloudflare challenge blocked the page",
+            },
         )
         self.assertIn("recaptcha", page.script)
         self.assertIn("hcaptcha", page.script)
-        await main._check_captcha(Page("recaptcha"), True)
+        self.assertIn("funcaptcha", page.script)
+        self.assertIn("embedded_widget", page.script)
+        await main._check_captcha(Page(challenge), True)
+        await main._check_captcha(
+            Page({"provider": "recaptcha", "kind": "embedded_widget"}),
+            False,
+        )
         await main._check_captcha(Page(None), False)
+
+    def test_png_jpeg_and_webp_capture_options(self):
+        clip = {"x": 0, "y": 0, "width": 100, "height": 50, "scale": 2}
+        png = main._capture_options("png", clip)
+        jpeg = main._capture_options("jpeg", clip)
+        webp = main._capture_options("webp", clip)
+
+        self.assertEqual(png["format"], "png")
+        self.assertNotIn("quality", png)
+        self.assertEqual(jpeg["format"], "jpeg")
+        self.assertEqual(jpeg["quality"], 90)
+        self.assertEqual(webp["format"], "webp")
+        self.assertEqual(webp["quality"], 90)
+        self.assertEqual(main._media_type("jpeg"), "image/jpeg")
+        self.assertEqual(main._safe_filename("capture.png", "webp"), "capture.webp")
+
+    def test_public_ui_has_formats_without_hosted_cleanup_controls(self):
+        html = (main.BASE_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('name="format"', html)
+        self.assertNotIn('name="consent_mode"', html)
+        self.assertNotIn('name="block_ads"', html)
+        self.assertNotIn("autoconsent", html.lower())
 
     async def test_downloads_button_uses_windows_known_folder(self):
         with (

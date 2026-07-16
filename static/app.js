@@ -45,6 +45,10 @@ const statusEl          = document.getElementById("status");
 const densityHint       = document.getElementById("densityHint");
 const captchaDialog     = document.getElementById("captchaDialog");
 const captchaProvider   = document.getElementById("captchaProvider");
+const outputFormat      = document.getElementById("outputFormat");
+const previewFormat     = document.getElementById("previewFormat");
+const downloadLabel     = document.getElementById("downloadLabel");
+const filenameTemplate  = document.getElementById("filenameTemplate");
 
 let maxScreenshotPixels = 50_000_000;
 
@@ -73,6 +77,8 @@ const captchaProviderNames = {
   cloudflare: "Cloudflare Turnstile",
   recaptcha: "Google reCAPTCHA",
   hcaptcha: "hCaptcha",
+  funcaptcha: "Arkose Labs FunCaptcha",
+  datadome: "DataDome",
 };
 
 const confirmCaptchaCapture = (provider) => new Promise((resolve) => {
@@ -188,16 +194,29 @@ const sanitizeFilePart = (value) =>
     .replace(/[^a-z0-9._-]+/gi, "_")
     .replace(/^_+|_+$/g, "") || "screenshot";
 
-const formatFilename = (urlText, templateText) => {
+const formatFilename = (urlText, templateText, imageFormat) => {
   const now  = new Date();
   const date = now.toISOString().slice(0, 10).replace(/-/g, "");
   const time = `${String(now.getHours()).padStart(2,"0")}${String(now.getMinutes()).padStart(2,"0")}${String(now.getSeconds()).padStart(2,"0")}`;
   let host = "site";
   try { host = sanitizeFilePart(new URL(urlText).hostname || "site"); } catch {}
-  const raw    = (templateText || "{host}_{date}_{time}.png").trim() || "{host}_{date}_{time}.png";
+  const extension = imageFormat === "jpeg" ? "jpg" : imageFormat;
+  const raw    = (templateText || `{host}_{date}_{time}.${extension}`).trim() || `{host}_{date}_{time}.${extension}`;
   const filled = raw.replaceAll("{host}", host).replaceAll("{date}", date).replaceAll("{time}", time);
-  return `${sanitizeFilePart(filled.replace(/\.png$/i, ""))}.png`;
+  return `${sanitizeFilePart(filled.replace(/\.(png|jpe?g|webp)$/i, ""))}.${extension}`;
 };
+
+const syncOutputFormat = () => {
+  const selected = outputFormat.value;
+  const label = selected === "jpeg" ? "JPEG" : selected.toUpperCase();
+  const extension = selected === "jpeg" ? "jpg" : selected;
+  previewFormat.textContent = `${label} · full page`;
+  downloadLabel.textContent = `Download ${label}`;
+  filenameTemplate.value = filenameTemplate.value.replace(/\.(png|jpe?g|webp)$/i, `.${extension}`);
+};
+
+outputFormat.addEventListener("change", syncOutputFormat);
+syncOutputFormat();
 
 /* ── Download helper ───────────────────────────────────────── */
 const triggerDownload = (blob, objectUrl, filename) => {
@@ -272,7 +291,8 @@ form.addEventListener("submit", async (e) => {
 
   const data             = new FormData(form);
   const url              = String(data.get("url") || "");
-  const filenameTemplate = String(data.get("filename_template") || "{host}_{date}_{time}.png");
+  const filenamePattern  = String(data.get("filename_template") || "{host}_{date}_{time}.png");
+  const imageFormat      = String(data.get("format") || "png");
   const params           = new URLSearchParams();
 
   params.set("url",                 url);
@@ -280,6 +300,7 @@ form.addEventListener("submit", async (e) => {
   params.set("height",              String(data.get("height")              || "1080"));
   params.set("device_scale_factor", String(data.get("device_scale_factor") || "2"));
   params.set("wait",                String(data.get("wait")                || "1"));
+  params.set("format",              imageFormat);
 
   setLoading(true);
   setStatus("Loading and scrolling the page before capture.", "loading");
@@ -320,7 +341,7 @@ form.addEventListener("submit", async (e) => {
     }
 
     latestBlob     = await res.blob();
-    latestFilename = formatFilename(url, filenameTemplate);
+    latestFilename = formatFilename(url, filenamePattern, imageFormat);
 
     latestObjectUrl = URL.createObjectURL(latestBlob);
 

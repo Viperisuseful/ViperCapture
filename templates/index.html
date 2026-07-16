@@ -23,8 +23,8 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=5c38065" />
-  <script defer src="/static/app.js?v=5c38065"></script>
+  <link rel="stylesheet" href="/static/style.css?v=capture-formats-1" />
+  <script defer src="/static/app.js?v=capture-formats-1"></script>
 </head>
 <body>
   <a class="skip-link" href="#capture-tool">Skip to capture tool</a>
@@ -68,12 +68,12 @@
       <div>
         <p class="eyebrow">SCP / screenshot capture</p>
         <h1 id="page-title">Full-page screenshot.</h1>
-        <p>Paste a URL, choose a viewport, and save the result as a PNG.</p>
+        <p>Paste a URL, choose a viewport, and save as PNG, JPEG, or WebP.</p>
       </div>
       <dl class="tool-notes" aria-label="Capture behavior">
         <div><dt>engine</dt><dd>Chromium</dd></div>
         <div><dt>page</dt><dd>auto-scroll</dd></div>
-        <div><dt>output</dt><dd>PNG</dd></div>
+        <div><dt>output</dt><dd>PNG · JPEG · WebP</dd></div>
       </dl>
     </section>
 
@@ -185,6 +185,15 @@
               </div>
 
               <div class="field">
+                <label for="outputFormat">Image format</label>
+                <select id="outputFormat" name="format">
+                  <option value="png" selected>PNG — lossless</option>
+                  <option value="jpeg">JPEG — compact</option>
+                  <option value="webp">WebP — smallest</option>
+                </select>
+              </div>
+
+              <div class="field">
                 <div class="label-row">
                   <label for="filenameTemplate">File name</label>
                   <span>{host} · {date} · {time}</span>
@@ -217,7 +226,7 @@
                 <span class="live-dot" aria-hidden="true"></span>
                 <h3 id="preview-heading">Preview</h3>
               </div>
-              <span class="preview-format">PNG · full page</span>
+              <span class="preview-format" id="previewFormat">PNG · full page</span>
             </header>
 
             <div class="preview-viewport" id="previewViewport">
@@ -238,7 +247,7 @@
                   <svg viewBox="0 0 20 20" aria-hidden="true">
                     <path d="M10 3v9m0 0 3.5-3.5M10 12 6.5 8.5M4 16h12" />
                   </svg>
-                  Download
+                  <span id="downloadLabel">Download PNG</span>
                 </button>
                 <button class="button button-secondary" id="openFolderBtn" type="button" hidden>
                   <svg viewBox="0 0 20 20" aria-hidden="true">

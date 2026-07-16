@@ -10,6 +10,7 @@ import re
 import socket
 import subprocess
 import sys
+from typing import Literal
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
@@ -51,6 +52,7 @@ CAPTURE_QUEUE_TIMEOUT_SECONDS = 30
 CAPTURE_TIMEOUT_SECONDS = 75
 LAZY_SCROLL_MAX_STEPS = 40
 LAZY_SCROLL_DELAY_SECONDS = 0.2
+ImageFormat = Literal["png", "jpeg", "webp"]
 
 if not HOSTED:
     CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
@@ -194,47 +196,148 @@ async def _load_lazy_content(page, viewport_height: int) -> None:
             await asyncio.sleep(LAZY_SCROLL_DELAY_SECONDS)
 
 
-async def _check_captcha(page, proceed_on_captcha: bool) -> None:
-    provider = await page.evaluate("""() => {
+async def _check_captcha(
+    page,
+    proceed_on_captcha: bool,
+    navigation_status: int | None = None,
+) -> None:
+    challenge = await page.evaluate("""({ status }) => {
         const visible = (element) => {
             const style = getComputedStyle(element);
             const rect = element.getBoundingClientRect();
             return style.display !== "none" && style.visibility !== "hidden" &&
                 Number(style.opacity) > 0 && rect.width > 0 && rect.height > 0;
         };
-        const providers = {
-            cloudflare: [
-                ".cf-turnstile", "#challenge-stage", "#challenge-running",
-                "#challenge-form", "iframe[src*='challenges.cloudflare.com']",
-                "iframe[src*='/cdn-cgi/challenge-platform/']"
-            ],
-            recaptcha: [
-                ".g-recaptcha", "iframe[src*='google.com/recaptcha']",
-                "iframe[src*='recaptcha.net/recaptcha']"
-            ],
-            hcaptcha: [
-                ".h-captcha", "iframe[src*='hcaptcha.com/captcha']"
-            ]
+        const obstruction = (element) => {
+            const rect = element.getBoundingClientRect();
+            const viewportArea = Math.max(1, innerWidth * innerHeight);
+            const area = Math.max(0, rect.width) * Math.max(0, rect.height);
+            const coversCenter = rect.left <= innerWidth / 2 && rect.right >= innerWidth / 2 &&
+                rect.top <= innerHeight / 2 && rect.bottom >= innerHeight / 2;
+            const areaRatio = area / viewportArea;
+            return areaRatio >= 0.25 || (coversCenter && areaRatio >= 0.10);
         };
+        const providers = {
+            cloudflare: {
+                widgets: [".cf-turnstile", "iframe[src*='challenges.cloudflare.com']"],
+                blocking: ["#challenge-stage", "#challenge-running", "#challenge-form",
+                    "iframe[src*='/cdn-cgi/challenge-platform/']"]
+            },
+            recaptcha: {
+                widgets: [".g-recaptcha", "iframe[src*='google.com/recaptcha']",
+                    "iframe[src*='recaptcha.net/recaptcha']"],
+                blocking: ["iframe[src*='/recaptcha/api2/bframe']"]
+            },
+            hcaptcha: {
+                widgets: [".h-captcha", "iframe[src*='hcaptcha.com/captcha']"],
+                blocking: ["iframe[src*='newassets.hcaptcha.com/captcha']"]
+            },
+            funcaptcha: {
+                widgets: [".arkose", "iframe[src*='arkoselabs.com']"],
+                blocking: ["iframe[src*='/fc/gc/']"]
+            },
+            datadome: {
+                widgets: ["iframe[src*='captcha-delivery.com']", "#datadome-captcha"],
+                blocking: ["iframe[src*='geo.captcha-delivery.com']"]
+            }
+        };
+        const title = (document.title || "").toLowerCase();
+        const bodyText = (document.body?.innerText || "").slice(0, 20000).toLowerCase();
+        const challengeText = [
+            "checking your browser", "verify you are human", "verification required",
+            "complete the security check", "performing security verification",
+            "unusual traffic", "attention required"
+        ].some((phrase) => title.includes(phrase) || bodyText.includes(phrase));
+        const signals = [];
+        let provider = null;
+        let hasBlockingElement = false;
+        let hasObstruction = false;
         for (const [name, selectors] of Object.entries(providers)) {
-            if (selectors.some((selector) =>
-                [...document.querySelectorAll(selector)].some(visible))) return name;
+            const widgetElements = selectors.widgets.flatMap((selector) =>
+                [...document.querySelectorAll(selector)].filter(visible));
+            const blockingElements = selectors.blocking.flatMap((selector) =>
+                [...document.querySelectorAll(selector)].filter(visible));
+            if (!widgetElements.length && !blockingElements.length) continue;
+            provider = name;
+            if (widgetElements.length) signals.push("provider_widget");
+            if (blockingElements.length) {
+                signals.push("challenge_form");
+                hasBlockingElement = true;
+            }
+            hasObstruction = [...widgetElements, ...blockingElements].some(obstruction);
+            if (hasObstruction) signals.push("viewport_obstruction");
+            break;
         }
-        return null;
-    }""")
-    if provider and not proceed_on_captcha:
+        if (status === 429) signals.push("main_response_429");
+        else if ([403, 503].includes(status)) signals.push(`main_response_${status}`);
+        if (challengeText) signals.push("challenge_copy");
+
+        let kind = null;
+        if (status === 429) kind = "rate_limited";
+        else if (status === 403 && !provider && !challengeText) kind = "access_denied";
+        else if (hasBlockingElement || hasObstruction || challengeText) kind = "blocking_interstitial";
+        else if (provider) kind = "embedded_widget";
+        if (!kind) return null;
+
+        const confidence = kind === "embedded_widget" ? 0.72 :
+            (provider && signals.length >= 2 ? 0.98 : 0.88);
+        return { provider: provider || "unknown", kind, confidence, signals };
+    }""", {"status": navigation_status})
+    if (
+        challenge
+        and challenge.get("kind") != "embedded_widget"
+        and not proceed_on_captcha
+    ):
+        provider = str(challenge.get("provider") or "unknown")
+        provider_label = {
+            "cloudflare": "Cloudflare",
+            "recaptcha": "Google reCAPTCHA",
+            "hcaptcha": "hCaptcha",
+            "funcaptcha": "Arkose Labs",
+            "datadome": "DataDome",
+            "unknown": "A page-level",
+        }.get(provider, provider.replace("_", " ").title())
         raise HTTPException(
             status_code=409,
-            detail={"code": "captcha_detected", "provider": provider},
+            detail={
+                "code": "captcha_detected",
+                **challenge,
+                "message": f"{provider_label} challenge blocked the page",
+            },
         )
 
 
-def _safe_filename(filename: str) -> str:
+def _media_type(image_format: ImageFormat) -> str:
+    return {
+        "png": "image/png",
+        "jpeg": "image/jpeg",
+        "webp": "image/webp",
+    }[image_format]
+
+
+def _capture_options(image_format: ImageFormat, clip: dict[str, float]) -> dict:
+    options = {
+        "format": image_format,
+        "captureBeyondViewport": True,
+        "optimizeForSpeed": True,
+        "clip": clip,
+    }
+    if image_format in {"jpeg", "webp"}:
+        options["quality"] = 90
+    return options
+
+
+def _safe_filename(filename: str, image_format: ImageFormat | None = None) -> str:
     name = filename.strip() or "screenshot.png"
     name = re.sub(r"[^a-zA-Z0-9._-]+", "_", name)
-    if not name.lower().endswith(".png"):
-        name = f"{name}.png"
-    return name
+    existing = re.search(r"\.(png|jpe?g|webp)$", name, flags=re.IGNORECASE)
+    selected = image_format or (
+        "jpeg" if existing and existing.group(1).lower() in {"jpg", "jpeg"}
+        else existing.group(1).lower() if existing else "png"
+    )
+    extension = "jpg" if selected == "jpeg" else selected
+    stem = name[:existing.start()] if existing else name
+    return f"{stem}.{extension}"
 
 
 def _unique_capture_path(filename: str) -> Path:
@@ -260,6 +363,7 @@ async def capture_screenshot(
     auth_username: str | None = Query(None, description="Optional HTTP basic auth username (local mode only)"),
     auth_password: str | None = Query(None, description="Optional HTTP basic auth password (local mode only)"),
     proceed_on_captcha: bool = Query(False, description="Capture even when a CAPTCHA is visible"),
+    image_format: ImageFormat = Query("png", alias="format", description="Output image format"),
 ):
     target_url = _validate_url(url)
     _ensure_pixel_budget(width, height, device_scale_factor)
@@ -330,12 +434,13 @@ async def capture_screenshot(
                     await popup.close()
 
             page.on("popup", lambda popup: asyncio.create_task(close_popup(popup)))
-            await page.goto(target_url, wait_until="load", timeout=45_000)
+            navigation = await page.goto(target_url, wait_until="load", timeout=45_000)
+            navigation_status = navigation.status if navigation else None
             if wait:
                 await asyncio.sleep(wait)
-            await _check_captcha(page, proceed_on_captcha)
+            await _check_captcha(page, proceed_on_captcha, navigation_status)
             await _load_lazy_content(page, height)
-            await _check_captcha(page, proceed_on_captcha)
+            await _check_captcha(page, proceed_on_captcha, navigation_status)
 
             cdp = await context.new_cdp_session(page)
             metrics = await cdp.send("Page.getLayoutMetrics")
@@ -345,18 +450,16 @@ async def capture_screenshot(
             _ensure_pixel_budget(clip_width, clip_height, device_scale_factor)
             screenshot = await cdp.send(
                 "Page.captureScreenshot",
-                {
-                    "format": "png",
-                    "captureBeyondViewport": True,
-                    "optimizeForSpeed": True,
-                    "clip": {
+                _capture_options(
+                    image_format,
+                    {
                         "x": 0,
                         "y": 0,
                         "width": clip_width,
                         "height": clip_height,
                         "scale": device_scale_factor,
                     },
-                },
+                ),
             )
             image = b64decode(screenshot["data"])
     except PlaywrightTimeoutError as exc:
@@ -383,7 +486,7 @@ async def capture_screenshot(
                 await _replace_browser(app, browser)
         app.state.capture_slots.release()
 
-    return Response(content=image, media_type="image/png")
+    return Response(content=image, media_type=_media_type(image_format))
 
 
 @app.get("/app-config")

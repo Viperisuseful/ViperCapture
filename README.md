@@ -2,7 +2,7 @@
 
 ViperCapture is an MIT-licensed webpage capture engine and browser interface.
 It loads a public URL in Chromium, performs a bounded lazy-content scroll, and
-returns a full-page PNG.
+returns a full-page PNG, JPEG, or WebP image.
 
 This public repository contains the capture API, website, launchers, and safety
 controls. The hosted service's accounts, payment processing, subscription
@@ -11,11 +11,11 @@ part of this repository.
 
 ## Features
 
-- Full-page PNG capture with headless Chromium
+- Full-page PNG, JPEG, and WebP capture with headless Chromium
 - Bounded scrolling for lazy-loaded pages
 - Phone through 4K presets plus custom viewport sizes
 - Configurable pixel density, wait time, and filenames
-- CAPTCHA detection with an explicit capture-anyway decision
+- Page-level challenge detection with provider, kind, confidence, and an explicit capture-anyway decision
 - Responsive light and dark interfaces
 - Hosted-mode public-network validation and resource limits
 - Local Windows launcher and cross-platform Python launcher
@@ -46,7 +46,7 @@ bash install.sh
 ## API
 
 ```http
-GET /screenshot?url=https://www.wikipedia.org&width=1920&height=1080&device_scale_factor=2&wait=1
+GET /screenshot?url=https://www.wikipedia.org&width=1920&height=1080&device_scale_factor=2&wait=1&format=webp
 ```
 
 | Parameter | Default | Description |
@@ -56,10 +56,13 @@ GET /screenshot?url=https://www.wikipedia.org&width=1920&height=1080&device_scal
 | `height` | `1080` | Viewport height |
 | `device_scale_factor` | `2` | Pixel density from 1–4 |
 | `wait` | `1` | Extra seconds after page load, from 0–15 |
-| `proceed_on_captcha` | `false` | Capture a detected challenge as displayed |
+| `format` | `png` | Output `png`, `jpeg`, or `webp` |
+| `proceed_on_captcha` | `false` | Capture a detected page-level challenge as displayed |
 
-A successful request returns `image/png`. The engine does not solve or bypass
-CAPTCHAs.
+A successful request returns the selected image media type. Detector v2 ignores
+ordinary embedded CAPTCHA form widgets, but reports page-level challenges with
+provider, kind, confidence, and detection signals. The engine does not solve or
+bypass CAPTCHAs.
 
 ## Hosted-mode safety
 
