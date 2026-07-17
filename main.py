@@ -18,6 +18,8 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from playwright.async_api import Browser, Playwright, TimeoutError as PlaywrightTimeoutError, async_playwright
 
+from render_errors import install_render_error_layer
+
 
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
@@ -93,6 +95,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+install_render_error_layer(app)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 
 
