@@ -18,7 +18,9 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from playwright.async_api import Browser, Playwright, TimeoutError as PlaywrightTimeoutError, async_playwright
 
-from render_errors import install_render_error_layer
+from render_contract import RenderRequest
+from render_engine import RenderEngine, RenderLimits
+from render_errors import RenderError, install_render_error_layer
 
 
 if sys.platform.startswith("win"):
@@ -308,6 +310,40 @@ async def _check_captcha(
                 "message": f"{provider_label} challenge blocked the page",
             },
         )
+
+
+@app.post("/v1/render", response_class=Response)
+async def render_v1(payload: RenderRequest) -> Response:
+    try:
+        await asyncio.wait_for(
+            app.state.capture_slots.acquire(), timeout=CAPTURE_QUEUE_TIMEOUT_SECONDS
+        )
+    except TimeoutError as exc:
+        raise RenderError("capture_queue_busy", "The render queue is busy.", 503, True) from exc
+    browser: Browser = app.state.browser
+    engine = RenderEngine(
+        hosted=HOSTED,
+        challenge_checker=_check_captcha,
+        browser_replacer=lambda failed: _replace_browser(app, failed),
+    )
+    try:
+        artifact = await engine.render_image(
+            browser,
+            payload,
+            RenderLimits(max_pixels=MAX_SCREENSHOT_PIXELS),
+        )
+    except RenderError:
+        if not browser.is_connected():
+            with suppress(Exception):
+                await _replace_browser(app, browser)
+        raise
+    finally:
+        app.state.capture_slots.release()
+    return Response(
+        artifact.body,
+        media_type=artifact.media_type,
+        headers={"Content-Disposition": f'attachment; filename="{artifact.filename}"'},
+    )
 
 
 def _media_type(image_format: ImageFormat) -> str:

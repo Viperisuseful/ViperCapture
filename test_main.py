@@ -1,5 +1,7 @@
 import unittest
-from unittest.mock import patch
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException
 
@@ -7,6 +9,27 @@ import main
 
 
 class CaptureLimitsTest(unittest.IsolatedAsyncioTestCase):
+    async def test_v1_route_returns_engine_artifact(self):
+        browser = SimpleNamespace(is_connected=lambda: True)
+        main.app.state.browser = browser
+        main.app.state.capture_slots = asyncio.Semaphore(1)
+        artifact = SimpleNamespace(
+            body=b"image-body",
+            media_type="image/png",
+            filename="vipercapture.png",
+        )
+        engine = SimpleNamespace(render_image=AsyncMock(return_value=artifact))
+        with patch.object(main, "RenderEngine", return_value=engine):
+            response = await main.render_v1(
+                main.RenderRequest.model_validate(
+                    {"url": "https://example.com", "full_page": False}
+                )
+            )
+        self.assertEqual(response.body, b"image-body")
+        self.assertEqual(response.media_type, "image/png")
+        self.assertIn("vipercapture.png", response.headers["content-disposition"])
+        engine.render_image.assert_awaited_once()
+
     def test_url_rules_change_in_hosted_mode(self):
         self.assertEqual(main._validate_url("https://example.com"), "https://example.com")
         self.assertEqual(main._validate_url("file:///tmp/page.html"), "file:///tmp/page.html")
