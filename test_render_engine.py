@@ -108,12 +108,14 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
             "selector": "main", "image": {"quality": 80, "transparent_background": True},
         })
         context = FakeContext()
-        artifact = await RenderEngine(hosted=False).render_image(
-            FakeBrowser(context), request, RenderLimits(max_width=1920, max_height=1080)
-        )
+        with patch("render_engine.capture_webp", AsyncMock(return_value=b"open-image")) as webp:
+            artifact = await RenderEngine(hosted=False).render_image(
+                FakeBrowser(context), request, RenderLimits(max_width=1920, max_height=1080)
+            )
         self.assertEqual(artifact.body, b"open-image")
-        self.assertEqual(context.page.options["quality"], 80)
-        self.assertTrue(context.page.options["omit_background"])
+        self.assertEqual(webp.await_args.kwargs["quality"], 80)
+        self.assertTrue(webp.await_args.kwargs["transparent"])
+        self.assertEqual(webp.await_args.kwargs["clip"]["width"], 300)
         self.assertTrue(context.closed)
 
     async def test_context_closes_after_failure(self):

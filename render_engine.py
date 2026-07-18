@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from base64 import b64decode
 from contextlib import suppress
 from dataclasses import dataclass, field
 import ipaddress
@@ -109,6 +110,42 @@ async def load_lazy_content(page: Page, viewport_height: int) -> None:
             await page.evaluate("window.scrollTo(0, 0)")
 
 
+async def capture_webp(
+    page: Page,
+    *,
+    clip: dict[str, float],
+    quality: int | None,
+    transparent: bool,
+) -> bytes:
+    """Use Chromium's native WebP encoder, which Playwright does not expose."""
+    session = await page.context.new_cdp_session(page)
+    try:
+        with suppress(Exception):
+            await page.evaluate("() => document.getAnimations().forEach(a => a.pause())")
+        if transparent:
+            await session.send(
+                "Emulation.setDefaultBackgroundColorOverride",
+                {"color": {"r": 0, "g": 0, "b": 0, "a": 0}},
+            )
+        result = await session.send(
+            "Page.captureScreenshot",
+            {
+                "format": "webp",
+                "quality": quality if quality is not None else 80,
+                "fromSurface": True,
+                "captureBeyondViewport": True,
+                "clip": clip,
+            },
+        )
+        return b64decode(result["data"])
+    finally:
+        if transparent:
+            with suppress(Exception):
+                await session.send("Emulation.setDefaultBackgroundColorOverride")
+        with suppress(Exception):
+            await session.detach()
+
+
 class RenderEngine:
     def __init__(self, *, hosted: bool,
                  challenge_checker: Callable[[Page, bool, int | None], Awaitable[None]] | None = None,
@@ -157,7 +194,7 @@ class RenderEngine:
                 if request.wait_for.selector:
                     await page.locator(request.wait_for.selector).wait_for(state="visible", timeout=min(request.wait_for.timeout_ms, limits.wait_timeout_ms))
                 if request.wait_for.text:
-                    await page.wait_for_function("text => Boolean(document.body?.innerText.includes(text))", request.wait_for.text, timeout=min(request.wait_for.timeout_ms, limits.wait_timeout_ms))
+                    await page.wait_for_function("text => Boolean(document.body?.innerText.includes(text))", arg=request.wait_for.text, timeout=min(request.wait_for.timeout_ms, limits.wait_timeout_ms))
                 if request.wait_for.delay_ms:
                     await page.wait_for_timeout(request.wait_for.delay_ms)
                 if self.challenge_checker:
@@ -172,7 +209,6 @@ class RenderEngine:
                     if not await locator.is_visible() or not (box := await locator.bounding_box()):
                         raise RenderError("selector_not_found", "The capture selector did not resolve to a visible element.", 404, False)
                     ensure_dimensions(box["width"], box["height"], request.viewport.device_scale_factor, limits)
-                    image = await locator.screenshot(**options)
                     width, height = box["width"], box["height"]
                 else:
                     width, height = request.viewport.width, request.viewport.height
@@ -182,6 +218,22 @@ class RenderEngine:
                         if height > limits.max_full_page_height:
                             raise RenderError("page_too_tall", "The page is too tall to capture safely.", 413, False)
                         ensure_dimensions(width, height, request.viewport.device_scale_factor, limits)
+                if request.output is OutputFormat.WEBP:
+                    image = await capture_webp(
+                        page,
+                        clip={
+                            "x": float(box["x"]) if request.selector else 0,
+                            "y": float(box["y"]) if request.selector else 0,
+                            "width": float(width),
+                            "height": float(height),
+                            "scale": request.viewport.device_scale_factor,
+                        },
+                        quality=request.image.quality,
+                        transparent=request.image.transparent_background,
+                    )
+                elif request.selector:
+                    image = await locator.screenshot(**options)
+                else:
                     image = await page.screenshot(full_page=request.full_page, **options)
                 if not image:
                     raise RenderError("empty_output", "The renderer produced an empty image.", 502, True)
