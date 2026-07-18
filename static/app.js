@@ -8,7 +8,7 @@ function currentTheme() {
 
 function applyTheme(theme, persist = true) {
   document.documentElement.dataset.theme = theme;
-  themeColor?.setAttribute("content", theme === "dark" ? "#111512" : "#f2f0e7");
+  themeColor?.setAttribute("content", theme === "dark" ? "#111318" : "#ffffff");
   themeToggle?.setAttribute("aria-label", `Switch to ${theme === "dark" ? "light" : "dark"} theme`);
   if (persist) {
     try { localStorage.setItem("theme", theme); } catch (error) {}

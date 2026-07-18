@@ -18,7 +18,7 @@ deployment configuration.
 - Full-page, viewport, and selector capture
 - Configurable density, JPEG/WebP quality, transparency, waits, and same-origin headers
 - Page-level challenge detection with provider, kind, confidence, and signals
-- Responsive light and dark interfaces
+- Responsive light and dark interfaces using the same Viper blue visual system as the hosted product
 - Hosted-mode public-network validation and resource limits
 - Local Windows launcher and cross-platform Python launcher
 
@@ -44,6 +44,8 @@ bash install.sh
   --host 127.0.0.1 --port 8000 --workers 1 \
   --limit-concurrency 4 --no-access-log
 ```
+
+See [`docs/self-hosting.md`](docs/self-hosting.md) for production boundaries and the exact open-source capability split.
 
 ## API
 

@@ -4,12 +4,12 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="description" content="ViperCapture renders public URLs to PNG, JPEG, or WebP with viewport, selector, header, and wait controls." />
-  <meta id="themeColor" name="theme-color" content="#f2f0e7" />
+  <meta id="themeColor" name="theme-color" content="#ffffff" />
   <meta property="og:title" content="ViperCapture" />
   <meta property="og:description" content="A small full-page website screenshot tool." />
-  <meta property="og:image" content="https://scp.viperisuseful.cc/SCPLogo.png" />
+  <meta property="og:image" content="https://capture.viperisuseful.cc/static/hero-preview.png" />
   <meta property="og:type" content="website" />
-  <meta property="og:url" content="https://scp.viperisuseful.cc/" />
+  <meta property="og:url" content="https://capture.viperisuseful.cc/" />
   <script>
     try {
       const theme = localStorage.getItem("theme") ||
@@ -18,8 +18,8 @@
     } catch (error) {}
   </script>
   <title>ViperCapture | Open-source webpage rendering</title>
-  <link rel="canonical" href="https://scp.viperisuseful.cc/" />
-  <link rel="icon" type="image/png" href="/SCPLogo.png" />
+  <link rel="canonical" href="https://capture.viperisuseful.cc/" />
+  <link rel="icon" type="image/svg+xml" href="/static/vipercapture-mark.svg" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -31,13 +31,12 @@
 
   <header class="site-header">
     <div class="header-inner">
-      <a class="brand" href="#top" aria-label="SCP home">
-        <span class="logo-crop">
-          <img src="/SCPLogo.png" alt="Viper Screenshot API cut-paper wordmark" />
-        </span>
+      <a class="brand" href="#top" aria-label="ViperCapture home">
+        <img src="/static/vipercapture-mark.svg" alt="" width="32" height="32" />
+        <span>ViperCapture</span>
       </a>
       <div class="header-actions">
-        <span>full-page capture</span>
+        <span>Open-source capture engine</span>
         <button
           class="theme-toggle"
           id="themeToggle"
@@ -66,9 +65,8 @@
   <main class="app-shell" id="top">
     <section class="tool-intro" aria-labelledby="page-title">
       <div>
-        <p class="eyebrow">ViperCapture / open engine</p>
-        <h1 id="page-title">Render the page you need.</h1>
-        <p>Paste a URL, choose a full page, viewport, or selector, then save as PNG, JPEG, or WebP.</p>
+        <h1 id="page-title">The whole webpage, in one capture.</h1>
+        <p>Render a public URL as PNG, JPEG, or WebP with full-page, viewport, and selector controls.</p>
       </div>
       <dl class="tool-notes" aria-label="Capture behavior">
         <div><dt>engine</dt><dd>Chromium</dd></div>
@@ -80,7 +78,6 @@
     <section class="capture-section" id="capture-tool" aria-labelledby="capture-heading">
       <header class="tool-heading">
         <div>
-          <p class="eyebrow">Capture desk</p>
           <h2 id="capture-heading">New capture</h2>
         </div>
         <span id="status" class="status-text" role="status" aria-live="polite">Ready for a URL</span>
@@ -116,7 +113,7 @@
         </div>
 
         <p class="scroll-note">
-          SCP walks down the page before capture so lazy-loaded sections have time to appear.
+          ViperCapture walks down the page before capture so lazy-loaded sections have time to appear.
         </p>
 
         <div class="workspace">
