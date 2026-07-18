@@ -43,12 +43,15 @@ const filmstripSection  = document.getElementById("filmstripSection");
 const openAfterDownload = document.getElementById("openAfterDownload");
 const statusEl          = document.getElementById("status");
 const densityHint       = document.getElementById("densityHint");
-const captchaDialog     = document.getElementById("captchaDialog");
-const captchaProvider   = document.getElementById("captchaProvider");
 const outputFormat      = document.getElementById("outputFormat");
 const previewFormat     = document.getElementById("previewFormat");
 const downloadLabel     = document.getElementById("downloadLabel");
 const filenameTemplate  = document.getElementById("filenameTemplate");
+const captureMode       = document.getElementById("captureMode");
+const selectorField     = document.getElementById("selectorField");
+const selectorInput     = document.getElementById("selector");
+const imageQuality      = document.getElementById("imageQuality");
+const transparentBackground = document.getElementById("transparentBackground");
 
 let maxScreenshotPixels = 50_000_000;
 
@@ -72,25 +75,6 @@ let latestBlob      = null;
 let latestObjectUrl = null;
 let latestFilename  = "screenshot.png";
 const captureHistory = [];
-
-const captchaProviderNames = {
-  cloudflare: "Cloudflare Turnstile",
-  recaptcha: "Google reCAPTCHA",
-  hcaptcha: "hCaptcha",
-  funcaptcha: "Arkose Labs FunCaptcha",
-  datadome: "DataDome",
-};
-
-const confirmCaptchaCapture = (provider) => new Promise((resolve) => {
-  captchaProvider.textContent = captchaProviderNames[provider] || "A captcha";
-  captchaDialog.returnValue = "cancel";
-  captchaDialog.addEventListener(
-    "close",
-    () => resolve(captchaDialog.returnValue === "proceed"),
-    { once: true },
-  );
-  captchaDialog.showModal();
-});
 
 /* ── Segmented quality control ──────────────────────────────── */
 const sharpnessControl = document.getElementById("sharpnessControl");
@@ -210,12 +194,21 @@ const syncOutputFormat = () => {
   const selected = outputFormat.value;
   const label = selected === "jpeg" ? "JPEG" : selected.toUpperCase();
   const extension = selected === "jpeg" ? "jpg" : selected;
-  previewFormat.textContent = `${label} · full page`;
+  const area = captureMode.value === "full_page" ? "full page" : captureMode.value;
+  previewFormat.textContent = `${label} · ${area}`;
   downloadLabel.textContent = `Download ${label}`;
   filenameTemplate.value = filenameTemplate.value.replace(/\.(png|jpe?g|webp)$/i, `.${extension}`);
+  imageQuality.disabled = selected === "png";
+  transparentBackground.disabled = selected === "jpeg";
+  if (selected === "jpeg") transparentBackground.checked = false;
 };
 
 outputFormat.addEventListener("change", syncOutputFormat);
+captureMode.addEventListener("change", () => {
+  selectorField.hidden = captureMode.value !== "selector";
+  selectorInput.required = captureMode.value === "selector";
+  syncOutputFormat();
+});
 syncOutputFormat();
 
 /* ── Download helper ───────────────────────────────────────── */
@@ -293,49 +286,60 @@ form.addEventListener("submit", async (e) => {
   const url              = String(data.get("url") || "");
   const filenamePattern  = String(data.get("filename_template") || "{host}_{date}_{time}.png");
   const imageFormat      = String(data.get("format") || "png");
-  const params           = new URLSearchParams();
-
-  params.set("url",                 url);
-  params.set("width",               String(data.get("width")               || "1920"));
-  params.set("height",              String(data.get("height")              || "1080"));
-  params.set("device_scale_factor", String(data.get("device_scale_factor") || "2"));
-  params.set("wait",                String(data.get("wait")                || "1"));
-  params.set("format",              imageFormat);
+  let headers = {};
+  const rawHeaders = String(data.get("headers") || "").trim();
+  if (rawHeaders) {
+    try {
+      headers = JSON.parse(rawHeaders);
+      if (!headers || Array.isArray(headers) || typeof headers !== "object") throw new Error();
+    } catch {
+      setStatus("Headers must be a JSON object of string names and values.", "error");
+      return;
+    }
+  }
+  const mode = String(data.get("capture_mode") || "full_page");
+  const waitSelector = String(data.get("wait_selector") || "").trim();
+  const waitText = String(data.get("wait_text") || "").trim();
+  const payload = {
+    url,
+    output: imageFormat,
+    viewport: {
+      width: Number(data.get("width") || 1920),
+      height: Number(data.get("height") || 1080),
+      device_scale_factor: Number(data.get("device_scale_factor") || 2),
+    },
+    full_page: mode === "full_page",
+    image: {
+      transparent_background: Boolean(data.get("transparent_background")),
+    },
+    headers,
+    wait_for: {
+      event: String(data.get("wait_event") || "load"),
+      delay_ms: Math.round(Number(data.get("wait") || 0) * 1000),
+      timeout_ms: Number(data.get("wait_timeout") || 15000),
+    },
+  };
+  if (mode === "selector") payload.selector = String(data.get("selector") || "").trim();
+  if (["jpeg", "webp"].includes(imageFormat)) payload.image.quality = Number(data.get("quality") || 90);
+  if (waitSelector) payload.wait_for.selector = waitSelector;
+  if (waitText) payload.wait_for.text = waitText;
 
   setLoading(true);
   setStatus("Loading and scrolling the page before capture.", "loading");
 
   try {
-    let res = await fetch(`/screenshot?${params}`);
-
-    if (res.status === 409) {
-      let detail = null;
-      try { detail = (await res.json())?.detail; } catch {}
-
-      if (detail?.code === "captcha_detected") {
-        setLoading(false);
-        setStatus("Captcha detected. Waiting for your choice.", "error");
-
-        const proceed = await confirmCaptchaCapture(detail.provider);
-        if (!proceed) {
-          downloadBtn.disabled = !latestBlob;
-          setStatus("Capture canceled.");
-          return;
-        }
-
-        params.set("proceed_on_captcha", "true");
-        setLoading(true);
-        setStatus("Reloading the page and capturing the result.", "loading");
-        res = await fetch(`/screenshot?${params}`);
-      }
-    }
+    const res = await fetch("/v1/render", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
 
     if (!res.ok) {
       let msg = `Request failed (${res.status})`;
       try {
         const body = await res.json();
-        if (typeof body?.detail === "string") msg = body.detail;
-        else if (body?.detail?.message) msg = body.detail.message;
+        if (body?.error?.message) msg = body.error.message;
+        if (body?.error?.request_id) msg += ` Request ID: ${body.error.request_id}`;
       } catch {}
       throw new Error(msg);
     }

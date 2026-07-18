@@ -30,4 +30,8 @@ def take_screenshot(url: str, filename: str) -> None:
 
 
 time.sleep(3)
-take_screenshot("https://example.com", "capture-smoke.png")
+artifact = Path("capture-smoke.png")
+try:
+    take_screenshot("https://example.com", str(artifact))
+finally:
+    artifact.unlink(missing_ok=True)

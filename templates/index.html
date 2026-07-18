@@ -3,9 +3,9 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="description" content="SCP by Viper captures full-page website screenshots at precise viewport sizes." />
+  <meta name="description" content="ViperCapture renders public URLs to PNG, JPEG, or WebP with viewport, selector, header, and wait controls." />
   <meta id="themeColor" name="theme-color" content="#f2f0e7" />
-  <meta property="og:title" content="SCP by Viper" />
+  <meta property="og:title" content="ViperCapture" />
   <meta property="og:description" content="A small full-page website screenshot tool." />
   <meta property="og:image" content="https://scp.viperisuseful.cc/SCPLogo.png" />
   <meta property="og:type" content="website" />
@@ -17,14 +17,14 @@
       document.documentElement.setAttribute("data-theme", theme);
     } catch (error) {}
   </script>
-  <title>SCP by Viper | Full-page screenshots</title>
+  <title>ViperCapture | Open-source webpage rendering</title>
   <link rel="canonical" href="https://scp.viperisuseful.cc/" />
   <link rel="icon" type="image/png" href="/SCPLogo.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=capture-formats-1" />
-  <script defer src="/static/app.js?v=capture-formats-1"></script>
+  <link rel="stylesheet" href="/static/style.css?v=v1-render-1" />
+  <script defer src="/static/app.js?v=v1-render-1"></script>
 </head>
 <body>
   <a class="skip-link" href="#capture-tool">Skip to capture tool</a>
@@ -66,9 +66,9 @@
   <main class="app-shell" id="top">
     <section class="tool-intro" aria-labelledby="page-title">
       <div>
-        <p class="eyebrow">SCP / screenshot capture</p>
-        <h1 id="page-title">Full-page screenshot.</h1>
-        <p>Paste a URL, choose a viewport, and save as PNG, JPEG, or WebP.</p>
+        <p class="eyebrow">ViperCapture / open engine</p>
+        <h1 id="page-title">Render the page you need.</h1>
+        <p>Paste a URL, choose a full page, viewport, or selector, then save as PNG, JPEG, or WebP.</p>
       </div>
       <dl class="tool-notes" aria-label="Capture behavior">
         <div><dt>engine</dt><dd>Chromium</dd></div>
@@ -193,6 +193,31 @@
                 </select>
               </div>
 
+              <div class="field-row">
+                <div class="field">
+                  <label for="captureMode">Capture area</label>
+                  <select id="captureMode" name="capture_mode">
+                    <option value="full_page" selected>Full page</option>
+                    <option value="viewport">Viewport</option>
+                    <option value="selector">Selector</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="imageQuality">JPEG/WebP quality</label>
+                  <input id="imageQuality" name="quality" type="number" min="1" max="100" value="90" inputmode="numeric" />
+                </div>
+              </div>
+
+              <div class="field" id="selectorField" hidden>
+                <label for="selector">CSS selector</label>
+                <input id="selector" name="selector" type="text" maxlength="2048" placeholder="main, #invoice, .card" spellcheck="false" />
+              </div>
+
+              <label class="toggle-standalone" for="transparentBackground">
+                <span class="toggle-copy"><strong>Transparent background</strong><small>PNG and WebP only</small></span>
+                <span class="toggle-wrap"><input id="transparentBackground" name="transparent_background" type="checkbox" class="toggle-input" /><span class="toggle-track" aria-hidden="true"></span></span>
+              </label>
+
               <div class="field">
                 <div class="label-row">
                   <label for="filenameTemplate">File name</label>
@@ -217,6 +242,17 @@
                   </span>
                 </label>
               </div>
+            </section>
+
+            <section class="settings-block" aria-labelledby="advanced-settings">
+              <h4 id="advanced-settings">Waits and headers</h4>
+              <div class="field-row">
+                <div class="field"><label for="waitEvent">Ready event</label><select id="waitEvent" name="wait_event"><option value="load" selected>Load</option><option value="domcontentloaded">DOM content loaded</option><option value="networkidle">Network idle</option></select></div>
+                <div class="field"><label for="waitTimeout">Timeout <span>ms</span></label><input id="waitTimeout" name="wait_timeout" type="number" min="1" max="30000" value="15000" inputmode="numeric" /></div>
+              </div>
+              <div class="field"><label for="waitSelector">Wait for selector</label><input id="waitSelector" name="wait_selector" type="text" maxlength="2048" placeholder=".ready" spellcheck="false" /></div>
+              <div class="field"><label for="waitText">Wait for text</label><input id="waitText" name="wait_text" type="text" maxlength="4096" placeholder="Loaded" /></div>
+              <div class="field"><label for="customHeaders">Same-origin request headers <span>JSON</span></label><textarea id="customHeaders" name="headers" rows="4" placeholder='{"Authorization":"Bearer …"}' spellcheck="false"></textarea><small class="field-help">Only sent to the target origin. Never share secrets with an untrusted URL.</small></div>
             </section>
           </aside>
 
@@ -274,30 +310,8 @@
     </section>
   </main>
 
-  <dialog
-    class="captcha-dialog"
-    id="captchaDialog"
-    aria-labelledby="captchaDialogTitle"
-    aria-describedby="captchaDialogDescription"
-  >
-    <form method="dialog">
-      <div class="captcha-mark" aria-hidden="true">?</div>
-      <p class="eyebrow">Capture paused</p>
-      <h2 id="captchaDialogTitle">Captcha detected</h2>
-      <p id="captchaDialogDescription">
-        <strong id="captchaProvider">A captcha</strong> is visible on this page.
-        Proceed with the screenshot anyway? SCP will reload the page once and
-        capture whatever appears.
-      </p>
-      <div class="captcha-actions">
-        <button class="button button-secondary" type="submit" value="cancel" autofocus>Cancel</button>
-        <button class="button button-primary" type="submit" value="proceed">Proceed</button>
-      </div>
-    </form>
-  </dialog>
-
   <footer class="site-footer">
-    <span>SCP by Viper</span>
+    <span>ViperCapture</span>
     <a href="https://viperisuseful.cc">viperisuseful.cc</a>
   </footer>
 </body>
