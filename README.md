@@ -128,13 +128,7 @@ boundary.
 See the [self-hosting guide](docs/self-hosting.md) for the full production
 boundary and supported capability set.
 
-## Development
-
-Run the test suite with:
-
-```bash
-.venv/bin/python -m unittest discover
-```
+## Project layout
 
 The main components are `main.py` for the FastAPI application,
 `render_contract.py` for request validation, and `render_engine.py` for

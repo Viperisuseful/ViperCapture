@@ -96,14 +96,6 @@ async def index() -> FileResponse:
     return FileResponse(BASE_DIR / "templates" / "index.html")
 
 
-@app.get("/SCPLogo.png", include_in_schema=False)
-async def logo() -> FileResponse:
-    return FileResponse(
-        BASE_DIR / "SCPLogo.png",
-        headers={"Cache-Control": "public, max-age=86400"},
-    )
-
-
 async def _check_captcha(
     page,
     proceed_on_captcha: bool,
