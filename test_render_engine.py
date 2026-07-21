@@ -49,6 +49,8 @@ class FakePage:
         return None
 
     async def evaluate(self, _script, *_args):
+        if "scrollHeight" in _script and "{width" not in _script:
+            return 480
         return {"width": 640, "height": 480}
 
     async def screenshot(self, **options):
@@ -129,6 +131,16 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
                 FakeBrowser(context), RenderRequest(url="https://example.com"), RenderLimits()
             )
         self.assertTrue(context.closed)
+
+    async def test_captcha_preference_reaches_challenge_check(self):
+        checker = AsyncMock()
+        await RenderEngine(hosted=False, challenge_checker=checker).render_image(
+            FakeBrowser(FakeContext()),
+            RenderRequest(url="https://example.com", proceed_on_captcha=True),
+            RenderLimits(),
+        )
+        self.assertEqual(checker.await_count, 2)
+        self.assertTrue(all(call.args[1] for call in checker.await_args_list))
 
     async def test_cleanup_failure_requests_browser_replacement(self):
         class BrokenCloseContext(FakeContext):

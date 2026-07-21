@@ -26,4 +26,4 @@ bash install.sh
 
 ## Capability boundary
 
-The public engine supports a public URL source, PNG/JPEG/WebP output, viewport/full-page/selector capture, image quality, transparency, wait conditions, and same-origin target headers. It detects page-level challenges but never solves or bypasses CAPTCHAs.
+The public engine supports a public URL source, PNG/JPEG/WebP output, viewport/full-page/selector capture, image quality, transparency, wait conditions, and same-origin target headers. It blocks detected page-level challenges by default. Callers may set `proceed_on_captcha: true` to capture the visible challenge as displayed; ViperCapture never solves or bypasses CAPTCHAs.

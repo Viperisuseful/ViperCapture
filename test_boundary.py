@@ -57,6 +57,13 @@ class PublicBoundaryTest(unittest.TestCase):
         }
         self.assertEqual(render_routes, {"/v1/render": {"POST"}})
 
+    def test_browser_ui_confirms_before_capturing_a_captcha(self):
+        html = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn('id="captchaDialog"', html)
+        for marker in ("captcha_detected", "proceed_on_captcha", "Capture anyway"):
+            self.assertIn(marker, html + script)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -307,6 +307,18 @@
     </section>
   </main>
 
+  <dialog class="captcha-dialog" id="captchaDialog" aria-labelledby="captchaDialogTitle" aria-describedby="captchaDialogDescription">
+    <form method="dialog">
+      <div class="captcha-mark" aria-hidden="true">!</div>
+      <h2 id="captchaDialogTitle">CAPTCHA detected</h2>
+      <p id="captchaDialogDescription"><strong id="captchaProvider">A page-level CAPTCHA</strong> is blocking the page. You can capture the visible challenge, but ViperCapture will not solve or bypass it.</p>
+      <div class="captcha-actions">
+        <button class="button button-secondary" value="cancel">Cancel capture</button>
+        <button class="button button-primary" value="proceed">Capture anyway</button>
+      </div>
+    </form>
+  </dialog>
+
   <footer class="site-footer">
     <span>ViperCapture</span>
     <a href="https://viperisuseful.cc">viperisuseful.cc</a>

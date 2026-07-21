@@ -198,9 +198,11 @@ class RenderEngine:
                 if request.wait_for.delay_ms:
                     await page.wait_for_timeout(request.wait_for.delay_ms)
                 if self.challenge_checker:
-                    await self.challenge_checker(page, False, navigation.status if navigation else None)
+                    await self.challenge_checker(page, request.proceed_on_captcha, navigation.status if navigation else None)
                 if request.full_page:
                     await load_lazy_content(page, request.viewport.height)
+                    if self.challenge_checker:
+                        await self.challenge_checker(page, request.proceed_on_captcha, navigation.status if navigation else None)
                 options: dict[str, object] = {"type": request.output.value, "animations": "disabled", "omit_background": request.image.transparent_background}
                 if request.image.quality is not None:
                     options["quality"] = request.image.quality

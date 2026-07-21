@@ -33,7 +33,7 @@ separate private services.
 - Wait conditions for page events, selectors, text, and fixed delays
 - Same-origin request headers for authenticated or customized pages
 - Bounded scrolling for lazy-loaded content
-- Page-level challenge detection without CAPTCHA solving or bypassing
+- Page-level challenge detection with an explicit capture-as-displayed choice
 
 ## Getting started
 
@@ -108,6 +108,11 @@ with a stable code, message, request ID, retryable flag, and details.
 | `image` | defaults | JPEG/WebP quality and PNG/WebP transparency |
 | `wait_for` | load | Page event, selector, text, delay, and timeout |
 | `headers` | `{}` | Headers sent only to same-origin target requests |
+| `proceed_on_captcha` | `false` | Capture a detected page-level challenge as displayed instead of returning HTTP 409 |
+
+Detected page-level challenges return `captcha_detected` by default. Setting
+`proceed_on_captcha` to `true` captures the visible challenge; it does not solve
+or bypass the CAPTCHA.
 
 ## Self-hosting
 

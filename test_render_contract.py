@@ -19,6 +19,13 @@ class RenderContractTest(unittest.TestCase):
             }
         )
         self.assertEqual(request.output, OutputFormat.PNG)
+        self.assertFalse(request.proceed_on_captcha)
+
+    def test_captcha_capture_can_be_explicitly_requested(self):
+        request = RenderRequest.model_validate(
+            {"url": "https://example.com", "proceed_on_captcha": True}
+        )
+        self.assertTrue(request.proceed_on_captcha)
 
     def test_non_url_source_is_rejected(self):
         with self.assertRaises(ValidationError):

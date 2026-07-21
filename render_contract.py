@@ -93,6 +93,10 @@ class RenderRequest(StrictModel):
     image: ImageOptions = Field(default_factory=ImageOptions)
     headers: dict[str, str] = Field(default_factory=dict)
     wait_for: WaitOptions = Field(default_factory=WaitOptions)
+    proceed_on_captcha: bool = Field(
+        default=False,
+        description="Capture a detected page-level CAPTCHA instead of returning captcha_detected.",
+    )
 
     @model_validator(mode="after")
     def validate_contract(self) -> "RenderRequest":

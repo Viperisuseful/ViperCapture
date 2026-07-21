@@ -52,8 +52,29 @@ const selectorField     = document.getElementById("selectorField");
 const selectorInput     = document.getElementById("selector");
 const imageQuality      = document.getElementById("imageQuality");
 const transparentBackground = document.getElementById("transparentBackground");
+const captchaDialog     = document.getElementById("captchaDialog");
+const captchaProvider   = document.getElementById("captchaProvider");
 
 let maxScreenshotPixels = 50_000_000;
+
+const captchaProviderLabels = {
+  cloudflare: "Cloudflare",
+  recaptcha: "Google reCAPTCHA",
+  hcaptcha: "hCaptcha",
+  funcaptcha: "Arkose Labs",
+  datadome: "DataDome",
+  unknown: "A page-level CAPTCHA",
+};
+
+const confirmCaptchaCapture = (provider) => new Promise((resolve) => {
+  captchaProvider.textContent = captchaProviderLabels[provider] || provider || captchaProviderLabels.unknown;
+  const handleClose = () => {
+    captchaDialog.removeEventListener("close", handleClose);
+    resolve(captchaDialog.returnValue === "proceed");
+  };
+  captchaDialog.addEventListener("close", handleClose);
+  captchaDialog.showModal();
+});
 
 const appConfig = fetch("/app-config")
   .then((res) => {
@@ -328,11 +349,31 @@ form.addEventListener("submit", async (e) => {
   setStatus("Loading and scrolling the page before capture.", "loading");
 
   try {
-    const res = await fetch("/v1/render", {
+    let res = await fetch("/v1/render", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
+
+    if (res.status === 409) {
+      const body = await res.clone().json().catch(() => null);
+      if (body?.error?.code === "captcha_detected") {
+        setLoading(false);
+        const proceed = await confirmCaptchaCapture(body?.error?.details?.provider);
+        if (!proceed) {
+          setStatus("Capture cancelled. The page is protected by a CAPTCHA.");
+          return;
+        }
+        setLoading(true);
+        setStatus("Capturing the visible challenge.", "loading");
+        payload.proceed_on_captcha = true;
+        res = await fetch("/v1/render", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+      }
+    }
 
     if (!res.ok) {
       let msg = `Request failed (${res.status})`;
