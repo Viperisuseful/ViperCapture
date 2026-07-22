@@ -1,0 +1,4 @@
+interface:
+  display_name: "Viper Full-Page Capture"
+  short_description: "Capture full web pages via ViperCapture"
+  default_prompt: "Use $viper-full-page-capture to capture this URL as a full-page image."
