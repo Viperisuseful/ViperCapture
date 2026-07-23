@@ -106,6 +106,70 @@ Detected page-level challenges return `captcha_detected` by default. Setting
 `proceed_on_captcha` to `true` captures the visible challenge; it does not solve
 or bypass the CAPTCHA.
 
+## Agent skill
+
+The portable [Agent Skill](https://agentskills.io) in
+[`skills/vipercapture`](skills/vipercapture) lets Codex, Claude Code, and
+Cursor capture webpages or render HTML and Markdown through ViperCapture. It
+includes a dependency-free Python client for the hosted API and self-hosted
+instances.
+
+Clone this repository, then copy the skill into the user-level directory for
+your agent:
+
+| Agent | Install location | Invocation |
+| --- | --- | --- |
+| [Codex](https://developers.openai.com/codex/skills) | `~/.agents/skills/vipercapture` | `$vipercapture` |
+| [Claude Code](https://code.claude.com/docs/en/skills) | `~/.claude/skills/vipercapture` | `/vipercapture` |
+| [Cursor](https://cursor.com/docs/skills) | `~/.agents/skills/vipercapture` or `~/.cursor/skills/vipercapture` | `/vipercapture` |
+
+```bash
+git clone https://github.com/Viperisuseful/ViperCapture.git
+cd ViperCapture
+```
+
+On macOS or Linux, install for Codex and Cursor with:
+
+```bash
+mkdir -p ~/.agents/skills
+cp -R skills/vipercapture ~/.agents/skills/
+```
+
+Install for Claude Code with:
+
+```bash
+mkdir -p ~/.claude/skills
+cp -R skills/vipercapture ~/.claude/skills/
+```
+
+On Windows PowerShell, replace the destination with
+`$HOME\.agents\skills\vipercapture`, `$HOME\.claude\skills\vipercapture`, or
+`$HOME\.cursor\skills\vipercapture`:
+
+```powershell
+New-Item -ItemType Directory -Force "$HOME\.agents\skills" | Out-Null
+Copy-Item -Recurse -Force ".\skills\vipercapture" "$HOME\.agents\skills"
+```
+
+For the hosted API, set the key from the
+[ViperCapture dashboard](https://capture.viperisuseful.cc/dashboard) in your
+shell or secret manager:
+
+```bash
+export VIPERCAPTURE_API_KEY="vc_live_..."
+```
+
+Do not save the key in this repository. For a self-hosted instance, set
+`VIPERCAPTURE_API_URL` instead; the local engine does not require a key by
+default:
+
+```bash
+export VIPERCAPTURE_API_URL="http://127.0.0.1:8000/v1/render"
+```
+
+Ask the agent to capture a URL, or invoke the skill explicitly. Restart the
+agent if a newly created top-level skills directory is not discovered.
+
 ## Self-hosting
 
 Run one application process because each process owns a Chromium process tree.
