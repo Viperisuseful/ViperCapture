@@ -28,7 +28,7 @@ Use the bundled script to render a public URL through `https://capture.viperisus
 Example:
 
 ```powershell
-python "C:\Users\ivand\.codex\skills\viper-full-page-capture\scripts\capture.py" `
+python "C:\Users\<user>\.codex\skills\viper-full-page-capture\scripts\capture.py" `
   --url "https://example.com" --output png --output-dir .
 ```
 
