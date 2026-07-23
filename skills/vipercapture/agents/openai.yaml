@@ -1,0 +1,4 @@
+interface:
+  display_name: "ViperCapture"
+  short_description: "Capture webpages with the ViperCapture API"
+  default_prompt: "Use $vipercapture to capture https://example.com as a full-page PNG."
