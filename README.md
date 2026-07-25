@@ -9,9 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://capture.viperisuseful.cc">Hosted service</a>
-  ·
-  <a href="https://capture.viperisuseful.cc/docs">API documentation</a>
+  <a href="https://capture.viperisuseful.cc">Live Demo</a>
   ·
   <a href="docs/self-hosting.md">Self-hosting guide</a>
 </p>
@@ -19,10 +17,6 @@
 ViperCapture is a webpage capture engine with a browser interface and a JSON
 API. It handles full-page, viewport, and element captures without requiring you
 to manage browser automation code.
-
-This repository contains the URL-to-image engine and local interface. The
-hosted account, billing, document rendering, and deployment systems are kept in
-separate private services.
 
 ## Features
 
@@ -111,8 +105,7 @@ or bypass the CAPTCHA.
 The portable [Agent Skill](https://agentskills.io) in
 [`skills/vipercapture`](skills/vipercapture) lets Codex, Claude Code, and
 Cursor capture webpages or render HTML and Markdown through ViperCapture. It
-includes a dependency-free Python client for the hosted API and self-hosted
-instances.
+includes a dependency-free Python client for ViperCapture instances.
 
 Clone this repository, then copy the skill into the user-level directory for
 your agent:
@@ -151,36 +144,11 @@ New-Item -ItemType Directory -Force "$HOME\.agents\skills" | Out-Null
 Copy-Item -Recurse -Force ".\skills\vipercapture" "$HOME\.agents\skills"
 ```
 
-For the hosted API, set the key from the
-[ViperCapture dashboard](https://capture.viperisuseful.cc/dashboard) in your
-shell or secret manager:
-
-```bash
-export VIPERCAPTURE_API_KEY="vc_live_..."
-```
-
-Do not save the key in this repository. The client sends it only to the
-canonical hosted HTTPS endpoint and rejects API redirects. For a self-hosted
-instance, set `VIPERCAPTURE_API_URL` instead; the local engine does not require
-a key by default:
-
-```bash
-export VIPERCAPTURE_API_URL="http://127.0.0.1:8000/v1/render"
-```
-
-Ask the agent to capture a URL, or invoke the skill explicitly. Restart the
-agent if a newly created top-level skills directory is not discovered.
-
 ## Self-hosting
 
 Run one application process because each process owns a Chromium process tree.
 Start with `VIPERCAPTURE_MAX_CONCURRENCY=1`, apply memory and CPU limits, and
 measure the host before raising browser concurrency.
-
-When `VIPERCAPTURE_HOSTED=1` is enabled, place ViperCapture behind a
-rate-limited reverse proxy. Keep an operating-system or network egress rule
-that blocks private address ranges and cloud metadata endpoints. This is the
-final SSRF boundary.
 
 See the [self-hosting guide](docs/self-hosting.md) for the full production
 boundary and supported capability set.
