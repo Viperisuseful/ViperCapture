@@ -24,6 +24,13 @@ EXTENSIONS = {"jpeg": "jpg"}
 RETRYABLE_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 
 
+class RejectRedirects(urllib.request.HTTPRedirectHandler):
+    """Keep API credentials and request bodies on the configured endpoint."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 class CaptureError(RuntimeError):
     """A normalized ViperCapture or network error."""
 
@@ -239,13 +246,17 @@ def parse_error(status: int, headers, raw: bytes) -> CaptureError:
     )
 
 
+def hosted_endpoint(api_url: str) -> bool:
+    return api_url == DEFAULT_API_URL
+
+
 def send_request(api_url: str, key: str | None, body: dict) -> tuple[bytes, str | None]:
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/octet-stream",
         "User-Agent": "vipercapture-agent-skill/1.0",
     }
-    if key:
+    if key and hosted_endpoint(api_url):
         headers["Authorization"] = f"Bearer {key}"
     request = urllib.request.Request(
         api_url,
@@ -254,7 +265,8 @@ def send_request(api_url: str, key: str | None, body: dict) -> tuple[bytes, str 
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=180) as response:
+        opener = urllib.request.build_opener(RejectRedirects())
+        with opener.open(request, timeout=180) as response:
             return response.read(), request_id(response.headers)
     except urllib.error.HTTPError as error:
         raise parse_error(error.code, error.headers, error.read()) from None
@@ -281,10 +293,6 @@ def output_path(args: argparse.Namespace) -> Path:
     extension = EXTENSIONS.get(args.output, args.output)
     name = f"{source_label(args)}-{timestamp}.{extension}"
     return args.output_dir.expanduser() / name
-
-
-def hosted_endpoint(api_url: str) -> bool:
-    return urllib.parse.urlparse(api_url).hostname == "capture.viperisuseful.cc"
 
 
 def validate_artifact(output: str, content: bytes) -> None:

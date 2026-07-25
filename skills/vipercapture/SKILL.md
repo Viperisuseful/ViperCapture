@@ -60,8 +60,10 @@ python /path/to/skills/vipercapture/scripts/capture.py \
 
 - The hosted API reads `VIPERCAPTURE_API_KEY` from the environment. Never put a
   key in a command, prompt, output filename, committed file, or chat response.
-- A custom self-hosted API URL may run without a key. If
-  `VIPERCAPTURE_API_KEY` is present, the client sends it to that endpoint.
+- The client sends `VIPERCAPTURE_API_KEY` only to the canonical hosted HTTPS
+  endpoint. Custom self-hosted API URLs run without that key.
+- API redirects are rejected so credentials and request bodies stay on the
+  configured endpoint.
 - Capture only public or explicitly authorized targets. ViperCapture blocks
   private-network targets and unsafe redirects.
 - Do not solve or bypass CAPTCHAs. `--proceed-on-captcha` captures the visible

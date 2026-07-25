@@ -159,9 +159,10 @@ shell or secret manager:
 export VIPERCAPTURE_API_KEY="vc_live_..."
 ```
 
-Do not save the key in this repository. For a self-hosted instance, set
-`VIPERCAPTURE_API_URL` instead; the local engine does not require a key by
-default:
+Do not save the key in this repository. The client sends it only to the
+canonical hosted HTTPS endpoint and rejects API redirects. For a self-hosted
+instance, set `VIPERCAPTURE_API_URL` instead; the local engine does not require
+a key by default:
 
 ```bash
 export VIPERCAPTURE_API_URL="http://127.0.0.1:8000/v1/render"
