@@ -1,3 +1,4 @@
+import asyncio
 import socket
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -42,8 +43,33 @@ class SsrfTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertFalse(await is_public_http_url("https://example.com"))
 
+    @patch("render_engine._resolve_public_origin", new_callable=AsyncMock)
+    async def test_render_validator_coalesces_only_inflight_checks(self, resolve):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def resolve_public(_hostname, _port):
+            started.set()
+            await release.wait()
+            return True
+
+        resolve.side_effect = resolve_public
+        validator = PublicUrlValidator()
+        first = asyncio.create_task(
+            validator.is_public("https://example.com/one")
+        )
+        await started.wait()
+        second = asyncio.create_task(
+            validator.is_public("https://example.com/two")
+        )
+        await asyncio.sleep(0)
+
+        self.assertEqual(resolve.await_count, 1)
+        release.set()
+        self.assertEqual(await asyncio.gather(first, second), [True, True])
+
     @patch("render_engine.socket.getaddrinfo")
-    async def test_render_validator_reuses_same_origin_check(self, getaddrinfo):
+    async def test_render_validator_rechecks_sequential_requests(self, getaddrinfo):
         getaddrinfo.return_value = [
             (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
         ]
@@ -51,19 +77,6 @@ class SsrfTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(await validator.is_public("https://example.com/one"))
         self.assertTrue(await validator.is_public("https://example.com/two"))
-        self.assertEqual(getaddrinfo.call_count, 1)
-
-    @patch("render_engine.socket.getaddrinfo")
-    async def test_render_validator_can_refresh_redirect_check(self, getaddrinfo):
-        getaddrinfo.return_value = [
-            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
-        ]
-        validator = PublicUrlValidator()
-
-        self.assertTrue(await validator.is_public("https://example.com/one"))
-        self.assertTrue(
-            await validator.is_public("https://example.com/two", refresh=True)
-        )
         self.assertEqual(getaddrinfo.call_count, 2)
 
 

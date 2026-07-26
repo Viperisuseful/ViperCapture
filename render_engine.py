@@ -77,20 +77,26 @@ async def _resolve_public_origin(hostname: str, port: int) -> bool:
 
 
 class PublicUrlValidator:
-    """Deduplicate DNS checks within one isolated render."""
+    """Coalesce concurrent DNS checks without caching their results."""
 
     def __init__(self) -> None:
         self._checks: dict[tuple[str, str, int], asyncio.Task[bool]] = {}
 
-    async def is_public(self, target: str, *, refresh: bool = False) -> bool:
+    async def is_public(self, target: str) -> bool:
         origin = normalized_origin(target)
         if origin is None:
             return False
         task = self._checks.get(origin)
-        if refresh or task is None:
+        if task is None or task.done():
             _, hostname, port = origin
             task = asyncio.create_task(_resolve_public_origin(hostname, port))
             self._checks[origin] = task
+
+            def forget(completed: asyncio.Task[bool]) -> None:
+                if self._checks.get(origin) is completed:
+                    self._checks.pop(origin, None)
+
+            task.add_done_callback(forget)
         return await asyncio.shield(task)
 
 
@@ -227,10 +233,7 @@ class RenderEngine:
                     navigation = await page.goto(target, wait_until=request.wait_for.event.value, timeout=min(request.wait_for.timeout_ms, limits.wait_timeout_ms))
                 except PlaywrightTimeoutError as exc:
                     raise RenderError("target_timeout", "The target did not become ready in time.", 504, True) from exc
-                if self.hosted and not await public_urls.is_public(
-                    page.url,
-                    refresh=True,
-                ):
+                if self.hosted and not await public_urls.is_public(page.url):
                     raise RenderError("redirect_not_public", "The target redirected to a private or non-public URL.", 400, False)
                 if request.wait_for.selector:
                     await page.locator(request.wait_for.selector).wait_for(state="visible", timeout=min(request.wait_for.timeout_ms, limits.wait_timeout_ms))
