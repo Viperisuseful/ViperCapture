@@ -37,6 +37,12 @@ class WaitEvent(str, Enum):
     NETWORKIDLE = "networkidle"
 
 
+class LazyLoadMode(str, Enum):
+    NONE = "none"
+    ADAPTIVE = "adaptive"
+    THOROUGH = "thorough"
+
+
 class Viewport(StrictModel):
     width: int = Field(default=1280, ge=1, le=7680)
     height: int = Field(default=720, ge=1, le=4320)
@@ -46,6 +52,7 @@ class Viewport(StrictModel):
 class ImageOptions(StrictModel):
     quality: int | None = Field(default=None, ge=1, le=100)
     transparent_background: bool = False
+    optimize_for_speed: bool = False
 
 
 class WaitOptions(StrictModel):
@@ -89,6 +96,7 @@ class RenderRequest(StrictModel):
     output: OutputFormat = OutputFormat.PNG
     viewport: Viewport = Field(default_factory=Viewport)
     full_page: bool = True
+    lazy_load: LazyLoadMode = LazyLoadMode.THOROUGH
     selector: str | None = Field(default=None, min_length=1, max_length=2_048)
     image: ImageOptions = Field(default_factory=ImageOptions)
     headers: dict[str, str] = Field(default_factory=dict)
@@ -109,6 +117,8 @@ class RenderRequest(StrictModel):
             raise ValueError("quality is accepted only for JPEG or WebP")
         if self.image.transparent_background and self.output is OutputFormat.JPEG:
             raise ValueError("transparent_background is accepted only for PNG or WebP")
+        if self.image.optimize_for_speed and self.output is not OutputFormat.WEBP:
+            raise ValueError("optimize_for_speed is currently accepted only for WebP")
         self.headers = _validate_headers(self.headers)
         return self
 

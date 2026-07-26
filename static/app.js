@@ -330,8 +330,10 @@ form.addEventListener("submit", async (e) => {
       device_scale_factor: Number(data.get("device_scale_factor") || 2),
     },
     full_page: mode === "full_page",
+    lazy_load: String(data.get("lazy_load") || "thorough"),
     image: {
       transparent_background: Boolean(data.get("transparent_background")),
+      optimize_for_speed: imageFormat === "webp" && Boolean(data.get("optimize_for_speed")),
     },
     headers,
     wait_for: {

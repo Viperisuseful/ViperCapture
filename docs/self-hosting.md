@@ -17,6 +17,31 @@ Playwright Chromium, starts the application, and opens the local interface.
 - Enforce network egress rules that block private ranges and cloud metadata endpoints.
 - Do not place credentials in the repository or browser-facing JavaScript.
 
+## Optional GPU rendering
+
+GPU acceleration is off by default. Self-hosters with a compatible GPU and
+driver can set:
+
+```bash
+VIPERCAPTURE_GPU_MODE=auto
+```
+
+Use `required` instead of `auto` to fail startup unless Chromium reports
+hardware GPU compositing through the Chrome DevTools Protocol. On headless
+Linux systems where normal graphics autodetection does not work, also try:
+
+```bash
+VIPERCAPTURE_GPU_BACKEND=vulkan
+```
+
+The host or container must expose the GPU device and its drivers to Chromium.
+The Vulkan backend is workload- and driver-dependent, so benchmark it against
+the default backend before enabling it permanently. GPU acceleration primarily
+helps rasterization, compositing, canvas, and WebGL-heavy pages; navigation,
+JavaScript, scrolling waits, and image encoding remain CPU- or network-bound.
+The older `VIPERCAPTURE_ENABLE_GPU=1` setting remains supported as an alias for
+`VIPERCAPTURE_GPU_MODE=auto`.
+
 ## Capability boundary
 
 The public engine supports a public URL source, PNG/JPEG/WebP output, viewport/full-page/selector capture, image quality, transparency, wait conditions, and same-origin target headers. It blocks detected page-level challenges by default. Callers may set `proceed_on_captcha: true` to capture the visible challenge as displayed; ViperCapture never solves or bypasses CAPTCHAs.
