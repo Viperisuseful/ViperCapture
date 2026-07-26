@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 
 from playwright.async_api import Browser, Page, TimeoutError as PlaywrightTimeoutError
 
-from render_contract import OutputFormat, RenderRequest
+from render_contract import LazyLoadMode, OutputFormat, RenderRequest
 from render_errors import RenderError
 
 
@@ -68,16 +68,45 @@ def routed_headers(request_url: str, original_url: str, browser_headers: dict[st
     return result
 
 
-async def is_public_http_url(target: str) -> bool:
-    origin = normalized_origin(target)
-    if origin is None:
-        return False
-    _, hostname, port = origin
+async def _resolve_public_origin(hostname: str, port: int) -> bool:
     try:
         addresses = await asyncio.to_thread(socket.getaddrinfo, hostname, port, type=socket.SOCK_STREAM)
         return bool(addresses) and all(ipaddress.ip_address(item[4][0].split("%", 1)[0]).is_global for item in addresses)
     except (OSError, ValueError):
         return False
+
+
+class PublicUrlValidator:
+    """Coalesce concurrent DNS checks without caching their results."""
+
+    def __init__(self) -> None:
+        self._checks: dict[tuple[str, str, int], asyncio.Task[bool]] = {}
+
+    async def is_public(self, target: str) -> bool:
+        origin = normalized_origin(target)
+        if origin is None:
+            return False
+        task = self._checks.get(origin)
+        if task is None or task.done():
+            _, hostname, port = origin
+            task = asyncio.create_task(_resolve_public_origin(hostname, port))
+            self._checks[origin] = task
+
+            def forget(completed: asyncio.Task[bool]) -> None:
+                if self._checks.get(origin) is completed:
+                    self._checks.pop(origin, None)
+
+            task.add_done_callback(forget)
+        return await asyncio.shield(task)
+
+
+async def is_public_http_url(target: str) -> bool:
+    return await PublicUrlValidator().is_public(target)
+
+
+def needs_request_routing(hosted: bool, custom_headers: dict[str, str]) -> bool:
+    """Avoid Playwright interception when it provides no behavior."""
+    return hosted or bool(custom_headers)
 
 
 def ensure_dimensions(width: float, height: float, scale: float, limits: RenderLimits) -> None:
@@ -89,11 +118,22 @@ def ensure_dimensions(width: float, height: float, scale: float, limits: RenderL
         raise RenderError("pixel_limit_exceeded", "The requested output exceeds the pixel limit.", 413, False)
 
 
-async def load_lazy_content(page: Page, viewport_height: int) -> None:
+async def load_lazy_content(
+    page: Page,
+    viewport_height: int,
+    mode: LazyLoadMode = LazyLoadMode.THOROUGH,
+) -> None:
+    if mode is LazyLoadMode.NONE:
+        return
+    max_steps, delay, step_ratio = (
+        (24, 0.075, 1.0)
+        if mode is LazyLoadMode.ADAPTIVE
+        else (40, 0.2, 0.8)
+    )
     position = 0
     stable = 0
     try:
-        for _ in range(40):
+        for _ in range(max_steps):
             height = math.ceil(await page.evaluate("Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0)"))
             bottom = max(0, height - viewport_height)
             if position >= bottom:
@@ -101,10 +141,10 @@ async def load_lazy_content(page: Page, viewport_height: int) -> None:
                 if stable >= 2:
                     break
             else:
-                position = min(position + max(1, viewport_height * 4 // 5), bottom)
+                position = min(position + max(1, math.ceil(viewport_height * step_ratio)), bottom)
                 stable = 0
             await page.evaluate("y => window.scrollTo(0, y)", position)
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(delay)
     finally:
         with suppress(Exception):
             await page.evaluate("window.scrollTo(0, 0)")
@@ -116,6 +156,7 @@ async def capture_webp(
     clip: dict[str, float],
     quality: int | None,
     transparent: bool,
+    optimize_for_speed: bool,
 ) -> bytes:
     """Use Chromium's native WebP encoder, which Playwright does not expose."""
     session = await page.context.new_cdp_session(page)
@@ -134,6 +175,7 @@ async def capture_webp(
                 "quality": quality if quality is not None else 80,
                 "fromSurface": True,
                 "captureBeyondViewport": True,
+                "optimizeForSpeed": optimize_for_speed,
                 "clip": clip,
             },
         )
@@ -156,7 +198,8 @@ class RenderEngine:
 
     async def render_image(self, browser: Browser, request: RenderRequest, limits: RenderLimits) -> RenderArtifact:
         target = str(request.url)
-        if self.hosted and not await is_public_http_url(target):
+        public_urls = PublicUrlValidator()
+        if self.hosted and not await public_urls.is_public(target):
             raise RenderError("target_not_public", "Private or non-public target URLs are blocked.", 400, False)
         ensure_dimensions(request.viewport.width, request.viewport.height, request.viewport.device_scale_factor, limits)
         if request.wait_for.timeout_ms > limits.wait_timeout_ms or request.wait_for.delay_ms > limits.delay_ms:
@@ -172,13 +215,14 @@ class RenderEngine:
                     scheme = urlsplit(request_url).scheme.lower()
                     if scheme in {"about", "blob", "data"}:
                         await route.continue_()
-                    elif self.hosted and not await is_public_http_url(request_url):
+                    elif self.hosted and not await public_urls.is_public(request_url):
                         blocked_urls.append(request_url)
                         await route.abort("blockedbyclient")
                     else:
                         await route.continue_(headers=routed_headers(request_url, target, dict(route.request.headers), request.headers))
 
-                await context.route("**/*", route_request)
+                if needs_request_routing(self.hosted, request.headers):
+                    await context.route("**/*", route_request)
                 if self.hosted:
                     async def block_web_socket(web_socket) -> None:
                         blocked_urls.append(web_socket.url)
@@ -189,7 +233,7 @@ class RenderEngine:
                     navigation = await page.goto(target, wait_until=request.wait_for.event.value, timeout=min(request.wait_for.timeout_ms, limits.wait_timeout_ms))
                 except PlaywrightTimeoutError as exc:
                     raise RenderError("target_timeout", "The target did not become ready in time.", 504, True) from exc
-                if self.hosted and not await is_public_http_url(page.url):
+                if self.hosted and not await public_urls.is_public(page.url):
                     raise RenderError("redirect_not_public", "The target redirected to a private or non-public URL.", 400, False)
                 if request.wait_for.selector:
                     await page.locator(request.wait_for.selector).wait_for(state="visible", timeout=min(request.wait_for.timeout_ms, limits.wait_timeout_ms))
@@ -200,7 +244,11 @@ class RenderEngine:
                 if self.challenge_checker:
                     await self.challenge_checker(page, request.proceed_on_captcha, navigation.status if navigation else None)
                 if request.full_page:
-                    await load_lazy_content(page, request.viewport.height)
+                    await load_lazy_content(
+                        page,
+                        request.viewport.height,
+                        request.lazy_load,
+                    )
                     if self.challenge_checker:
                         await self.challenge_checker(page, request.proceed_on_captcha, navigation.status if navigation else None)
                 options: dict[str, object] = {"type": request.output.value, "animations": "disabled", "omit_background": request.image.transparent_background}
@@ -232,6 +280,7 @@ class RenderEngine:
                         },
                         quality=request.image.quality,
                         transparent=request.image.transparent_background,
+                        optimize_for_speed=request.image.optimize_for_speed,
                     )
                 elif request.selector:
                     image = await locator.screenshot(**options)

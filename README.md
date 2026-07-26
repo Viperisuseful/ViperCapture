@@ -27,6 +27,9 @@ to manage browser automation code.
 - Wait conditions for page events, selectors, text, and fixed delays
 - Same-origin request headers for authenticated or customized pages
 - Bounded scrolling for lazy-loaded content
+- Optional adaptive or disabled lazy-load scrolling for faster full-page captures
+- Optional speed-first WebP encoding
+- Optional hardware GPU rendering with startup verification
 - Page-level challenge detection with an explicit capture-as-displayed choice
 
 ## Getting started
@@ -61,10 +64,12 @@ curl 'http://127.0.0.1:8000/v1/render' \
       "device_scale_factor": 1
     },
     "full_page": false,
+    "lazy_load": "adaptive",
     "selector": "main",
     "image": {
       "quality": 82,
-      "transparent_background": true
+      "transparent_background": true,
+      "optimize_for_speed": true
     },
     "wait_for": {
       "event": "networkidle",
@@ -90,8 +95,9 @@ with a stable code, message, request ID, retryable flag, and details.
 | `output` | `png` | `png`, `jpeg`, or `webp` |
 | `viewport` | `1280 × 720 × 1` | Width, height, and device scale factor |
 | `full_page` | `true` | Capture the full document or current viewport |
+| `lazy_load` | `thorough` | `thorough`, `adaptive`, or `none` full-page scrolling |
 | `selector` | empty | Capture one visible element when `full_page` is `false` |
-| `image` | defaults | JPEG/WebP quality and PNG/WebP transparency |
+| `image` | defaults | JPEG/WebP quality, PNG/WebP transparency, and speed-first WebP encoding |
 | `wait_for` | load | Page event, selector, text, delay, and timeout |
 | `headers` | `{}` | Headers sent only to same-origin target requests |
 | `proceed_on_captcha` | `false` | Capture a detected page-level challenge as displayed instead of returning HTTP 409 |
@@ -99,6 +105,11 @@ with a stable code, message, request ID, retryable flag, and details.
 Detected page-level challenges return `captcha_detected` by default. Setting
 `proceed_on_captcha` to `true` captures the visible challenge; it does not solve
 or bypass the CAPTCHA.
+
+For the lowest latency, combine `wait_for.event: "domcontentloaded"` with
+`lazy_load: "none"`. This captures earlier and may omit resources or content
+that appears later. `lazy_load: "adaptive"` is a middle ground, while the
+default `thorough` mode preserves the existing scrolling behavior.
 
 ## Agent skill
 

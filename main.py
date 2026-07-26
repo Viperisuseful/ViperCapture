@@ -43,7 +43,15 @@ def _load_local_env() -> None:
 _load_local_env()
 
 HOSTED = os.getenv("VIPERCAPTURE_HOSTED") == "1"
-ENABLE_GPU = os.getenv("VIPERCAPTURE_ENABLE_GPU") == "1"
+GPU_MODE = os.getenv(
+    "VIPERCAPTURE_GPU_MODE",
+    "auto" if os.getenv("VIPERCAPTURE_ENABLE_GPU") == "1" else "off",
+).lower()
+GPU_BACKEND = os.getenv("VIPERCAPTURE_GPU_BACKEND", "default").lower()
+if GPU_MODE not in {"off", "auto", "required"}:
+    raise ValueError("VIPERCAPTURE_GPU_MODE must be off, auto, or required")
+if GPU_BACKEND not in {"default", "vulkan"}:
+    raise ValueError("VIPERCAPTURE_GPU_BACKEND must be default or vulkan")
 MAX_CONCURRENT_CAPTURES = max(
     1, int(os.getenv("VIPERCAPTURE_MAX_CONCURRENCY", "1"))
 )
@@ -56,11 +64,66 @@ if not HOSTED:
     CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def gpu_launch_args(
+    mode: str = GPU_MODE,
+    backend: str = GPU_BACKEND,
+    platform: str = sys.platform,
+) -> list[str]:
+    if mode == "off":
+        return []
+    args = ["--enable-gpu"]
+    if backend == "vulkan" and platform.startswith("linux"):
+        args.append("--use-angle=vulkan")
+    return args
+
+
+def hardware_gpu_active(info: dict[str, object]) -> bool:
+    gpu = info.get("gpu")
+    if not isinstance(gpu, dict):
+        return False
+    description = " ".join(
+        str(value)
+        for value in (
+            gpu.get("devices", []),
+            gpu.get("auxAttributes", {}),
+        )
+    ).lower()
+    if any(
+        marker in description
+        for marker in ("swiftshader", "llvmpipe", "software rasterizer")
+    ):
+        return False
+    features = gpu.get("featureStatus")
+    if not isinstance(features, dict):
+        return False
+    return str(features.get("gpu_compositing", "")).startswith("enabled")
+
+
+async def _hardware_gpu_active(browser: Browser) -> bool:
+    session = await browser.new_browser_cdp_session()
+    try:
+        return hardware_gpu_active(await session.send("SystemInfo.getInfo"))
+    finally:
+        await session.detach()
+
+
 async def _launch_browser(playwright: Playwright) -> Browser:
-    return await playwright.chromium.launch(
+    browser = await playwright.chromium.launch(
         headless=True,
-        args=["--enable-gpu"] if ENABLE_GPU else [],
+        args=gpu_launch_args(),
     )
+    if GPU_MODE == "required":
+        try:
+            active = await _hardware_gpu_active(browser)
+        except Exception as exc:
+            await browser.close()
+            raise RuntimeError("Chromium hardware GPU verification failed") from exc
+        if not active:
+            await browser.close()
+            raise RuntimeError(
+                "A hardware GPU was required but Chromium is using software rendering"
+            )
+    return browser
 
 
 async def _replace_browser(app: FastAPI, failed_browser: Browser) -> None:

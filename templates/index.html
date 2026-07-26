@@ -247,6 +247,13 @@
                 <div class="field"><label for="waitEvent">Ready event</label><select id="waitEvent" name="wait_event"><option value="load" selected>Load</option><option value="domcontentloaded">DOM content loaded</option><option value="networkidle">Network idle</option></select></div>
                 <div class="field"><label for="waitTimeout">Timeout <span>ms</span></label><input id="waitTimeout" name="wait_timeout" type="number" min="1" max="30000" value="15000" inputmode="numeric" /></div>
               </div>
+              <div class="field-row">
+                <div class="field"><label for="lazyLoad">Full-page lazy loading</label><select id="lazyLoad" name="lazy_load"><option value="thorough" selected>Thorough</option><option value="adaptive">Adaptive — faster</option><option value="none">Off — fastest</option></select></div>
+                <label class="toggle-standalone" for="optimizeForSpeed">
+                  <span class="toggle-copy"><strong>Fast WebP encoding</strong><small>Larger output, less CPU time</small></span>
+                  <span class="toggle-wrap"><input id="optimizeForSpeed" name="optimize_for_speed" type="checkbox" class="toggle-input" /><span class="toggle-track" aria-hidden="true"></span></span>
+                </label>
+              </div>
               <div class="field"><label for="waitSelector">Wait for selector</label><input id="waitSelector" name="wait_selector" type="text" maxlength="2048" placeholder=".ready" spellcheck="false" /></div>
               <div class="field"><label for="waitText">Wait for text</label><input id="waitText" name="wait_text" type="text" maxlength="4096" placeholder="Loaded" /></div>
               <div class="field"><label for="customHeaders">Same-origin request headers <span>JSON</span></label><textarea id="customHeaders" name="headers" rows="4" placeholder='{"Authorization":"Bearer …"}' spellcheck="false"></textarea><small class="field-help">Only sent to the target origin. Never share secrets with an untrusted URL.</small></div>
