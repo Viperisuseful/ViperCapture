@@ -42,6 +42,13 @@ JavaScript, scrolling waits, and image encoding remain CPU- or network-bound.
 The older `VIPERCAPTURE_ENABLE_GPU=1` setting remains supported as an alias for
 `VIPERCAPTURE_GPU_MODE=auto`.
 
+The local interface also exposes a **GPU rendering** switch. It drains active
+captures, restarts Chromium in `auto` or `off` mode, and reports whether
+Chromium verified hardware compositing. For safety, this runtime switch accepts
+only same-origin requests from the loopback interface; remotely hosted
+instances should continue to configure GPU mode through environment variables
+and restart the service normally.
+
 ## Capability boundary
 
 The public engine supports a public URL source, PNG/JPEG/WebP output, viewport/full-page/selector capture, image quality, transparency, wait conditions, and same-origin target headers. It blocks detected page-level challenges by default. Callers may set `proceed_on_captcha: true` to capture the visible challenge as displayed; ViperCapture never solves or bypasses CAPTCHAs.

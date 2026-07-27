@@ -7,7 +7,7 @@ import re
 import subprocess
 import sys
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from playwright.async_api import Browser, Playwright, async_playwright
@@ -107,12 +107,25 @@ async def _hardware_gpu_active(browser: Browser) -> bool:
         await session.detach()
 
 
-async def _launch_browser(playwright: Playwright) -> Browser:
+async def _detect_hardware_gpu(browser: Browser, mode: str) -> bool:
+    if mode == "off":
+        return False
+    try:
+        return await _hardware_gpu_active(browser)
+    except Exception:
+        return False
+
+
+async def _launch_browser(
+    playwright: Playwright,
+    gpu_mode: str | None = None,
+) -> Browser:
+    selected_mode = gpu_mode or GPU_MODE
     browser = await playwright.chromium.launch(
         headless=True,
-        args=gpu_launch_args(),
+        args=gpu_launch_args(selected_mode),
     )
-    if GPU_MODE == "required":
+    if selected_mode == "required":
         try:
             active = await _hardware_gpu_active(browser)
         except Exception as exc:
@@ -133,8 +146,12 @@ async def _replace_browser(app: FastAPI, failed_browser: Browser) -> None:
         with suppress(Exception):
             await asyncio.wait_for(failed_browser.close(), timeout=5)
         app.state.browser = await asyncio.wait_for(
-            _launch_browser(app.state.playwright),
+            _launch_browser(app.state.playwright, app.state.gpu_mode),
             timeout=15,
+        )
+        app.state.gpu_hardware_active = await _detect_hardware_gpu(
+            app.state.browser,
+            app.state.gpu_mode,
         )
 
 
@@ -144,12 +161,15 @@ async def lifespan(app: FastAPI):
     browser = await _launch_browser(playwright)
     app.state.playwright = playwright
     app.state.browser = browser
+    app.state.gpu_mode = GPU_MODE
+    app.state.gpu_hardware_active = await _detect_hardware_gpu(browser, GPU_MODE)
     app.state.capture_slots = asyncio.Semaphore(MAX_CONCURRENT_CAPTURES)
     app.state.browser_restart_lock = asyncio.Lock()
     try:
         yield
     finally:
-        await app.state.browser.close()
+        with suppress(Exception):
+            await app.state.browser.close()
         await playwright.stop()
 
 
@@ -160,7 +180,8 @@ app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 
 @app.get("/")
 async def index() -> FileResponse:
-    return FileResponse(BASE_DIR / "templates" / "index.html")
+    frontend = BASE_DIR / "static" / "app" / "index.html"
+    return FileResponse(frontend if frontend.exists() else BASE_DIR / "templates" / "index.html")
 
 
 async def _check_captcha(
@@ -332,15 +353,91 @@ def _unique_capture_path(filename: str) -> Path:
     return CAPTURES_DIR / f"{stem}_{timestamp}{suffix}"
 
 
+def _is_local_control_request(request: Request) -> bool:
+    client = request.client.host if request.client else ""
+    host_header = request.headers.get("host", "").lower()
+    host = (
+        host_header[1:host_header.find("]")]
+        if host_header.startswith("[") and "]" in host_header
+        else host_header.split(":", 1)[0]
+    )
+    origin = request.headers.get("origin")
+    expected_origins = {
+        f"http://127.0.0.1:{request.url.port or 80}",
+        f"http://localhost:{request.url.port or 80}",
+        f"http://[::1]:{request.url.port or 80}",
+    }
+    return (
+        client in {"127.0.0.1", "::1"}
+        and host in {"127.0.0.1", "localhost", "::1"}
+        and origin in expected_origins
+    )
+
+
+async def _gpu_config(app: FastAPI) -> dict[str, object]:
+    return {
+        "mode": app.state.gpu_mode,
+        "hardware_active": app.state.gpu_hardware_active,
+        "mutable": not HOSTED,
+    }
+
+
 @app.get("/app-config")
 async def app_config():
     return {
         "server_saves": not HOSTED,
         "max_screenshot_pixels": MAX_SCREENSHOT_PIXELS,
+        "gpu": await _gpu_config(app),
     }
 
 
 if not HOSTED:
+    @app.post("/local/gpu-mode")
+    async def set_local_gpu_mode(request: Request):
+        if not _is_local_control_request(request):
+            raise HTTPException(
+                status_code=403,
+                detail="GPU mode can only be changed from the local ViperCapture interface",
+            )
+        payload = await request.json()
+        mode = payload.get("mode") if isinstance(payload, dict) else None
+        if mode not in {"off", "auto"}:
+            raise HTTPException(status_code=422, detail="GPU mode must be off or auto")
+        if mode == app.state.gpu_mode:
+            return {"gpu": await _gpu_config(app)}
+
+        acquired = 0
+        try:
+            for _ in range(MAX_CONCURRENT_CAPTURES):
+                await asyncio.wait_for(
+                    app.state.capture_slots.acquire(),
+                    timeout=CAPTURE_QUEUE_TIMEOUT_SECONDS,
+                )
+                acquired += 1
+            async with app.state.browser_restart_lock:
+                replacement = await asyncio.wait_for(
+                    _launch_browser(app.state.playwright, mode),
+                    timeout=15,
+                )
+                hardware_active = await _detect_hardware_gpu(replacement, mode)
+                previous = app.state.browser
+                app.state.browser = replacement
+                app.state.gpu_mode = mode
+                app.state.gpu_hardware_active = hardware_active
+                with suppress(Exception):
+                    await asyncio.wait_for(previous.close(), timeout=5)
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="The renderer is busy; try the GPU switch again shortly",
+            ) from exc
+        finally:
+            for _ in range(acquired):
+                app.state.capture_slots.release()
+
+        return {"gpu": await _gpu_config(app)}
+
+
     @app.post("/save-screenshot")
     async def save_screenshot(
         screenshot: UploadFile = File(...),

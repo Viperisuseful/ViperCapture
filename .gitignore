@@ -22,6 +22,7 @@ captures/
 # Launcher stamp files (generated automatically, not needed in git)
 .venv/.deps_stamp
 .venv/.playwright_stamp
+frontend/node_modules/
 
 # OS
 .DS_Store

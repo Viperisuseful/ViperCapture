@@ -2,10 +2,12 @@ import asyncio
 import socket
 import unittest
 from unittest.mock import AsyncMock, patch
+from pathlib import Path
 
 from pydantic import ValidationError
+from starlette.requests import Request
 
-from main import gpu_launch_args, hardware_gpu_active
+from main import _is_local_control_request, gpu_launch_args, hardware_gpu_active
 from render_contract import LazyLoadMode, RenderRequest
 from render_engine import (
     PublicUrlValidator,
@@ -203,6 +205,62 @@ class GpuConfigurationTests(unittest.TestCase):
                 }
             )
         )
+
+    def test_gpu_control_accepts_same_origin_loopback_request(self):
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/local/gpu-mode",
+                "query_string": b"",
+                "server": ("127.0.0.1", 8000),
+                "client": ("127.0.0.1", 44000),
+                "headers": [
+                    (b"host", b"127.0.0.1:8000"),
+                    (b"origin", b"http://127.0.0.1:8000"),
+                ],
+            }
+        )
+
+        self.assertTrue(_is_local_control_request(request))
+
+    def test_gpu_control_rejects_remote_or_cross_origin_request(self):
+        for client, origin in [
+            ("203.0.113.8", "http://127.0.0.1:8000"),
+            ("127.0.0.1", "https://attacker.example"),
+        ]:
+            with self.subTest(client=client, origin=origin):
+                request = Request(
+                    {
+                        "type": "http",
+                        "method": "POST",
+                        "scheme": "http",
+                        "path": "/local/gpu-mode",
+                        "query_string": b"",
+                        "server": ("127.0.0.1", 8000),
+                        "client": (client, 44000),
+                        "headers": [
+                            (b"host", b"127.0.0.1:8000"),
+                            (b"origin", origin.encode()),
+                        ],
+                    }
+                )
+
+                self.assertFalse(_is_local_control_request(request))
+
+
+class FrontendTests(unittest.TestCase):
+    def test_built_frontend_uses_vipercapture_brand_and_assets(self):
+        root = Path(__file__).resolve().parent
+        index = (root / "static" / "app" / "index.html").read_text(encoding="utf-8")
+        source = (root / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
+        components = (root / "frontend" / "components.json").read_text(encoding="utf-8")
+
+        self.assertIn("ViperCapture | Open-source webpage rendering", index)
+        self.assertIn("/static/app/assets/", index)
+        self.assertIn("GPU rendering", source)
+        self.assertIn('"style": "radix-nova"', components)
 
 
 class ValidationTests(unittest.TestCase):

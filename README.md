@@ -30,6 +30,8 @@ to manage browser automation code.
 - Optional adaptive or disabled lazy-load scrolling for faster full-page captures
 - Optional speed-first WebP encoding
 - Optional hardware GPU rendering with startup verification
+- A local-only GPU rendering switch that safely restarts Chromium after active captures finish
+- The same Radix Nova shadcn/ui component system and theme used by ViperCapture Cloud
 - Page-level challenge detection with an explicit capture-as-displayed choice
 
 ## Getting started
