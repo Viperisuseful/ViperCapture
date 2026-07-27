@@ -50,6 +50,16 @@ Chromium, starts ViperCapture, and opens `http://127.0.0.1:8000`.
 Running `python launch.py` is the supported setup and startup method on every
 platform.
 
+## Desktop app
+
+The Tauri 2 app is isolated in [`desktop/`](desktop), so desktop packaging and
+releases do not change the web frontend in [`frontend/`](frontend). It bundles
+the FastAPI renderer, Python runtime, and Playwright Chromium as a local,
+authenticated sidecar; users do not need to install Python or a browser.
+
+See the [desktop build guide](docs/desktop.md) for local development,
+validation, package formats, and signing status.
+
 ## API
 
 Send a JSON request to `POST /v1/render`:
@@ -170,7 +180,8 @@ boundary and supported capability set.
 
 The main components are `main.py` for the FastAPI application,
 `render_contract.py` for request validation, and `render_engine.py` for
-Playwright rendering. The local interface is in `templates/` and `static/`.
+Playwright rendering. The hosted/self-hosted interface remains in `frontend/`;
+the independently packaged Tauri application is in `desktop/`.
 
 ## License
 

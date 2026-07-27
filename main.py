@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from playwright.async_api import Browser, Playwright, async_playwright
@@ -22,7 +23,21 @@ if sys.platform.startswith("win"):
 
 
 BASE_DIR = Path(__file__).resolve().parent
-CAPTURES_DIR = BASE_DIR / "captures"
+CAPTURES_DIR = Path(
+    os.getenv("VIPERCAPTURE_CAPTURES_DIR", str(BASE_DIR / "captures"))
+).expanduser()
+DESKTOP_TOKEN = os.getenv("VIPERCAPTURE_DESKTOP_TOKEN")
+DESKTOP_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "VIPERCAPTURE_DESKTOP_ORIGINS",
+        (
+            "http://tauri.localhost,https://tauri.localhost,tauri://localhost,"
+            "http://localhost:1420,http://127.0.0.1:1420"
+        ),
+    ).split(",")
+    if origin.strip()
+]
 
 
 def _load_local_env() -> None:
@@ -175,7 +190,44 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 install_render_error_layer(app)
-app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+if DESKTOP_TOKEN:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=DESKTOP_ORIGINS,
+        allow_credentials=False,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Authorization", "Content-Type"],
+        expose_headers=["Content-Disposition", "X-Request-ID"],
+    )
+STATIC_DIR = BASE_DIR / "static"
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.middleware("http")
+async def require_desktop_token(request: Request, call_next):
+    if (
+        DESKTOP_TOKEN
+        and request.method != "OPTIONS"
+        and request.headers.get("authorization") != f"Bearer {DESKTOP_TOKEN}"
+    ):
+        return Response(status_code=401)
+    return await call_next(request)
+
+
+@app.get("/health")
+async def health() -> dict[str, bool]:
+    return {"ready": True}
+
+
+if DESKTOP_TOKEN:
+    @app.post("/shutdown")
+    async def shutdown(request: Request) -> dict[str, bool]:
+        callback = getattr(request.app.state, "shutdown_callback", None)
+        if callback is None:
+            raise HTTPException(status_code=503, detail="Shutdown is unavailable")
+        asyncio.get_running_loop().call_later(0.1, callback)
+        return {"shutting_down": True}
 
 
 @app.get("/")
@@ -354,6 +406,8 @@ def _unique_capture_path(filename: str) -> Path:
 
 
 def _is_local_control_request(request: Request) -> bool:
+    if DESKTOP_TOKEN:
+        return request.headers.get("authorization") == f"Bearer {DESKTOP_TOKEN}"
     client = request.client.host if request.client else ""
     host_header = request.headers.get("host", "").lower()
     host = (
