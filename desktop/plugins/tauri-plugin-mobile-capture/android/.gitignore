@@ -1,0 +1,4 @@
+/.tauri/
+/build/
+/.gradle/
+/local.properties

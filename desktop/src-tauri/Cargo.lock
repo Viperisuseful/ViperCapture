@@ -3273,6 +3273,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tauri-plugin-mobile-capture"
+version = "0.1.0"
+dependencies = [
+ "tauri",
+ "tauri-plugin",
+]
+
+[[package]]
 name = "tauri-plugin-shell"
 version = "2.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3870,6 +3878,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-log",
+ "tauri-plugin-mobile-capture",
  "tauri-plugin-shell",
 ]
 

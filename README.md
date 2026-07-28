@@ -50,7 +50,7 @@ Chromium, starts ViperCapture, and opens `http://127.0.0.1:8000`.
 Running `python launch.py` is the supported setup and startup method on every
 platform.
 
-## Desktop app
+## Native apps
 
 The Tauri 2 app is isolated in [`desktop/`](desktop), so desktop packaging and
 releases do not change the web frontend in [`frontend/`](frontend). It bundles
@@ -59,6 +59,11 @@ authenticated sidecar; users do not need to install Python or a browser.
 
 See the [desktop build guide](docs/desktop.md) for local development,
 validation, package formats, and signing status.
+
+The Android build uses a native, offscreen Android WebView renderer instead of
+the desktop Python sidecar. It supports Android 10 and newer and saves captures
+through Android's Downloads collection. See the [Android build guide](docs/android.md)
+for setup, local builds, supported controls, and release signing.
 
 ## API
 

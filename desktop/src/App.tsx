@@ -48,7 +48,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 
 type Output = "png" | "jpeg" | "webp"
-type Capture = { name: string; url: string; type: string }
+type Capture = { id?: string; name: string; url: string; type: string }
 type AppConfig = {
   max_screenshot_pixels?: number
   gpu?: { mode?: "off" | "auto" | "required"; hardware_active?: boolean; mutable?: boolean }
@@ -59,6 +59,7 @@ type ThemePreference = "system" | "light" | "dark"
 
 const appWindow = getCurrentWindow()
 const themeStorageKey = "vipercapture.desktop.theme"
+const isAndroid = /Android/i.test(navigator.userAgent)
 
 const presets = [
   ["Phone", 390, 844],
@@ -134,6 +135,7 @@ export default function App() {
     }
   }, [dark, themePreference])
   useEffect(() => {
+    if (isAndroid) return
     let stopListening: (() => void) | undefined
     const syncWindowState = async () => setMaximized(await appWindow.isMaximized())
 
@@ -150,6 +152,11 @@ export default function App() {
     let cancelled = false
 
     const start = async () => {
+      if (isAndroid) {
+        setConfig({ max_screenshot_pixels: 16_000_000, gpu: { mode: "off", mutable: false } })
+        setStatus("Ready")
+        return
+      }
       try {
         const runtime = await invoke<BackendConfig>("backend_config")
         for (let attempt = 0; attempt < 120; attempt += 1) {
@@ -190,7 +197,9 @@ export default function App() {
     }
   }, [])
   useEffect(
-    () => () => historyRef.current.forEach((item) => URL.revokeObjectURL(item.url)),
+    () => () => historyRef.current.forEach((item) => {
+      if (item.url.startsWith("blob:")) URL.revokeObjectURL(item.url)
+    }),
     [],
   )
 
@@ -215,13 +224,23 @@ export default function App() {
 
   const openExternal = async (destination: "github" | "cloud") => {
     try {
-      await invoke("open_external", { destination })
+      await invoke(isAndroid ? "plugin:mobile-capture|open_external" : "open_external", { destination })
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Could not open the link")
     }
   }
 
-  const downloadCapture = (item: Capture) => {
+  const downloadCapture = async (item: Capture) => {
+    if (isAndroid) {
+      if (!item.id) return toast.error("That capture is no longer available")
+      try {
+        const saved = await invoke<{ name: string }>("plugin:mobile-capture|save", { id: item.id })
+        toast.success("Image saved to Downloads", { description: saved.name })
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "Could not save the image")
+      }
+      return
+    }
     const link = document.createElement("a")
     link.href = item.url
     link.download = item.name
@@ -231,7 +250,7 @@ export default function App() {
 
   const openDownloads = async () => {
     try {
-      await invoke("open_downloads")
+      await invoke(isAndroid ? "plugin:mobile-capture|open_downloads" : "open_downloads")
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Could not open Downloads")
     }
@@ -325,6 +344,41 @@ export default function App() {
     setBusy(true)
     setStatus("Rendering")
     try {
+      if (isAndroid) {
+        const rendered = await invoke<{
+          id: string
+          name: string
+          type: string
+          dataUrl: string
+        }>("plugin:mobile-capture|capture", {
+          url: normalized,
+          output,
+          width,
+          height,
+          density,
+          fullPage,
+          quality,
+          transparent,
+          lazyLoad,
+          waitDelayMs: waitDelay * 1000,
+          timeoutMs: waitTimeout * 1000,
+        })
+        const item = {
+          id: rendered.id,
+          name: rendered.name,
+          url: rendered.dataUrl,
+          type: rendered.type,
+        }
+        setLatest(item)
+        setHistory((items) => {
+          const next = [item, ...items].slice(0, 6)
+          historyRef.current = next
+          return next
+        })
+        setStatus("Complete")
+        toast.success("Capture ready")
+        return
+      }
       const response = await backendFetch("/v1/render", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -376,7 +430,7 @@ export default function App() {
 
   return (
     <div className="min-h-svh bg-background text-foreground">
-      <header className="app-titlebar sticky top-0 z-50 flex h-12 select-none items-center border-b bg-background/95 backdrop-blur" data-tauri-drag-region>
+      <header className={`app-titlebar sticky top-0 z-50 flex h-12 select-none items-center border-b bg-background/95 backdrop-blur ${isAndroid ? "pt-[env(safe-area-inset-top)]" : ""}`} data-tauri-drag-region={!isAndroid ? true : undefined}>
         <div className="flex min-w-0 items-center gap-2 px-4 font-semibold tracking-tight" data-tauri-drag-region>
           <img src={`${import.meta.env.BASE_URL}vipercapture-mark.svg`} alt="" className="size-7 rounded-md" draggable={false} />
           <span data-tauri-drag-region>ViperCapture</span>
@@ -398,27 +452,31 @@ export default function App() {
             <Code2 data-icon="inline-start" />
             <span className="hidden sm:inline">GitHub</span>
           </Button>
-          <button className="window-control" onClick={() => void appWindow.minimize()} aria-label="Minimize window" title="Minimize">
-            <Minus aria-hidden="true" />
-          </button>
-          <button
-            className="window-control"
-            onClick={() => void appWindow.toggleMaximize()}
-            aria-label={maximized ? "Restore window" : "Maximize window"}
-            title={maximized ? "Restore" : "Maximize"}
-          >
-            <Square aria-hidden="true" className={maximized ? "size-3" : undefined} />
-          </button>
-          <button className="window-control window-control-close" onClick={() => void appWindow.close()} aria-label="Close window" title="Close">
-            <X aria-hidden="true" />
-          </button>
+          {!isAndroid && (
+            <>
+              <button className="window-control" onClick={() => void appWindow.minimize()} aria-label="Minimize window" title="Minimize">
+                <Minus aria-hidden="true" />
+              </button>
+              <button
+                className="window-control"
+                onClick={() => void appWindow.toggleMaximize()}
+                aria-label={maximized ? "Restore window" : "Maximize window"}
+                title={maximized ? "Restore" : "Maximize"}
+              >
+                <Square aria-hidden="true" className={maximized ? "size-3" : undefined} />
+              </button>
+              <button className="window-control window-control-close" onClick={() => void appWindow.close()} aria-label="Close window" title="Close">
+                <X aria-hidden="true" />
+              </button>
+            </>
+          )}
         </nav>
       </header>
 
       <main className="site-shell py-10 sm:py-14">
         <section className="mb-8 grid gap-6 lg:grid-cols-[1fr_auto] lg:items-end">
           <div className="max-w-3xl">
-            <Badge variant="outline" className="mb-4"><Sparkles data-icon="inline-start" />Local Chromium renderer</Badge>
+            <Badge variant="outline" className="mb-4"><Sparkles data-icon="inline-start" />{isAndroid ? "Local Android renderer" : "Local Chromium renderer"}</Badge>
             <h1 className="page-title">The whole webpage, in one capture.</h1>
             <p className="mt-4 max-w-2xl text-base leading-7 text-muted-foreground sm:text-lg">
               Render a public URL as PNG, JPEG, or WebP with the same focused workspace as ViperCapture Cloud.
@@ -427,7 +485,7 @@ export default function App() {
           <div className="grid grid-cols-3 gap-2">
             {[
               [Gauge, "Local", "Private"],
-              [Zap, "Fast", "Chromium"],
+              [Zap, "Fast", isAndroid ? "WebView" : "Chromium"],
               [ImageIcon, "3", "Formats"],
             ].map(([Icon, value, label]) => (
               <Card key={String(label)} size="sm" className="min-w-24">
@@ -449,7 +507,7 @@ export default function App() {
                 <InputGroupTextarea id="capture-url" rows={1} value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://example.com" className="min-h-10" />
               </InputGroup>
             </Field>
-            <Button size="lg" onClick={() => void capture()} disabled={busy || !backend} className="lg:min-w-36">
+            <Button size="lg" onClick={() => void capture()} disabled={busy || (!isAndroid && !backend)} className="lg:min-w-36">
               {busy ? <Loader2 data-icon="inline-start" className="animate-spin" /> : <ImageIcon data-icon="inline-start" />}
               {busy ? "Rendering" : "Capture"}
             </Button>
@@ -494,18 +552,20 @@ export default function App() {
                   </Field>
                 </FieldSet>
 
-                <FieldSet>
-                  <FieldLegend>Rendering</FieldLegend>
-                  <Field orientation="horizontal" data-disabled={!config?.gpu?.mutable}>
-                    <FieldLabel htmlFor="gpu-rendering">
-                      <span>
-                        <span className="flex items-center gap-2"><Zap />GPU rendering</span>
-                        <FieldDescription>{gpuCopy}</FieldDescription>
-                      </span>
-                    </FieldLabel>
-                    <Switch id="gpu-rendering" checked={gpuEnabled} onCheckedChange={(checked: boolean) => void setGpu(checked)} disabled={!config?.gpu?.mutable || gpuBusy} />
-                  </Field>
-                </FieldSet>
+                {!isAndroid && (
+                  <FieldSet>
+                    <FieldLegend>Rendering</FieldLegend>
+                    <Field orientation="horizontal" data-disabled={!config?.gpu?.mutable}>
+                      <FieldLabel htmlFor="gpu-rendering">
+                        <span>
+                          <span className="flex items-center gap-2"><Zap />GPU rendering</span>
+                          <FieldDescription>{gpuCopy}</FieldDescription>
+                        </span>
+                      </FieldLabel>
+                      <Switch id="gpu-rendering" checked={gpuEnabled} onCheckedChange={(checked: boolean) => void setGpu(checked)} disabled={!config?.gpu?.mutable || gpuBusy} />
+                    </Field>
+                  </FieldSet>
+                )}
 
                 <Collapsible>
                   <CollapsibleTrigger asChild>
@@ -513,21 +573,21 @@ export default function App() {
                   </CollapsibleTrigger>
                   <CollapsibleContent className="pt-4">
                     <FieldGroup>
-                      <Field><FieldLabel htmlFor="selector">Element selector</FieldLabel><Input id="selector" value={selector} onChange={(event) => setSelector(event.target.value)} placeholder="main, #invoice" /></Field>
+                      {!isAndroid && <Field><FieldLabel htmlFor="selector">Element selector</FieldLabel><Input id="selector" value={selector} onChange={(event) => setSelector(event.target.value)} placeholder="main, #invoice" /></Field>}
                       <Field><FieldLabel>Lazy content loading</FieldLabel><Select value={lazyLoad} onValueChange={setLazyLoad}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="thorough">Thorough (default)</SelectItem><SelectItem value="adaptive">Adaptive (faster)</SelectItem><SelectItem value="none">None (fastest)</SelectItem></SelectGroup></SelectContent></Select></Field>
                       <div className="grid grid-cols-3 gap-3">
-                        <Field><FieldLabel>Load event</FieldLabel><Select value={waitEvent} onValueChange={setWaitEvent}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="load">Load</SelectItem><SelectItem value="domcontentloaded">DOM ready</SelectItem><SelectItem value="networkidle">Network idle</SelectItem></SelectGroup></SelectContent></Select></Field>
+                        {!isAndroid && <Field><FieldLabel>Load event</FieldLabel><Select value={waitEvent} onValueChange={setWaitEvent}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="load">Load</SelectItem><SelectItem value="domcontentloaded">DOM ready</SelectItem><SelectItem value="networkidle">Network idle</SelectItem></SelectGroup></SelectContent></Select></Field>}
                         <Field><FieldLabel htmlFor="delay">Wait (sec)</FieldLabel><Input id="delay" type="number" min={0} max={15} value={waitDelay} onChange={(event) => setWaitDelay(Number(event.target.value))} /></Field>
                         <Field><FieldLabel htmlFor="timeout">Timeout</FieldLabel><Input id="timeout" type="number" min={1} max={30} value={waitTimeout} onChange={(event) => setWaitTimeout(Number(event.target.value))} /></Field>
                       </div>
-                      <div className="grid grid-cols-2 gap-3">
+                      {!isAndroid && <div className="grid grid-cols-2 gap-3">
                         <Field><FieldLabel htmlFor="wait-selector">Wait selector</FieldLabel><Input id="wait-selector" value={waitSelector} onChange={(event) => setWaitSelector(event.target.value)} placeholder=".ready" /></Field>
                         <Field><FieldLabel htmlFor="wait-text">Wait text</FieldLabel><Input id="wait-text" value={waitText} onChange={(event) => setWaitText(event.target.value)} placeholder="Loaded" /></Field>
-                      </div>
+                      </div>}
                       {output !== "png" && <Field><FieldLabel htmlFor="quality">Image quality</FieldLabel><Input id="quality" type="number" min={1} max={100} value={quality} onChange={(event) => setQuality(Number(event.target.value))} /></Field>}
                       {output !== "jpeg" && <Field orientation="horizontal"><FieldLabel htmlFor="transparent">Transparent background</FieldLabel><Switch id="transparent" checked={transparent} onCheckedChange={setTransparent} /></Field>}
                       {output === "webp" && <Field orientation="horizontal"><FieldLabel htmlFor="optimize-webp"><span><span className="block">Fast WebP encoding</span><FieldDescription>Prioritize speed over the smallest file.</FieldDescription></span></FieldLabel><Switch id="optimize-webp" checked={optimizeWebp} onCheckedChange={setOptimizeWebp} /></Field>}
-                      <Field><FieldLabel htmlFor="headers">Same-origin headers</FieldLabel><Input id="headers" value={headers} onChange={(event) => setHeaders(event.target.value)} placeholder={'{"Authorization":"Bearer …"}'} /><FieldDescription>Sent only to the exact target origin.</FieldDescription></Field>
+                      {!isAndroid && <Field><FieldLabel htmlFor="headers">Same-origin headers</FieldLabel><Input id="headers" value={headers} onChange={(event) => setHeaders(event.target.value)} placeholder={'{"Authorization":"Bearer …"}'} /><FieldDescription>Sent only to the exact target origin.</FieldDescription></Field>}
                     </FieldGroup>
                   </CollapsibleContent>
                 </Collapsible>
@@ -553,7 +613,7 @@ export default function App() {
                   <div className="min-w-0"><p className="truncate text-sm font-medium">{latest.name}</p><p className="text-xs text-muted-foreground">{latest.type}</p></div>
                   <div className="flex gap-2">
                     <Button variant="outline" size="sm" onClick={() => void openDownloads()}><FolderOpen data-icon="inline-start" />Downloads</Button>
-                    <Button size="sm" onClick={() => downloadCapture(latest)}><Download data-icon="inline-start" />Download</Button>
+                    <Button size="sm" onClick={() => void downloadCapture(latest)}><Download data-icon="inline-start" />Download</Button>
                   </div>
                 </div>
               )}
@@ -561,7 +621,11 @@ export default function App() {
                 <div className="mt-5 border-t pt-4">
                   <p className="mono-label mb-3">Recent in this tab</p>
                   <div className="flex gap-2 overflow-x-auto pb-1">
-                    {history.map((item) => <a key={item.url} href={item.url} download={item.name} className="flex min-w-36 items-center gap-2 rounded-lg border bg-background p-2 text-xs hover:bg-accent"><CheckCircle2 className="size-4 text-primary" /><span className="truncate">{item.name}</span></a>)}
+                    {history.map((item) => (
+                      <button key={item.url} onClick={() => { setLatest(item); if (isAndroid) void downloadCapture(item) }} className="flex min-w-36 items-center gap-2 rounded-lg border bg-background p-2 text-xs hover:bg-accent">
+                        <CheckCircle2 className="size-4 text-primary" /><span className="truncate">{item.name}</span>
+                      </button>
+                    ))}
                   </div>
                 </div>
               )}

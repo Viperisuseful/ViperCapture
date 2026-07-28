@@ -1,12 +1,18 @@
+#[cfg(desktop)]
 use rand::{distr::Alphanumeric, Rng};
+#[cfg(desktop)]
 use serde::Serialize;
+#[cfg(desktop)]
 use std::{net::TcpListener, path::PathBuf, sync::Mutex};
+#[cfg(desktop)]
 use tauri::{AppHandle, Manager, RunEvent, State};
+#[cfg(desktop)]
 use tauri_plugin_shell::{
     process::{CommandChild, CommandEvent},
     ShellExt,
 };
 
+#[cfg(desktop)]
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BackendConfig {
@@ -14,12 +20,14 @@ struct BackendConfig {
     token: String,
 }
 
+#[cfg(desktop)]
 #[derive(Default)]
 struct BackendState {
     config: Mutex<Option<BackendConfig>>,
     child: Mutex<Option<CommandChild>>,
 }
 
+#[cfg(desktop)]
 #[tauri::command]
 fn backend_config(state: State<'_, BackendState>) -> Result<BackendConfig, String> {
     state
@@ -30,6 +38,7 @@ fn backend_config(state: State<'_, BackendState>) -> Result<BackendConfig, Strin
         .ok_or_else(|| "Renderer is still starting".to_string())
 }
 
+#[cfg(desktop)]
 #[tauri::command]
 fn open_external(destination: String) -> Result<(), String> {
     let url = match destination.as_str() {
@@ -41,6 +50,7 @@ fn open_external(destination: String) -> Result<(), String> {
     open::that(url).map_err(|error| format!("Could not open the default browser: {error}"))
 }
 
+#[cfg(desktop)]
 #[tauri::command]
 fn open_downloads(app: AppHandle) -> Result<(), String> {
     let downloads = app
@@ -50,6 +60,7 @@ fn open_downloads(app: AppHandle) -> Result<(), String> {
     open::that(downloads).map_err(|error| format!("Could not open the Downloads folder: {error}"))
 }
 
+#[cfg(desktop)]
 fn reserve_loopback_port() -> Result<u16, String> {
     TcpListener::bind(("127.0.0.1", 0))
         .and_then(|listener| listener.local_addr())
@@ -57,6 +68,7 @@ fn reserve_loopback_port() -> Result<u16, String> {
         .map_err(|error| format!("Could not reserve a renderer port: {error}"))
 }
 
+#[cfg(desktop)]
 fn playwright_dir(app: &tauri::App) -> Result<PathBuf, String> {
     let bundled = app
         .path()
@@ -72,6 +84,7 @@ fn playwright_dir(app: &tauri::App) -> Result<PathBuf, String> {
         .join("playwright"))
 }
 
+#[cfg(desktop)]
 fn stop_backend(app: &tauri::AppHandle) {
     let state = app.state::<BackendState>();
     if let Ok(mut guard) = state.child.lock() {
@@ -83,7 +96,10 @@ fn stop_backend(app: &tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let app = tauri::Builder::default()
+    let builder = tauri::Builder::default().plugin(tauri_plugin_mobile_capture::init());
+
+    #[cfg(desktop)]
+    let builder = builder
         .manage(BackendState::default())
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
@@ -158,13 +174,30 @@ pub fn run() {
             backend_config,
             open_external,
             open_downloads
-        ])
+        ]);
+
+    #[cfg(mobile)]
+    let builder = builder.setup(|app| {
+        if cfg!(debug_assertions) {
+            app.handle().plugin(
+                tauri_plugin_log::Builder::default()
+                    .level(log::LevelFilter::Info)
+                    .build(),
+            )?;
+        }
+        Ok(())
+    });
+
+    let app = builder
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
     app.run(|handle, event| {
+        #[cfg(desktop)]
         if matches!(event, RunEvent::Exit | RunEvent::ExitRequested { .. }) {
             stop_backend(handle);
         }
+        #[cfg(mobile)]
+        let _ = (handle, event);
     });
 }
