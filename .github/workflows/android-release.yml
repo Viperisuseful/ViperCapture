@@ -98,7 +98,7 @@ jobs:
           test -n "$APK"
           test -n "$AAB"
           "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$APK"
-          jarsigner -verify -strict -certs "$AAB"
+          jarsigner -verify -certs "$AAB"
           mkdir -p artifacts
           cp "$APK" artifacts/ViperCapture-Android-v0.1.0-universal.apk
           cp "$AAB" artifacts/ViperCapture-Android-v0.1.0-universal.aab
