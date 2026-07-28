@@ -11,6 +11,7 @@ import android.net.Uri
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.util.Base64
 import android.view.View
@@ -113,6 +114,7 @@ class MobileCapturePlugin(private val activity: Activity) : Plugin(activity) {
         timeout: Int
     ) {
         val completed = AtomicBoolean(false)
+        val renderingStarted = AtomicBoolean(false)
         val root = activity.findViewById<ViewGroup>(android.R.id.content)
         val systemDensity = activity.resources.displayMetrics.density
         val viewWidth = max(1, (width * systemDensity).roundToInt())
@@ -143,7 +145,7 @@ class MobileCapturePlugin(private val activity: Activity) : Plugin(activity) {
             cacheMode = WebSettings.LOAD_DEFAULT
             mediaPlaybackRequiresUserGesture = true
         }
-        webView.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
+        webView.setLayerType(View.LAYER_TYPE_NONE, null)
         webView.setBackgroundColor(if (transparent && output != "jpeg") Color.TRANSPARENT else Color.WHITE)
         webView.translationX = -viewWidth * 2f
         root.addView(webView, ViewGroup.LayoutParams(viewWidth, viewHeight))
@@ -153,7 +155,7 @@ class MobileCapturePlugin(private val activity: Activity) : Plugin(activity) {
 
         webView.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView, loadedUrl: String) {
-                if (completed.get()) return
+                if (completed.get() || !renderingStarted.compareAndSet(false, true)) return
                 val lazyScript = if (lazyLoad == "none") {
                     "window.scrollTo(0,0); true;"
                 } else {
@@ -172,18 +174,29 @@ class MobileCapturePlugin(private val activity: Activity) : Plugin(activity) {
                 view.evaluateJavascript(lazyScript) {
                     mainHandler.postDelayed({
                         if (!completed.get()) {
-                            drawCapture(
-                                invoke,
-                                root,
-                                webView,
-                                completed,
-                                width,
-                                height,
-                                outputDensity,
-                                fullPage,
-                                output,
-                                quality,
-                                transparent
+                            view.postVisualStateCallback(
+                                System.nanoTime(),
+                                object : WebView.VisualStateCallback() {
+                                    override fun onComplete(requestId: Long) {
+                                        mainHandler.postDelayed({
+                                            if (!completed.get()) {
+                                                drawCapture(
+                                                    invoke,
+                                                    root,
+                                                    webView,
+                                                    completed,
+                                                    width,
+                                                    height,
+                                                    outputDensity,
+                                                    fullPage,
+                                                    output,
+                                                    quality,
+                                                    transparent
+                                                )
+                                            }
+                                        }, 100)
+                                    }
+                                }
                             )
                         }
                     }, waitDelay.toLong())
@@ -215,29 +228,42 @@ class MobileCapturePlugin(private val activity: Activity) : Plugin(activity) {
         quality: Int,
         transparent: Boolean
     ) {
-        val contentCssHeight = max(height, webView.contentHeight)
         val outputWidth = max(1, (width * outputDensity).roundToInt())
-        val requestedHeight = if (fullPage) contentCssHeight else height
-        var outputHeight = max(1, (requestedHeight * outputDensity).roundToInt())
+        val picture = webView.capturePicture()
+        if (picture.width <= 0 || picture.height <= 0) {
+            if (completed.compareAndSet(false, true)) {
+                root.removeView(webView)
+                webView.destroy()
+                invoke.reject("Android WebView did not produce a drawable page")
+            }
+            return
+        }
+
+        val pictureScale = outputWidth.toFloat() / picture.width.toFloat()
+        var outputHeight = if (fullPage) {
+            max(1, (picture.height * pictureScale).roundToInt())
+        } else {
+            max(1, (height * outputDensity).roundToInt())
+        }
         if (outputWidth.toLong() * outputHeight > MAX_PIXELS) {
             outputHeight = (MAX_PIXELS / outputWidth).toInt().coerceAtLeast(1)
         }
 
-        val systemDensity = activity.resources.displayMetrics.density
-        val layoutHeight = max(1, (requestedHeight * systemDensity).roundToInt())
-        webView.measure(
-            ViewGroup.LayoutParams.MATCH_PARENT.let {
-                android.view.View.MeasureSpec.makeMeasureSpec(webView.width, android.view.View.MeasureSpec.EXACTLY)
-            },
-            android.view.View.MeasureSpec.makeMeasureSpec(layoutHeight, android.view.View.MeasureSpec.EXACTLY)
-        )
-        webView.layout(0, 0, webView.measuredWidth, layoutHeight)
-
         val bitmap = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bitmap)
         if (!(transparent && output != "jpeg")) canvas.drawColor(Color.WHITE)
-        canvas.scale(outputWidth.toFloat() / webView.measuredWidth.toFloat(), outputWidth.toFloat() / webView.measuredWidth.toFloat())
-        webView.draw(canvas)
+        canvas.scale(pictureScale, pictureScale)
+        picture.draw(canvas)
+
+        if (!hasVisibleContent(bitmap)) {
+            bitmap.recycle()
+            if (completed.compareAndSet(false, true)) {
+                root.removeView(webView)
+                webView.destroy()
+                invoke.reject("Android WebView returned an empty page. Try increasing the wait time.")
+            }
+            return
+        }
 
         val stream = ByteArrayOutputStream()
         val mimeType: String
@@ -295,6 +321,28 @@ class MobileCapturePlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
+    private fun hasVisibleContent(bitmap: Bitmap): Boolean {
+        val xStep = max(1, bitmap.width / 128)
+        val yStep = max(1, bitmap.height / 128)
+        var visibleSamples = 0
+        var y = 0
+        while (y < bitmap.height) {
+            var x = 0
+            while (x < bitmap.width) {
+                val pixel = bitmap.getPixel(x, y)
+                if (Color.alpha(pixel) > 16 &&
+                    (Color.red(pixel) < 245 || Color.green(pixel) < 245 || Color.blue(pixel) < 245)
+                ) {
+                    visibleSamples += 1
+                    if (visibleSamples >= 2) return true
+                }
+                x += xStep
+            }
+            y += yStep
+        }
+        return false
+    }
+
     @Command
     fun save(invoke: Invoke) {
         val id = invoke.getArgs().optString("id", "")
@@ -330,17 +378,34 @@ class MobileCapturePlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @Command
-    fun open_downloads(invoke: Invoke) {
+    fun openDownloads(invoke: Invoke) {
         try {
-            activity.startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS))
+            val downloads = Uri.parse(
+                "content://com.android.externalstorage.documents/document/primary%3ADownload"
+            )
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "image/*"
+                putExtra(DocumentsContract.EXTRA_INITIAL_URI, downloads)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            activity.applicationContext.startActivity(intent)
             invoke.resolve()
         } catch (error: Exception) {
-            invoke.reject("Could not open Downloads: ${error.message}")
+            try {
+                val fallback = Intent(DownloadManager.ACTION_VIEW_DOWNLOADS).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                activity.applicationContext.startActivity(fallback)
+                invoke.resolve()
+            } catch (fallbackError: Exception) {
+                invoke.reject("Could not open Downloads: ${fallbackError.message ?: error.message}")
+            }
         }
     }
 
     @Command
-    fun open_external(invoke: Invoke) {
+    fun openExternal(invoke: Invoke) {
         val url = when (invoke.getArgs().optString("destination", "")) {
             "github" -> "https://github.com/Viperisuseful/ViperCapture"
             "cloud" -> "https://capture.viperisuseful.cc"
@@ -350,7 +415,10 @@ class MobileCapturePlugin(private val activity: Activity) : Plugin(activity) {
             }
         }
         try {
-            activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+            val browserIntent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            activity.applicationContext.startActivity(browserIntent)
             invoke.resolve()
         } catch (error: Exception) {
             invoke.reject("Could not open the link: ${error.message}")

@@ -83,6 +83,12 @@ function extension(output: Output) {
   return output === "jpeg" ? "jpg" : output
 }
 
+function errorMessage(error: unknown, fallback: string) {
+  if (error instanceof Error && error.message) return error.message
+  if (typeof error === "string" && error.trim()) return error
+  return fallback
+}
+
 export default function App() {
   const [themePreference, setThemePreference] = useState<ThemePreference>(() => {
     const stored = localStorage.getItem(themeStorageKey)
@@ -226,7 +232,7 @@ export default function App() {
     try {
       await invoke(isAndroid ? "plugin:mobile-capture|open_external" : "open_external", { destination })
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Could not open the link")
+      toast.error(errorMessage(error, "Could not open the link"))
     }
   }
 
@@ -237,7 +243,7 @@ export default function App() {
         const saved = await invoke<{ name: string }>("plugin:mobile-capture|save", { id: item.id })
         toast.success("Image saved to Downloads", { description: saved.name })
       } catch (error) {
-        toast.error(error instanceof Error ? error.message : "Could not save the image")
+        toast.error(errorMessage(error, "Could not save the image"))
       }
       return
     }
@@ -252,7 +258,7 @@ export default function App() {
     try {
       await invoke(isAndroid ? "plugin:mobile-capture|open_downloads" : "open_downloads")
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Could not open Downloads")
+      toast.error(errorMessage(error, "Could not open Downloads"))
     }
   }
 
@@ -422,7 +428,7 @@ export default function App() {
       toast.success("Capture ready")
     } catch (error) {
       setStatus("Failed")
-      toast.error(error instanceof Error ? error.message : "Capture failed")
+      toast.error(errorMessage(error, "Capture failed"))
     } finally {
       setBusy(false)
     }
@@ -430,7 +436,7 @@ export default function App() {
 
   return (
     <div className="min-h-svh bg-background text-foreground">
-      <header className={`app-titlebar sticky top-0 z-50 flex h-12 select-none items-center border-b bg-background/95 backdrop-blur ${isAndroid ? "pt-[env(safe-area-inset-top)]" : ""}`} data-tauri-drag-region={!isAndroid ? true : undefined}>
+      <header className={`app-titlebar sticky top-0 z-50 flex select-none items-center border-b bg-background/95 backdrop-blur ${isAndroid ? "android-titlebar" : "h-12"}`} data-tauri-drag-region={!isAndroid ? true : undefined}>
         <div className="flex min-w-0 items-center gap-2 px-4 font-semibold tracking-tight" data-tauri-drag-region>
           <img src={`${import.meta.env.BASE_URL}vipercapture-mark.svg`} alt="" className="size-7 rounded-md" draggable={false} />
           <span data-tauri-drag-region>ViperCapture</span>

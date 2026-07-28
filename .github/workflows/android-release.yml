@@ -6,7 +6,7 @@ on:
       tag:
         description: Release tag
         required: true
-        default: android-v0.1.0
+        default: android-v0.1.1
       publish:
         description: Publish a GitHub release after the build passes
         required: true
@@ -92,6 +92,8 @@ jobs:
         run: npm run tauri -- android build --apk --aab --ci
 
       - name: Verify signatures and create checksums
+        env:
+          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.tag }}
         run: |
           APK="$(find desktop/src-tauri/gen/android/app/build/outputs/apk -type f -name '*universal-release.apk' -print -quit)"
           AAB="$(find desktop/src-tauri/gen/android/app/build/outputs/bundle -type f -name '*universal-release.aab' -print -quit)"
@@ -100,8 +102,9 @@ jobs:
           "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$APK"
           jarsigner -verify -certs "$AAB"
           mkdir -p artifacts
-          cp "$APK" artifacts/ViperCapture-Android-v0.1.0-universal.apk
-          cp "$AAB" artifacts/ViperCapture-Android-v0.1.0-universal.aab
+          VERSION="${RELEASE_TAG#android-v}"
+          cp "$APK" "artifacts/ViperCapture-Android-v${VERSION}-universal.apk"
+          cp "$AAB" "artifacts/ViperCapture-Android-v${VERSION}-universal.aab"
           cd artifacts
           sha256sum *.apk *.aab > SHA256SUMS.txt
 
@@ -133,4 +136,4 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "ViperCapture Android ${RELEASE_TAG#android-v}" \
             --generate-notes \
-            --notes "First Android release. Requires Android 10 or newer. The APK is signed and ready for direct installation; the AAB is included for store distribution."
+            --notes "Android 10 or newer. The APK is signed and ready for direct installation; the AAB is included for store distribution."

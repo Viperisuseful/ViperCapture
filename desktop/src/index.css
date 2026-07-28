@@ -100,6 +100,15 @@
   .app-titlebar button {
     -webkit-app-region: no-drag;
   }
+  .android-titlebar {
+    min-height: calc(3rem + env(safe-area-inset-top, 0px));
+    padding-top: env(safe-area-inset-top, 0px);
+  }
+  @media (max-width: 600px) {
+    [data-sonner-toaster][data-y-position="bottom"] {
+      bottom: calc(1rem + env(safe-area-inset-bottom, 0px)) !important;
+    }
+  }
   .window-control {
     @apply flex h-full w-12 items-center justify-center text-foreground/80 transition-colors hover:bg-accent hover:text-foreground focus-visible:z-10 focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring;
   }

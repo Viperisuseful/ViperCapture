@@ -7,6 +7,10 @@ import { Toaster } from '@/components/ui/sonner'
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <App />
-    <Toaster richColors position="bottom-right" />
+    <Toaster
+      richColors
+      position="bottom-right"
+      mobileOffset={{ bottom: "calc(1rem + env(safe-area-inset-bottom, 0px))", left: 16, right: 16 }}
+    />
   </StrictMode>,
 )
