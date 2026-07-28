@@ -1,21 +1,26 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import { invoke } from "@tauri-apps/api/core"
+import { getCurrentWindow } from "@tauri-apps/api/window"
 import {
   AlertTriangle,
   CheckCircle2,
   ChevronDown,
   Download,
   ExternalLink,
+  FolderOpen,
   Gauge,
   Code2,
   Globe2,
   ImageIcon,
   Loader2,
+  Minus,
   Moon,
   RotateCcw,
+  Square,
   SlidersHorizontal,
   Sparkles,
   Sun,
+  X,
   Zap,
 } from "lucide-react"
 import { toast } from "sonner"
@@ -50,6 +55,10 @@ type AppConfig = {
 }
 type BackendConfig = { baseUrl: string; token: string }
 type CaptchaWarning = { provider: string; requestId?: string }
+type ThemePreference = "system" | "light" | "dark"
+
+const appWindow = getCurrentWindow()
+const themeStorageKey = "vipercapture.desktop.theme"
 
 const presets = [
   ["Phone", 390, 844],
@@ -74,7 +83,12 @@ function extension(output: Output) {
 }
 
 export default function App() {
-  const [dark, setDark] = useState(() => localStorage.getItem("theme") === "dark")
+  const [themePreference, setThemePreference] = useState<ThemePreference>(() => {
+    const stored = localStorage.getItem(themeStorageKey)
+    return stored === "light" || stored === "dark" ? stored : "system"
+  })
+  const [systemDark, setSystemDark] = useState(() => window.matchMedia("(prefers-color-scheme: dark)").matches)
+  const [maximized, setMaximized] = useState(false)
   const [url, setUrl] = useState("https://example.com")
   const [output, setOutput] = useState<Output>("png")
   const [width, setWidth] = useState(1280)
@@ -102,10 +116,36 @@ export default function App() {
   const [captchaWarning, setCaptchaWarning] = useState<CaptchaWarning | null>(null)
   const historyRef = useRef<Capture[]>([])
 
+  const dark = themePreference === "system" ? systemDark : themePreference === "dark"
+
+  useEffect(() => {
+    const media = window.matchMedia("(prefers-color-scheme: dark)")
+    const updateSystemTheme = (event: MediaQueryListEvent) => setSystemDark(event.matches)
+    media.addEventListener("change", updateSystemTheme)
+    return () => media.removeEventListener("change", updateSystemTheme)
+  }, [])
   useEffect(() => {
     document.documentElement.classList.toggle("dark", dark)
-    localStorage.setItem("theme", dark ? "dark" : "light")
-  }, [dark])
+    document.documentElement.style.colorScheme = dark ? "dark" : "light"
+    if (themePreference === "system") {
+      localStorage.removeItem(themeStorageKey)
+    } else {
+      localStorage.setItem(themeStorageKey, themePreference)
+    }
+  }, [dark, themePreference])
+  useEffect(() => {
+    let stopListening: (() => void) | undefined
+    const syncWindowState = async () => setMaximized(await appWindow.isMaximized())
+
+    void syncWindowState()
+    void appWindow.onResized(() => {
+      void syncWindowState()
+    }).then((unlisten) => {
+      stopListening = unlisten
+    })
+
+    return () => stopListening?.()
+  }, [])
   useEffect(() => {
     let cancelled = false
 
@@ -171,6 +211,30 @@ export default function App() {
     const requestHeaders = new Headers(init.headers)
     requestHeaders.set("Authorization", `Bearer ${backend.token}`)
     return fetch(`${backend.baseUrl}${path}`, { ...init, headers: requestHeaders })
+  }
+
+  const openExternal = async (destination: "github" | "cloud") => {
+    try {
+      await invoke("open_external", { destination })
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Could not open the link")
+    }
+  }
+
+  const downloadCapture = (item: Capture) => {
+    const link = document.createElement("a")
+    link.href = item.url
+    link.download = item.name
+    link.click()
+    toast.success("Image downloaded", { description: item.name })
+  }
+
+  const openDownloads = async () => {
+    try {
+      await invoke("open_downloads")
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Could not open Downloads")
+    }
   }
 
   const reset = () => {
@@ -312,25 +376,43 @@ export default function App() {
 
   return (
     <div className="min-h-svh bg-background text-foreground">
-      <header className="sticky top-0 z-10 border-b bg-background/90 backdrop-blur">
-        <div className="site-shell flex h-16 items-center justify-between">
-          <a href="/" className="flex items-center gap-2 font-semibold tracking-tight">
-            <img src={`${import.meta.env.BASE_URL}vipercapture-mark.svg`} alt="" className="size-8 rounded-lg" />
-            ViperCapture
-            <Badge variant="secondary" className="hidden sm:inline-flex">Open source</Badge>
-          </a>
-          <nav className="flex items-center gap-1">
-            <Button variant="ghost" size="icon-sm" onClick={() => setDark((value) => !value)} aria-label="Toggle color theme">
-              {dark ? <Sun /> : <Moon />}
-            </Button>
-            <Button variant="ghost" size="sm" asChild>
-              <a href="https://github.com/Viperisuseful/ViperCapture" target="_blank" rel="noreferrer">
-                <Code2 data-icon="inline-start" />
-                <span className="hidden sm:inline">GitHub</span>
-              </a>
-            </Button>
-          </nav>
+      <header className="app-titlebar sticky top-0 z-50 flex h-12 select-none items-center border-b bg-background/95 backdrop-blur" data-tauri-drag-region>
+        <div className="flex min-w-0 items-center gap-2 px-4 font-semibold tracking-tight" data-tauri-drag-region>
+          <img src={`${import.meta.env.BASE_URL}vipercapture-mark.svg`} alt="" className="size-7 rounded-md" draggable={false} />
+          <span data-tauri-drag-region>ViperCapture</span>
+          <Badge variant="secondary" className="hidden sm:inline-flex" data-tauri-drag-region>Open source</Badge>
         </div>
+        <div className="h-full min-w-4 flex-1" data-tauri-drag-region />
+        <nav className="flex h-full items-center">
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            className="mr-1"
+            onClick={() => setThemePreference(dark ? "light" : "dark")}
+            aria-label={dark ? "Switch to light theme" : "Switch to dark theme"}
+            title={themePreference === "system" ? "Using system theme" : dark ? "Switch to light theme" : "Switch to dark theme"}
+          >
+            {dark ? <Sun /> : <Moon />}
+          </Button>
+          <Button variant="ghost" size="sm" className="mr-2" onClick={() => void openExternal("github")}>
+            <Code2 data-icon="inline-start" />
+            <span className="hidden sm:inline">GitHub</span>
+          </Button>
+          <button className="window-control" onClick={() => void appWindow.minimize()} aria-label="Minimize window" title="Minimize">
+            <Minus aria-hidden="true" />
+          </button>
+          <button
+            className="window-control"
+            onClick={() => void appWindow.toggleMaximize()}
+            aria-label={maximized ? "Restore window" : "Maximize window"}
+            title={maximized ? "Restore" : "Maximize"}
+          >
+            <Square aria-hidden="true" className={maximized ? "size-3" : undefined} />
+          </button>
+          <button className="window-control window-control-close" onClick={() => void appWindow.close()} aria-label="Close window" title="Close">
+            <X aria-hidden="true" />
+          </button>
+        </nav>
       </header>
 
       <main className="site-shell py-10 sm:py-14">
@@ -470,8 +552,8 @@ export default function App() {
                 <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
                   <div className="min-w-0"><p className="truncate text-sm font-medium">{latest.name}</p><p className="text-xs text-muted-foreground">{latest.type}</p></div>
                   <div className="flex gap-2">
-                    <Button variant="outline" size="sm" asChild><a href={latest.url} target="_blank" rel="noreferrer"><ExternalLink data-icon="inline-start" />Open</a></Button>
-                    <Button size="sm" asChild><a href={latest.url} download={latest.name}><Download data-icon="inline-start" />Download</a></Button>
+                    <Button variant="outline" size="sm" onClick={() => void openDownloads()}><FolderOpen data-icon="inline-start" />Downloads</Button>
+                    <Button size="sm" onClick={() => downloadCapture(latest)}><Download data-icon="inline-start" />Download</Button>
                   </div>
                 </div>
               )}
@@ -489,7 +571,7 @@ export default function App() {
 
         <footer className="flex flex-col gap-3 py-8 text-sm text-muted-foreground sm:flex-row sm:items-center sm:justify-between">
           <p>Open source under the MIT License.</p>
-          <Button variant="link" size="sm" asChild><a href="https://capture.viperisuseful.cc" target="_blank" rel="noreferrer">Try ViperCapture Cloud <ExternalLink data-icon="inline-end" /></a></Button>
+          <Button variant="link" size="sm" onClick={() => void openExternal("cloud")}>Try ViperCapture Cloud <ExternalLink data-icon="inline-end" /></Button>
         </footer>
       </main>
 

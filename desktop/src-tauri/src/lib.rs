@@ -1,7 +1,7 @@
 use rand::{distr::Alphanumeric, Rng};
 use serde::Serialize;
 use std::{net::TcpListener, path::PathBuf, sync::Mutex};
-use tauri::{Manager, RunEvent, State};
+use tauri::{AppHandle, Manager, RunEvent, State};
 use tauri_plugin_shell::{
     process::{CommandChild, CommandEvent},
     ShellExt,
@@ -28,6 +28,26 @@ fn backend_config(state: State<'_, BackendState>) -> Result<BackendConfig, Strin
         .map_err(|_| "Renderer state is unavailable".to_string())?
         .clone()
         .ok_or_else(|| "Renderer is still starting".to_string())
+}
+
+#[tauri::command]
+fn open_external(destination: String) -> Result<(), String> {
+    let url = match destination.as_str() {
+        "github" => "https://github.com/Viperisuseful/ViperCapture",
+        "cloud" => "https://capture.viperisuseful.cc",
+        _ => return Err("That external destination is not allowed".to_string()),
+    };
+
+    open::that(url).map_err(|error| format!("Could not open the default browser: {error}"))
+}
+
+#[tauri::command]
+fn open_downloads(app: AppHandle) -> Result<(), String> {
+    let downloads = app
+        .path()
+        .download_dir()
+        .map_err(|error| format!("Could not locate the Downloads folder: {error}"))?;
+    open::that(downloads).map_err(|error| format!("Could not open the Downloads folder: {error}"))
 }
 
 fn reserve_loopback_port() -> Result<u16, String> {
@@ -134,7 +154,11 @@ pub fn run() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![backend_config])
+        .invoke_handler(tauri::generate_handler![
+            backend_config,
+            open_external,
+            open_downloads
+        ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 

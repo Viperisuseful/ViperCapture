@@ -85,6 +85,7 @@
   }
   body {
     @apply min-h-svh bg-background text-foreground antialiased;
+    overflow-x: hidden;
   }
   button:not(:disabled),
   [role="button"]:not(:disabled) {
@@ -93,6 +94,23 @@
 }
 
 @layer components {
+  .app-titlebar {
+    -webkit-app-region: drag;
+  }
+  .app-titlebar button {
+    -webkit-app-region: no-drag;
+  }
+  .window-control {
+    @apply flex h-full w-12 items-center justify-center text-foreground/80 transition-colors hover:bg-accent hover:text-foreground focus-visible:z-10 focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring;
+  }
+  .window-control svg {
+    @apply size-4;
+    stroke-width: 1.6;
+  }
+  .window-control-close:hover {
+    color: white;
+    background: #c42b1c;
+  }
   .site-shell {
     @apply mx-auto w-full max-w-[1440px] px-4 sm:px-6 lg:px-8;
   }

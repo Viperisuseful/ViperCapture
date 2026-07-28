@@ -147,4 +147,5 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "ViperCapture Desktop ${RELEASE_TAG#desktop-v}" \
-            --notes "First desktop release. Includes unsigned Windows x64, macOS Apple Silicon and Intel, and Linux x64 packages. Windows SmartScreen and macOS Gatekeeper may warn until platform signing certificates are configured."
+            --generate-notes \
+            --notes "Includes unsigned Windows x64, macOS Apple Silicon and Intel, and Linux x64 packages. Windows SmartScreen and macOS Gatekeeper may warn until platform signing certificates are configured."
