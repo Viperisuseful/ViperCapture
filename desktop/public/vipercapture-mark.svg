@@ -1,6 +1,1 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
-  <title id="title">ViperCapture mark</title>
-  <rect width="64" height="64" rx="16" fill="#3157e5"/>
-  <rect x="15" y="15" width="24" height="24" rx="7" fill="none" stroke="#f5f7ff" stroke-width="5"/>
-  <rect x="25" y="25" width="24" height="24" rx="7" fill="none" stroke="#f5f7ff" stroke-width="5"/>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" aria-labelledby="title" role="img" viewBox="0 0 64 64"><title id="title">ViperCapture mark</title><rect width="64" height="64" fill="#3157e5" rx="16"/><rect width="24" height="24" x="15" y="15" fill="none" stroke="#f5f7ff" stroke-width="5" rx="7"/><rect width="24" height="24" x="25" y="25" fill="none" stroke="#f5f7ff" stroke-width="5" rx="7"/></svg>
