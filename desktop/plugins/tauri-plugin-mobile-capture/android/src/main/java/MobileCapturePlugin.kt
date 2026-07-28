@@ -379,27 +379,39 @@ class MobileCapturePlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun openDownloads(invoke: Invoke) {
+        val downloads = DocumentsContract.buildDocumentUri(
+            "com.android.externalstorage.documents",
+            "primary:${Environment.DIRECTORY_DOWNLOADS}/ViperCapture"
+        )
         try {
-            val downloads = Uri.parse(
-                "content://com.android.externalstorage.documents/document/primary%3ADownload"
-            )
-            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-                addCategory(Intent.CATEGORY_OPENABLE)
-                type = "image/*"
-                putExtra(DocumentsContract.EXTRA_INITIAL_URI, downloads)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(downloads, DocumentsContract.Document.MIME_TYPE_DIR)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
             activity.applicationContext.startActivity(intent)
             invoke.resolve()
         } catch (error: Exception) {
             try {
-                val fallback = Intent(DownloadManager.ACTION_VIEW_DOWNLOADS).apply {
+                val picker = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    type = "image/*"
+                    putExtra(DocumentsContract.EXTRA_INITIAL_URI, downloads)
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
-                activity.applicationContext.startActivity(fallback)
+                activity.applicationContext.startActivity(picker)
                 invoke.resolve()
-            } catch (fallbackError: Exception) {
-                invoke.reject("Could not open Downloads: ${fallbackError.message ?: error.message}")
+            } catch (pickerError: Exception) {
+                try {
+                    val fallback = Intent(DownloadManager.ACTION_VIEW_DOWNLOADS).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    activity.applicationContext.startActivity(fallback)
+                    invoke.resolve()
+                } catch (fallbackError: Exception) {
+                    invoke.reject(
+                        "Could not open Downloads: ${fallbackError.message ?: pickerError.message ?: error.message}"
+                    )
+                }
             }
         }
     }
