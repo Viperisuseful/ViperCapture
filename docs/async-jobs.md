@@ -84,7 +84,9 @@ without exceeding its `max_attempts` argument. `maintain` returns expired
 artifact keys for deletion and must preserve successful metadata and artifacts
 until `result_expires_at`, even when the metadata TTL is shorter. `requeue`
 must be idempotent because workers retry it when a processing state transition
-fails.
+fails. `acknowledge_artifact_deletion` clears a returned artifact key only
+after the storage provider confirms its idempotent deletion; until then,
+`maintain` must continue returning the key.
 
 The application encrypts the serialized request before calling `create` and
 decrypts it only after `claim`. Adapters must treat `JobRecord.payload` as

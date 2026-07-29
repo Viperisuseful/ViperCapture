@@ -521,7 +521,7 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await service.close()
 
-    async def test_worker_retries_recovery_after_state_transition_error(self):
+    async def test_worker_retries_requeue_state_transition_error(self):
         recovered = asyncio.Event()
         claims = 0
         requeues = 0
@@ -588,6 +588,103 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             service._wakeup.set()
             await asyncio.wait_for(worker, timeout=1)
 
+    async def test_nonretryable_failure_retries_fail_transition(self):
+        failed = asyncio.Event()
+        fail_calls = 0
+
+        async def fail(*_args, **_kwargs):
+            nonlocal fail_calls
+            fail_calls += 1
+            if fail_calls == 1:
+                raise RuntimeError("temporary state-store failure")
+            failed.set()
+
+        job_store = SimpleNamespace(
+            fail=AsyncMock(side_effect=fail),
+            requeue=AsyncMock(),
+        )
+        artifact_store = SimpleNamespace(
+            delete=AsyncMock(),
+        )
+
+        async def nonretryable_failure(_payload):
+            raise RenderError(
+                "invalid_target",
+                "The target cannot be rendered.",
+                400,
+                False,
+            )
+
+        settings = _settings(self.root, poll_seconds=0.001)
+        service = AsyncJobService(
+            settings,
+            job_store,
+            artifact_store,
+            nonretryable_failure,
+        )
+        now = datetime.now(UTC)
+        job_id = str(uuid4())
+        job = JobRecord(
+            id=job_id,
+            request_id="terminal-transition-recovery",
+            status="running",
+            payload=service.cipher.encrypt(job_id, _payload()),
+            attempt_count=settings.max_attempts,
+            available_at=now,
+            queue_expires_at=now + timedelta(minutes=1),
+            created_at=now,
+            started_at=now,
+        )
+
+        await asyncio.wait_for(service._process(job), timeout=1)
+        self.assertTrue(failed.is_set())
+        self.assertEqual(fail_calls, 2)
+        job_store.requeue.assert_not_awaited()
+
+    async def test_expired_artifact_key_remains_until_deletion_acknowledged(self):
+        await self.store.start()
+        try:
+            now = datetime.now(UTC)
+            job = JobRecord(
+                id=str(uuid4()),
+                request_id="deletion-retry",
+                status="queued",
+                payload=b"encrypted",
+                attempt_count=0,
+                available_at=now - timedelta(seconds=2),
+                queue_expires_at=now + timedelta(minutes=1),
+                created_at=now - timedelta(seconds=2),
+            )
+            await self.store.create(job, active_limit=1)
+            await self.store.claim(now - timedelta(seconds=1))
+            await self.store.succeed(
+                job.id,
+                artifact_key="retry-delete",
+                media_type="image/png",
+                filename="capture.png",
+                artifact_bytes=3,
+                result_expires_at=now - timedelta(seconds=1),
+                queue_ms=0,
+                render_ms=1,
+                now=now - timedelta(seconds=1),
+            )
+
+            first = await self.store.maintain(now)
+            current = await self.store.get(job.id, now)
+            self.assertIn("retry-delete", first)
+            self.assertEqual(current.status, "expired")
+            self.assertEqual(current.artifact_key, "retry-delete")
+
+            second = await self.store.maintain(now)
+            self.assertIn("retry-delete", second)
+            await self.store.acknowledge_artifact_deletion("retry-delete")
+            third = await self.store.maintain(now)
+            current = await self.store.get(job.id, now)
+            self.assertNotIn("retry-delete", third)
+            self.assertIsNone(current.artifact_key)
+        finally:
+            await self.store.close()
+
 
 class ProviderLoadingTests(unittest.TestCase):
     def test_generated_local_key_is_private_and_restart_stable(self):
@@ -630,6 +727,7 @@ class ProviderLoadingTests(unittest.TestCase):
                 (
                     "start", "close", "create", "claim", "get", "cancel",
                     "succeed", "fail", "requeue_running", "requeue", "maintain",
+                    "acknowledge_artifact_deletion",
                 ),
             ),
             (

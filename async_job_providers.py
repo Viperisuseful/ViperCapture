@@ -456,6 +456,11 @@ class SQLiteJobStore:
                       AND artifact_key IS NOT NULL
                     UNION
                     SELECT artifact_key FROM async_jobs
+                    WHERE status = 'expired'
+                      AND error_code = 'async_result_expired'
+                      AND artifact_key IS NOT NULL
+                    UNION
+                    SELECT artifact_key FROM async_jobs
                     WHERE status IN ('failed', 'cancelled', 'expired')
                       AND completed_at < ? AND artifact_key IS NOT NULL
                     """,
@@ -476,7 +481,7 @@ class SQLiteJobStore:
             connection.execute(
                 """
                 UPDATE async_jobs
-                SET status = 'expired', artifact_key = NULL,
+                SET status = 'expired',
                     error_code = 'async_result_expired',
                     error_message = 'The async job result is no longer available.',
                     error_retryable = 0
@@ -489,6 +494,7 @@ class SQLiteJobStore:
                 DELETE FROM async_jobs
                 WHERE status IN ('failed', 'cancelled', 'expired')
                   AND completed_at < ?
+                  AND artifact_key IS NULL
                 """,
                 (cutoff,),
             )
@@ -498,6 +504,19 @@ class SQLiteJobStore:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
             raise
+
+    async def acknowledge_artifact_deletion(self, key: str) -> None:
+        await self._run(
+            lambda connection: connection.execute(
+                """
+                UPDATE async_jobs
+                SET artifact_key = NULL
+                WHERE artifact_key = ?
+                  AND status IN ('failed', 'cancelled', 'expired')
+                """,
+                (key,),
+            )
+        )
 
 
 _SAFE_KEY = re.compile(r"^[0-9a-f-]{36}\.(png|jpg|webp)$")

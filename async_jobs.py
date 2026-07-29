@@ -139,6 +139,7 @@ class JobStore(Protocol):
     ) -> int: ...
     async def requeue(self, job_id: str, available_at: datetime) -> None: ...
     async def maintain(self, now: datetime) -> list[str]: ...
+    async def acknowledge_artifact_deletion(self, key: str) -> None: ...
 
 
 @runtime_checkable
@@ -428,7 +429,14 @@ class AsyncJobService:
         now = datetime.now(UTC)
         keys = await self.job_store.maintain(now)
         for key in keys:
-            await self._safe_delete(key)
+            if await self._safe_delete(key):
+                try:
+                    await self.job_store.acknowledge_artifact_deletion(key)
+                except Exception as exc:
+                    logger.warning(
+                        "artifact deletion acknowledgement retry error_type=%s",
+                        type(exc).__name__,
+                    )
         try:
             await self.artifact_store.maintain(now)
         except Exception as exc:
@@ -437,14 +445,16 @@ class AsyncJobService:
                 type(exc).__name__,
             )
 
-    async def _safe_delete(self, key: str) -> None:
+    async def _safe_delete(self, key: str) -> bool:
         try:
             await self.artifact_store.delete(key)
+            return True
         except Exception as exc:
             logger.warning(
                 "artifact deletion retry error_type=%s",
                 type(exc).__name__,
             )
+            return False
 
     async def _worker(self, _index: int) -> None:
         try:
@@ -485,16 +495,27 @@ class AsyncJobService:
             raise
 
     async def _recover_claimed_job(self, job: JobRecord) -> None:
+        await self._retry_state_transition(
+            "requeue",
+            lambda: self.job_store.requeue(job.id, datetime.now(UTC)),
+        )
+        self._wakeup.set()
+
+    async def _retry_state_transition(
+        self,
+        name: str,
+        transition: Callable[[], Awaitable[None]],
+    ) -> None:
         while True:
             try:
-                await self.job_store.requeue(job.id, datetime.now(UTC))
-                self._wakeup.set()
+                await transition()
                 return
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.warning(
-                    "async job recovery retry error_type=%s",
+                    "async job transition retry transition=%s error_type=%s",
+                    name,
                     type(exc).__name__,
                 )
                 await asyncio.sleep(self.settings.poll_seconds)
@@ -557,7 +578,13 @@ class AsyncJobService:
             if stored_key:
                 await self._safe_delete(stored_key)
             if self._closing:
-                await self.job_store.requeue(job.id, datetime.now(UTC))
+                await self._retry_state_transition(
+                    "requeue",
+                    lambda: self.job_store.requeue(
+                        job.id,
+                        datetime.now(UTC),
+                    ),
+                )
                 return
             if isinstance(exc, RenderError):
                 code, message, retryable = exc.code, exc.message, exc.retryable
@@ -571,17 +598,23 @@ class AsyncJobService:
                 and job.attempt_count < self.settings.max_attempts
                 and now < job.queue_expires_at
             ):
-                await self.job_store.requeue(
-                    job.id,
-                    now + timedelta(seconds=min(job.attempt_count, 5)),
+                await self._retry_state_transition(
+                    "requeue",
+                    lambda: self.job_store.requeue(
+                        job.id,
+                        now + timedelta(seconds=min(job.attempt_count, 5)),
+                    ),
                 )
                 return
-            await self.job_store.fail(
-                job.id,
-                code=code,
-                message=message,
-                retryable=retryable,
-                now=now,
+            await self._retry_state_transition(
+                "fail",
+                lambda: self.job_store.fail(
+                    job.id,
+                    code=code,
+                    message=message,
+                    retryable=retryable,
+                    now=now,
+                ),
             )
         finally:
             self._wakeup.set()
