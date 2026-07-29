@@ -170,15 +170,13 @@ async def capture_cdp_image(
     try:
         with suppress(Exception):
             if fast_png:
-                await page.evaluate("""async () => {
+                await page.evaluate("""() => {
                     document.getAnimations().forEach((animation) => animation.pause());
                     const style = document.createElement("style");
                     style.dataset.vipercaptureScreenshot = "true";
                     style.textContent = "*, *::before, *::after { caret-color: transparent !important; }";
                     document.documentElement.append(style);
-                    await new Promise((resolve) =>
-                        requestAnimationFrame(() => requestAnimationFrame(resolve))
-                    );
+                    void document.documentElement.offsetWidth;
                 }""")
             else:
                 await page.evaluate(
@@ -306,12 +304,27 @@ class RenderEngine:
                         and request.image.optimize_for_speed
                     )
                 ):
+                    scroll = (
+                        {"x": 0, "y": 0}
+                        if request.full_page
+                        else await page.evaluate(
+                            "() => ({x: window.scrollX, y: window.scrollY})"
+                        )
+                    )
                     image = await capture_cdp_image(
                         page,
                         output=request.output,
                         clip={
-                            "x": float(box["x"]) if request.selector else 0,
-                            "y": float(box["y"]) if request.selector else 0,
+                            "x": (
+                                float(box["x"]) + float(scroll["x"])
+                                if request.selector
+                                else float(scroll["x"])
+                            ),
+                            "y": (
+                                float(box["y"]) + float(scroll["y"])
+                                if request.selector
+                                else float(scroll["y"])
+                            ),
                             "width": float(width),
                             "height": float(height),
                             "scale": request.viewport.device_scale_factor,

@@ -44,6 +44,20 @@ class _RenderFixtureHandler(BaseHTTPRequestHandler):
             html,body{margin:0;background:transparent}
             #target{width:20px;height:20px;background:#e11d48}
         </style><div id="target"></div>""",
+        "/scrolled": """<!doctype html><style>
+            html,body{margin:0}
+            body{height:800px;background:linear-gradient(
+                to bottom,
+                #e11d48 0 300px,
+                #2563eb 300px 600px,
+                #16a34a 600px
+            )}
+            #target{position:absolute;top:420px;left:20px;width:80px;height:60px;
+                background:#facc15}
+        </style><div id="target"></div><script>scrollTo(0, 300)</script>""",
+        "/hostile-animation-frame": """<!doctype html><style>
+            html,body{margin:0;width:100%;height:100%;background:#2563eb}
+        </style><script>window.requestAnimationFrame = () => 1</script>""",
     }
 
     def do_GET(self) -> None:
@@ -213,6 +227,10 @@ class CaptureOptimizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(capture_call.args[1]["optimizeForSpeed"])
         self.assertEqual(capture_call.args[1]["format"], "png")
         self.assertNotIn("quality", capture_call.args[1])
+        evaluated = " ".join(
+            str(call.args[0]) for call in page.evaluate.await_args_list
+        )
+        self.assertNotIn("requestAnimationFrame", evaluated)
 
     async def test_webp_does_not_claim_fast_encoding(self):
         session = AsyncMock()
@@ -291,6 +309,7 @@ class BrowserCaptureRegressionTests(unittest.IsolatedAsyncioTestCase):
                 return {
                     width: canvas.width,
                     height: canvas.height,
+                    first: Array.from(first),
                     different,
                     transparent,
                 };
@@ -365,6 +384,42 @@ class BrowserCaptureRegressionTests(unittest.IsolatedAsyncioTestCase):
                     ),
                     limits,
                 )
+                scrolled_viewport = await engine.render_image(
+                    browser,
+                    RenderRequest(
+                        url=f"{self.base_url}/scrolled",
+                        output="png",
+                        full_page=False,
+                        lazy_load="none",
+                        viewport={"width": 160, "height": 100},
+                        image={"optimize_for_speed": True},
+                    ),
+                    limits,
+                )
+                scrolled_selector = await engine.render_image(
+                    browser,
+                    RenderRequest(
+                        url=f"{self.base_url}/scrolled",
+                        output="png",
+                        full_page=False,
+                        lazy_load="none",
+                        selector="#target",
+                        viewport={"width": 160, "height": 100},
+                        image={"optimize_for_speed": True},
+                    ),
+                    limits,
+                )
+                hostile_animation_frame = await asyncio.wait_for(
+                    engine.render_image(
+                        browser,
+                        RenderRequest(
+                            url=f"{self.base_url}/hostile-animation-frame",
+                            **base,
+                        ),
+                        limits,
+                    ),
+                    timeout=5,
+                )
                 legacy_webp = await engine.render_image(
                     browser,
                     RenderRequest(
@@ -393,6 +448,17 @@ class BrowserCaptureRegressionTests(unittest.IsolatedAsyncioTestCase):
                 transparent_stats = await self._pixel_stats(
                     decoder, transparent.body, transparent.media_type
                 )
+                scrolled_viewport_stats = await self._pixel_stats(
+                    decoder, scrolled_viewport.body, scrolled_viewport.media_type
+                )
+                scrolled_selector_stats = await self._pixel_stats(
+                    decoder, scrolled_selector.body, scrolled_selector.media_type
+                )
+                hostile_animation_frame_stats = await self._pixel_stats(
+                    decoder,
+                    hostile_animation_frame.body,
+                    hostile_animation_frame.media_type,
+                )
 
                 self.assertGreater(content_stats["different"], 0)
                 self.assertEqual(blank_stats["different"], 0)
@@ -405,6 +471,18 @@ class BrowserCaptureRegressionTests(unittest.IsolatedAsyncioTestCase):
                     (320, 1800),
                 )
                 self.assertGreater(transparent_stats["transparent"], 0)
+                self.assertEqual(
+                    scrolled_viewport_stats["first"],
+                    [37, 99, 235, 255],
+                )
+                self.assertEqual(
+                    scrolled_selector_stats["first"],
+                    [250, 204, 21, 255],
+                )
+                self.assertEqual(
+                    hostile_animation_frame_stats["first"],
+                    [37, 99, 235, 255],
+                )
                 self.assertEqual(legacy_webp.media_type, "image/webp")
             finally:
                 await browser.close()
