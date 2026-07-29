@@ -127,6 +127,7 @@ class JobStore(Protocol):
         self,
         now: datetime,
         max_attempts: int,
+        claim_token: str,
     ) -> JobRecord | None: ...
     async def get(self, job_id: str, now: datetime) -> JobRecord | None: ...
     async def cancel(self, job_id: str, now: datetime) -> JobRecord | None: ...
@@ -366,6 +367,7 @@ class AsyncJobService:
             asyncio.Event() for _ in range(settings.worker_count)
         ]
         self._workers: list[asyncio.Task] = []
+        self._wake_tasks: set[asyncio.Task] = set()
         self._closing = False
         self._maintenance_lock = asyncio.Lock()
         self._next_maintenance_at = 0.0
@@ -407,10 +409,20 @@ class AsyncJobService:
         if self._workers:
             await asyncio.gather(*self._workers, return_exceptions=True)
         self._workers.clear()
+        for task in self._wake_tasks:
+            task.cancel()
+        await asyncio.gather(*self._wake_tasks, return_exceptions=True)
+        self._wake_tasks.clear()
         try:
             await self.artifact_store.close()
         finally:
-            await self.job_store.close()
+            close_task = asyncio.create_task(self.job_store.close())
+            done, _pending = await asyncio.wait(
+                {close_task},
+                timeout=1.0,
+            )
+            if close_task not in done:
+                close_task.add_done_callback(self._consume_task_result)
 
     async def submit(
         self,
@@ -518,10 +530,8 @@ class AsyncJobService:
                 wakeup.clear()
                 try:
                     await self._maintain()
-                    job = await self.job_store.claim(
-                        datetime.now(UTC),
-                        self.settings.max_attempts,
-                    )
+                    claim_token = str(uuid4())
+                    job = await self._claim_with_retry(claim_token)
                 except Exception as exc:
                     logger.warning(
                         "async provider retry error_type=%s",
@@ -566,6 +576,36 @@ class AsyncJobService:
         for wakeup in self._wakeups:
             wakeup.set()
 
+    async def _claim_with_retry(self, claim_token: str) -> JobRecord | None:
+        while True:
+            try:
+                return await self.job_store.claim(
+                    datetime.now(UTC),
+                    self.settings.max_attempts,
+                    claim_token,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "async claim retry error_type=%s",
+                    type(exc).__name__,
+                )
+                await asyncio.sleep(self.settings.poll_seconds)
+
+    def _wake_at(self, available_at: datetime) -> None:
+        async def wake() -> None:
+            delay = max(
+                0.0,
+                (available_at - datetime.now(UTC)).total_seconds(),
+            )
+            await asyncio.sleep(delay)
+            self._wake_workers()
+
+        task = asyncio.create_task(wake())
+        self._wake_tasks.add(task)
+        task.add_done_callback(self._wake_tasks.discard)
+
     async def _retry_state_transition(
         self,
         name: str,
@@ -589,22 +629,32 @@ class AsyncJobService:
                     await asyncio.sleep(self.settings.poll_seconds)
         except asyncio.CancelledError:
             if settle_on_cancel:
-                try:
-                    await asyncio.wait_for(
-                        transition(),
-                        timeout=max(
-                            0.1,
-                            min(1.0, self.settings.poll_seconds),
-                        ),
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "async job final transition failed "
-                        "transition=%s error_type=%s",
-                        name,
-                        type(exc).__name__,
-                    )
+                final_task = asyncio.create_task(transition())
+                done, _pending = await asyncio.wait(
+                    {final_task},
+                    timeout=max(
+                        0.1,
+                        min(1.0, self.settings.poll_seconds),
+                    ),
+                )
+                if final_task not in done:
+                    final_task.add_done_callback(self._consume_task_result)
+                else:
+                    try:
+                        final_task.result()
+                    except Exception as exc:
+                        logger.warning(
+                            "async job final transition failed "
+                            "transition=%s error_type=%s",
+                            name,
+                            type(exc).__name__,
+                        )
             raise
+
+    @staticmethod
+    def _consume_task_result(task: asyncio.Task) -> None:
+        with suppress(BaseException):
+            task.result()
 
     async def _retry_success_transition(
         self,
@@ -691,6 +741,9 @@ class AsyncJobService:
                         job.attempt_count,
                         now + timedelta(seconds=min(job.attempt_count, 5)),
                     ),
+                )
+                self._wake_at(
+                    now + timedelta(seconds=min(job.attempt_count, 5))
                 )
                 return
             await self._retry_state_transition(

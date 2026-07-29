@@ -30,6 +30,9 @@ erase that ciphertext.
 The bundled providers create the database, WAL sidecars, key, and result files
 with owner-only permissions. Key and result creation fsync both file contents
 and directory entries before reporting durable success.
+Because Python file modes do not create private Windows ACLs, the bundled
+SQLite and filesystem providers refuse to start on Windows; use external
+providers there.
 
 ViperCapture leaves claimed work `running` during shutdown. At startup it
 requeues interrupted jobs unless they have already reached the configured
@@ -87,8 +90,10 @@ VIPERCAPTURE_JOB_STORE_FACTORY=my_vipercapture_pg:create_job_store
 The adapter owns its client library, schema, connections, and migrations.
 `create` must atomically enforce the active limit and request-ID idempotency.
 `claim` must atomically move one eligible job from `queued` to `running`; use
-the database's row-locking or compare-and-swap primitive. It receives
-`max_attempts` and must terminally fail queued jobs that have already reached
+the database's row-locking or compare-and-swap primitive. Retrying its
+`claim_token` after an ambiguous acknowledgement must return the same row
+without incrementing the attempt again. It receives `max_attempts` and must
+terminally fail queued jobs that have already reached
 that cap before selecting work. Terminal operations must erase the encrypted
 payload. `succeed` and `fail` receive the claimed job's `expected_attempt` and
 must never settle a different attempt. `succeed` must return the existing

@@ -44,6 +44,11 @@ class SQLiteJobStore:
         self._lock = asyncio.Lock()
 
     async def start(self) -> None:
+        if os.name == "nt":
+            raise RuntimeError(
+                "The bundled SQLite job store requires POSIX owner-only "
+                "permissions; configure an external job store on Windows."
+            )
         self.config.data_dir.mkdir(parents=True, exist_ok=True)
         with suppress(OSError):
             self.config.data_dir.chmod(0o700)
@@ -107,6 +112,7 @@ class SQLiteJobStore:
                 queue_expires_at REAL NOT NULL,
                 created_at REAL NOT NULL,
                 started_at REAL,
+                claim_token TEXT,
                 completed_at REAL,
                 artifact_key TEXT,
                 media_type TEXT,
@@ -129,6 +135,16 @@ class SQLiteJobStore:
                 ON async_jobs(completed_at);
             """
         )
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(async_jobs)"
+            ).fetchall()
+        }
+        if "claim_token" not in columns:
+            connection.execute(
+                "ALTER TABLE async_jobs ADD COLUMN claim_token TEXT"
+            )
 
     @staticmethod
     def _from_row(row: sqlite3.Row | None) -> JobRecord | None:
@@ -215,8 +231,14 @@ class SQLiteJobStore:
         self,
         now: datetime,
         max_attempts: int,
+        claim_token: str | None = None,
     ) -> JobRecord | None:
-        return await self._run(self._claim, now, max_attempts)
+        return await self._run(
+            self._claim,
+            now,
+            max_attempts,
+            claim_token or str(uuid4()),
+        )
 
     @classmethod
     def _claim(
@@ -224,10 +246,21 @@ class SQLiteJobStore:
         connection: sqlite3.Connection,
         now: datetime,
         max_attempts: int,
+        claim_token: str,
     ) -> JobRecord | None:
         current = _epoch(now)
         connection.execute("BEGIN IMMEDIATE")
         try:
+            existing = connection.execute(
+                """
+                SELECT * FROM async_jobs
+                WHERE status = 'running' AND claim_token = ?
+                """,
+                (claim_token,),
+            ).fetchone()
+            if existing is not None:
+                connection.execute("COMMIT")
+                return cls._from_row(existing)
             connection.execute(
                 """
                 UPDATE async_jobs
@@ -257,10 +290,10 @@ class SQLiteJobStore:
                 """
                 UPDATE async_jobs
                 SET status = 'running', attempt_count = attempt_count + 1,
-                    started_at = ?
+                    started_at = ?, claim_token = ?
                 WHERE id = ? AND status = 'queued'
                 """,
-                (started_at, row["id"]),
+                (started_at, claim_token, row["id"]),
             )
             updated = connection.execute(
                 "SELECT * FROM async_jobs WHERE id = ?",
@@ -507,7 +540,7 @@ class SQLiteJobStore:
             requeued = connection.execute(
                 """
                 UPDATE async_jobs
-                SET status = 'queued', available_at = ?
+                SET status = 'queued', available_at = ?, claim_token = NULL
                 WHERE status = 'running' AND queue_expires_at > ?
                   AND attempt_count < ?
                 """,
@@ -655,6 +688,11 @@ class LocalArtifactStore:
         self.root = config.data_dir / "job-results"
 
     async def start(self) -> None:
+        if os.name == "nt":
+            raise RuntimeError(
+                "The bundled local artifact store requires POSIX owner-only "
+                "permissions; configure an external artifact store on Windows."
+            )
         await asyncio.to_thread(self.root.mkdir, parents=True, exist_ok=True)
         try:
             self.root.chmod(0o700)

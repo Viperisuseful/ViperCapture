@@ -287,6 +287,29 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.store.close()
 
+    async def test_claim_token_recovers_a_lost_acknowledgement(self):
+        await self.store.start()
+        try:
+            now = datetime.now(UTC)
+            job = JobRecord(
+                id=str(uuid4()),
+                request_id="lost-claim-ack",
+                status="queued",
+                payload=b"encrypted",
+                attempt_count=0,
+                available_at=now,
+                queue_expires_at=now + timedelta(minutes=1),
+                created_at=now,
+            )
+            await self.store.create(job, active_limit=1)
+            token = str(uuid4())
+            first = await self.store.claim(now, 3, token)
+            repeated = await self.store.claim(now, 3, token)
+            self.assertEqual(repeated.id, first.id)
+            self.assertEqual(repeated.attempt_count, 1)
+        finally:
+            await self.store.close()
+
     async def test_stale_attempt_cannot_settle_a_newer_running_attempt(self):
         await self.store.start()
         try:
@@ -524,6 +547,13 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.artifacts._sync_directory()
         open_file.assert_not_called()
+
+    async def test_bundled_stores_refuse_unprotected_windows_data(self):
+        with patch("async_job_providers.os.name", "nt"):
+            with self.assertRaisesRegex(RuntimeError, "external job store"):
+                await self.store.start()
+            with self.assertRaisesRegex(RuntimeError, "external artifact store"):
+                await self.artifacts.start()
 
     async def test_metadata_cleanup_preserves_live_successful_result(self):
         settings = _settings(self.root, metadata_ttl=timedelta(seconds=1))
@@ -867,13 +897,13 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             injected_job = None
             service = None
 
-            async def claim(self, now, max_attempts):
+            async def claim(self, now, max_attempts, claim_token):
                 if self.injected_job is not None:
                     job, self.injected_job = self.injected_job, None
                     await self.create(job, active_limit=2)
                     self.service._wake_workers()
                     return None
-                return await super().claim(now, max_attempts)
+                return await super().claim(now, max_attempts, claim_token)
 
         settings = _settings(self.root, poll_seconds=1)
         store = InjectingStore(
@@ -929,7 +959,7 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         now = datetime.now(UTC)
         job_id = str(uuid4())
 
-        async def claim(_now, _max_attempts):
+        async def claim(_now, _max_attempts, _claim_token):
             nonlocal claims
             claims += 1
             return job if claims == 1 else None
