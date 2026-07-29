@@ -520,6 +520,22 @@ class AsyncJobService:
                 )
                 await asyncio.sleep(self.settings.poll_seconds)
 
+    async def _retry_success_transition(
+        self,
+        transition: Callable[[], Awaitable[JobRecord]],
+    ) -> JobRecord:
+        while True:
+            try:
+                return await transition()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "async job transition retry transition=succeed error_type=%s",
+                    type(exc).__name__,
+                )
+                await asyncio.sleep(self.settings.poll_seconds)
+
     async def _process(self, job: JobRecord) -> None:
         stored_key: str | None = None
         success_committed = False
@@ -542,16 +558,18 @@ class AsyncJobService:
                 else 0,
             )
             settlement = asyncio.create_task(
-                self.job_store.succeed(
-                    job.id,
-                    artifact_key=stored_key,
-                    media_type=rendered.media_type,
-                    filename=rendered.filename,
-                    artifact_bytes=len(rendered.body),
-                    result_expires_at=result_expires_at,
-                    queue_ms=queue_ms,
-                    render_ms=max(0, rendered.render_ms),
-                    now=now,
+                self._retry_success_transition(
+                    lambda: self.job_store.succeed(
+                        job.id,
+                        artifact_key=stored_key,
+                        media_type=rendered.media_type,
+                        filename=rendered.filename,
+                        artifact_bytes=len(rendered.body),
+                        result_expires_at=result_expires_at,
+                        queue_ms=queue_ms,
+                        render_ms=max(0, rendered.render_ms),
+                        now=now,
+                    )
                 )
             )
             try:

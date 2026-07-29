@@ -335,7 +335,40 @@ class SQLiteJobStore:
                 ),
             )
             if updated.rowcount != 1:
-                raise JobConflictError
+                existing = connection.execute(
+                    "SELECT * FROM async_jobs WHERE id = ?",
+                    (job_id,),
+                ).fetchone()
+                expected = (
+                    artifact_key,
+                    media_type,
+                    filename,
+                    artifact_bytes,
+                    _epoch(result_expires_at),
+                    queue_ms,
+                    render_ms,
+                    _epoch(now),
+                )
+                actual = (
+                    (
+                        existing["artifact_key"],
+                        existing["media_type"],
+                        existing["filename"],
+                        existing["artifact_bytes"],
+                        existing["result_expires_at"],
+                        existing["queue_ms"],
+                        existing["render_ms"],
+                        existing["completed_at"],
+                    )
+                    if (
+                        existing is not None
+                        and existing["status"] == "succeeded"
+                    )
+                    else None
+                )
+                if actual != expected:
+                    raise JobConflictError
+                return self._from_row(existing)
             row = connection.execute(
                 "SELECT * FROM async_jobs WHERE id = ?",
                 (job_id,),
