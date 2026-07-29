@@ -521,6 +521,73 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await service.close()
 
+    async def test_worker_retries_recovery_after_state_transition_error(self):
+        recovered = asyncio.Event()
+        claims = 0
+        requeues = 0
+        now = datetime.now(UTC)
+        job_id = str(uuid4())
+
+        async def claim(_now):
+            nonlocal claims
+            claims += 1
+            return job if claims == 1 else None
+
+        async def requeue(_job_id, _available_at):
+            nonlocal requeues
+            requeues += 1
+            if requeues == 1:
+                raise RuntimeError("temporary state-store failure")
+            recovered.set()
+
+        job_store = SimpleNamespace(
+            maintain=AsyncMock(return_value=[]),
+            claim=AsyncMock(side_effect=claim),
+            requeue=AsyncMock(side_effect=requeue),
+            fail=AsyncMock(),
+        )
+        artifact_store = SimpleNamespace(
+            maintain=AsyncMock(),
+            delete=AsyncMock(),
+        )
+
+        async def retryable_failure(_payload):
+            raise RenderError(
+                "render_failed",
+                "The image render failed.",
+                500,
+                True,
+            )
+
+        settings = _settings(self.root, poll_seconds=0.001)
+        service = AsyncJobService(
+            settings,
+            job_store,
+            artifact_store,
+            retryable_failure,
+        )
+        job = JobRecord(
+            id=job_id,
+            request_id="transition-recovery",
+            status="running",
+            payload=service.cipher.encrypt(job_id, _payload()),
+            attempt_count=1,
+            available_at=now,
+            queue_expires_at=now + timedelta(minutes=1),
+            created_at=now,
+            started_at=now,
+        )
+
+        worker = asyncio.create_task(service._worker(0))
+        try:
+            await asyncio.wait_for(recovered.wait(), timeout=1)
+            self.assertEqual(requeues, 2)
+            job_store.fail.assert_not_awaited()
+        finally:
+            service._closing = True
+            service._wakeup.set()
+            await asyncio.wait_for(worker, timeout=1)
+
 
 class ProviderLoadingTests(unittest.TestCase):
     def test_generated_local_key_is_private_and_restart_stable(self):

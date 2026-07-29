@@ -82,7 +82,9 @@ the database's row-locking or compare-and-swap primitive. Terminal operations
 must erase the encrypted payload. `requeue_running` supplies restart recovery
 without exceeding its `max_attempts` argument. `maintain` returns expired
 artifact keys for deletion and must preserve successful metadata and artifacts
-until `result_expires_at`, even when the metadata TTL is shorter.
+until `result_expires_at`, even when the metadata TTL is shorter. `requeue`
+must be idempotent because workers retry it when a processing state transition
+fails.
 
 The application encrypts the serialized request before calling `create` and
 decrypts it only after `claim`. Adapters must treat `JobRecord.payload` as

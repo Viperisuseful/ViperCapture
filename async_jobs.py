@@ -478,10 +478,26 @@ class AsyncJobService:
                         "async worker recovered error_type=%s",
                         type(exc).__name__,
                     )
+                    await self._recover_claimed_job(job)
                 if self._closing:
                     return
         except asyncio.CancelledError:
             raise
+
+    async def _recover_claimed_job(self, job: JobRecord) -> None:
+        while True:
+            try:
+                await self.job_store.requeue(job.id, datetime.now(UTC))
+                self._wakeup.set()
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "async job recovery retry error_type=%s",
+                    type(exc).__name__,
+                )
+                await asyncio.sleep(self.settings.poll_seconds)
 
     async def _process(self, job: JobRecord) -> None:
         stored_key: str | None = None
