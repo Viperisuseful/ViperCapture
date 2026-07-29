@@ -137,7 +137,12 @@ class JobStore(Protocol):
         now: datetime,
         max_attempts: int,
     ) -> int: ...
-    async def requeue(self, job_id: str, available_at: datetime) -> None: ...
+    async def requeue(
+        self,
+        job_id: str,
+        expected_attempt: int,
+        available_at: datetime,
+    ) -> None: ...
     async def maintain(self, now: datetime) -> list[str]: ...
     async def acknowledge_artifact_deletion(self, key: str) -> None: ...
 
@@ -330,6 +335,9 @@ class AsyncJobService:
         self._wakeup = asyncio.Event()
         self._workers: list[asyncio.Task] = []
         self._closing = False
+        self._maintenance_lock = asyncio.Lock()
+        self._next_maintenance_at = 0.0
+        self._maintenance_interval = max(1.0, settings.poll_seconds)
 
     async def start(self) -> None:
         self._closing = False
@@ -340,7 +348,7 @@ class AsyncJobService:
                 datetime.now(UTC),
                 self.settings.max_attempts,
             )
-            await self._maintain()
+            await self._maintain(force=True)
             self._workers = [
                 asyncio.create_task(
                     self._worker(index),
@@ -425,25 +433,32 @@ class AsyncJobService:
             return None
         return await self.artifact_store.get(job.artifact_key)
 
-    async def _maintain(self) -> None:
-        now = datetime.now(UTC)
-        keys = await self.job_store.maintain(now)
-        for key in keys:
-            if await self._safe_delete(key):
-                try:
-                    await self.job_store.acknowledge_artifact_deletion(key)
-                except Exception as exc:
-                    logger.warning(
-                        "artifact deletion acknowledgement retry error_type=%s",
-                        type(exc).__name__,
-                    )
-        try:
-            await self.artifact_store.maintain(now)
-        except Exception as exc:
-            logger.warning(
-                "artifact maintenance retry error_type=%s",
-                type(exc).__name__,
-            )
+    async def _maintain(self, *, force: bool = False) -> None:
+        loop = asyncio.get_running_loop()
+        if not force and loop.time() < self._next_maintenance_at:
+            return
+        async with self._maintenance_lock:
+            if not force and loop.time() < self._next_maintenance_at:
+                return
+            self._next_maintenance_at = loop.time() + self._maintenance_interval
+            now = datetime.now(UTC)
+            keys = await self.job_store.maintain(now)
+            for key in keys:
+                if await self._safe_delete(key):
+                    try:
+                        await self.job_store.acknowledge_artifact_deletion(key)
+                    except Exception as exc:
+                        logger.warning(
+                            "artifact deletion acknowledgement retry error_type=%s",
+                            type(exc).__name__,
+                        )
+            try:
+                await self.artifact_store.maintain(now)
+            except Exception as exc:
+                logger.warning(
+                    "artifact maintenance retry error_type=%s",
+                    type(exc).__name__,
+                )
 
     async def _safe_delete(self, key: str) -> bool:
         try:
@@ -497,7 +512,11 @@ class AsyncJobService:
     async def _recover_claimed_job(self, job: JobRecord) -> None:
         await self._retry_state_transition(
             "requeue",
-            lambda: self.job_store.requeue(job.id, datetime.now(UTC)),
+            lambda: self.job_store.requeue(
+                job.id,
+                job.attempt_count,
+                datetime.now(UTC),
+            ),
         )
         self._wakeup.set()
 
@@ -603,6 +622,7 @@ class AsyncJobService:
                     "requeue",
                     lambda: self.job_store.requeue(
                         job.id,
+                        job.attempt_count,
                         now + timedelta(seconds=min(job.attempt_count, 5)),
                     ),
                 )

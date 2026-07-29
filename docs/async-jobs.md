@@ -87,11 +87,17 @@ failed record; conflicting terminal transitions should raise `JobConflictError`.
 `requeue_running` supplies restart recovery without exceeding its
 `max_attempts` argument. `maintain` returns expired artifact keys for deletion
 and must preserve successful metadata and artifacts until `result_expires_at`,
-even when the metadata TTL is shorter. `requeue` must be idempotent because
-workers retry it when a processing state transition fails.
+even when the metadata TTL is shorter. `requeue` receives the claimed job's
+`expected_attempt` and must use it as a compare-and-swap token. Retrying an
+already committed requeue must be accepted, while a stale retry must never
+change a newer running attempt or a terminal job.
 `acknowledge_artifact_deletion` clears a returned artifact key only after the
 storage provider confirms its idempotent deletion; until then, `maintain` must
 continue returning the key.
+
+The service throttles queue and artifact maintenance to one shared run per
+process per polling interval, with a one-second minimum. Status polling
+therefore does not trigger a full provider scan for every request.
 
 The application encrypts the serialized request before calling `create` and
 decrypts it only after `claim`. Adapters must treat `JobRecord.payload` as

@@ -474,16 +474,22 @@ class SQLiteJobStore:
 
         return await self._run(operation)
 
-    async def requeue(self, job_id: str, available_at: datetime) -> None:
+    async def requeue(
+        self,
+        job_id: str,
+        expected_attempt: int,
+        available_at: datetime,
+    ) -> None:
         def operation(connection: sqlite3.Connection) -> None:
             current = _epoch(available_at)
             updated = connection.execute(
                 """
                 UPDATE async_jobs
                 SET status = 'queued', available_at = ?
-                WHERE id = ? AND status = 'running' AND queue_expires_at > ?
+                WHERE id = ? AND status = 'running'
+                  AND attempt_count = ? AND queue_expires_at > ?
                 """,
-                (current, job_id, current),
+                (current, job_id, expected_attempt, current),
             )
             if updated.rowcount == 0:
                 connection.execute(
@@ -494,8 +500,9 @@ class SQLiteJobStore:
                         error_message = 'The interrupted job expired.',
                         error_retryable = 1
                     WHERE id = ? AND status = 'running'
+                      AND attempt_count = ? AND queue_expires_at <= ?
                     """,
-                    (current, job_id),
+                    (current, job_id, expected_attempt, current),
                 )
 
         await self._run(operation)

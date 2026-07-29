@@ -220,6 +220,62 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await recovered.close()
 
+    async def test_stale_requeue_cannot_replace_a_newer_running_attempt(self):
+        await self.store.start()
+        try:
+            now = datetime.now(UTC)
+            job = JobRecord(
+                id=str(uuid4()),
+                request_id="stale-requeue",
+                status="queued",
+                payload=b"encrypted",
+                attempt_count=0,
+                available_at=now,
+                queue_expires_at=now + timedelta(minutes=1),
+                created_at=now,
+            )
+            await self.store.create(job, active_limit=1)
+            first = await self.store.claim(now)
+            self.assertEqual(first.attempt_count, 1)
+
+            await self.store.requeue(job.id, first.attempt_count, now)
+            second = await self.store.claim(now)
+            self.assertEqual(second.attempt_count, 2)
+
+            await self.store.requeue(
+                job.id,
+                first.attempt_count,
+                now + timedelta(seconds=1),
+            )
+            current = await self.store.get(job.id, now)
+            self.assertEqual(current.status, "running")
+            self.assertEqual(current.attempt_count, 2)
+        finally:
+            await self.store.close()
+
+    async def test_polling_shares_one_throttled_maintenance_run(self):
+        job_store = SimpleNamespace(
+            maintain=AsyncMock(return_value=[]),
+            acknowledge_artifact_deletion=AsyncMock(),
+            get=AsyncMock(return_value=None),
+        )
+        artifact_store = SimpleNamespace(
+            maintain=AsyncMock(),
+            delete=AsyncMock(),
+        )
+        service = AsyncJobService(
+            _settings(self.root, poll_seconds=10),
+            job_store,
+            artifact_store,
+            _successful_renderer,
+        )
+
+        await asyncio.gather(*(service.get("missing") for _ in range(20)))
+
+        self.assertEqual(job_store.get.await_count, 20)
+        job_store.maintain.assert_awaited_once()
+        artifact_store.maintain.assert_awaited_once()
+
     async def test_restart_does_not_exceed_max_attempts(self):
         settings = _settings(self.root, max_attempts=1)
         await self.store.start()
@@ -617,7 +673,7 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             claims += 1
             return job if claims == 1 else None
 
-        async def requeue(_job_id, _available_at):
+        async def requeue(_job_id, _expected_attempt, _available_at):
             nonlocal requeues
             requeues += 1
             if requeues == 1:
