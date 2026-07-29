@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -567,20 +567,29 @@ class SQLiteJobStore:
                 row[0]
                 for row in connection.execute(
                     """
-                    SELECT artifact_key FROM async_jobs
-                    WHERE status = 'succeeded' AND result_expires_at <= ?
-                      AND artifact_key IS NOT NULL
-                    UNION
-                    SELECT artifact_key FROM async_jobs
-                    WHERE status = 'expired'
-                      AND error_code = 'async_result_expired'
-                      AND artifact_key IS NOT NULL
-                    UNION
-                    SELECT artifact_key FROM async_jobs
-                    WHERE status IN ('failed', 'cancelled', 'expired')
-                      AND completed_at < ? AND artifact_key IS NOT NULL
+                    WITH candidates(artifact_key) AS (
+                        SELECT artifact_key FROM async_jobs
+                        WHERE status = 'succeeded' AND result_expires_at <= ?
+                          AND artifact_key IS NOT NULL
+                        UNION
+                        SELECT artifact_key FROM async_jobs
+                        WHERE status = 'expired'
+                          AND error_code = 'async_result_expired'
+                          AND artifact_key IS NOT NULL
+                        UNION
+                        SELECT artifact_key FROM async_jobs
+                        WHERE status IN ('failed', 'cancelled', 'expired')
+                          AND completed_at < ? AND artifact_key IS NOT NULL
+                    )
+                    SELECT artifact_key FROM candidates AS candidate
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM async_jobs AS live
+                        WHERE live.artifact_key = candidate.artifact_key
+                          AND live.status = 'succeeded'
+                          AND live.result_expires_at > ?
+                    )
                     """,
-                    (current, cutoff),
+                    (current, cutoff, current),
                 ).fetchall()
             ]
             connection.execute(
@@ -700,12 +709,11 @@ class LocalArtifactStore:
             self._write_durable(data_temp, body)
             os.replace(data_temp, data_path)
             self._sync_directory()
-            expires_at = datetime.now(UTC) + self.config.result_ttl
             metadata = json.dumps(
                 {
                     "media_type": media_type,
                     "filename": filename,
-                    "expires_at": expires_at.isoformat(),
+                    "ttl_seconds": self.config.result_ttl.total_seconds(),
                 },
                 separators=(",", ":"),
             ).encode("utf-8")
@@ -715,6 +723,11 @@ class LocalArtifactStore:
             )
             os.replace(metadata_temp, metadata_path)
             self._sync_directory()
+            completed_at = datetime.now(UTC)
+            timestamp = completed_at.timestamp()
+            os.utime(metadata_path, (timestamp, timestamp))
+            self._sync_directory()
+            expires_at = completed_at + self.config.result_ttl
             return expires_at
         finally:
             for path in (data_temp, metadata_temp):
@@ -755,7 +768,7 @@ class LocalArtifactStore:
         data_path, metadata_path = self._paths(key)
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            expires_at = datetime.fromisoformat(metadata["expires_at"])
+            expires_at = self._metadata_expiry(metadata_path, metadata)
             if expires_at <= datetime.now(UTC):
                 self._delete(key)
                 return None
@@ -800,7 +813,7 @@ class LocalArtifactStore:
                 continue
             try:
                 metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-                expires_at = datetime.fromisoformat(metadata["expires_at"])
+                expires_at = self._metadata_expiry(metadata_path, metadata)
             except (OSError, KeyError, ValueError, json.JSONDecodeError):
                 continue
             if expires_at <= now:
@@ -822,6 +835,18 @@ class LocalArtifactStore:
                     data_path.unlink()
                 except FileNotFoundError:
                     pass
+
+    @staticmethod
+    def _metadata_expiry(
+        metadata_path: Path,
+        metadata: dict[str, object],
+    ) -> datetime:
+        if "ttl_seconds" in metadata:
+            return datetime.fromtimestamp(
+                metadata_path.stat().st_mtime,
+                UTC,
+            ) + timedelta(seconds=float(metadata["ttl_seconds"]))
+        return datetime.fromisoformat(str(metadata["expires_at"]))
 
 
 def create_sqlite_job_store(config: JobStoreConfig) -> SQLiteJobStore:

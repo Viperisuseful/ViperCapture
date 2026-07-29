@@ -373,8 +373,12 @@ class AsyncJobService:
 
     async def start(self) -> None:
         self._closing = False
-        await self.job_store.start()
+        job_store_started = False
+        artifact_store_started = False
         try:
+            job_store_started = True
+            await self.job_store.start()
+            artifact_store_started = True
             await self.artifact_store.start()
             await self.job_store.requeue_running(
                 datetime.now(UTC),
@@ -389,9 +393,11 @@ class AsyncJobService:
                 for index in range(self.settings.worker_count)
             ]
         except BaseException:
-            with suppress(Exception):
-                await self.artifact_store.close()
-            await self.job_store.close()
+            if artifact_store_started:
+                with suppress(Exception):
+                    await self.artifact_store.close()
+            if job_store_started:
+                await self.job_store.close()
             raise
 
     async def close(self) -> None:

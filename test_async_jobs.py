@@ -746,6 +746,31 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("expires_at", artifact_store.put.await_args.kwargs)
 
+    async def test_local_result_ttl_starts_after_metadata_persistence(self):
+        class SlowMetadataStore(LocalArtifactStore):
+            @staticmethod
+            def _write_durable(path, body):
+                if path.name.endswith(".json.tmp"):
+                    import time
+
+                    time.sleep(0.03)
+                LocalArtifactStore._write_durable(path, body)
+
+        ttl = timedelta(milliseconds=100)
+        artifacts = SlowMetadataStore(ArtifactStoreConfig(self.root, ttl))
+        await artifacts.start()
+        try:
+            stored = await artifacts.put(
+                str(uuid4()),
+                b"slow-metadata",
+                media_type="image/png",
+                filename="capture.png",
+            )
+            remaining = stored.expires_at - datetime.now(UTC)
+            self.assertGreater(remaining, timedelta(milliseconds=85))
+        finally:
+            await artifacts.close()
+
     async def test_success_timing_includes_settlement_retries(self):
         class DelayedSuccessStore(SQLiteJobStore):
             succeed_calls = 0
@@ -1184,6 +1209,47 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.store.close()
 
+    async def test_shared_artifact_key_waits_for_every_live_job(self):
+        await self.store.start()
+        try:
+            now = datetime.now(UTC)
+            for index, expires_at in enumerate(
+                (
+                    now - timedelta(seconds=1),
+                    now + timedelta(minutes=5),
+                )
+            ):
+                job = JobRecord(
+                    id=str(uuid4()),
+                    request_id=f"shared-artifact-{index}",
+                    status="queued",
+                    payload=b"encrypted",
+                    attempt_count=0,
+                    available_at=now,
+                    queue_expires_at=now + timedelta(minutes=1),
+                    created_at=now + timedelta(microseconds=index),
+                )
+                await self.store.create(job, active_limit=1)
+                await self.store.claim(now, self.settings.max_attempts)
+                await self.store.succeed(
+                    job.id,
+                    expected_attempt=1,
+                    artifact_key="shared-result",
+                    media_type="image/png",
+                    filename="capture.png",
+                    artifact_bytes=3,
+                    result_expires_at=expires_at,
+                    queue_ms=0,
+                )
+
+            first = await self.store.maintain(now)
+            self.assertNotIn("shared-result", first)
+
+            second = await self.store.maintain(now + timedelta(minutes=6))
+            self.assertIn("shared-result", second)
+        finally:
+            await self.store.close()
+
 
 class ProviderLoadingTests(unittest.TestCase):
     def test_generated_local_key_is_private_and_restart_stable(self):
@@ -1482,6 +1548,30 @@ class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
         service.close.assert_awaited_once()
         browser.close.assert_awaited_once()
         playwright.stop.assert_awaited_once()
+
+    async def test_partially_started_job_store_is_closed(self):
+        job_store = SimpleNamespace(
+            start=AsyncMock(side_effect=RuntimeError("start failed")),
+            close=AsyncMock(),
+        )
+        artifact_store = SimpleNamespace(
+            start=AsyncMock(),
+            close=AsyncMock(),
+        )
+        service = AsyncJobService(
+            _settings(Path(".")),
+            job_store,
+            artifact_store,
+            _successful_renderer,
+            cipher=PayloadCipher(b"\0" * 32),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "start failed"):
+            await service.start()
+
+        job_store.close.assert_awaited_once()
+        artifact_store.start.assert_not_awaited()
+        artifact_store.close.assert_not_awaited()
 
     def test_openapi_exposes_complete_job_surface(self):
         paths = main.app.openapi()["paths"]
