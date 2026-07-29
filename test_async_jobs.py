@@ -260,7 +260,7 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await recovered.close()
 
-    async def test_shutdown_requeues_playwright_style_close_error(self):
+    async def test_shutdown_leaves_playwright_style_close_error_running(self):
         rendering = asyncio.Event()
 
         async def closing_renderer(_payload):
@@ -292,7 +292,7 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         await reopened.start()
         try:
             current = await reopened.get(job.id, datetime.now(UTC))
-            self.assertEqual(current.status, "queued")
+            self.assertEqual(current.status, "running")
             self.assertIsNotNone(current.payload)
         finally:
             await reopened.close()
@@ -427,13 +427,12 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(operation, return_exceptions=True)
             await self.store.close()
 
-    async def test_cancellation_preserves_committed_success_artifact(self):
+    async def test_shutdown_bounds_settlement_and_preserves_artifact(self):
         settlement_started = asyncio.Event()
-        release_settlement = asyncio.Event()
 
         async def settle_success(*_args, **_kwargs):
             settlement_started.set()
-            await release_settlement.wait()
+            await asyncio.Event().wait()
 
         job_store = SimpleNamespace(
             succeed=AsyncMock(side_effect=settle_success),
@@ -466,11 +465,8 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         processing = asyncio.create_task(service._process(job))
         await asyncio.wait_for(settlement_started.wait(), timeout=1)
         processing.cancel()
-        await asyncio.sleep(0.02)
-        self.assertFalse(processing.done())
-        release_settlement.set()
         with self.assertRaises(asyncio.CancelledError):
-            await processing
+            await asyncio.wait_for(processing, timeout=0.25)
 
         artifact_store.delete.assert_not_awaited()
         job_store.requeue.assert_not_awaited()
@@ -517,6 +513,49 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(service._process(job), timeout=1)
         self.assertEqual(succeed_calls, 2)
         artifact_store.delete.assert_not_awaited()
+        job_store.requeue.assert_not_awaited()
+        job_store.fail.assert_not_awaited()
+
+    async def test_shutdown_leaves_final_attempt_for_startup_recovery(self):
+        rendering = asyncio.Event()
+
+        async def blocked_renderer(_payload):
+            rendering.set()
+            await asyncio.Event().wait()
+
+        job_store = SimpleNamespace(
+            requeue=AsyncMock(),
+            fail=AsyncMock(),
+        )
+        artifact_store = SimpleNamespace(
+            delete=AsyncMock(),
+        )
+        settings = _settings(self.root, max_attempts=1)
+        service = AsyncJobService(
+            settings,
+            job_store,
+            artifact_store,
+            blocked_renderer,
+        )
+        now = datetime.now(UTC)
+        job_id = str(uuid4())
+        job = JobRecord(
+            id=job_id,
+            request_id="final-attempt-shutdown",
+            status="running",
+            payload=service.cipher.encrypt(job_id, _payload()),
+            attempt_count=settings.max_attempts,
+            available_at=now,
+            queue_expires_at=now + timedelta(minutes=1),
+            created_at=now,
+            started_at=now,
+        )
+
+        processing = asyncio.create_task(service._process(job))
+        await asyncio.wait_for(rendering.wait(), timeout=1)
+        processing.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(processing, timeout=0.25)
         job_store.requeue.assert_not_awaited()
         job_store.fail.assert_not_awaited()
 

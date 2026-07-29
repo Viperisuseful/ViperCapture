@@ -538,7 +538,6 @@ class AsyncJobService:
 
     async def _process(self, job: JobRecord) -> None:
         stored_key: str | None = None
-        success_committed = False
         try:
             payload = self.cipher.decrypt(job)
             rendered = await self.renderer(payload)
@@ -575,34 +574,18 @@ class AsyncJobService:
             try:
                 await asyncio.shield(settlement)
             except asyncio.CancelledError:
-                while not settlement.done():
-                    try:
-                        await asyncio.shield(settlement)
-                    except asyncio.CancelledError:
-                        continue
-                settlement.result()
-                success_committed = True
+                settlement.cancel()
+                await asyncio.gather(settlement, return_exceptions=True)
                 raise
-            success_committed = True
         except asyncio.CancelledError:
-            if not success_committed:
-                if stored_key:
-                    await self._safe_delete(stored_key)
-                await asyncio.shield(
-                    self.job_store.requeue(job.id, datetime.now(UTC))
-                )
+            # Leave the claimed row running. Startup recovery can distinguish
+            # a committed success from interrupted work and enforce attempts.
+            # An uploaded-but-uncommitted artifact retains its storage TTL.
             raise
         except Exception as exc:
             if stored_key:
                 await self._safe_delete(stored_key)
             if self._closing:
-                await self._retry_state_transition(
-                    "requeue",
-                    lambda: self.job_store.requeue(
-                        job.id,
-                        datetime.now(UTC),
-                    ),
-                )
                 return
             if isinstance(exc, RenderError):
                 code, message, retryable = exc.code, exc.message, exc.retryable
