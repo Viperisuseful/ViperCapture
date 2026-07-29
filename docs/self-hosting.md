@@ -52,3 +52,44 @@ and restart the service normally.
 ## Capability boundary
 
 The public engine supports a public URL source, PNG/JPEG/WebP output, viewport/full-page/selector capture, image quality, transparency, wait conditions, and same-origin target headers. It blocks detected page-level challenges by default. Callers may set `proceed_on_captcha: true` to capture the visible challenge as displayed; ViperCapture never solves or bypasses CAPTCHAs.
+
+## Selectors and waits
+
+`selector` captures the first visible matching element and requires
+`full_page: false`. `wait_for.selector` waits for a matching element to become
+visible before capture. Both fields accept standard CSS selectors, are limited
+to 2,048 characters, and do not support pseudo-elements such as `::before`.
+
+Use `wait_for.event` for `load`, `domcontentloaded`, or `networkidle`.
+`wait_for.text` waits for text in the document body, `delay_ms` adds a final
+settle delay, and `timeout_ms` bounds page and selector waits. The local
+interface displays the active wait plan and elapsed time while a render runs.
+Cancelling the interface request also cancels queued or active server work.
+
+For full-page captures of unusually wide documents, set
+`preserve_viewport_width: true` to clip horizontal overflow to the requested
+viewport while retaining the full document height.
+
+## Custom headers
+
+`headers` must be a JSON object whose values are strings. At most 32 headers
+and 16 KiB serialized data are accepted; each name is limited to 128 bytes and
+each value to 4 KiB. Hop-by-hop, proxy, `Host`, `Content-Length`, `Sec-*`, and
+`X-Forwarded-*` headers are managed by ViperCapture and cannot be overridden.
+
+Custom headers are sent only to requests matching the target URL's exact
+scheme, hostname, and port. They are stripped from cross-origin subresources
+and redirects.
+
+## Diagnostic response headers
+
+Successful `POST /v1/render` responses include:
+
+- `X-Request-Id`
+- `X-ViperCapture-Queue-Ms`
+- `X-ViperCapture-Render-Ms`
+- `X-ViperCapture-Width`
+- `X-ViperCapture-Height`
+- `X-ViperCapture-Navigation-Status`, when navigation returned a response
+
+Dimensions are output pixels after applying the device scale factor.

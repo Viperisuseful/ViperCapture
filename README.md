@@ -22,6 +22,7 @@ to manage browser automation code.
 
 - PNG, JPEG, and WebP output
 - Full-page, viewport, and CSS selector capture
+- Optional viewport-width preservation for wide full-page captures
 - Phone, desktop, and 4K presets with custom viewport support
 - Image quality, transparent background, and device scale controls
 - Wait conditions for page events, selectors, text, and fixed delays
@@ -33,6 +34,9 @@ to manage browser automation code.
 - A local-only GPU rendering switch that safely restarts Chromium after active captures finish
 - The same Radix Nova shadcn/ui component system and theme used by ViperCapture Cloud
 - Page-level challenge detection with an explicit capture-as-displayed choice
+- Observable renders with elapsed time, active waits, cancellation, dimensions,
+  file size, render duration, and request IDs
+- Inline validation for selectors, waits, and same-origin custom headers
 
 ## Getting started
 
@@ -100,8 +104,10 @@ curl 'http://127.0.0.1:8000/v1/render' \
 ```
 
 A successful request returns the image bytes with the matching media type.
-Every response includes `X-Request-Id`. Errors use a consistent JSON object
-with a stable code, message, request ID, retryable flag, and details.
+Every response includes `X-Request-Id`. Successful renders also report queue
+time, render time, and output dimensions in `X-ViperCapture-*` diagnostic
+headers. Errors use a consistent JSON object with a stable code, message,
+request ID, retryable flag, and details.
 
 ### Request options
 
@@ -111,6 +117,7 @@ with a stable code, message, request ID, retryable flag, and details.
 | `output` | `png` | `png`, `jpeg`, or `webp` |
 | `viewport` | `1280 × 720 × 1` | Width, height, and device scale factor |
 | `full_page` | `true` | Capture the full document or current viewport |
+| `preserve_viewport_width` | `false` | Clip wide full-page output to the requested viewport width |
 | `lazy_load` | `thorough` | `thorough`, `adaptive`, or `none` full-page scrolling |
 | `selector` | empty | Capture one visible element when `full_page` is `false` |
 | `image` | defaults | JPEG/WebP quality, PNG/WebP transparency, and speed-first WebP encoding |

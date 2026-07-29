@@ -6,12 +6,13 @@ import threading
 import unittest
 from unittest.mock import AsyncMock, patch
 from pathlib import Path
+from types import SimpleNamespace
 
 from playwright.async_api import async_playwright
 from pydantic import ValidationError
 from starlette.requests import Request
 
-from main import _is_local_control_request, gpu_launch_args, hardware_gpu_active
+from main import _await_while_connected, _is_local_control_request, gpu_launch_args, hardware_gpu_active
 from render_contract import LazyLoadMode, OutputFormat, RenderRequest
 from render_engine import (
     PublicUrlValidator,
@@ -19,6 +20,7 @@ from render_engine import (
     RenderLimits,
     capture_cdp_image,
     ensure_dimensions,
+    ensure_full_page_dimensions,
     is_public_http_url,
     load_lazy_content,
     needs_request_routing,
@@ -185,7 +187,7 @@ class CaptureOptimizationTests(unittest.IsolatedAsyncioTestCase):
         with patch("render_engine.asyncio.sleep", new_callable=AsyncMock) as sleep:
             await load_lazy_content(page, 720, LazyLoadMode.ADAPTIVE)
 
-        sleep.assert_awaited_once_with(0.075)
+        self.assertEqual([call.args[0] for call in sleep.await_args_list], [0.075, 0.2])
 
     async def test_thorough_lazy_loading_preserves_existing_delay(self):
         page = AsyncMock()
@@ -197,7 +199,7 @@ class CaptureOptimizationTests(unittest.IsolatedAsyncioTestCase):
         with patch("render_engine.asyncio.sleep", new_callable=AsyncMock) as sleep:
             await load_lazy_content(page, 720, LazyLoadMode.THOROUGH)
 
-        sleep.assert_awaited_once_with(0.2)
+        self.assertEqual([call.args[0] for call in sleep.await_args_list], [0.2, 0.2])
 
     async def test_fast_png_sets_cdp_speed_flag(self):
         session = AsyncMock()
@@ -488,6 +490,38 @@ class BrowserCaptureRegressionTests(unittest.IsolatedAsyncioTestCase):
                 await browser.close()
 
 
+class CaptureCancellationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_completed_work_returns_without_waiting_on_disconnect_poll(self):
+        request = SimpleNamespace(is_disconnected=AsyncMock(return_value=False))
+
+        result = await asyncio.wait_for(
+            _await_while_connected(request, asyncio.sleep(0.01, result="done")),
+            timeout=1,
+        )
+
+        self.assertEqual(result, "done")
+
+    async def test_disconnect_cancels_in_flight_work(self):
+        operation_started = asyncio.Event()
+        operation_cancelled = asyncio.Event()
+
+        async def operation():
+            operation_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                operation_cancelled.set()
+
+        request = SimpleNamespace(is_disconnected=AsyncMock(return_value=True))
+        with self.assertRaises(RenderError) as error:
+            await _await_while_connected(request, operation())
+
+        self.assertEqual(error.exception.code, "client_disconnected")
+        self.assertEqual(error.exception.status_code, 499)
+        self.assertTrue(operation_started.is_set())
+        self.assertTrue(operation_cancelled.is_set())
+
+
 class GpuConfigurationTests(unittest.TestCase):
     def test_gpu_is_off_by_default(self):
         self.assertEqual(gpu_launch_args("off", "default", "linux"), [])
@@ -601,6 +635,18 @@ class ValidationTests(unittest.TestCase):
         )
         self.assertEqual(request.source_type, "url")
 
+    def test_preserve_viewport_width_requires_full_page(self):
+        request = RenderRequest(
+            url="https://example.com", preserve_viewport_width=True
+        )
+        self.assertTrue(request.preserve_viewport_width)
+        with self.assertRaises(ValidationError):
+            RenderRequest(
+                url="https://example.com",
+                full_page=False,
+                preserve_viewport_width=True,
+            )
+
     def test_lazy_load_modes_and_fast_png_are_valid(self):
         request = RenderRequest(
             url="https://example.com",
@@ -641,6 +687,31 @@ class DimensionTests(unittest.TestCase):
     def test_pixel_limit_is_enforced(self):
         with self.assertRaisesRegex(RenderError, "pixel_limit_exceeded"):
             ensure_dimensions(100, 100, 1, RenderLimits(max_pixels=9999))
+
+    def test_full_page_height_uses_separate_safety_limit(self):
+        limits = RenderLimits(
+            max_width=1920,
+            max_height=1080,
+            max_pixels=50_000_000,
+        )
+        ensure_full_page_dimensions(1280, 4_000, 1, limits)
+        with self.assertRaisesRegex(RenderError, "page_too_tall"):
+            ensure_full_page_dimensions(1280, 20_001, 1, limits)
+
+    def test_wide_page_error_suggests_preserving_viewport_width(self):
+        with self.assertRaises(RenderError) as raised:
+            ensure_full_page_dimensions(
+                4_000,
+                1_000,
+                1,
+                RenderLimits(max_width=1920, max_height=1080),
+                viewport_width=1280,
+            )
+
+        self.assertEqual(
+            raised.exception.details["suggested_action"],
+            "preserve_viewport_width",
+        )
 
 
 if __name__ == "__main__":

@@ -6,6 +6,8 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
+from typing import Awaitable, TypeVar
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -74,6 +76,7 @@ MAX_SCREENSHOT_PIXELS = max(
     1, int(os.getenv("VIPERCAPTURE_MAX_PIXELS", "50000000"))
 )
 CAPTURE_QUEUE_TIMEOUT_SECONDS = 30
+AwaitedResult = TypeVar("AwaitedResult")
 
 if not HOSTED:
     CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
@@ -230,6 +233,38 @@ if DESKTOP_TOKEN:
         return {"shutting_down": True}
 
 
+async def _await_while_connected(
+    request: Request,
+    operation: Awaitable[AwaitedResult],
+) -> AwaitedResult:
+    """Cancel queued or rendering work when the client disconnects."""
+    is_disconnected = getattr(request, "is_disconnected", None)
+    if not callable(is_disconnected):
+        return await operation
+
+    operation_task = asyncio.ensure_future(operation)
+    try:
+        while True:
+            done, _pending = await asyncio.wait({operation_task}, timeout=0.1)
+            if operation_task in done:
+                return await operation_task
+            if await is_disconnected():
+                operation_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await operation_task
+                raise RenderError(
+                    "client_disconnected",
+                    "The capture was cancelled.",
+                    499,
+                    False,
+                )
+    finally:
+        if not operation_task.done():
+            operation_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await operation_task
+
+
 @app.get("/")
 async def index() -> FileResponse:
     frontend = BASE_DIR / "static" / "app" / "index.html"
@@ -347,24 +382,34 @@ async def _check_captcha(
 
 
 @app.post("/v1/render", response_class=Response)
-async def render_v1(payload: RenderRequest) -> Response:
+async def render_v1(payload: RenderRequest, request: Request) -> Response:
+    queue_started = time.perf_counter()
     try:
-        await asyncio.wait_for(
-            app.state.capture_slots.acquire(), timeout=CAPTURE_QUEUE_TIMEOUT_SECONDS
+        await _await_while_connected(
+            request,
+            asyncio.wait_for(
+                app.state.capture_slots.acquire(),
+                timeout=CAPTURE_QUEUE_TIMEOUT_SECONDS,
+            ),
         )
     except TimeoutError as exc:
         raise RenderError("capture_queue_busy", "The render queue is busy.", 503, True) from exc
+    queue_ms = round((time.perf_counter() - queue_started) * 1000)
     browser: Browser = app.state.browser
     engine = RenderEngine(
         hosted=HOSTED,
         challenge_checker=_check_captcha,
         browser_replacer=lambda failed: _replace_browser(app, failed),
     )
+    render_started = time.perf_counter()
     try:
-        artifact = await engine.render_image(
-            browser,
-            payload,
-            RenderLimits(max_pixels=MAX_SCREENSHOT_PIXELS),
+        artifact = await _await_while_connected(
+            request,
+            engine.render_image(
+                browser,
+                payload,
+                RenderLimits(max_pixels=MAX_SCREENSHOT_PIXELS),
+            ),
         )
     except RenderError:
         if not browser.is_connected():
@@ -373,10 +418,27 @@ async def render_v1(payload: RenderRequest) -> Response:
         raise
     finally:
         app.state.capture_slots.release()
+    render_ms = round((time.perf_counter() - render_started) * 1000)
+    metadata = artifact.metadata or {}
+    diagnostic_headers = {
+        "X-ViperCapture-Queue-Ms": str(max(0, queue_ms)),
+        "X-ViperCapture-Render-Ms": str(max(0, render_ms)),
+    }
+    for key, header in (
+        ("width", "X-ViperCapture-Width"),
+        ("height", "X-ViperCapture-Height"),
+        ("navigation_status", "X-ViperCapture-Navigation-Status"),
+    ):
+        value = metadata.get(key)
+        if isinstance(value, (int, float)):
+            diagnostic_headers[header] = str(round(value))
     return Response(
         artifact.body,
         media_type=artifact.media_type,
-        headers={"Content-Disposition": f'attachment; filename="{artifact.filename}"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{artifact.filename}"',
+            **diagnostic_headers,
+        },
     )
 
 
