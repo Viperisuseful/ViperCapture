@@ -256,6 +256,8 @@ def _read_or_create_key(data_dir: Path) -> bytes:
     if supplied:
         return sha256(PAYLOAD_VERSION + supplied.encode("utf-8")).digest()
     data_dir.mkdir(parents=True, exist_ok=True)
+    with suppress(OSError):
+        data_dir.chmod(0o700)
     path = data_dir / "async-jobs.key"
     try:
         material = path.read_bytes()
@@ -268,9 +270,18 @@ def _read_or_create_key(data_dir: Path) -> bytes:
             material = path.read_bytes()
         else:
             try:
-                os.write(descriptor, material)
+                view = memoryview(material)
+                while view:
+                    written = os.write(descriptor, view)
+                    view = view[written:]
+                os.fsync(descriptor)
             finally:
                 os.close(descriptor)
+            directory = os.open(data_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
     if len(material) < 32:
         raise RuntimeError("async job key must contain at least 32 bytes")
     with suppress(OSError):
@@ -542,20 +553,41 @@ class AsyncJobService:
         self,
         name: str,
         transition: Callable[[], Awaitable[None]],
+        *,
+        settle_on_cancel: bool = False,
     ) -> None:
-        while True:
-            try:
-                await transition()
-                return
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.warning(
-                    "async job transition retry transition=%s error_type=%s",
-                    name,
-                    type(exc).__name__,
-                )
-                await asyncio.sleep(self.settings.poll_seconds)
+        try:
+            while True:
+                try:
+                    await transition()
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "async job transition retry transition=%s error_type=%s",
+                        name,
+                        type(exc).__name__,
+                    )
+                    await asyncio.sleep(self.settings.poll_seconds)
+        except asyncio.CancelledError:
+            if settle_on_cancel:
+                try:
+                    await asyncio.wait_for(
+                        transition(),
+                        timeout=max(
+                            0.1,
+                            min(1.0, self.settings.poll_seconds),
+                        ),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "async job final transition failed "
+                        "transition=%s error_type=%s",
+                        name,
+                        type(exc).__name__,
+                    )
+            raise
 
     async def _retry_success_transition(
         self,
@@ -653,6 +685,7 @@ class AsyncJobService:
                     message=message,
                     retryable=retryable,
                 ),
+                settle_on_cancel=not retryable,
             )
         finally:
             self._wake_workers()

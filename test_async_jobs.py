@@ -490,6 +490,21 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(metadata_path.exists())
         await artifacts.close()
 
+    async def test_local_artifact_is_synced_before_put_returns(self):
+        await self.artifacts.start()
+        with patch(
+            "async_job_providers.os.fsync",
+            wraps=os.fsync,
+        ) as sync:
+            await self.artifacts.put(
+                str(uuid4()),
+                b"durable",
+                media_type="image/png",
+                filename="durable.png",
+            )
+        self.assertGreaterEqual(sync.call_count, 4)
+        await self.artifacts.close()
+
     async def test_metadata_cleanup_preserves_live_successful_result(self):
         settings = _settings(self.root, metadata_ttl=timedelta(seconds=1))
         store = SQLiteJobStore(
@@ -982,6 +997,64 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fail_calls, 2)
         job_store.requeue.assert_not_awaited()
 
+    async def test_shutdown_retries_nonretryable_failure_once(self):
+        first_failure = asyncio.Event()
+        settled = asyncio.Event()
+        fail_calls = 0
+
+        async def fail(*_args, **_kwargs):
+            nonlocal fail_calls
+            fail_calls += 1
+            if fail_calls == 1:
+                first_failure.set()
+                raise RuntimeError("temporary state-store failure")
+            settled.set()
+
+        job_store = SimpleNamespace(
+            fail=AsyncMock(side_effect=fail),
+            requeue=AsyncMock(),
+        )
+        artifact_store = SimpleNamespace(delete=AsyncMock())
+
+        async def nonretryable_failure(_payload):
+            raise RenderError(
+                "invalid_target",
+                "The target cannot be rendered.",
+                400,
+                False,
+            )
+
+        settings = _settings(self.root, poll_seconds=1)
+        service = AsyncJobService(
+            settings,
+            job_store,
+            artifact_store,
+            nonretryable_failure,
+        )
+        now = datetime.now(UTC)
+        job_id = str(uuid4())
+        job = JobRecord(
+            id=job_id,
+            request_id="shutdown-terminal-intent",
+            status="running",
+            payload=service.cipher.encrypt(job_id, _payload()),
+            attempt_count=1,
+            available_at=now,
+            queue_expires_at=now + timedelta(minutes=1),
+            created_at=now,
+            started_at=now,
+        )
+
+        processing = asyncio.create_task(service._process(job))
+        await asyncio.wait_for(first_failure.wait(), timeout=1)
+        processing.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(processing, timeout=0.25)
+
+        self.assertTrue(settled.is_set())
+        self.assertEqual(fail_calls, 2)
+        job_store.requeue.assert_not_awaited()
+
     async def test_sqlite_failure_transition_is_idempotent(self):
         await self.store.start()
         try:
@@ -1009,6 +1082,28 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             current = await self.store.get(job.id, now)
             self.assertEqual(current.status, "failed")
             self.assertEqual(current.error_code, "invalid_target")
+        finally:
+            await self.store.close()
+
+    async def test_sqlite_database_and_sidecars_are_owner_only(self):
+        await self.store.start()
+        try:
+            now = datetime.now(UTC)
+            job = JobRecord(
+                id=str(uuid4()),
+                request_id="private-sqlite-files",
+                status="queued",
+                payload=b"encrypted",
+                attempt_count=0,
+                available_at=now,
+                queue_expires_at=now + timedelta(minutes=1),
+                created_at=now,
+            )
+            await self.store.create(job, active_limit=1)
+            paths = list(self.root.glob("async-jobs.sqlite3*"))
+            self.assertGreaterEqual(len(paths), 2)
+            for path in paths:
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         finally:
             await self.store.close()
 
@@ -1079,7 +1174,9 @@ class ProviderLoadingTests(unittest.TestCase):
         ):
             os.environ.pop("VIPERCAPTURE_JOB_SECRET", None)
             root = Path(directory)
-            first = PayloadCipher.for_data_dir(root)
+            with patch("async_jobs.os.fsync", wraps=os.fsync) as sync:
+                first = PayloadCipher.for_data_dir(root)
+            self.assertGreaterEqual(sync.call_count, 2)
             job_id = str(uuid4())
             encrypted = first.encrypt(job_id, _payload())
             second = PayloadCipher.for_data_dir(root)

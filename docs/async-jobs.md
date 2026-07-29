@@ -27,6 +27,9 @@ Preserve both the database and encryption key when backing up or moving an
 instance. The job database receives only ciphertext for request bodies, so URLs
 and custom target headers are not stored as plaintext. Terminal transitions
 erase that ciphertext.
+The bundled providers create the database, WAL sidecars, key, and result files
+with owner-only permissions. Key and result creation fsync both file contents
+and directory entries before reporting durable success.
 
 ViperCapture leaves claimed work `running` during shutdown. At startup it
 requeues interrupted jobs unless they have already reached the configured
@@ -94,7 +97,10 @@ an existing failed record; conflicting terminal transitions should raise
 `JobConflictError`. The state provider assigns `completed_at` when the terminal
 transition commits and derives successful `render_ms` from the preserved first
 `started_at`, so state-transition retries are included without changing the
-arguments used for an idempotent retry.
+arguments used for an idempotent retry. During graceful shutdown, a
+non-retryable failure gets one final bounded settlement attempt before its
+worker exits, preventing a transient first write failure from becoming a retry
+after restart.
 `requeue_running` supplies restart recovery without exceeding its
 `max_attempts` argument. `maintain` returns expired artifact keys for deletion
 and must preserve successful metadata and artifacts until `result_expires_at`,

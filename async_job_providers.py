@@ -45,6 +45,15 @@ class SQLiteJobStore:
 
     async def start(self) -> None:
         self.config.data_dir.mkdir(parents=True, exist_ok=True)
+        with suppress(OSError):
+            self.config.data_dir.chmod(0o700)
+        descriptor = os.open(
+            self.path,
+            os.O_RDWR | os.O_CREAT,
+            0o600,
+        )
+        os.close(descriptor)
+        self.path.chmod(0o600)
         self._connection = sqlite3.connect(
             self.path,
             check_same_thread=False,
@@ -52,10 +61,13 @@ class SQLiteJobStore:
         )
         self._connection.row_factory = sqlite3.Row
         await self._run(self._initialize)
-        try:
-            self.path.chmod(0o600)
-        except OSError:
-            pass
+        for path in (
+            self.path,
+            Path(f"{self.path}-wal"),
+            Path(f"{self.path}-shm"),
+        ):
+            with suppress(OSError):
+                path.chmod(0o600)
 
     async def close(self) -> None:
         if self._connection is None:
@@ -685,23 +697,24 @@ class LocalArtifactStore:
         data_temp = self.root / f".{key}.{token}.tmp"
         metadata_temp = self.root / f".{key}.{token}.json.tmp"
         try:
-            data_temp.write_bytes(body)
-            data_temp.chmod(0o600)
+            self._write_durable(data_temp, body)
             os.replace(data_temp, data_path)
+            self._sync_directory()
             expires_at = datetime.now(UTC) + self.config.result_ttl
-            metadata_temp.write_text(
-                json.dumps(
-                    {
-                        "media_type": media_type,
-                        "filename": filename,
-                        "expires_at": expires_at.isoformat(),
-                    },
-                    separators=(",", ":"),
-                ),
-                encoding="utf-8",
+            metadata = json.dumps(
+                {
+                    "media_type": media_type,
+                    "filename": filename,
+                    "expires_at": expires_at.isoformat(),
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+            self._write_durable(
+                metadata_temp,
+                metadata,
             )
-            metadata_temp.chmod(0o600)
             os.replace(metadata_temp, metadata_path)
+            self._sync_directory()
             return expires_at
         finally:
             for path in (data_temp, metadata_temp):
@@ -709,6 +722,29 @@ class LocalArtifactStore:
                     path.unlink()
                 except FileNotFoundError:
                     pass
+
+    @staticmethod
+    def _write_durable(path: Path, body: bytes) -> None:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        try:
+            view = memoryview(body)
+            while view:
+                written = os.write(descriptor, view)
+                view = view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _sync_directory(self) -> None:
+        descriptor = os.open(self.root, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     async def get(self, key: str) -> Artifact | None:
         return await asyncio.to_thread(self._get, key)
