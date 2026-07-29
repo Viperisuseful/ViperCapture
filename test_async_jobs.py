@@ -18,6 +18,7 @@ from async_jobs import (
     Artifact,
     ArtifactStoreConfig,
     AsyncJobService,
+    JobConflictError,
     JobRecord,
     JobSettings,
     JobStoreConfig,
@@ -286,6 +287,54 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.store.close()
 
+    async def test_stale_attempt_cannot_settle_a_newer_running_attempt(self):
+        await self.store.start()
+        try:
+            now = datetime.now(UTC)
+            job = JobRecord(
+                id=str(uuid4()),
+                request_id="stale-terminal-transition",
+                status="queued",
+                payload=b"encrypted",
+                attempt_count=0,
+                available_at=now,
+                queue_expires_at=now + timedelta(minutes=1),
+                created_at=now,
+            )
+            await self.store.create(job, active_limit=1)
+            first = await self.store.claim(now, max_attempts=3)
+            await self.store.requeue(job.id, first.attempt_count, now)
+            second = await self.store.claim(now, max_attempts=3)
+
+            with self.assertRaises(JobConflictError):
+                await self.store.succeed(
+                    job.id,
+                    expected_attempt=first.attempt_count,
+                    artifact_key="stale-result",
+                    media_type="image/png",
+                    filename="capture.png",
+                    artifact_bytes=3,
+                    result_expires_at=now + timedelta(minutes=1),
+                    queue_ms=0,
+                    render_ms=1,
+                    now=now,
+                )
+            with self.assertRaises(JobConflictError):
+                await self.store.fail(
+                    job.id,
+                    expected_attempt=first.attempt_count,
+                    code="stale_failure",
+                    message="A stale attempt failed.",
+                    retryable=False,
+                    now=now,
+                )
+
+            current = await self.store.get(job.id, now)
+            self.assertEqual(current.status, "running")
+            self.assertEqual(current.attempt_count, second.attempt_count)
+        finally:
+            await self.store.close()
+
     async def test_polling_shares_one_throttled_maintenance_run(self):
         job_store = SimpleNamespace(
             maintain=AsyncMock(return_value=[]),
@@ -467,6 +516,7 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             await store.claim(completed_at, settings.max_attempts)
             await store.succeed(
                 job.id,
+                expected_attempt=1,
                 artifact_key="still-live",
                 media_type="image/png",
                 filename="capture.png",
@@ -665,6 +715,48 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             upload_completed_at + self.settings.result_ttl,
         )
         self.assertNotIn("expires_at", artifact_store.put.await_args.kwargs)
+
+    async def test_success_timing_includes_prior_attempts_and_backoff(self):
+        now = datetime.now(UTC)
+        job_store = SimpleNamespace(
+            succeed=AsyncMock(),
+            requeue=AsyncMock(),
+            fail=AsyncMock(),
+        )
+        artifact_store = SimpleNamespace(
+            put=AsyncMock(
+                return_value=StoredArtifact(
+                    "retried-result",
+                    now + self.settings.result_ttl,
+                )
+            ),
+            delete=AsyncMock(),
+        )
+        service = AsyncJobService(
+            self.settings,
+            job_store,
+            artifact_store,
+            _successful_renderer,
+        )
+        job_id = str(uuid4())
+        job = JobRecord(
+            id=job_id,
+            request_id="retried-timing",
+            status="running",
+            payload=service.cipher.encrypt(job_id, _payload()),
+            attempt_count=2,
+            available_at=now,
+            queue_expires_at=now + timedelta(minutes=1),
+            created_at=now - timedelta(seconds=6),
+            started_at=now - timedelta(seconds=5),
+        )
+
+        await service._process(job)
+
+        self.assertGreaterEqual(
+            job_store.succeed.await_args.kwargs["render_ms"],
+            5000,
+        )
 
     async def test_shutdown_leaves_final_attempt_for_startup_recovery(self):
         rendering = asyncio.Event()
@@ -892,6 +984,7 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             await self.store.create(job, active_limit=1)
             await self.store.claim(now, self.settings.max_attempts)
             arguments = {
+                "expected_attempt": 1,
                 "code": "invalid_target",
                 "message": "The target cannot be rendered.",
                 "retryable": False,
@@ -926,6 +1019,7 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             )
             succeeded = await self.store.succeed(
                 job.id,
+                expected_attempt=1,
                 artifact_key="retry-delete",
                 media_type="image/png",
                 filename="capture.png",
@@ -937,6 +1031,7 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             )
             repeated = await self.store.succeed(
                 job.id,
+                expected_attempt=1,
                 artifact_key="retry-delete",
                 media_type="image/png",
                 filename="capture.png",

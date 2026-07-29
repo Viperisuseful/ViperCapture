@@ -319,6 +319,7 @@ class SQLiteJobStore:
         self,
         job_id: str,
         *,
+        expected_attempt: int,
         artifact_key: str,
         media_type: str,
         filename: str,
@@ -337,7 +338,7 @@ class SQLiteJobStore:
                     result_expires_at = ?, queue_ms = ?, render_ms = ?,
                     completed_at = ?, error_code = NULL, error_message = NULL,
                     error_retryable = NULL
-                WHERE id = ? AND status = 'running'
+                WHERE id = ? AND status = 'running' AND attempt_count = ?
                 """,
                 (
                     artifact_key,
@@ -349,6 +350,7 @@ class SQLiteJobStore:
                     render_ms,
                     _epoch(now),
                     job_id,
+                    expected_attempt,
                 ),
             )
             if updated.rowcount != 1:
@@ -380,6 +382,7 @@ class SQLiteJobStore:
                     if (
                         existing is not None
                         and existing["status"] == "succeeded"
+                        and existing["attempt_count"] == expected_attempt
                     )
                     else None
                 )
@@ -398,6 +401,7 @@ class SQLiteJobStore:
         self,
         job_id: str,
         *,
+        expected_attempt: int,
         code: str,
         message: str,
         retryable: bool,
@@ -411,7 +415,7 @@ class SQLiteJobStore:
                 UPDATE async_jobs
                 SET status = 'failed', payload = NULL, completed_at = ?,
                     error_code = ?, error_message = ?, error_retryable = ?
-                WHERE id = ? AND status IN ('queued', 'running')
+                WHERE id = ? AND status = 'running' AND attempt_count = ?
                 """,
                 (
                     _epoch(now),
@@ -419,6 +423,7 @@ class SQLiteJobStore:
                     message_value,
                     retryable,
                     job_id,
+                    expected_attempt,
                 ),
             )
             if updated.rowcount == 1:
@@ -440,7 +445,11 @@ class SQLiteJobStore:
                     bool(existing["error_retryable"]),
                     existing["completed_at"],
                 )
-                if existing is not None and existing["status"] == "failed"
+                if (
+                    existing is not None
+                    and existing["status"] == "failed"
+                    and existing["attempt_count"] == expected_attempt
+                )
                 else None
             )
             if actual != expected:

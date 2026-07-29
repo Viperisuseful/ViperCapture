@@ -36,6 +36,10 @@ job has 15 minutes to be claimed. Local results expire after one hour and
 terminal metadata after 24 hours. Expired and orphaned local artifacts are
 removed during routine queue maintenance.
 
+Successful job timings report queue time through the first claim and render
+time from that first claim through final settlement. The render duration
+therefore includes failed attempts, retry backoff, and result persistence.
+
 ## Configuration
 
 | Variable | Default | Purpose |
@@ -82,10 +86,12 @@ The adapter owns its client library, schema, connections, and migrations.
 the database's row-locking or compare-and-swap primitive. It receives
 `max_attempts` and must terminally fail queued jobs that have already reached
 that cap before selecting work. Terminal operations must erase the encrypted
-payload. `succeed` must return the existing successful
-record when retried with identical arguments, because a commit acknowledgement
-can be lost. `fail` must likewise accept an identical retry of an existing
-failed record; conflicting terminal transitions should raise `JobConflictError`.
+payload. `succeed` and `fail` receive the claimed job's `expected_attempt` and
+must never settle a different attempt. `succeed` must return the existing
+successful record when retried with identical arguments, because a commit
+acknowledgement can be lost. `fail` must likewise accept an identical retry of
+an existing failed record; conflicting terminal transitions should raise
+`JobConflictError`.
 `requeue_running` supplies restart recovery without exceeding its
 `max_attempts` argument. `maintain` returns expired artifact keys for deletion
 and must preserve successful metadata and artifacts until `result_expires_at`,

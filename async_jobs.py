@@ -124,6 +124,7 @@ class JobStore(Protocol):
         self,
         job_id: str,
         *,
+        expected_attempt: int,
         artifact_key: str,
         media_type: str,
         filename: str,
@@ -137,6 +138,7 @@ class JobStore(Protocol):
         self,
         job_id: str,
         *,
+        expected_attempt: int,
         code: str,
         message: str,
         retryable: bool,
@@ -591,13 +593,21 @@ class AsyncJobService:
                 self._retry_success_transition(
                     lambda: self.job_store.succeed(
                         job.id,
+                        expected_attempt=job.attempt_count,
                         artifact_key=stored_key,
                         media_type=rendered.media_type,
                         filename=rendered.filename,
                         artifact_bytes=len(rendered.body),
                         result_expires_at=result_expires_at,
                         queue_ms=queue_ms,
-                        render_ms=max(0, rendered.render_ms),
+                        render_ms=max(
+                            0,
+                            round(
+                                (now - job.started_at).total_seconds() * 1000
+                            )
+                            if job.started_at
+                            else rendered.render_ms,
+                        ),
                         now=now,
                     )
                 )
@@ -643,6 +653,7 @@ class AsyncJobService:
                 "fail",
                 lambda: self.job_store.fail(
                     job.id,
+                    expected_attempt=job.attempt_count,
                     code=code,
                     message=message,
                     retryable=retryable,
