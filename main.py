@@ -588,7 +588,7 @@ async def cancel_render_job(job_id: UUID) -> JSONResponse:
 
 
 @app.get("/v1/jobs/{job_id}/result", response_class=Response)
-async def read_render_job_result(job_id: UUID) -> Response:
+async def read_render_job_result(job_id: UUID, request: Request) -> Response:
     service = _async_job_service()
     job = await service.get(str(job_id))
     if job is None:
@@ -615,7 +615,16 @@ async def read_render_job_result(job_id: UUID) -> Response:
             {"Retry-After": "1"} if job.status in {"queued", "running"} else None,
         )
     slots = app.state.async_result_slots
-    await slots.acquire()
+    await _await_while_connected(request, slots.acquire())
+    is_disconnected = getattr(request, "is_disconnected", None)
+    if callable(is_disconnected) and await is_disconnected():
+        slots.release()
+        raise RenderError(
+            "client_disconnected",
+            "The result download was cancelled.",
+            499,
+            False,
+        )
     try:
         artifact = await service.result(job)
     except BaseException:

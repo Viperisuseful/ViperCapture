@@ -127,7 +127,22 @@ job_id="$(
   python -c 'import json,sys; print(json.load(sys.stdin)["id"])'
 )"
 
-curl --fail-with-body "http://127.0.0.1:8000/v1/jobs/$job_id"
+while true; do
+  job_status="$(
+    curl --fail-with-body --silent \
+      "http://127.0.0.1:8000/v1/jobs/$job_id" |
+    python -c 'import json,sys; print(json.load(sys.stdin)["status"])'
+  )"
+  case "$job_status" in
+    succeeded) break ;;
+    failed|cancelled|expired)
+      echo "async capture ended with status: $job_status" >&2
+      exit 1
+      ;;
+  esac
+  sleep 1
+done
+
 curl --fail-with-body "http://127.0.0.1:8000/v1/jobs/$job_id/result" \
   --output capture.png
 ```

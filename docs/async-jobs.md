@@ -153,9 +153,10 @@ returns an `Artifact`; `delete` must be idempotent. `maintain` lets local
 or database-backed providers remove expired objects. Managed object stores
 should also enforce provider-side lifecycle expiration so a process crash
 between upload and state settlement cannot leave an object indefinitely.
-Opaque keys may be shared by deduplicating providers; job stores must not
-return a key for deletion while any unexpired successful job still references
-it.
+Each successful `put` must return an exclusive logical key owned by that job.
+Deduplicating providers may share physical bytes internally, but must expose a
+unique handle or reference-counted key so deleting one job cannot race with or
+remove another job's result.
 
 Database and artifact providers are selected separately. For example, SQLite
 state can be paired with S3-compatible storage, or PostgreSQL state with a

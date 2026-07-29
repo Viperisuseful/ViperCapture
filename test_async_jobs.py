@@ -1209,48 +1209,6 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.store.close()
 
-    async def test_shared_artifact_key_waits_for_every_live_job(self):
-        await self.store.start()
-        try:
-            now = datetime.now(UTC)
-            for index, expires_at in enumerate(
-                (
-                    now - timedelta(seconds=1),
-                    now + timedelta(minutes=5),
-                )
-            ):
-                job = JobRecord(
-                    id=str(uuid4()),
-                    request_id=f"shared-artifact-{index}",
-                    status="queued",
-                    payload=b"encrypted",
-                    attempt_count=0,
-                    available_at=now,
-                    queue_expires_at=now + timedelta(minutes=1),
-                    created_at=now + timedelta(microseconds=index),
-                )
-                await self.store.create(job, active_limit=1)
-                await self.store.claim(now, self.settings.max_attempts)
-                await self.store.succeed(
-                    job.id,
-                    expected_attempt=1,
-                    artifact_key="shared-result",
-                    media_type="image/png",
-                    filename="capture.png",
-                    artifact_bytes=3,
-                    result_expires_at=expires_at,
-                    queue_ms=0,
-                )
-
-            first = await self.store.maintain(now)
-            self.assertNotIn("shared-result", first)
-
-            second = await self.store.maintain(now + timedelta(minutes=6))
-            self.assertIn("shared-result", second)
-        finally:
-            await self.store.close()
-
-
 class ProviderLoadingTests(unittest.TestCase):
     def test_generated_local_key_is_private_and_restart_stable(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
@@ -1364,6 +1322,9 @@ class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
             None,
         )
         main.app.state.async_result_slots = asyncio.Semaphore(2)
+        self.request = SimpleNamespace(
+            is_disconnected=AsyncMock(return_value=False)
+        )
         self.service = SimpleNamespace(
             submit=AsyncMock(),
             get=AsyncMock(),
@@ -1423,7 +1384,7 @@ class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
         status = await main.read_render_job(self.job.id)
         self.assertEqual(status.status_code, 200)
         self.assertEqual(json.loads(status.body)["result"]["bytes"], 3)
-        result = await main.read_render_job_result(self.job.id)
+        result = await main.read_render_job_result(self.job.id, self.request)
         self.assertEqual(result.status_code, 200)
         body = b"".join([chunk async for chunk in result.body_iterator])
         self.assertEqual(body, b"png")
@@ -1451,9 +1412,9 @@ class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
         )
         main.app.state.async_result_slots = asyncio.Semaphore(1)
 
-        first = await main.read_render_job_result(self.job.id)
+        first = await main.read_render_job_result(self.job.id, self.request)
         second_task = asyncio.create_task(
-            main.read_render_job_result(self.job.id)
+            main.read_render_job_result(self.job.id, self.request)
         )
         await asyncio.sleep(0)
         self.assertFalse(second_task.done())
@@ -1467,6 +1428,32 @@ class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(first_body, b"png")
         self.assertEqual(second_body, b"png")
+
+    async def test_disconnected_result_waiter_does_not_load_artifact(self):
+        succeeded = self.job.__class__(
+            **{
+                **self.job.__dict__,
+                "status": "succeeded",
+                "payload": None,
+                "artifact_key": "external-key",
+                "media_type": "image/png",
+                "filename": "capture.png",
+                "artifact_bytes": 3,
+                "result_expires_at": datetime.now(UTC) + timedelta(minutes=5),
+                "completed_at": datetime.now(UTC),
+            }
+        )
+        self.service.get.return_value = succeeded
+        main.app.state.async_result_slots = asyncio.Semaphore(0)
+        request = SimpleNamespace(
+            is_disconnected=AsyncMock(return_value=True)
+        )
+
+        with self.assertRaises(RenderError) as error:
+            await main.read_render_job_result(self.job.id, request)
+
+        self.assertEqual(error.exception.code, "client_disconnected")
+        self.service.result.assert_not_awaited()
 
     async def test_missing_job_raises_stable_error(self):
         self.service.get.return_value = None
@@ -1487,7 +1474,7 @@ class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         with self.assertRaises(RenderError) as error:
-            await main.read_render_job_result(self.job.id)
+            await main.read_render_job_result(self.job.id, self.request)
         self.assertEqual(error.exception.code, "async_result_expired")
         self.assertEqual(error.exception.status_code, 410)
 
