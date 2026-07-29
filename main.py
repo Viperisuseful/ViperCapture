@@ -218,11 +218,13 @@ async def lifespan(app: FastAPI):
             app.state.async_jobs = service
         yield
     finally:
-        if app.state.async_jobs is not None:
-            await app.state.async_jobs.close()
-        with suppress(Exception):
-            await app.state.browser.close()
-        await playwright.stop()
+        try:
+            if app.state.async_jobs is not None:
+                await app.state.async_jobs.close()
+        finally:
+            with suppress(Exception):
+                await app.state.browser.close()
+            await playwright.stop()
 
 
 app = FastAPI(lifespan=lifespan)

@@ -1265,6 +1265,34 @@ class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
             main.app.state.capture_slots = original_slots
             main.app.state.browser = original_browser
 
+    async def test_provider_close_error_does_not_skip_browser_cleanup(self):
+        provider_error = RuntimeError("provider close failed")
+        service = SimpleNamespace(
+            start=AsyncMock(),
+            close=AsyncMock(side_effect=provider_error),
+        )
+        browser = SimpleNamespace(close=AsyncMock())
+        playwright = SimpleNamespace(stop=AsyncMock())
+        manager = SimpleNamespace(start=AsyncMock(return_value=playwright))
+        test_app = SimpleNamespace(state=SimpleNamespace())
+
+        with (
+            patch("main.async_playwright", return_value=manager),
+            patch("main._launch_browser", AsyncMock(return_value=browser)),
+            patch("main._detect_hardware_gpu", AsyncMock(return_value=False)),
+            patch("main.ASYNC_JOBS_ENABLED", True),
+            patch("main.ASYNC_JOB_SETTINGS", _settings(Path("."))),
+            patch("main.load_providers", return_value=(object(), object())),
+            patch("main.AsyncJobService", return_value=service),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "provider close failed"):
+                async with main.lifespan(test_app):
+                    pass
+
+        service.close.assert_awaited_once()
+        browser.close.assert_awaited_once()
+        playwright.stop.assert_awaited_once()
+
     def test_openapi_exposes_complete_job_surface(self):
         paths = main.app.openapi()["paths"]
         self.assertIn("/v1/jobs", paths)
