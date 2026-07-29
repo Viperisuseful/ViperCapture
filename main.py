@@ -421,6 +421,7 @@ async def _check_captcha(
 
 
 async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
+    started = time.perf_counter()
     await app.state.capture_slots.acquire()
     browser: Browser = app.state.browser
     engine = RenderEngine(
@@ -428,7 +429,6 @@ async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
         challenge_checker=_check_captcha,
         browser_replacer=lambda failed: _replace_browser(app, failed),
     )
-    started = time.perf_counter()
     try:
         artifact = await engine.render_image(
             browser,

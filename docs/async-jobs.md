@@ -82,7 +82,9 @@ The adapter owns its client library, schema, connections, and migrations.
 the database's row-locking or compare-and-swap primitive. Terminal operations
 must erase the encrypted payload. `succeed` must return the existing successful
 record when retried with identical arguments, because a commit acknowledgement
-can be lost. `requeue_running` supplies restart recovery without exceeding its
+can be lost. `fail` must likewise accept an identical retry of an existing
+failed record; conflicting terminal transitions should raise `JobConflictError`.
+`requeue_running` supplies restart recovery without exceeding its
 `max_attempts` argument. `maintain` returns expired artifact keys for deletion
 and must preserve successful metadata and artifacts until `result_expires_at`,
 even when the metadata TTL is shorter. `requeue` must be idempotent because

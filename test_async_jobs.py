@@ -725,6 +725,36 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fail_calls, 2)
         job_store.requeue.assert_not_awaited()
 
+    async def test_sqlite_failure_transition_is_idempotent(self):
+        await self.store.start()
+        try:
+            now = datetime.now(UTC)
+            job = JobRecord(
+                id=str(uuid4()),
+                request_id="idempotent-failure",
+                status="queued",
+                payload=b"encrypted",
+                attempt_count=0,
+                available_at=now,
+                queue_expires_at=now + timedelta(minutes=1),
+                created_at=now,
+            )
+            await self.store.create(job, active_limit=1)
+            await self.store.claim(now)
+            arguments = {
+                "code": "invalid_target",
+                "message": "The target cannot be rendered.",
+                "retryable": False,
+                "now": now,
+            }
+            await self.store.fail(job.id, **arguments)
+            await self.store.fail(job.id, **arguments)
+            current = await self.store.get(job.id, now)
+            self.assertEqual(current.status, "failed")
+            self.assertEqual(current.error_code, "invalid_target")
+        finally:
+            await self.store.close()
+
     async def test_expired_artifact_key_remains_until_deletion_acknowledged(self):
         await self.store.start()
         try:
@@ -956,6 +986,36 @@ class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
             await main.read_render_job_result(self.job.id)
         self.assertEqual(error.exception.code, "async_result_expired")
         self.assertEqual(error.exception.status_code, 410)
+
+    async def test_async_render_timing_includes_capture_slot_wait(self):
+        original_slots = getattr(main.app.state, "capture_slots", None)
+        original_browser = getattr(main.app.state, "browser", None)
+        main.app.state.capture_slots = asyncio.Semaphore(0)
+        main.app.state.browser = SimpleNamespace()
+        try:
+            with (
+                patch("main.time.perf_counter", side_effect=[10.0, 10.25])
+                as clock,
+                patch("main.RenderEngine") as engine_class,
+            ):
+                engine_class.return_value.render_image = AsyncMock(
+                    return_value=SimpleNamespace(
+                        body=b"png",
+                        media_type="image/png",
+                        filename="capture.png",
+                    )
+                )
+                rendering = asyncio.create_task(
+                    main._render_async_image(_payload())
+                )
+                await asyncio.sleep(0)
+                self.assertEqual(clock.call_count, 1)
+                main.app.state.capture_slots.release()
+                rendered = await asyncio.wait_for(rendering, timeout=1)
+            self.assertEqual(rendered.render_ms, 250)
+        finally:
+            main.app.state.capture_slots = original_slots
+            main.app.state.browser = original_browser
 
     def test_openapi_exposes_complete_job_surface(self):
         paths = main.app.openapi()["paths"]

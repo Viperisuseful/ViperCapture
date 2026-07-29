@@ -386,17 +386,50 @@ class SQLiteJobStore:
         retryable: bool,
         now: datetime,
     ) -> None:
-        await self._run(
-            lambda connection: connection.execute(
+        def operation(connection: sqlite3.Connection) -> None:
+            code_value = code[:64]
+            message_value = message[:256]
+            updated = connection.execute(
                 """
                 UPDATE async_jobs
                 SET status = 'failed', payload = NULL, completed_at = ?,
                     error_code = ?, error_message = ?, error_retryable = ?
                 WHERE id = ? AND status IN ('queued', 'running')
                 """,
-                (_epoch(now), code[:64], message[:256], retryable, job_id),
+                (
+                    _epoch(now),
+                    code_value,
+                    message_value,
+                    retryable,
+                    job_id,
+                ),
             )
-        )
+            if updated.rowcount == 1:
+                return
+            existing = connection.execute(
+                "SELECT * FROM async_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            expected = (
+                code_value,
+                message_value,
+                bool(retryable),
+                _epoch(now),
+            )
+            actual = (
+                (
+                    existing["error_code"],
+                    existing["error_message"],
+                    bool(existing["error_retryable"]),
+                    existing["completed_at"],
+                )
+                if existing is not None and existing["status"] == "failed"
+                else None
+            )
+            if actual != expected:
+                raise JobConflictError
+
+        await self._run(operation)
 
     async def requeue_running(
         self,
