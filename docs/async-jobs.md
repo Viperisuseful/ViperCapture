@@ -91,7 +91,10 @@ must never settle a different attempt. `succeed` must return the existing
 successful record when retried with identical arguments, because a commit
 acknowledgement can be lost. `fail` must likewise accept an identical retry of
 an existing failed record; conflicting terminal transitions should raise
-`JobConflictError`.
+`JobConflictError`. The state provider assigns `completed_at` when the terminal
+transition commits and derives successful `render_ms` from the preserved first
+`started_at`, so state-transition retries are included without changing the
+arguments used for an idempotent retry.
 `requeue_running` supplies restart recovery without exceeding its
 `max_attempts` argument. `maintain` returns expired artifact keys for deletion
 and must preserve successful metadata and artifacts until `result_expires_at`,

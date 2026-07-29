@@ -326,10 +326,21 @@ class SQLiteJobStore:
         artifact_bytes: int,
         result_expires_at: datetime,
         queue_ms: int,
-        render_ms: int,
-        now: datetime,
     ) -> JobRecord:
         def operation(connection: sqlite3.Connection) -> JobRecord:
+            current = datetime.now(UTC).timestamp()
+            running = connection.execute(
+                """
+                SELECT started_at FROM async_jobs
+                WHERE id = ? AND status = 'running' AND attempt_count = ?
+                """,
+                (job_id, expected_attempt),
+            ).fetchone()
+            render_ms = (
+                max(0, round((current - running["started_at"]) * 1000))
+                if running is not None and running["started_at"] is not None
+                else 0
+            )
             updated = connection.execute(
                 """
                 UPDATE async_jobs
@@ -348,7 +359,7 @@ class SQLiteJobStore:
                     _epoch(result_expires_at),
                     queue_ms,
                     render_ms,
-                    _epoch(now),
+                    current,
                     job_id,
                     expected_attempt,
                 ),
@@ -365,8 +376,6 @@ class SQLiteJobStore:
                     artifact_bytes,
                     _epoch(result_expires_at),
                     queue_ms,
-                    render_ms,
-                    _epoch(now),
                 )
                 actual = (
                     (
@@ -376,8 +385,6 @@ class SQLiteJobStore:
                         existing["artifact_bytes"],
                         existing["result_expires_at"],
                         existing["queue_ms"],
-                        existing["render_ms"],
-                        existing["completed_at"],
                     )
                     if (
                         existing is not None
@@ -405,11 +412,11 @@ class SQLiteJobStore:
         code: str,
         message: str,
         retryable: bool,
-        now: datetime,
     ) -> None:
         def operation(connection: sqlite3.Connection) -> None:
             code_value = code[:64]
             message_value = message[:256]
+            completed_at = datetime.now(UTC).timestamp()
             updated = connection.execute(
                 """
                 UPDATE async_jobs
@@ -418,7 +425,7 @@ class SQLiteJobStore:
                 WHERE id = ? AND status = 'running' AND attempt_count = ?
                 """,
                 (
-                    _epoch(now),
+                    completed_at,
                     code_value,
                     message_value,
                     retryable,
@@ -436,14 +443,12 @@ class SQLiteJobStore:
                 code_value,
                 message_value,
                 bool(retryable),
-                _epoch(now),
             )
             actual = (
                 (
                     existing["error_code"],
                     existing["error_message"],
                     bool(existing["error_retryable"]),
-                    existing["completed_at"],
                 )
                 if (
                     existing is not None

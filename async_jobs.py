@@ -131,8 +131,6 @@ class JobStore(Protocol):
         artifact_bytes: int,
         result_expires_at: datetime,
         queue_ms: int,
-        render_ms: int,
-        now: datetime,
     ) -> JobRecord: ...
     async def fail(
         self,
@@ -142,7 +140,6 @@ class JobStore(Protocol):
         code: str,
         message: str,
         retryable: bool,
-        now: datetime,
     ) -> None: ...
     async def requeue_running(
         self,
@@ -343,7 +340,9 @@ class AsyncJobService:
         self.artifact_store = artifact_store
         self.renderer = renderer
         self.cipher = cipher or PayloadCipher.for_data_dir(settings.data_dir)
-        self._wakeup = asyncio.Event()
+        self._wakeups = [
+            asyncio.Event() for _ in range(settings.worker_count)
+        ]
         self._workers: list[asyncio.Task] = []
         self._closing = False
         self._maintenance_lock = asyncio.Lock()
@@ -415,7 +414,7 @@ class AsyncJobService:
                 {"limit": self.settings.queue_limit},
                 {"Retry-After": "5"},
             ) from exc
-        self._wakeup.set()
+        self._wake_workers()
         return stored
 
     async def get(self, job_id: str) -> JobRecord | None:
@@ -483,11 +482,12 @@ class AsyncJobService:
             return False
 
     async def _worker(self, _index: int) -> None:
+        wakeup = self._wakeups[_index]
         try:
             while True:
                 if self._closing:
                     return
-                self._wakeup.clear()
+                wakeup.clear()
                 try:
                     await self._maintain()
                     job = await self.job_store.claim(
@@ -504,7 +504,7 @@ class AsyncJobService:
                 if job is None:
                     try:
                         await asyncio.wait_for(
-                            self._wakeup.wait(),
+                            wakeup.wait(),
                             timeout=self.settings.poll_seconds,
                         )
                     except TimeoutError:
@@ -532,7 +532,11 @@ class AsyncJobService:
                 datetime.now(UTC),
             ),
         )
-        self._wakeup.set()
+        self._wake_workers()
+
+    def _wake_workers(self) -> None:
+        for wakeup in self._wakeups:
+            wakeup.set()
 
     async def _retry_state_transition(
         self,
@@ -600,15 +604,6 @@ class AsyncJobService:
                         artifact_bytes=len(rendered.body),
                         result_expires_at=result_expires_at,
                         queue_ms=queue_ms,
-                        render_ms=max(
-                            0,
-                            round(
-                                (now - job.started_at).total_seconds() * 1000
-                            )
-                            if job.started_at
-                            else rendered.render_ms,
-                        ),
-                        now=now,
                     )
                 )
             )
@@ -657,11 +652,10 @@ class AsyncJobService:
                     code=code,
                     message=message,
                     retryable=retryable,
-                    now=now,
                 ),
             )
         finally:
-            self._wakeup.set()
+            self._wake_workers()
 
 
 def public_job_document(job: JobRecord) -> dict[str, object]:

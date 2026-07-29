@@ -316,8 +316,6 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
                     artifact_bytes=3,
                     result_expires_at=now + timedelta(minutes=1),
                     queue_ms=0,
-                    render_ms=1,
-                    now=now,
                 )
             with self.assertRaises(JobConflictError):
                 await self.store.fail(
@@ -326,7 +324,6 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
                     code="stale_failure",
                     message="A stale attempt failed.",
                     retryable=False,
-                    now=now,
                 )
 
             current = await self.store.get(job.id, now)
@@ -523,8 +520,6 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
                 artifact_bytes=3,
                 result_expires_at=now + timedelta(minutes=5),
                 queue_ms=0,
-                render_ms=1,
-                now=completed_at,
             )
 
             expired_keys = await store.maintain(now)
@@ -716,47 +711,53 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("expires_at", artifact_store.put.await_args.kwargs)
 
-    async def test_success_timing_includes_prior_attempts_and_backoff(self):
-        now = datetime.now(UTC)
-        job_store = SimpleNamespace(
-            succeed=AsyncMock(),
-            requeue=AsyncMock(),
-            fail=AsyncMock(),
+    async def test_success_timing_includes_settlement_retries(self):
+        class DelayedSuccessStore(SQLiteJobStore):
+            succeed_calls = 0
+            first_failure_at = None
+
+            async def succeed(self, *args, **kwargs):
+                self.succeed_calls += 1
+                if self.succeed_calls == 1:
+                    await asyncio.sleep(0.02)
+                    self.first_failure_at = datetime.now(UTC)
+                    raise RuntimeError("temporary settlement outage")
+                return await super().succeed(*args, **kwargs)
+
+        settings = _settings(self.root, poll_seconds=0.001)
+        store = DelayedSuccessStore(
+            JobStoreConfig(self.root, settings.metadata_ttl)
         )
-        artifact_store = SimpleNamespace(
-            put=AsyncMock(
-                return_value=StoredArtifact(
-                    "retried-result",
-                    now + self.settings.result_ttl,
-                )
-            ),
-            delete=AsyncMock(),
+        artifacts = LocalArtifactStore(
+            ArtifactStoreConfig(self.root, settings.result_ttl)
         )
         service = AsyncJobService(
-            self.settings,
-            job_store,
-            artifact_store,
+            settings,
+            store,
+            artifacts,
             _successful_renderer,
         )
-        job_id = str(uuid4())
-        job = JobRecord(
-            id=job_id,
-            request_id="retried-timing",
-            status="running",
-            payload=service.cipher.encrypt(job_id, _payload()),
-            attempt_count=2,
-            available_at=now,
-            queue_expires_at=now + timedelta(minutes=1),
-            created_at=now - timedelta(seconds=6),
-            started_at=now - timedelta(seconds=5),
-        )
+        await store.start()
+        await artifacts.start()
+        try:
+            job = await service.submit(
+                _payload(),
+                request_id="settlement-timing",
+            )
+            claimed = await store.claim(
+                datetime.now(UTC),
+                settings.max_attempts,
+            )
 
-        await service._process(job)
+            await service._process(claimed)
 
-        self.assertGreaterEqual(
-            job_store.succeed.await_args.kwargs["render_ms"],
-            5000,
-        )
+            current = await store.get(job.id, datetime.now(UTC))
+            self.assertEqual(store.succeed_calls, 2)
+            self.assertGreaterEqual(current.completed_at, store.first_failure_at)
+            self.assertGreaterEqual(current.render_ms, 20)
+        finally:
+            await artifacts.close()
+            await store.close()
 
     async def test_shutdown_leaves_final_attempt_for_startup_recovery(self):
         rendering = asyncio.Event()
@@ -810,7 +811,7 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
                 if self.injected_job is not None:
                     job, self.injected_job = self.injected_job, None
                     await self.create(job, active_limit=2)
-                    self.service._wakeup.set()
+                    self.service._wake_workers()
                     return None
                 return await super().claim(now, max_attempts)
 
@@ -846,6 +847,20 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(rendered.wait(), timeout=0.25)
         finally:
             await service.close()
+
+    async def test_workers_have_independent_wake_notifications(self):
+        service = AsyncJobService(
+            _settings(self.root, worker_count=2),
+            SimpleNamespace(),
+            SimpleNamespace(),
+            _successful_renderer,
+        )
+
+        service._wake_workers()
+        service._wakeups[0].clear()
+
+        self.assertFalse(service._wakeups[0].is_set())
+        self.assertTrue(service._wakeups[1].is_set())
 
     async def test_worker_retries_requeue_state_transition_error(self):
         recovered = asyncio.Event()
@@ -911,7 +926,7 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             job_store.fail.assert_not_awaited()
         finally:
             service._closing = True
-            service._wakeup.set()
+            service._wake_workers()
             await asyncio.wait_for(worker, timeout=1)
 
     async def test_nonretryable_failure_retries_fail_transition(self):
@@ -988,7 +1003,6 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
                 "code": "invalid_target",
                 "message": "The target cannot be rendered.",
                 "retryable": False,
-                "now": now,
             }
             await self.store.fail(job.id, **arguments)
             await self.store.fail(job.id, **arguments)
@@ -1026,8 +1040,6 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
                 artifact_bytes=3,
                 result_expires_at=now - timedelta(seconds=1),
                 queue_ms=0,
-                render_ms=1,
-                now=now - timedelta(seconds=1),
             )
             repeated = await self.store.succeed(
                 job.id,
@@ -1038,8 +1050,6 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
                 artifact_bytes=3,
                 result_expires_at=now - timedelta(seconds=1),
                 queue_ms=0,
-                render_ms=1,
-                now=now - timedelta(seconds=1),
             )
             self.assertEqual(repeated, succeeded)
 
