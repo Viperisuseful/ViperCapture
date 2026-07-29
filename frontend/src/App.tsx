@@ -14,6 +14,7 @@ import {
   RotateCcw,
   SlidersHorizontal,
   Sparkles,
+  Square,
   Sun,
   Zap,
 } from "lucide-react"
@@ -31,18 +32,36 @@ import {
 } from "@/components/ui/alert-dialog"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent } from "@/components/ui/card"
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
-import { Field, FieldDescription, FieldGroup, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field"
+import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { InputGroup, InputGroupAddon, InputGroupTextarea } from "@/components/ui/input-group"
+import { Progress } from "@/components/ui/progress"
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 
 type Output = "png" | "jpeg" | "webp"
-type Capture = { name: string; url: string; type: string }
+type Capture = {
+  name: string
+  url: string
+  type: string
+  width?: number
+  height?: number
+  sizeBytes: number
+  renderMs?: number
+  requestId?: string
+}
+type ActiveRun = { waitConditions: string; waitTimeout: number }
 type AppConfig = {
   max_screenshot_pixels?: number
   gpu?: { mode?: "off" | "auto" | "required"; hardware_active?: boolean; mutable?: boolean }
@@ -66,9 +85,110 @@ const providerNames: Record<string, string> = {
   datadome: "DataDome",
   unknown: "A page-level CAPTCHA",
 }
+const docsUrl = "https://github.com/Viperisuseful/ViperCapture/blob/master/docs/self-hosting.md"
+const blockedHeaderNames = new Set([
+  "connection", "content-length", "forwarded", "host", "keep-alive",
+  "proxy-authenticate", "proxy-authorization", "te", "trailer",
+  "transfer-encoding", "upgrade",
+])
+const blockedHeaderPrefixes = ["proxy-", "sec-", "x-forwarded-"]
+const headerNamePattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/
 
 function extension(output: Output) {
   return output === "jpeg" ? "jpg" : output
+}
+
+function formatBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`
+  const units = ["KiB", "MiB", "GiB"]
+  let value = bytes / 1024
+  let unit = units[0]
+  for (let index = 1; index < units.length && value >= 1024; index += 1) {
+    value /= 1024
+    unit = units[index]
+  }
+  return `${value.toFixed(value >= 10 ? 1 : 2)} ${unit}`
+}
+
+function formatDuration(milliseconds: number) {
+  return milliseconds < 1000
+    ? `${milliseconds} ms`
+    : `${(milliseconds / 1000).toFixed(milliseconds < 10_000 ? 2 : 1)} s`
+}
+
+function integerHeader(response: Response, name: string) {
+  const value = Number(response.headers.get(name))
+  return Number.isFinite(value) && value >= 0 ? Math.round(value) : undefined
+}
+
+function validateSelector(value: string) {
+  const selector = value.trim()
+  if (!selector) return null
+  if (selector.length > 2048) return "Selectors may contain at most 2,048 characters."
+  if (/::[a-z-]+/i.test(selector)) {
+    return "Pseudo-elements are unsupported. Select the element itself."
+  }
+  try {
+    document.createDocumentFragment().querySelector(selector)
+    return null
+  } catch {
+    return "Enter a valid CSS selector, such as main, #invoice, or .ready."
+  }
+}
+
+function parseCustomHeaders(value: string): {
+  headers: Record<string, string>
+  error: string | null
+} {
+  if (!value.trim()) return { headers: {}, error: null }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(value)
+  } catch {
+    return { headers: {}, error: 'Enter valid JSON, for example {"Accept-Language":"en-US"}.' }
+  }
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") {
+    return { headers: {}, error: "Custom headers must be a JSON object." }
+  }
+  const entries = Object.entries(parsed)
+  if (entries.length > 32) return { headers: {}, error: "Custom headers may contain at most 32 entries." }
+  const seenNames = new Set<string>()
+  let totalBytes = 0
+  for (const [name, headerValue] of entries) {
+    const lowered = name.toLowerCase()
+    if (!headerNamePattern.test(name) || new TextEncoder().encode(name).length > 128) {
+      return { headers: {}, error: `“${name}” is not a valid HTTP header name.` }
+    }
+    if (blockedHeaderNames.has(lowered) || blockedHeaderPrefixes.some((prefix) => lowered.startsWith(prefix))) {
+      return { headers: {}, error: `“${name}” is managed by ViperCapture and cannot be overridden.` }
+    }
+    if (seenNames.has(lowered)) {
+      return { headers: {}, error: `“${name}” duplicates another header name with different capitalization.` }
+    }
+    seenNames.add(lowered)
+    if (typeof headerValue !== "string") return { headers: {}, error: `The value for “${name}” must be text.` }
+    if (
+      new TextEncoder().encode(headerValue).length > 4096 ||
+      [...headerValue].some((character) => {
+        const code = character.charCodeAt(0)
+        return code < 32 || code === 127
+      })
+    ) {
+      return { headers: {}, error: `The value for “${name}” is too long or contains control characters.` }
+    }
+    totalBytes += new TextEncoder().encode(name).length + new TextEncoder().encode(headerValue).length + 4
+  }
+  if (totalBytes > 16 * 1024) return { headers: {}, error: "Custom headers may use at most 16 KiB." }
+  return { headers: Object.fromEntries(entries) as Record<string, string>, error: null }
+}
+
+function ResultMetric({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
+  return (
+    <div className="min-w-0">
+      <dt className="text-xs text-muted-foreground">{label}</dt>
+      <dd className={mono ? "mt-1 truncate font-mono text-xs" : "mt-1 text-sm font-medium"} title={value}>{value}</dd>
+    </div>
+  )
 }
 
 export default function App() {
@@ -79,6 +199,7 @@ export default function App() {
   const [height, setHeight] = useState(720)
   const [density, setDensity] = useState(1)
   const [fullPage, setFullPage] = useState(true)
+  const [preserveViewportWidth, setPreserveViewportWidth] = useState(false)
   const [selector, setSelector] = useState("")
   const [quality, setQuality] = useState(90)
   const [transparent, setTransparent] = useState(false)
@@ -94,10 +215,17 @@ export default function App() {
   const [gpuBusy, setGpuBusy] = useState(false)
   const [busy, setBusy] = useState(false)
   const [status, setStatus] = useState("Ready")
+  const [elapsedMs, setElapsedMs] = useState(0)
+  const [activeRun, setActiveRun] = useState<ActiveRun | null>(null)
+  const [headersTouched, setHeadersTouched] = useState(false)
+  const [selectorTouched, setSelectorTouched] = useState(false)
+  const [waitSelectorTouched, setWaitSelectorTouched] = useState(false)
   const [latest, setLatest] = useState<Capture | null>(null)
   const [history, setHistory] = useState<Capture[]>([])
   const [captchaWarning, setCaptchaWarning] = useState<CaptchaWarning | null>(null)
   const historyRef = useRef<Capture[]>([])
+  const abortControllerRef = useRef<AbortController | null>(null)
+  const captureStartedAtRef = useRef(0)
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", dark)
@@ -107,9 +235,19 @@ export default function App() {
     fetch("/app-config").then((response) => response.json()).then(setConfig).catch(() => null)
   }, [])
   useEffect(
-    () => () => historyRef.current.forEach((item) => URL.revokeObjectURL(item.url)),
+    () => () => {
+      abortControllerRef.current?.abort()
+      historyRef.current.forEach((item) => URL.revokeObjectURL(item.url))
+    },
     [],
   )
+  useEffect(() => {
+    if (!busy) return
+    const updateElapsed = () => setElapsedMs(performance.now() - captureStartedAtRef.current)
+    updateElapsed()
+    const timer = window.setInterval(updateElapsed, 250)
+    return () => window.clearInterval(timer)
+  }, [busy])
 
   const maxPixels = config?.max_screenshot_pixels ?? 50_000_000
   const gpuEnabled = config?.gpu?.mode !== "off"
@@ -122,6 +260,33 @@ export default function App() {
 
   const fits = (w: number, h: number, scale = density) =>
     w * h * scale * scale <= maxPixels
+  const headersValidation = useMemo(() => parseCustomHeaders(headers), [headers])
+  const selectorError = useMemo(() => validateSelector(selector), [selector])
+  const waitSelectorError = useMemo(() => validateSelector(waitSelector), [waitSelector])
+  const waitConditions = useMemo(() => {
+    const conditions = [
+      waitEvent === "domcontentloaded" ? "DOM readiness" : waitEvent === "networkidle" ? "network quiet" : "page load",
+      waitSelector.trim() ? `visible ${waitSelector.trim()}` : null,
+      waitText.trim() ? `text “${waitText.trim().slice(0, 48)}”` : null,
+      waitDelay > 0 ? `${waitDelay}s settle delay` : null,
+      fullPage && lazyLoad !== "none" ? `${lazyLoad} lazy-content scan` : null,
+    ].filter(Boolean)
+    return conditions.join(" → ")
+  }, [fullPage, lazyLoad, waitDelay, waitEvent, waitSelector, waitText])
+  const progressStage = useMemo(() => {
+    const elapsed = elapsedMs / 1000
+    const waitWindow = Math.min(Math.max(activeRun?.waitTimeout ?? 15, 5), 15)
+    if (elapsed < 1.5) return "Securing a render slot"
+    if (elapsed < 3.5) return "Opening the page"
+    if (elapsed < 3.5 + waitWindow) return `Waiting for ${activeRun?.waitConditions ?? "page readiness"}`
+    if (elapsed < 7 + waitWindow) return "Capturing the page"
+    if (elapsed < 10 + waitWindow) return "Finalizing the image"
+    return "Still working — this page needs a little longer"
+  }, [activeRun, elapsedMs])
+  const progressValue = Math.min(
+    92,
+    6 + (elapsedMs / Math.max(10_000, ((activeRun?.waitTimeout ?? 15) + 10) * 1000)) * 86,
+  )
 
   const reset = () => {
     setOutput("png")
@@ -129,6 +294,7 @@ export default function App() {
     setHeight(720)
     setDensity(1)
     setFullPage(true)
+    setPreserveViewportWidth(false)
     setSelector("")
     setQuality(90)
     setTransparent(false)
@@ -140,6 +306,9 @@ export default function App() {
     setWaitText("")
     setWaitTimeout(15)
     setHeaders("")
+    setHeadersTouched(false)
+    setSelectorTouched(false)
+    setWaitSelectorTouched(false)
   }
 
   const setGpu = async (enabled: boolean) => {
@@ -171,26 +340,20 @@ export default function App() {
   const capture = async (proceedOnCaptcha = false) => {
     if (!url.trim()) return toast.error("Enter a public website URL.")
     if (!fits(width, height)) return toast.error("The selected viewport and density exceed the server pixel limit.")
-    let customHeaders: Record<string, string> = {}
-    if (headers.trim()) {
-      try {
-        customHeaders = JSON.parse(headers)
-      } catch {
-        return toast.error("Custom headers must be a JSON object.")
-      }
-      if (!customHeaders || Array.isArray(customHeaders) || typeof customHeaders !== "object") {
-        return toast.error("Custom headers must be a JSON object.")
-      }
-      if (Object.values(customHeaders).some((value) => typeof value !== "string")) {
-        return toast.error("Every custom header value must be text.")
-      }
+    if (selectorError || waitSelectorError || headersValidation.error) {
+      setSelectorTouched(true)
+      setWaitSelectorTouched(true)
+      setHeadersTouched(true)
+      return toast.error("Fix the highlighted advanced settings before capturing.")
     }
+    const customHeaders = headersValidation.headers
     const normalized = /^https?:\/\//i.test(url.trim()) ? url.trim() : `https://${url.trim()}`
     const payload = {
       url: normalized,
       output,
       viewport: { width, height, device_scale_factor: density },
       full_page: selector ? false : fullPage,
+      preserve_viewport_width: !selector && fullPage && preserveViewportWidth,
       lazy_load: lazyLoad,
       selector: selector || null,
       image: {
@@ -208,6 +371,11 @@ export default function App() {
       },
       proceed_on_captcha: proceedOnCaptcha,
     }
+    const controller = new AbortController()
+    abortControllerRef.current = controller
+    captureStartedAtRef.current = performance.now()
+    setActiveRun({ waitConditions, waitTimeout })
+    setElapsedMs(0)
     setBusy(true)
     setStatus("Rendering")
     try {
@@ -215,18 +383,23 @@ export default function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
+        signal: controller.signal,
       })
+      const requestId = response.headers.get("x-request-id") ?? undefined
+      const renderMs = integerHeader(response, "x-vipercapture-render-ms")
+      const responseWidth = integerHeader(response, "x-vipercapture-width")
+      const responseHeight = integerHeader(response, "x-vipercapture-height")
       if (!response.ok) {
         const body = await response.json().catch(() => null)
-        const requestId = body?.error?.request_id ?? response.headers.get("x-request-id")
+        const failureRequestId = body?.error?.request_id ?? requestId
         if (response.status === 409 && body?.error?.code === "captcha_detected") {
           const provider = body?.error?.details?.provider ?? "unknown"
-          setCaptchaWarning({ provider: providerNames[provider] ?? provider, requestId })
+          setCaptchaWarning({ provider: providerNames[provider] ?? provider, requestId: failureRequestId })
           setStatus("Challenge detected")
           return
         }
         const message = body?.detail ?? body?.error?.message ?? `Capture failed (${response.status})`
-        throw new Error(requestId ? `${message} · Request ${requestId}` : message)
+        throw new Error(failureRequestId ? `${message} · Request ${failureRequestId}` : message)
       }
       const blob = await response.blob()
       const disposition = response.headers.get("content-disposition") ?? ""
@@ -242,6 +415,11 @@ export default function App() {
         name: serverName ?? `${host}_${Date.now()}.${extension(output)}`,
         url: URL.createObjectURL(blob),
         type: blob.type,
+        width: responseWidth,
+        height: responseHeight,
+        sizeBytes: blob.size,
+        renderMs,
+        requestId,
       }
       setLatest(item)
       setHistory((items) => {
@@ -253,12 +431,20 @@ export default function App() {
       setStatus("Complete")
       toast.success("Capture ready")
     } catch (error) {
-      setStatus("Failed")
-      toast.error(error instanceof Error ? error.message : "Capture failed")
+      if (error instanceof DOMException && error.name === "AbortError") {
+        setStatus("Cancelled")
+        toast("Capture cancelled")
+      } else {
+        setStatus("Failed")
+        toast.error(error instanceof Error ? error.message : "Capture failed")
+      }
     } finally {
+      if (abortControllerRef.current === controller) abortControllerRef.current = null
       setBusy(false)
     }
   }
+
+  const cancelCapture = () => abortControllerRef.current?.abort()
 
   return (
     <div className="min-h-svh bg-background text-foreground">
@@ -360,6 +546,12 @@ export default function App() {
                     <FieldLabel htmlFor="full-page"><span><span className="block">Full page</span><FieldDescription>Scroll and capture the document.</FieldDescription></span></FieldLabel>
                     <Switch id="full-page" checked={fullPage} onCheckedChange={(checked: boolean) => setFullPage(checked)} disabled={Boolean(selector)} />
                   </Field>
+                  {fullPage && !selector && (
+                    <Field orientation="horizontal">
+                      <FieldLabel htmlFor="preserve-width"><span><span className="block">Preserve viewport width</span><FieldDescription>Clip horizontal overflow while keeping the full page height.</FieldDescription></span></FieldLabel>
+                      <Switch id="preserve-width" checked={preserveViewportWidth} onCheckedChange={setPreserveViewportWidth} />
+                    </Field>
+                  )}
                 </FieldSet>
 
                 <FieldSet>
@@ -381,7 +573,11 @@ export default function App() {
                   </CollapsibleTrigger>
                   <CollapsibleContent className="pt-4">
                     <FieldGroup>
-                      <Field><FieldLabel htmlFor="selector">Element selector</FieldLabel><Input id="selector" value={selector} onChange={(event) => setSelector(event.target.value)} placeholder="main, #invoice" /></Field>
+                      <Field data-invalid={selectorTouched && Boolean(selectorError)}>
+                        <FieldLabel htmlFor="selector">Element selector · <a href={`${docsUrl}#selectors-and-waits`} target="_blank" rel="noreferrer">Docs</a></FieldLabel>
+                        <Input id="selector" value={selector} onChange={(event) => setSelector(event.target.value)} onBlur={() => setSelectorTouched(true)} placeholder="main, #invoice" aria-invalid={selectorTouched && Boolean(selectorError)} />
+                        {selectorTouched && <FieldError>{selectorError}</FieldError>}
+                      </Field>
                       <Field><FieldLabel>Lazy content loading</FieldLabel><Select value={lazyLoad} onValueChange={setLazyLoad}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="thorough">Thorough (default)</SelectItem><SelectItem value="adaptive">Adaptive (faster)</SelectItem><SelectItem value="none">None (fastest)</SelectItem></SelectGroup></SelectContent></Select></Field>
                       <div className="grid grid-cols-3 gap-3">
                         <Field><FieldLabel>Load event</FieldLabel><Select value={waitEvent} onValueChange={setWaitEvent}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="load">Load</SelectItem><SelectItem value="domcontentloaded">DOM ready</SelectItem><SelectItem value="networkidle">Network idle</SelectItem></SelectGroup></SelectContent></Select></Field>
@@ -389,13 +585,22 @@ export default function App() {
                         <Field><FieldLabel htmlFor="timeout">Timeout</FieldLabel><Input id="timeout" type="number" min={1} max={30} value={waitTimeout} onChange={(event) => setWaitTimeout(Number(event.target.value))} /></Field>
                       </div>
                       <div className="grid grid-cols-2 gap-3">
-                        <Field><FieldLabel htmlFor="wait-selector">Wait selector</FieldLabel><Input id="wait-selector" value={waitSelector} onChange={(event) => setWaitSelector(event.target.value)} placeholder=".ready" /></Field>
+                        <Field data-invalid={waitSelectorTouched && Boolean(waitSelectorError)}>
+                          <FieldLabel htmlFor="wait-selector">Wait selector · <a href={`${docsUrl}#selectors-and-waits`} target="_blank" rel="noreferrer">Docs</a></FieldLabel>
+                          <Input id="wait-selector" value={waitSelector} onChange={(event) => setWaitSelector(event.target.value)} onBlur={() => setWaitSelectorTouched(true)} placeholder=".ready" aria-invalid={waitSelectorTouched && Boolean(waitSelectorError)} />
+                          {waitSelectorTouched && <FieldError>{waitSelectorError}</FieldError>}
+                        </Field>
                         <Field><FieldLabel htmlFor="wait-text">Wait text</FieldLabel><Input id="wait-text" value={waitText} onChange={(event) => setWaitText(event.target.value)} placeholder="Loaded" /></Field>
                       </div>
                       {output !== "png" && <Field><FieldLabel htmlFor="quality">Image quality</FieldLabel><Input id="quality" type="number" min={1} max={100} value={quality} onChange={(event) => setQuality(Number(event.target.value))} /></Field>}
                       {output !== "jpeg" && <Field orientation="horizontal"><FieldLabel htmlFor="transparent">Transparent background</FieldLabel><Switch id="transparent" checked={transparent} onCheckedChange={setTransparent} /></Field>}
                       {output === "png" && <Field orientation="horizontal"><FieldLabel htmlFor="optimize-png"><span><span className="block">Fast PNG encoding</span><FieldDescription>Uses less encoding work, with a larger file.</FieldDescription></span></FieldLabel><Switch id="optimize-png" checked={optimizePng} onCheckedChange={setOptimizePng} /></Field>}
-                      <Field><FieldLabel htmlFor="headers">Same-origin headers</FieldLabel><Input id="headers" value={headers} onChange={(event) => setHeaders(event.target.value)} placeholder={'{"Authorization":"Bearer …"}'} /><FieldDescription>Sent only to the exact target origin.</FieldDescription></Field>
+                      <Field data-invalid={headersTouched && Boolean(headersValidation.error)}>
+                        <FieldLabel htmlFor="headers">Same-origin headers · <a href={`${docsUrl}#custom-headers`} target="_blank" rel="noreferrer">Docs</a></FieldLabel>
+                        <Input id="headers" value={headers} onChange={(event) => setHeaders(event.target.value)} onBlur={() => setHeadersTouched(true)} placeholder={'{"Authorization":"Bearer …"}'} aria-invalid={headersTouched && Boolean(headersValidation.error)} />
+                        <FieldDescription>Sent only to the exact target origin.</FieldDescription>
+                        {headersTouched && <FieldError>{headersValidation.error}</FieldError>}
+                      </Field>
                     </FieldGroup>
                   </CollapsibleContent>
                 </Collapsible>
@@ -409,21 +614,51 @@ export default function App() {
               </div>
               <div className="subtle-grid flex min-h-[420px] flex-1 items-center justify-center overflow-hidden rounded-xl border bg-muted/20 p-4">
                 {busy ? (
-                  <div className="text-center"><Loader2 className="mx-auto size-8 animate-spin text-primary" /><p className="mt-3 text-sm text-muted-foreground">Loading and rendering…</p></div>
+                  <Card className="w-full max-w-md text-center" aria-live="polite">
+                    <CardHeader>
+                      <Loader2 className="mx-auto size-8 animate-spin text-primary" />
+                      <CardTitle>{progressStage}</CardTitle>
+                      <CardDescription>{formatDuration(Math.round(elapsedMs))} elapsed · live estimate</CardDescription>
+                    </CardHeader>
+                    <CardContent className="flex flex-col gap-4 text-left">
+                      <Progress value={progressValue} aria-label="Estimated capture progress" />
+                      <div className="rounded-lg border bg-muted/30 p-3">
+                        <p className="text-xs font-medium">Active wait plan</p>
+                        <p className="mt-1 text-xs leading-5 text-muted-foreground">{activeRun?.waitConditions ?? waitConditions}</p>
+                      </div>
+                    </CardContent>
+                    <CardFooter className="justify-center">
+                      <Button variant="outline" onClick={cancelCapture}>
+                        <Square data-icon="inline-start" />
+                        Cancel capture
+                      </Button>
+                    </CardFooter>
+                  </Card>
                 ) : latest ? (
                   <img src={latest.url} alt="Latest ViperCapture result" className="max-h-[580px] max-w-full rounded-lg border bg-background object-contain shadow-xl" />
                 ) : (
                   <div className="max-w-sm text-center"><div className="mx-auto flex size-12 items-center justify-center rounded-xl border bg-background"><ImageIcon className="size-5 text-muted-foreground" /></div><p className="mt-4 font-medium">Your capture will appear here</p><p className="mt-1 text-sm leading-6 text-muted-foreground">Choose a URL and capture settings, then run the renderer.</p></div>
                 )}
               </div>
-              {latest && (
-                <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
-                  <div className="min-w-0"><p className="truncate text-sm font-medium">{latest.name}</p><p className="text-xs text-muted-foreground">{latest.type}</p></div>
-                  <div className="flex gap-2">
+              {latest && !busy && (
+                <Card className="mt-4">
+                  <CardHeader>
+                    <CardTitle className="truncate text-base">{latest.name}</CardTitle>
+                    <CardDescription>{latest.type || output.toUpperCase()}</CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <dl className="grid grid-cols-2 gap-4 xl:grid-cols-4">
+                      <ResultMetric label="Dimensions" value={latest.width && latest.height ? `${latest.width} × ${latest.height} px` : "Not reported"} />
+                      <ResultMetric label="File size" value={formatBytes(latest.sizeBytes)} />
+                      <ResultMetric label="Render duration" value={latest.renderMs === undefined ? "Not reported" : formatDuration(latest.renderMs)} />
+                      <ResultMetric label="Request ID" value={latest.requestId ?? "Not reported"} mono />
+                    </dl>
+                  </CardContent>
+                  <CardFooter className="justify-end gap-2">
                     <Button variant="outline" size="sm" asChild><a href={latest.url} target="_blank" rel="noreferrer"><ExternalLink data-icon="inline-start" />Open</a></Button>
                     <Button size="sm" asChild><a href={latest.url} download={latest.name}><Download data-icon="inline-start" />Download</a></Button>
-                  </div>
-                </div>
+                  </CardFooter>
+                </Card>
               )}
               {history.length > 1 && (
                 <div className="mt-5 border-t pt-4">

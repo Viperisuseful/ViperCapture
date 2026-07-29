@@ -118,6 +118,61 @@ def ensure_dimensions(width: float, height: float, scale: float, limits: RenderL
         raise RenderError("pixel_limit_exceeded", "The requested output exceeds the pixel limit.", 413, False)
 
 
+def ensure_full_page_dimensions(
+    width: float,
+    height: float,
+    scale: float,
+    limits: RenderLimits,
+    *,
+    viewport_width: float | None = None,
+) -> None:
+    """Validate scroll captures without treating viewport height as page height."""
+    output_width = math.ceil(width * scale)
+    output_height = math.ceil(height * scale)
+    if output_width > max(limits.max_width, limits.max_height):
+        details: dict[str, object] = {
+            "max_width": limits.max_width,
+            "max_height": limits.max_height,
+        }
+        if viewport_width is not None and width > viewport_width:
+            details.update({
+                "page_width": math.ceil(width),
+                "viewport_width": math.ceil(viewport_width),
+                "suggested_action": "preserve_viewport_width",
+            })
+        raise RenderError(
+            "output_dimensions_exceeded",
+            "This page is wider than the configured output limit.",
+            413,
+            False,
+            details,
+        )
+    if height > limits.max_full_page_height:
+        raise RenderError(
+            "page_too_tall",
+            "The page is too tall to capture safely.",
+            413,
+            False,
+            {"max_full_page_height": limits.max_full_page_height},
+        )
+    if output_width * output_height > limits.max_pixels:
+        raise RenderError(
+            "pixel_limit_exceeded",
+            "The requested output exceeds the pixel limit.",
+            413,
+            False,
+            {"max_pixels": limits.max_pixels},
+        )
+
+
+async def measure_page_dimensions(page: Page) -> tuple[float, float]:
+    dimensions = await page.evaluate("""() => ({
+        width: Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth || 0),
+        height: Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0)
+    })""")
+    return float(dimensions["width"]), float(dimensions["height"])
+
+
 async def load_lazy_content(
     page: Page,
     viewport_height: int,
@@ -130,24 +185,34 @@ async def load_lazy_content(
         if mode is LazyLoadMode.ADAPTIVE
         else (40, 0.2, 0.8)
     )
+    scroll = "(y) => window.scrollTo({ top: y, left: 0, behavior: 'instant' })"
+    document_height = """Math.max(
+        document.documentElement.scrollHeight,
+        document.documentElement.offsetHeight,
+        document.body?.scrollHeight || 0,
+        document.body?.offsetHeight || 0
+    )"""
+    step = max(1, math.ceil(viewport_height * step_ratio))
     position = 0
-    stable = 0
+    stable_bottom_checks = 0
+    await page.evaluate(scroll, 0)
     try:
         for _ in range(max_steps):
-            height = math.ceil(await page.evaluate("Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0)"))
+            height = math.ceil(await page.evaluate(document_height))
             bottom = max(0, height - viewport_height)
             if position >= bottom:
-                stable += 1
-                if stable >= 2:
+                stable_bottom_checks += 1
+                if stable_bottom_checks >= 2:
                     break
             else:
-                position = min(position + max(1, math.ceil(viewport_height * step_ratio)), bottom)
-                stable = 0
-            await page.evaluate("y => window.scrollTo(0, y)", position)
+                position = min(position + step, bottom)
+                stable_bottom_checks = 0
+            await page.evaluate(scroll, position)
             await asyncio.sleep(delay)
     finally:
         with suppress(Exception):
-            await page.evaluate("window.scrollTo(0, 0)")
+            await page.evaluate(scroll, 0)
+            await asyncio.sleep(0.2)
 
 
 async def capture_cdp_image(
@@ -217,6 +282,42 @@ async def capture_cdp_image(
             await session.detach()
 
 
+async def capture_clipped_image(
+    page: Page,
+    *,
+    output: OutputFormat,
+    clip: dict[str, float],
+    quality: int | None,
+    transparent: bool,
+) -> bytes:
+    """Capture a tall explicit clip beyond the visible viewport."""
+    session = await page.context.new_cdp_session(page)
+    try:
+        with suppress(Exception):
+            await page.evaluate("() => document.getAnimations().forEach(a => a.pause())")
+        if transparent:
+            await session.send(
+                "Emulation.setDefaultBackgroundColorOverride",
+                {"color": {"r": 0, "g": 0, "b": 0, "a": 0}},
+            )
+        options: dict[str, object] = {
+            "format": output.value,
+            "fromSurface": True,
+            "captureBeyondViewport": True,
+            "clip": clip,
+        }
+        if output is OutputFormat.JPEG:
+            options["quality"] = quality if quality is not None else 80
+        result = await session.send("Page.captureScreenshot", options)
+        return b64decode(result["data"])
+    finally:
+        if transparent:
+            with suppress(Exception):
+                await session.send("Emulation.setDefaultBackgroundColorOverride")
+        with suppress(Exception):
+            await session.detach()
+
+
 class RenderEngine:
     def __init__(self, *, hosted: bool,
                  challenge_checker: Callable[[Page, bool, int | None], Awaitable[None]] | None = None,
@@ -273,6 +374,15 @@ class RenderEngine:
                 if self.challenge_checker:
                     await self.challenge_checker(page, request.proceed_on_captcha, navigation.status if navigation else None)
                 if request.full_page:
+                    if not request.preserve_viewport_width:
+                        page_width, _ = await measure_page_dimensions(page)
+                        ensure_full_page_dimensions(
+                            max(page_width, request.viewport.width),
+                            1,
+                            request.viewport.device_scale_factor,
+                            limits,
+                            viewport_width=request.viewport.width,
+                        )
                     await load_lazy_content(
                         page,
                         request.viewport.height,
@@ -292,16 +402,28 @@ class RenderEngine:
                 else:
                     width, height = request.viewport.width, request.viewport.height
                     if request.full_page:
-                        size = await page.evaluate("() => ({width: Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth || 0), height: Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0)})")
-                        width, height = max(float(size["width"]), width), max(float(size["height"]), height)
-                        if height > limits.max_full_page_height:
-                            raise RenderError("page_too_tall", "The page is too tall to capture safely.", 413, False)
-                        ensure_dimensions(width, height, request.viewport.device_scale_factor, limits)
+                        page_width, page_height = await measure_page_dimensions(page)
+                        width = (
+                            request.viewport.width
+                            if request.preserve_viewport_width
+                            else max(page_width, request.viewport.width)
+                        )
+                        height = max(page_height, request.viewport.height)
+                        ensure_full_page_dimensions(
+                            width,
+                            height,
+                            request.viewport.device_scale_factor,
+                            limits,
+                            viewport_width=request.viewport.width,
+                        )
                 if (
                     request.output is OutputFormat.WEBP
                     or (
                         request.output is OutputFormat.PNG
-                        and request.image.optimize_for_speed
+                        and (
+                            request.image.optimize_for_speed
+                            or (request.full_page and request.preserve_viewport_width)
+                        )
                     )
                 ):
                     scroll = (
@@ -338,13 +460,36 @@ class RenderEngine:
                     )
                 elif request.selector:
                     image = await locator.screenshot(**options)
+                elif request.full_page and request.preserve_viewport_width:
+                    image = await capture_clipped_image(
+                        page,
+                        output=request.output,
+                        clip={
+                            "x": 0,
+                            "y": 0,
+                            "width": float(width),
+                            "height": float(height),
+                            "scale": request.viewport.device_scale_factor,
+                        },
+                        quality=request.image.quality,
+                        transparent=request.image.transparent_background,
+                    )
                 else:
                     image = await page.screenshot(full_page=request.full_page, **options)
                 if not image:
                     raise RenderError("empty_output", "The renderer produced an empty image.", 502, True)
                 if len(image) > limits.output_bytes:
                     raise RenderError("output_too_large", "The rendered image exceeds the output limit.", 413, False)
-                return RenderArtifact(image, MEDIA_TYPES[request.output], f"vipercapture.{EXTENSIONS[request.output]}", {"width": math.ceil(width), "height": math.ceil(height)})
+                return RenderArtifact(
+                    image,
+                    MEDIA_TYPES[request.output],
+                    f"vipercapture.{EXTENSIONS[request.output]}",
+                    {
+                        "width": math.ceil(width * request.viewport.device_scale_factor),
+                        "height": math.ceil(height * request.viewport.device_scale_factor),
+                        "navigation_status": navigation.status if navigation else None,
+                    },
+                )
         except PlaywrightTimeoutError as exc:
             raise RenderError("wait_timeout", "A wait condition timed out.", 504, True) from exc
         except TimeoutError as exc:

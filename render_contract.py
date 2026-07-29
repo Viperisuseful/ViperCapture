@@ -102,6 +102,13 @@ class RenderRequest(StrictModel):
     output: OutputFormat = OutputFormat.PNG
     viewport: Viewport = Field(default_factory=Viewport)
     full_page: bool = True
+    preserve_viewport_width: bool = Field(
+        default=False,
+        description=(
+            "For full-page images, clip horizontal overflow to the requested "
+            "viewport width while preserving the full document height."
+        ),
+    )
     lazy_load: LazyLoadMode = LazyLoadMode.THOROUGH
     selector: str | None = Field(default=None, min_length=1, max_length=2_048)
     image: ImageOptions = Field(default_factory=ImageOptions)
@@ -116,6 +123,8 @@ class RenderRequest(StrictModel):
     def validate_contract(self) -> "RenderRequest":
         if self.selector is not None and self.full_page:
             raise ValueError("selector requires full_page=false")
+        if self.preserve_viewport_width and not self.full_page:
+            raise ValueError("preserve_viewport_width requires full_page=true")
         if self.image.quality is not None and self.output not in {
             OutputFormat.JPEG,
             OutputFormat.WEBP,
