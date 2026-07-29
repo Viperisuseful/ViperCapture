@@ -505,6 +505,26 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(sync.call_count, 4)
         await self.artifacts.close()
 
+    async def test_artifact_maintenance_removes_abandoned_temp_files(self):
+        await self.artifacts.start()
+        temporary = self.artifacts.root / ".abandoned.data.tmp"
+        temporary.write_bytes(b"partial")
+        old = datetime.now(UTC) - timedelta(hours=2)
+        os.utime(temporary, (old.timestamp(), old.timestamp()))
+
+        await self.artifacts.maintain(datetime.now(UTC))
+
+        self.assertFalse(temporary.exists())
+        await self.artifacts.close()
+
+    def test_artifact_directory_sync_is_skipped_on_windows(self):
+        with (
+            patch("async_job_providers.os.name", "nt"),
+            patch("async_job_providers.os.open") as open_file,
+        ):
+            self.artifacts._sync_directory()
+        open_file.assert_not_called()
+
     async def test_metadata_cleanup_preserves_live_successful_result(self):
         settings = _settings(self.root, metadata_ttl=timedelta(seconds=1))
         store = SQLiteJobStore(
@@ -1174,9 +1194,14 @@ class ProviderLoadingTests(unittest.TestCase):
         ):
             os.environ.pop("VIPERCAPTURE_JOB_SECRET", None)
             root = Path(directory)
-            with patch("async_jobs.os.fsync", wraps=os.fsync) as sync:
+            with (
+                patch("async_jobs.os.fsync", wraps=os.fsync) as sync,
+                patch("async_jobs.os.link", wraps=os.link) as link,
+            ):
                 first = PayloadCipher.for_data_dir(root)
             self.assertGreaterEqual(sync.call_count, 2)
+            link.assert_called_once()
+            self.assertEqual(list(root.glob(".async-jobs.key.*.tmp")), [])
             job_id = str(uuid4())
             encrypted = first.encrypt(job_id, _payload())
             second = PayloadCipher.for_data_dir(root)
@@ -1197,6 +1222,16 @@ class ProviderLoadingTests(unittest.TestCase):
             )
             mode = (root / "async-jobs.key").stat().st_mode & 0o777
             self.assertEqual(mode & 0o077, 0)
+
+    def test_key_directory_sync_is_skipped_on_windows(self):
+        with (
+            patch("async_jobs.os.name", "nt"),
+            patch("async_jobs.os.open") as open_file,
+        ):
+            from async_jobs import _sync_directory
+
+            _sync_directory(Path("."))
+        open_file.assert_not_called()
 
     def test_external_factories_receive_provider_specific_config(self):
         module = ModuleType("test_async_provider_module")
@@ -1257,6 +1292,12 @@ class ProviderLoadingTests(unittest.TestCase):
 
 class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        self.original_result_slots = getattr(
+            main.app.state,
+            "async_result_slots",
+            None,
+        )
+        main.app.state.async_result_slots = asyncio.Semaphore(2)
         self.service = SimpleNamespace(
             submit=AsyncMock(),
             get=AsyncMock(),
@@ -1278,6 +1319,7 @@ class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
 
     def tearDown(self):
         main.app.state.async_jobs = None
+        main.app.state.async_result_slots = self.original_result_slots
 
     async def test_submit_status_and_result_contract(self):
         self.service.submit.return_value = self.job
@@ -1317,7 +1359,48 @@ class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(status.body)["result"]["bytes"], 3)
         result = await main.read_render_job_result(self.job.id)
         self.assertEqual(result.status_code, 200)
-        self.assertEqual(result.body, b"png")
+        body = b"".join([chunk async for chunk in result.body_iterator])
+        self.assertEqual(body, b"png")
+
+    async def test_result_downloads_hold_a_concurrency_slot_while_streaming(self):
+        succeeded = self.job.__class__(
+            **{
+                **self.job.__dict__,
+                "status": "succeeded",
+                "payload": None,
+                "artifact_key": "external-key",
+                "media_type": "image/png",
+                "filename": "capture.png",
+                "artifact_bytes": 3,
+                "result_expires_at": datetime.now(UTC) + timedelta(minutes=5),
+                "completed_at": datetime.now(UTC),
+            }
+        )
+        self.service.get.return_value = succeeded
+        self.service.result.return_value = Artifact(
+            "external-key",
+            b"png",
+            "image/png",
+            "capture.png",
+        )
+        main.app.state.async_result_slots = asyncio.Semaphore(1)
+
+        first = await main.read_render_job_result(self.job.id)
+        second_task = asyncio.create_task(
+            main.read_render_job_result(self.job.id)
+        )
+        await asyncio.sleep(0)
+        self.assertFalse(second_task.done())
+
+        first_body = b"".join(
+            [chunk async for chunk in first.body_iterator]
+        )
+        second = await asyncio.wait_for(second_task, timeout=1)
+        second_body = b"".join(
+            [chunk async for chunk in second.body_iterator]
+        )
+        self.assertEqual(first_body, b"png")
+        self.assertEqual(second_body, b"png")
 
     async def test_missing_job_raises_stable_error(self):
         self.service.get.return_value = None

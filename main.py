@@ -12,7 +12,12 @@ from uuid import UUID
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from playwright.async_api import Browser, Playwright, async_playwright
 
@@ -84,6 +89,9 @@ if GPU_BACKEND not in {"default", "vulkan"}:
     raise ValueError("VIPERCAPTURE_GPU_BACKEND must be default or vulkan")
 MAX_CONCURRENT_CAPTURES = max(
     1, int(os.getenv("VIPERCAPTURE_MAX_CONCURRENCY", "1"))
+)
+MAX_ASYNC_RESULT_DOWNLOADS = max(
+    1, int(os.getenv("VIPERCAPTURE_ASYNC_RESULT_CONCURRENCY", "2"))
 )
 MAX_SCREENSHOT_PIXELS = max(
     1, int(os.getenv("VIPERCAPTURE_MAX_PIXELS", "50000000"))
@@ -201,6 +209,7 @@ async def lifespan(app: FastAPI):
     app.state.gpu_mode = GPU_MODE
     app.state.gpu_hardware_active = await _detect_hardware_gpu(browser, GPU_MODE)
     app.state.capture_slots = asyncio.Semaphore(MAX_CONCURRENT_CAPTURES)
+    app.state.async_result_slots = asyncio.Semaphore(MAX_ASYNC_RESULT_DOWNLOADS)
     app.state.browser_restart_lock = asyncio.Lock()
     app.state.async_jobs = None
     try:
@@ -605,16 +614,29 @@ async def read_render_job_result(job_id: UUID) -> Response:
             {"status": job.status},
             {"Retry-After": "1"} if job.status in {"queued", "running"} else None,
         )
-    artifact = await service.result(job)
+    slots = app.state.async_result_slots
+    await slots.acquire()
+    try:
+        artifact = await service.result(job)
+    except BaseException:
+        slots.release()
+        raise
     if artifact is None:
+        slots.release()
         raise RenderError(
             "async_result_expired",
             "The async job result is no longer available.",
             410,
             False,
         )
-    return Response(
-        artifact.body,
+    async def stream_body():
+        try:
+            yield artifact.body
+        finally:
+            slots.release()
+
+    return StreamingResponse(
+        stream_body(),
         media_type=artifact.media_type,
         headers={
             "Content-Disposition": f'attachment; filename="{artifact.filename}"',

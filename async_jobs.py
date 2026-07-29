@@ -106,6 +106,16 @@ class JobConflictError(Exception):
     pass
 
 
+def _sync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 @runtime_checkable
 class JobStore(Protocol):
     """Atomic durable state operations required from a database adapter."""
@@ -263,12 +273,10 @@ def _read_or_create_key(data_dir: Path) -> bytes:
         material = path.read_bytes()
     except FileNotFoundError:
         material = os.urandom(32)
+        temporary = data_dir / f".async-jobs.key.{uuid4().hex}.tmp"
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         try:
-            descriptor = os.open(path, flags, 0o600)
-        except FileExistsError:
-            material = path.read_bytes()
-        else:
+            descriptor = os.open(temporary, flags, 0o600)
             try:
                 view = memoryview(material)
                 while view:
@@ -277,11 +285,14 @@ def _read_or_create_key(data_dir: Path) -> bytes:
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
-            directory = os.open(data_dir, os.O_RDONLY)
             try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+                os.link(temporary, path)
+                _sync_directory(data_dir)
+            except FileExistsError:
+                material = path.read_bytes()
+        finally:
+            with suppress(FileNotFoundError):
+                temporary.unlink()
     if len(material) < 32:
         raise RuntimeError("async job key must contain at least 32 bytes")
     with suppress(OSError):

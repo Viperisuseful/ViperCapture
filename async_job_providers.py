@@ -740,6 +740,8 @@ class LocalArtifactStore:
             os.close(descriptor)
 
     def _sync_directory(self) -> None:
+        if os.name == "nt":
+            return
         descriptor = os.open(self.root, os.O_RDONLY)
         try:
             os.fsync(descriptor)
@@ -780,6 +782,18 @@ class LocalArtifactStore:
         await asyncio.to_thread(self._maintain, now)
 
     def _maintain(self, now: datetime) -> None:
+        oldest_temporary = now.timestamp() - max(
+            self.config.result_ttl.total_seconds(),
+            3600,
+        )
+        for temporary in self.root.glob(".*.tmp"):
+            try:
+                abandoned = temporary.stat().st_mtime <= oldest_temporary
+            except OSError:
+                continue
+            if abandoned:
+                with suppress(FileNotFoundError):
+                    temporary.unlink()
         for metadata_path in self.root.glob("*.json"):
             key = metadata_path.name[:-5]
             if not _SAFE_KEY.fullmatch(key):

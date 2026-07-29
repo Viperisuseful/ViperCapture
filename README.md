@@ -117,10 +117,11 @@ For work that should survive a client disconnect or application restart, submit
 the same request to `POST /v1/jobs`, poll its status, and download the result:
 
 ```bash
+capture_run="$(date -u +%Y-%m-%dT%H)"
 job_id="$(
   curl --fail-with-body --silent \
     --header 'Content-Type: application/json' \
-    --header 'X-Request-Id: nightly-homepage' \
+    --header "X-Request-Id: homepage-$capture_run" \
     --data '{"url":"https://example.com","full_page":false}' \
     http://127.0.0.1:8000/v1/jobs |
   python -c 'import json,sys; print(json.load(sys.stdin)["id"])'

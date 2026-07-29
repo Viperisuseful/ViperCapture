@@ -56,6 +56,7 @@ therefore includes failed attempts, retry backoff, and result persistence.
 | `VIPERCAPTURE_JOB_RESULT_TTL_SECONDS` | `3600` | Successful result lifetime |
 | `VIPERCAPTURE_JOB_METADATA_TTL_SECONDS` | `86400` | Terminal metadata lifetime |
 | `VIPERCAPTURE_JOB_MAX_ATTEMPTS` | `3` | Maximum attempts for retryable render failures |
+| `VIPERCAPTURE_ASYNC_RESULT_CONCURRENCY` | `2` | Maximum simultaneous async result streams |
 | `VIPERCAPTURE_JOB_STORE_FACTORY` | bundled SQLite | `module:function` database adapter factory |
 | `VIPERCAPTURE_ARTIFACT_STORE_FACTORY` | bundled filesystem | `module:function` artifact adapter factory |
 
@@ -115,6 +116,8 @@ continue returning the key.
 The service throttles queue and artifact maintenance to one shared run per
 process per polling interval, with a one-second minimum. Status polling
 therefore does not trigger a full provider scan for every request.
+The result endpoint holds a bounded download slot until its streaming response
+finishes, limiting memory retained by concurrent local-file downloads.
 
 The application encrypts the serialized request before calling `create` and
 decrypts it only after `claim`. Adapters must treat `JobRecord.payload` as
