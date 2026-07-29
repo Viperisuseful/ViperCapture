@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from datetime import datetime, timezone
 import json
 import os
@@ -66,7 +67,15 @@ class SQLiteJobStore:
         async with self._lock:
             if self._connection is None:
                 raise RuntimeError("SQLite job store is not started")
-            return await asyncio.to_thread(operation, self._connection, *args)
+            operation_task = asyncio.create_task(
+                asyncio.to_thread(operation, self._connection, *args)
+            )
+            try:
+                return await asyncio.shield(operation_task)
+            except asyncio.CancelledError:
+                with suppress(Exception):
+                    await asyncio.shield(operation_task)
+                raise
 
     @staticmethod
     def _initialize(connection: sqlite3.Connection) -> None:
@@ -356,7 +365,11 @@ class SQLiteJobStore:
             )
         )
 
-    async def requeue_running(self, now: datetime) -> int:
+    async def requeue_running(
+        self,
+        now: datetime,
+        max_attempts: int,
+    ) -> int:
         def operation(connection: sqlite3.Connection) -> int:
             current = _epoch(now)
             expired = connection.execute(
@@ -370,15 +383,28 @@ class SQLiteJobStore:
                 """,
                 (current, current),
             ).rowcount
+            exhausted = connection.execute(
+                """
+                UPDATE async_jobs
+                SET status = 'failed', payload = NULL, completed_at = ?,
+                    error_code = 'job_attempts_exhausted',
+                    error_message = 'The interrupted job exhausted its retry attempts.',
+                    error_retryable = 0
+                WHERE status = 'running' AND queue_expires_at > ?
+                  AND attempt_count >= ?
+                """,
+                (current, current, max_attempts),
+            ).rowcount
             requeued = connection.execute(
                 """
                 UPDATE async_jobs
                 SET status = 'queued', available_at = ?
                 WHERE status = 'running' AND queue_expires_at > ?
+                  AND attempt_count < ?
                 """,
-                (current, current),
+                (current, current, max_attempts),
             ).rowcount
-            return int(expired) + int(requeued)
+            return int(expired) + int(exhausted) + int(requeued)
 
         return await self._run(operation)
 
@@ -430,7 +456,7 @@ class SQLiteJobStore:
                       AND artifact_key IS NOT NULL
                     UNION
                     SELECT artifact_key FROM async_jobs
-                    WHERE status IN ('succeeded', 'failed', 'cancelled', 'expired')
+                    WHERE status IN ('failed', 'cancelled', 'expired')
                       AND completed_at < ? AND artifact_key IS NOT NULL
                     """,
                     (current, cutoff),
@@ -461,7 +487,7 @@ class SQLiteJobStore:
             connection.execute(
                 """
                 DELETE FROM async_jobs
-                WHERE status IN ('succeeded', 'failed', 'cancelled', 'expired')
+                WHERE status IN ('failed', 'cancelled', 'expired')
                   AND completed_at < ?
                 """,
                 (cutoff,),

@@ -6,6 +6,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 import unittest
@@ -219,6 +220,46 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await recovered.close()
 
+    async def test_restart_does_not_exceed_max_attempts(self):
+        settings = _settings(self.root, max_attempts=1)
+        await self.store.start()
+        await self.artifacts.start()
+        service = AsyncJobService(
+            settings,
+            self.store,
+            self.artifacts,
+            _successful_renderer,
+        )
+        job = await service.submit(_payload(), request_id="exhausted-restart")
+        claimed = await self.store.claim(datetime.now(UTC))
+        self.assertEqual(claimed.attempt_count, 1)
+        await self.artifacts.close()
+        await self.store.close()
+
+        recovered_store = SQLiteJobStore(
+            JobStoreConfig(self.root, settings.metadata_ttl)
+        )
+        recovered_artifacts = LocalArtifactStore(
+            ArtifactStoreConfig(self.root, settings.result_ttl)
+        )
+        renderer = AsyncMock(side_effect=_successful_renderer)
+        recovered = AsyncJobService(
+            settings,
+            recovered_store,
+            recovered_artifacts,
+            renderer,
+        )
+        await recovered.start()
+        try:
+            current = await recovered.get(job.id)
+            self.assertEqual(current.status, "failed")
+            self.assertEqual(current.attempt_count, 1)
+            self.assertEqual(current.error_code, "job_attempts_exhausted")
+            self.assertIsNone(current.payload)
+            renderer.assert_not_awaited()
+        finally:
+            await recovered.close()
+
     async def test_shutdown_requeues_playwright_style_close_error(self):
         rendering = asyncio.Event()
 
@@ -312,6 +353,125 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(data_path.exists())
         self.assertFalse(metadata_path.exists())
         await self.artifacts.close()
+
+    async def test_metadata_cleanup_preserves_live_successful_result(self):
+        settings = _settings(self.root, metadata_ttl=timedelta(seconds=1))
+        store = SQLiteJobStore(
+            JobStoreConfig(self.root, settings.metadata_ttl)
+        )
+        await store.start()
+        try:
+            now = datetime.now(UTC)
+            completed_at = now - timedelta(seconds=2)
+            job = JobRecord(
+                id=str(uuid4()),
+                request_id="live-result",
+                status="queued",
+                payload=b"encrypted",
+                attempt_count=0,
+                available_at=completed_at,
+                queue_expires_at=now + timedelta(minutes=1),
+                created_at=completed_at,
+            )
+            await store.create(job, active_limit=1)
+            await store.claim(completed_at)
+            await store.succeed(
+                job.id,
+                artifact_key="still-live",
+                media_type="image/png",
+                filename="capture.png",
+                artifact_bytes=3,
+                result_expires_at=now + timedelta(minutes=5),
+                queue_ms=0,
+                render_ms=1,
+                now=completed_at,
+            )
+
+            expired_keys = await store.maintain(now)
+            current = await store.get(job.id, now)
+            self.assertNotIn("still-live", expired_keys)
+            self.assertEqual(current.status, "succeeded")
+            self.assertEqual(current.artifact_key, "still-live")
+        finally:
+            await store.close()
+
+    async def test_cancelled_sqlite_call_keeps_lock_until_thread_finishes(self):
+        await self.store.start()
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocked_operation(_connection):
+            started.set()
+            release.wait(timeout=2)
+
+        operation = asyncio.create_task(self.store._run(blocked_operation))
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(started.wait),
+                timeout=1,
+            )
+            operation.cancel()
+            await asyncio.sleep(0)
+            close = asyncio.create_task(self.store.close())
+            await asyncio.sleep(0.02)
+            self.assertFalse(close.done())
+
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await operation
+            await asyncio.wait_for(close, timeout=1)
+        finally:
+            release.set()
+            if not operation.done():
+                operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
+            await self.store.close()
+
+    async def test_worker_does_not_lose_wakeup_between_claim_and_wait(self):
+        class InjectingStore(SQLiteJobStore):
+            injected_job = None
+            service = None
+
+            async def claim(self, now):
+                if self.injected_job is not None:
+                    job, self.injected_job = self.injected_job, None
+                    await self.create(job, active_limit=2)
+                    self.service._wakeup.set()
+                    return None
+                return await super().claim(now)
+
+        settings = _settings(self.root, poll_seconds=1)
+        store = InjectingStore(
+            JobStoreConfig(self.root, settings.metadata_ttl)
+        )
+        artifacts = LocalArtifactStore(
+            ArtifactStoreConfig(self.root, settings.result_ttl)
+        )
+        rendered = asyncio.Event()
+
+        async def renderer(payload):
+            rendered.set()
+            return await _successful_renderer(payload)
+
+        service = AsyncJobService(settings, store, artifacts, renderer)
+        now = datetime.now(UTC)
+        job_id = str(uuid4())
+        store.injected_job = JobRecord(
+            id=job_id,
+            request_id="claim-wakeup-race",
+            status="queued",
+            payload=service.cipher.encrypt(job_id, _payload()),
+            attempt_count=0,
+            available_at=now,
+            queue_expires_at=now + timedelta(minutes=1),
+            created_at=now,
+        )
+        store.service = service
+        await service.start()
+        try:
+            await asyncio.wait_for(rendered.wait(), timeout=0.25)
+        finally:
+            await service.close()
 
 
 class ProviderLoadingTests(unittest.TestCase):
@@ -469,6 +629,24 @@ class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
         self.service.get.return_value = None
         with self.assertRaisesRegex(Exception, "job_not_found"):
             await main.read_render_job(uuid4())
+
+    async def test_expired_result_returns_gone(self):
+        self.service.get.return_value = self.job.__class__(
+            **{
+                **self.job.__dict__,
+                "status": "expired",
+                "payload": None,
+                "completed_at": datetime.now(UTC) - timedelta(minutes=1),
+                "error_code": "async_result_expired",
+                "error_message":
+                    "The async job result is no longer available.",
+                "error_retryable": False,
+            }
+        )
+        with self.assertRaises(RenderError) as error:
+            await main.read_render_job_result(self.job.id)
+        self.assertEqual(error.exception.code, "async_result_expired")
+        self.assertEqual(error.exception.status_code, 410)
 
     def test_openapi_exposes_complete_job_surface(self):
         paths = main.app.openapi()["paths"]

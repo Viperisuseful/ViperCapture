@@ -582,6 +582,13 @@ async def read_render_job_result(job_id: UUID) -> Response:
             404,
             False,
         )
+    if job.status == "expired" and job.error_code == "async_result_expired":
+        raise RenderError(
+            "async_result_expired",
+            "The async job result is no longer available.",
+            410,
+            False,
+        )
     if job.status != "succeeded":
         raise RenderError(
             "job_not_ready",

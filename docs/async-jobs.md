@@ -28,11 +28,12 @@ instance. The job database receives only ciphertext for request bodies, so URLs
 and custom target headers are not stored as plaintext. Terminal transitions
 erase that ciphertext.
 
-ViperCapture requeues interrupted `running` jobs at startup. Retryable render
-failures are attempted up to three times by default. A queued job has 15
-minutes to be claimed. Local results expire after one hour and terminal
-metadata after 24 hours. Expired and orphaned local artifacts are removed
-during routine queue maintenance.
+ViperCapture requeues interrupted `running` jobs at startup unless they have
+already reached the configured attempt limit. Retryable render failures are
+attempted up to three times by default. A queued job has 15 minutes to be
+claimed. Local results expire after one hour and terminal metadata after 24
+hours. Expired and orphaned local artifacts are removed during routine queue
+maintenance.
 
 ## Configuration
 
@@ -78,8 +79,10 @@ The adapter owns its client library, schema, connections, and migrations.
 `create` must atomically enforce the active limit and request-ID idempotency.
 `claim` must atomically move one eligible job from `queued` to `running`; use
 the database's row-locking or compare-and-swap primitive. Terminal operations
-must erase the encrypted payload. `requeue_running` supplies restart recovery,
-and `maintain` returns expired artifact keys for deletion.
+must erase the encrypted payload. `requeue_running` supplies restart recovery
+without exceeding its `max_attempts` argument. `maintain` returns expired
+artifact keys for deletion and must preserve successful metadata and artifacts
+until `result_expires_at`, even when the metadata TTL is shorter.
 
 The application encrypts the serialized request before calling `create` and
 decrypts it only after `claim`. Adapters must treat `JobRecord.payload` as

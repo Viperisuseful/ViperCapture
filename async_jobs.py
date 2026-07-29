@@ -132,7 +132,11 @@ class JobStore(Protocol):
         retryable: bool,
         now: datetime,
     ) -> None: ...
-    async def requeue_running(self, now: datetime) -> int: ...
+    async def requeue_running(
+        self,
+        now: datetime,
+        max_attempts: int,
+    ) -> int: ...
     async def requeue(self, job_id: str, available_at: datetime) -> None: ...
     async def maintain(self, now: datetime) -> list[str]: ...
 
@@ -331,7 +335,10 @@ class AsyncJobService:
         await self.job_store.start()
         try:
             await self.artifact_store.start()
-            await self.job_store.requeue_running(datetime.now(UTC))
+            await self.job_store.requeue_running(
+                datetime.now(UTC),
+                self.settings.max_attempts,
+            )
             await self._maintain()
             self._workers = [
                 asyncio.create_task(
@@ -444,6 +451,7 @@ class AsyncJobService:
             while True:
                 if self._closing:
                     return
+                self._wakeup.clear()
                 try:
                     await self._maintain()
                     job = await self.job_store.claim(datetime.now(UTC))
@@ -455,7 +463,6 @@ class AsyncJobService:
                     await asyncio.sleep(self.settings.poll_seconds)
                     continue
                 if job is None:
-                    self._wakeup.clear()
                     try:
                         await asyncio.wait_for(
                             self._wakeup.wait(),
