@@ -23,6 +23,7 @@ from async_jobs import (
     JobStoreConfig,
     PayloadCipher,
     RenderedArtifact,
+    StoredArtifact,
     load_providers,
 )
 import main
@@ -189,7 +190,10 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             _successful_renderer,
         )
         job = await service.submit(_payload(), request_id="restart-job")
-        claimed = await self.store.claim(datetime.now(UTC))
+        claimed = await self.store.claim(
+            datetime.now(UTC),
+            self.settings.max_attempts,
+        )
         self.assertEqual(claimed.id, job.id)
         self.assertEqual(claimed.status, "running")
         await self.artifacts.close()
@@ -235,11 +239,11 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
                 created_at=now,
             )
             await self.store.create(job, active_limit=1)
-            first = await self.store.claim(now)
+            first = await self.store.claim(now, self.settings.max_attempts)
             self.assertEqual(first.attempt_count, 1)
 
             await self.store.requeue(job.id, first.attempt_count, now)
-            second = await self.store.claim(now)
+            second = await self.store.claim(now, self.settings.max_attempts)
             self.assertEqual(second.attempt_count, 2)
 
             await self.store.requeue(
@@ -250,6 +254,35 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             current = await self.store.get(job.id, now)
             self.assertEqual(current.status, "running")
             self.assertEqual(current.attempt_count, 2)
+        finally:
+            await self.store.close()
+
+    async def test_claim_fails_queued_retry_at_a_lowered_attempt_cap(self):
+        await self.store.start()
+        try:
+            now = datetime.now(UTC)
+            job = JobRecord(
+                id=str(uuid4()),
+                request_id="lowered-attempt-cap",
+                status="queued",
+                payload=b"encrypted",
+                attempt_count=0,
+                available_at=now,
+                queue_expires_at=now + timedelta(minutes=1),
+                created_at=now,
+            )
+            await self.store.create(job, active_limit=1)
+            first = await self.store.claim(now, max_attempts=3)
+            await self.store.requeue(job.id, first.attempt_count, now)
+
+            claimed = await self.store.claim(now, max_attempts=1)
+
+            self.assertIsNone(claimed)
+            current = await self.store.get(job.id, now)
+            self.assertEqual(current.status, "failed")
+            self.assertEqual(current.attempt_count, 1)
+            self.assertEqual(current.error_code, "job_attempts_exhausted")
+            self.assertIsNone(current.payload)
         finally:
             await self.store.close()
 
@@ -287,7 +320,7 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             _successful_renderer,
         )
         job = await service.submit(_payload(), request_id="exhausted-restart")
-        claimed = await self.store.claim(datetime.now(UTC))
+        claimed = await self.store.claim(datetime.now(UTC), settings.max_attempts)
         self.assertEqual(claimed.attempt_count, 1)
         await self.artifacts.close()
         await self.store.close()
@@ -395,20 +428,21 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             await service.close()
 
     async def test_expired_artifacts_are_removed(self):
-        await self.artifacts.start()
-        expired = datetime.now(UTC) - timedelta(seconds=1)
-        key = await self.artifacts.put(
+        artifacts = LocalArtifactStore(
+            ArtifactStoreConfig(self.root, timedelta(seconds=-1))
+        )
+        await artifacts.start()
+        stored = await artifacts.put(
             str(uuid4()),
             b"old",
             media_type="image/png",
             filename="old.png",
-            expires_at=expired,
         )
-        self.assertIsNone(await self.artifacts.get(key))
-        data_path, metadata_path = self.artifacts._paths(key)
+        self.assertIsNone(await artifacts.get(stored.key))
+        data_path, metadata_path = artifacts._paths(stored.key)
         self.assertFalse(data_path.exists())
         self.assertFalse(metadata_path.exists())
-        await self.artifacts.close()
+        await artifacts.close()
 
     async def test_metadata_cleanup_preserves_live_successful_result(self):
         settings = _settings(self.root, metadata_ttl=timedelta(seconds=1))
@@ -430,7 +464,7 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
                 created_at=completed_at,
             )
             await store.create(job, active_limit=1)
-            await store.claim(completed_at)
+            await store.claim(completed_at, settings.max_attempts)
             await store.succeed(
                 job.id,
                 artifact_key="still-live",
@@ -495,7 +529,12 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             requeue=AsyncMock(),
         )
         artifact_store = SimpleNamespace(
-            put=AsyncMock(return_value="committed-result"),
+            put=AsyncMock(
+                return_value=StoredArtifact(
+                    "committed-result",
+                    datetime.now(UTC) + self.settings.result_ttl,
+                )
+            ),
             delete=AsyncMock(),
         )
         service = AsyncJobService(
@@ -542,7 +581,12 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             fail=AsyncMock(),
         )
         artifact_store = SimpleNamespace(
-            put=AsyncMock(return_value="committed-result"),
+            put=AsyncMock(
+                return_value=StoredArtifact(
+                    "committed-result",
+                    datetime.now(UTC) + self.settings.result_ttl,
+                )
+            ),
             delete=AsyncMock(),
         )
         settings = _settings(self.root, poll_seconds=0.001)
@@ -571,6 +615,56 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         artifact_store.delete.assert_not_awaited()
         job_store.requeue.assert_not_awaited()
         job_store.fail.assert_not_awaited()
+
+    async def test_result_ttl_starts_after_artifact_upload(self):
+        upload_completed_at = None
+
+        async def slow_put(*_args, **_kwargs):
+            nonlocal upload_completed_at
+            await asyncio.sleep(0.02)
+            upload_completed_at = datetime.now(UTC)
+            return StoredArtifact(
+                "slow-upload",
+                upload_completed_at + self.settings.result_ttl,
+            )
+
+        job_store = SimpleNamespace(
+            succeed=AsyncMock(),
+            requeue=AsyncMock(),
+            fail=AsyncMock(),
+        )
+        artifact_store = SimpleNamespace(
+            put=AsyncMock(side_effect=slow_put),
+            delete=AsyncMock(),
+        )
+        service = AsyncJobService(
+            self.settings,
+            job_store,
+            artifact_store,
+            _successful_renderer,
+        )
+        now = datetime.now(UTC)
+        job_id = str(uuid4())
+        job = JobRecord(
+            id=job_id,
+            request_id="slow-upload",
+            status="running",
+            payload=service.cipher.encrypt(job_id, _payload()),
+            attempt_count=1,
+            available_at=now,
+            queue_expires_at=now + timedelta(minutes=1),
+            created_at=now,
+            started_at=now,
+        )
+
+        await service._process(job)
+
+        expires_at = job_store.succeed.await_args.kwargs["result_expires_at"]
+        self.assertEqual(
+            expires_at,
+            upload_completed_at + self.settings.result_ttl,
+        )
+        self.assertNotIn("expires_at", artifact_store.put.await_args.kwargs)
 
     async def test_shutdown_leaves_final_attempt_for_startup_recovery(self):
         rendering = asyncio.Event()
@@ -620,13 +714,13 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             injected_job = None
             service = None
 
-            async def claim(self, now):
+            async def claim(self, now, max_attempts):
                 if self.injected_job is not None:
                     job, self.injected_job = self.injected_job, None
                     await self.create(job, active_limit=2)
                     self.service._wakeup.set()
                     return None
-                return await super().claim(now)
+                return await super().claim(now, max_attempts)
 
         settings = _settings(self.root, poll_seconds=1)
         store = InjectingStore(
@@ -668,7 +762,7 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         now = datetime.now(UTC)
         job_id = str(uuid4())
 
-        async def claim(_now):
+        async def claim(_now, _max_attempts):
             nonlocal claims
             claims += 1
             return job if claims == 1 else None
@@ -796,7 +890,7 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
                 created_at=now,
             )
             await self.store.create(job, active_limit=1)
-            await self.store.claim(now)
+            await self.store.claim(now, self.settings.max_attempts)
             arguments = {
                 "code": "invalid_target",
                 "message": "The target cannot be rendered.",
@@ -826,7 +920,10 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
                 created_at=now - timedelta(seconds=2),
             )
             await self.store.create(job, active_limit=1)
-            await self.store.claim(now - timedelta(seconds=1))
+            await self.store.claim(
+                now - timedelta(seconds=1),
+                self.settings.max_attempts,
+            )
             succeeded = await self.store.succeed(
                 job.id,
                 artifact_key="retry-delete",

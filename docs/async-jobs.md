@@ -79,8 +79,10 @@ VIPERCAPTURE_JOB_STORE_FACTORY=my_vipercapture_pg:create_job_store
 The adapter owns its client library, schema, connections, and migrations.
 `create` must atomically enforce the active limit and request-ID idempotency.
 `claim` must atomically move one eligible job from `queued` to `running`; use
-the database's row-locking or compare-and-swap primitive. Terminal operations
-must erase the encrypted payload. `succeed` must return the existing successful
+the database's row-locking or compare-and-swap primitive. It receives
+`max_attempts` and must terminally fail queued jobs that have already reached
+that cap before selecting work. Terminal operations must erase the encrypted
+payload. `succeed` must return the existing successful
 record when retried with identical arguments, because a commit acknowledgement
 can be lost. `fail` must likewise accept an identical retry of an existing
 failed record; conflicting terminal transitions should raise `JobConflictError`.
@@ -125,9 +127,11 @@ Configure it independently:
 VIPERCAPTURE_ARTIFACT_STORE_FACTORY=my_vipercapture_s3:create_artifact_store
 ```
 
-`put` receives the job ID, validated image bytes, media type, download
-filename, and absolute expiry. It returns an opaque key saved by the job store.
-`get` returns an `Artifact`; `delete` must be idempotent. `maintain` lets local
+`put` receives the job ID, validated image bytes, media type, and download
+filename. It returns a `StoredArtifact` containing an opaque key and its
+absolute expiry. The provider must start the configured result TTL after the
+artifact is durably persisted, not before a potentially slow upload. `get`
+returns an `Artifact`; `delete` must be idempotent. `maintain` lets local
 or database-backed providers remove expired objects. Managed object stores
 should also enforce provider-side lifecycle expiration so a process crash
 between upload and state settlement cannot leave an object indefinitely.

@@ -92,6 +92,12 @@ class RenderedArtifact:
     render_ms: int
 
 
+@dataclass(frozen=True)
+class StoredArtifact:
+    key: str
+    expires_at: datetime
+
+
 class QueueFullError(Exception):
     pass
 
@@ -107,7 +113,11 @@ class JobStore(Protocol):
     async def start(self) -> None: ...
     async def close(self) -> None: ...
     async def create(self, job: JobRecord, active_limit: int) -> JobRecord: ...
-    async def claim(self, now: datetime) -> JobRecord | None: ...
+    async def claim(
+        self,
+        now: datetime,
+        max_attempts: int,
+    ) -> JobRecord | None: ...
     async def get(self, job_id: str, now: datetime) -> JobRecord | None: ...
     async def cancel(self, job_id: str, now: datetime) -> JobRecord | None: ...
     async def succeed(
@@ -160,8 +170,7 @@ class ArtifactStore(Protocol):
         *,
         media_type: str,
         filename: str,
-        expires_at: datetime,
-    ) -> str: ...
+    ) -> StoredArtifact: ...
     async def get(self, key: str) -> Artifact | None: ...
     async def delete(self, key: str) -> None: ...
     async def maintain(self, now: datetime) -> None: ...
@@ -479,7 +488,10 @@ class AsyncJobService:
                 self._wakeup.clear()
                 try:
                     await self._maintain()
-                    job = await self.job_store.claim(datetime.now(UTC))
+                    job = await self.job_store.claim(
+                        datetime.now(UTC),
+                        self.settings.max_attempts,
+                    )
                 except Exception as exc:
                     logger.warning(
                         "async provider retry error_type=%s",
@@ -560,15 +572,15 @@ class AsyncJobService:
         try:
             payload = self.cipher.decrypt(job)
             rendered = await self.renderer(payload)
-            now = datetime.now(UTC)
-            result_expires_at = now + self.settings.result_ttl
-            stored_key = await self.artifact_store.put(
+            stored = await self.artifact_store.put(
                 job.id,
                 rendered.body,
                 media_type=rendered.media_type,
                 filename=rendered.filename,
-                expires_at=result_expires_at,
             )
+            stored_key = stored.key
+            now = datetime.now(UTC)
+            result_expires_at = stored.expires_at
             queue_ms = max(
                 0,
                 round((job.started_at - job.created_at).total_seconds() * 1000)

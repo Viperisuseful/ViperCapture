@@ -19,6 +19,7 @@ from async_jobs import (
     JobRecord,
     JobStoreConfig,
     QueueFullError,
+    StoredArtifact,
 )
 
 
@@ -198,27 +199,43 @@ class SQLiteJobStore:
                 connection.execute("ROLLBACK")
             raise
 
-    async def claim(self, now: datetime) -> JobRecord | None:
-        return await self._run(self._claim, now)
+    async def claim(
+        self,
+        now: datetime,
+        max_attempts: int,
+    ) -> JobRecord | None:
+        return await self._run(self._claim, now, max_attempts)
 
     @classmethod
     def _claim(
         cls,
         connection: sqlite3.Connection,
         now: datetime,
+        max_attempts: int,
     ) -> JobRecord | None:
         current = _epoch(now)
         connection.execute("BEGIN IMMEDIATE")
         try:
+            connection.execute(
+                """
+                UPDATE async_jobs
+                SET status = 'failed', payload = NULL, completed_at = ?,
+                    error_code = 'job_attempts_exhausted',
+                    error_message = 'The queued job exhausted its retry attempts.',
+                    error_retryable = 0
+                WHERE status = 'queued' AND attempt_count >= ?
+                """,
+                (current, max_attempts),
+            )
             row = connection.execute(
                 """
                 SELECT * FROM async_jobs
                 WHERE status = 'queued' AND available_at <= ?
-                  AND queue_expires_at > ?
+                  AND queue_expires_at > ? AND attempt_count < ?
                 ORDER BY created_at, id
                 LIMIT 1
                 """,
-                (current, current),
+                (current, current, max_attempts),
             ).fetchone()
             if row is None:
                 connection.execute("COMMIT")
@@ -624,8 +641,7 @@ class LocalArtifactStore:
         *,
         media_type: str,
         filename: str,
-        expires_at: datetime,
-    ) -> str:
+    ) -> StoredArtifact:
         extension = {
             "image/png": "png",
             "image/jpeg": "jpg",
@@ -634,15 +650,14 @@ class LocalArtifactStore:
         if extension is None:
             raise ValueError("unsupported async artifact media type")
         key = f"{uuid4()}.{extension}"
-        await asyncio.to_thread(
+        expires_at = await asyncio.to_thread(
             self._put,
             key,
             body,
             media_type,
             filename,
-            expires_at,
         )
-        return key
+        return StoredArtifact(key, expires_at)
 
     def _put(
         self,
@@ -650,14 +665,16 @@ class LocalArtifactStore:
         body: bytes,
         media_type: str,
         filename: str,
-        expires_at: datetime,
-    ) -> None:
+    ) -> datetime:
         data_path, metadata_path = self._paths(key)
         token = uuid4().hex
         data_temp = self.root / f".{key}.{token}.tmp"
         metadata_temp = self.root / f".{key}.{token}.json.tmp"
         try:
             data_temp.write_bytes(body)
+            data_temp.chmod(0o600)
+            os.replace(data_temp, data_path)
+            expires_at = datetime.now(UTC) + self.config.result_ttl
             metadata_temp.write_text(
                 json.dumps(
                     {
@@ -669,10 +686,9 @@ class LocalArtifactStore:
                 ),
                 encoding="utf-8",
             )
-            data_temp.chmod(0o600)
             metadata_temp.chmod(0o600)
-            os.replace(data_temp, data_path)
             os.replace(metadata_temp, metadata_path)
+            return expires_at
         finally:
             for path in (data_temp, metadata_temp):
                 try:
