@@ -52,7 +52,13 @@ class Viewport(StrictModel):
 class ImageOptions(StrictModel):
     quality: int | None = Field(default=None, ge=1, le=100)
     transparent_background: bool = False
-    optimize_for_speed: bool = False
+    optimize_for_speed: bool = Field(
+        default=False,
+        description=(
+            "Use Chromium's faster PNG encoder. This increases output size and "
+            "is accepted as a deprecated no-op for WebP compatibility."
+        ),
+    )
 
 
 class WaitOptions(StrictModel):
@@ -117,8 +123,11 @@ class RenderRequest(StrictModel):
             raise ValueError("quality is accepted only for JPEG or WebP")
         if self.image.transparent_background and self.output is OutputFormat.JPEG:
             raise ValueError("transparent_background is accepted only for PNG or WebP")
-        if self.image.optimize_for_speed and self.output is not OutputFormat.WEBP:
-            raise ValueError("optimize_for_speed is currently accepted only for WebP")
+        if (
+            self.image.optimize_for_speed
+            and self.output not in {OutputFormat.PNG, OutputFormat.WEBP}
+        ):
+            raise ValueError("optimize_for_speed is accepted only for PNG or WebP")
         self.headers = _validate_headers(self.headers)
         return self
 

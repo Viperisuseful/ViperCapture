@@ -74,7 +74,7 @@ curl 'http://127.0.0.1:8000/v1/render' \
   --header 'Content-Type: application/json' \
   --data '{
     "url": "https://www.wikipedia.org",
-    "output": "webp",
+    "output": "png",
     "viewport": {
       "width": 1280,
       "height": 720,
@@ -84,7 +84,6 @@ curl 'http://127.0.0.1:8000/v1/render' \
     "lazy_load": "adaptive",
     "selector": "main",
     "image": {
-      "quality": 82,
       "transparent_background": true,
       "optimize_for_speed": true
     },
@@ -97,7 +96,7 @@ curl 'http://127.0.0.1:8000/v1/render' \
       "X-Render-Mode": "docs"
     }
   }' \
-  --output wikipedia.webp
+  --output wikipedia.png
 ```
 
 A successful request returns the image bytes with the matching media type.

@@ -106,7 +106,7 @@ export default function App() {
   const [quality, setQuality] = useState(90)
   const [transparent, setTransparent] = useState(false)
   const [lazyLoad, setLazyLoad] = useState("thorough")
-  const [optimizeWebp, setOptimizeWebp] = useState(false)
+  const [optimizePng, setOptimizePng] = useState(false)
   const [waitEvent, setWaitEvent] = useState("load")
   const [waitDelay, setWaitDelay] = useState(1)
   const [waitSelector, setWaitSelector] = useState("")
@@ -272,7 +272,7 @@ export default function App() {
     setQuality(90)
     setTransparent(false)
     setLazyLoad("thorough")
-    setOptimizeWebp(false)
+    setOptimizePng(false)
     setWaitEvent("load")
     setWaitDelay(1)
     setWaitSelector("")
@@ -335,7 +335,7 @@ export default function App() {
       image: {
         quality: output === "png" ? null : quality,
         transparent_background: output !== "jpeg" && transparent,
-        optimize_for_speed: output === "webp" && optimizeWebp,
+        optimize_for_speed: output === "png" && optimizePng,
       },
       headers: customHeaders,
       wait_for: {
@@ -592,7 +592,7 @@ export default function App() {
                       </div>}
                       {output !== "png" && <Field><FieldLabel htmlFor="quality">Image quality</FieldLabel><Input id="quality" type="number" min={1} max={100} value={quality} onChange={(event) => setQuality(Number(event.target.value))} /></Field>}
                       {output !== "jpeg" && <Field orientation="horizontal"><FieldLabel htmlFor="transparent">Transparent background</FieldLabel><Switch id="transparent" checked={transparent} onCheckedChange={setTransparent} /></Field>}
-                      {output === "webp" && <Field orientation="horizontal"><FieldLabel htmlFor="optimize-webp"><span><span className="block">Fast WebP encoding</span><FieldDescription>Prioritize speed over the smallest file.</FieldDescription></span></FieldLabel><Switch id="optimize-webp" checked={optimizeWebp} onCheckedChange={setOptimizeWebp} /></Field>}
+                      {!isAndroid && output === "png" && <Field orientation="horizontal"><FieldLabel htmlFor="optimize-png"><span><span className="block">Fast PNG encoding</span><FieldDescription>Uses less encoding work, with a larger file.</FieldDescription></span></FieldLabel><Switch id="optimize-png" checked={optimizePng} onCheckedChange={setOptimizePng} /></Field>}
                       {!isAndroid && <Field><FieldLabel htmlFor="headers">Same-origin headers</FieldLabel><Input id="headers" value={headers} onChange={(event) => setHeaders(event.target.value)} placeholder={'{"Authorization":"Bearer …"}'} /><FieldDescription>Sent only to the exact target origin.</FieldDescription></Field>}
                     </FieldGroup>
                   </CollapsibleContent>

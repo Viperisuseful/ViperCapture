@@ -150,37 +150,66 @@ async def load_lazy_content(
             await page.evaluate("window.scrollTo(0, 0)")
 
 
-async def capture_webp(
+async def capture_cdp_image(
     page: Page,
     *,
+    output: OutputFormat,
     clip: dict[str, float],
     quality: int | None,
     transparent: bool,
     optimize_for_speed: bool,
 ) -> bytes:
-    """Use Chromium's native WebP encoder, which Playwright does not expose."""
+    """Capture formats or encoding modes unavailable through Playwright."""
+    if output not in {OutputFormat.PNG, OutputFormat.WEBP}:
+        raise ValueError("CDP capture supports only PNG and WebP")
+    if optimize_for_speed and output is not OutputFormat.PNG:
+        raise ValueError("Chromium fast encoding is available only for PNG")
+
     session = await page.context.new_cdp_session(page)
+    fast_png = output is OutputFormat.PNG and optimize_for_speed
     try:
         with suppress(Exception):
-            await page.evaluate("() => document.getAnimations().forEach(a => a.pause())")
+            if fast_png:
+                await page.evaluate("""() => {
+                    document.getAnimations().forEach((animation) => animation.pause());
+                    const style = document.createElement("style");
+                    style.dataset.vipercaptureScreenshot = "true";
+                    style.textContent = "*, *::before, *::after { caret-color: transparent !important; }";
+                    document.documentElement.append(style);
+                    void document.documentElement.offsetWidth;
+                }""")
+            else:
+                await page.evaluate(
+                    "() => document.getAnimations().forEach(a => a.pause())"
+                )
         if transparent:
             await session.send(
                 "Emulation.setDefaultBackgroundColorOverride",
                 {"color": {"r": 0, "g": 0, "b": 0, "a": 0}},
             )
+        params: dict[str, object] = {
+            "format": output.value,
+            "fromSurface": True,
+            "captureBeyondViewport": True,
+            "clip": clip,
+        }
+        if output is OutputFormat.WEBP:
+            params["quality"] = quality if quality is not None else 80
+        if optimize_for_speed:
+            params["optimizeForSpeed"] = True
         result = await session.send(
             "Page.captureScreenshot",
-            {
-                "format": "webp",
-                "quality": quality if quality is not None else 80,
-                "fromSurface": True,
-                "captureBeyondViewport": True,
-                "optimizeForSpeed": optimize_for_speed,
-                "clip": clip,
-            },
+            params,
         )
         return b64decode(result["data"])
     finally:
+        if fast_png:
+            with suppress(Exception):
+                await page.evaluate(
+                    """() => document.querySelectorAll(
+                        "style[data-vipercapture-screenshot]"
+                    ).forEach((style) => style.remove())"""
+                )
         if transparent:
             with suppress(Exception):
                 await session.send("Emulation.setDefaultBackgroundColorOverride")
@@ -268,19 +297,44 @@ class RenderEngine:
                         if height > limits.max_full_page_height:
                             raise RenderError("page_too_tall", "The page is too tall to capture safely.", 413, False)
                         ensure_dimensions(width, height, request.viewport.device_scale_factor, limits)
-                if request.output is OutputFormat.WEBP:
-                    image = await capture_webp(
+                if (
+                    request.output is OutputFormat.WEBP
+                    or (
+                        request.output is OutputFormat.PNG
+                        and request.image.optimize_for_speed
+                    )
+                ):
+                    scroll = (
+                        {"x": 0, "y": 0}
+                        if request.full_page
+                        else await page.evaluate(
+                            "() => ({x: window.scrollX, y: window.scrollY})"
+                        )
+                    )
+                    image = await capture_cdp_image(
                         page,
+                        output=request.output,
                         clip={
-                            "x": float(box["x"]) if request.selector else 0,
-                            "y": float(box["y"]) if request.selector else 0,
+                            "x": (
+                                float(box["x"]) + float(scroll["x"])
+                                if request.selector
+                                else float(scroll["x"])
+                            ),
+                            "y": (
+                                float(box["y"]) + float(scroll["y"])
+                                if request.selector
+                                else float(scroll["y"])
+                            ),
                             "width": float(width),
                             "height": float(height),
                             "scale": request.viewport.device_scale_factor,
                         },
                         quality=request.image.quality,
                         transparent=request.image.transparent_background,
-                        optimize_for_speed=request.image.optimize_for_speed,
+                        optimize_for_speed=(
+                            request.output is OutputFormat.PNG
+                            and request.image.optimize_for_speed
+                        ),
                     )
                 elif request.selector:
                     image = await locator.screenshot(**options)
