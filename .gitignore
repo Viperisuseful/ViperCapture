@@ -18,6 +18,7 @@ playwright_cache/
 # Screenshots saved by the app
 captures/
 /*.png
+.vipercapture/
 
 # Launcher stamp files (generated automatically, not needed in git)
 .venv/.deps_stamp

@@ -1,0 +1,640 @@
+"""Bundled SQLite job state and filesystem artifact providers."""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+from uuid import uuid4
+
+from async_jobs import (
+    Artifact,
+    ArtifactStoreConfig,
+    JobConflictError,
+    JobRecord,
+    JobStoreConfig,
+    QueueFullError,
+)
+
+
+UTC = timezone.utc
+
+
+def _epoch(value: datetime | None) -> float | None:
+    return value.timestamp() if value is not None else None
+
+
+def _datetime(value: float | None) -> datetime | None:
+    return datetime.fromtimestamp(value, UTC) if value is not None else None
+
+
+class SQLiteJobStore:
+    """Single-process durable queue using Python's bundled SQLite driver."""
+
+    def __init__(self, config: JobStoreConfig) -> None:
+        self.config = config
+        self.path = config.data_dir / "async-jobs.sqlite3"
+        self._connection: sqlite3.Connection | None = None
+        self._lock = asyncio.Lock()
+
+    async def start(self) -> None:
+        self.config.data_dir.mkdir(parents=True, exist_ok=True)
+        self._connection = sqlite3.connect(
+            self.path,
+            check_same_thread=False,
+            isolation_level=None,
+        )
+        self._connection.row_factory = sqlite3.Row
+        await self._run(self._initialize)
+        try:
+            self.path.chmod(0o600)
+        except OSError:
+            pass
+
+    async def close(self) -> None:
+        if self._connection is None:
+            return
+        async with self._lock:
+            connection, self._connection = self._connection, None
+            await asyncio.to_thread(connection.close)
+
+    async def _run(self, operation, *args):
+        async with self._lock:
+            if self._connection is None:
+                raise RuntimeError("SQLite job store is not started")
+            return await asyncio.to_thread(operation, self._connection, *args)
+
+    @staticmethod
+    def _initialize(connection: sqlite3.Connection) -> None:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS async_jobs (
+                id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL,
+                payload BLOB,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                available_at REAL NOT NULL,
+                queue_expires_at REAL NOT NULL,
+                created_at REAL NOT NULL,
+                started_at REAL,
+                completed_at REAL,
+                artifact_key TEXT,
+                media_type TEXT,
+                filename TEXT,
+                artifact_bytes INTEGER,
+                result_expires_at REAL,
+                queue_ms INTEGER,
+                render_ms INTEGER,
+                error_code TEXT,
+                error_message TEXT,
+                error_retryable INTEGER,
+                CHECK (status IN (
+                    'queued', 'running', 'succeeded', 'failed',
+                    'cancelled', 'expired'
+                ))
+            );
+            CREATE INDEX IF NOT EXISTS async_jobs_dispatch_idx
+                ON async_jobs(status, available_at, created_at);
+            CREATE INDEX IF NOT EXISTS async_jobs_cleanup_idx
+                ON async_jobs(completed_at);
+            """
+        )
+
+    @staticmethod
+    def _from_row(row: sqlite3.Row | None) -> JobRecord | None:
+        if row is None:
+            return None
+        return JobRecord(
+            id=row["id"],
+            request_id=row["request_id"],
+            status=row["status"],
+            payload=bytes(row["payload"]) if row["payload"] is not None else None,
+            attempt_count=int(row["attempt_count"]),
+            available_at=_datetime(row["available_at"]),
+            queue_expires_at=_datetime(row["queue_expires_at"]),
+            created_at=_datetime(row["created_at"]),
+            started_at=_datetime(row["started_at"]),
+            completed_at=_datetime(row["completed_at"]),
+            artifact_key=row["artifact_key"],
+            media_type=row["media_type"],
+            filename=row["filename"],
+            artifact_bytes=row["artifact_bytes"],
+            result_expires_at=_datetime(row["result_expires_at"]),
+            queue_ms=row["queue_ms"],
+            render_ms=row["render_ms"],
+            error_code=row["error_code"],
+            error_message=row["error_message"],
+            error_retryable=(
+                bool(row["error_retryable"])
+                if row["error_retryable"] is not None
+                else None
+            ),
+        )
+
+    async def create(self, job: JobRecord, active_limit: int) -> JobRecord:
+        return await self._run(self._create, job, active_limit)
+
+    @classmethod
+    def _create(
+        cls,
+        connection: sqlite3.Connection,
+        job: JobRecord,
+        active_limit: int,
+    ) -> JobRecord:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = connection.execute(
+                "SELECT * FROM async_jobs WHERE request_id = ?",
+                (job.request_id,),
+            ).fetchone()
+            if existing:
+                connection.execute("COMMIT")
+                return cls._from_row(existing)
+            active = connection.execute(
+                """
+                SELECT count(*) FROM async_jobs
+                WHERE status IN ('queued', 'running')
+                """
+            ).fetchone()[0]
+            if int(active) >= active_limit:
+                raise QueueFullError
+            connection.execute(
+                """
+                INSERT INTO async_jobs (
+                    id, request_id, status, payload, attempt_count,
+                    available_at, queue_expires_at, created_at
+                ) VALUES (?, ?, 'queued', ?, 0, ?, ?, ?)
+                """,
+                (
+                    job.id,
+                    job.request_id,
+                    job.payload,
+                    _epoch(job.available_at),
+                    _epoch(job.queue_expires_at),
+                    _epoch(job.created_at),
+                ),
+            )
+            connection.execute("COMMIT")
+            return job
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+
+    async def claim(self, now: datetime) -> JobRecord | None:
+        return await self._run(self._claim, now)
+
+    @classmethod
+    def _claim(
+        cls,
+        connection: sqlite3.Connection,
+        now: datetime,
+    ) -> JobRecord | None:
+        current = _epoch(now)
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = connection.execute(
+                """
+                SELECT * FROM async_jobs
+                WHERE status = 'queued' AND available_at <= ?
+                  AND queue_expires_at > ?
+                ORDER BY created_at, id
+                LIMIT 1
+                """,
+                (current, current),
+            ).fetchone()
+            if row is None:
+                connection.execute("COMMIT")
+                return None
+            started_at = row["started_at"] or current
+            connection.execute(
+                """
+                UPDATE async_jobs
+                SET status = 'running', attempt_count = attempt_count + 1,
+                    started_at = ?
+                WHERE id = ? AND status = 'queued'
+                """,
+                (started_at, row["id"]),
+            )
+            updated = connection.execute(
+                "SELECT * FROM async_jobs WHERE id = ?",
+                (row["id"],),
+            ).fetchone()
+            connection.execute("COMMIT")
+            return cls._from_row(updated)
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+
+    async def get(self, job_id: str, now: datetime) -> JobRecord | None:
+        return await self._run(
+            lambda connection: self._from_row(
+                connection.execute(
+                    "SELECT * FROM async_jobs WHERE id = ?",
+                    (job_id,),
+                ).fetchone()
+            )
+        )
+
+    async def cancel(self, job_id: str, now: datetime) -> JobRecord | None:
+        return await self._run(self._cancel, job_id, now)
+
+    @classmethod
+    def _cancel(
+        cls,
+        connection: sqlite3.Connection,
+        job_id: str,
+        now: datetime,
+    ) -> JobRecord | None:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = connection.execute(
+                "SELECT * FROM async_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                connection.execute("COMMIT")
+                return None
+            if row["status"] == "running":
+                raise JobConflictError
+            if row["status"] == "queued":
+                connection.execute(
+                    """
+                    UPDATE async_jobs
+                    SET status = 'cancelled', payload = NULL, completed_at = ?,
+                        error_code = 'job_cancelled',
+                        error_message = 'The queued job was cancelled.',
+                        error_retryable = 0
+                    WHERE id = ?
+                    """,
+                    (_epoch(now), job_id),
+                )
+            updated = connection.execute(
+                "SELECT * FROM async_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            connection.execute("COMMIT")
+            return cls._from_row(updated)
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+
+    async def succeed(
+        self,
+        job_id: str,
+        *,
+        artifact_key: str,
+        media_type: str,
+        filename: str,
+        artifact_bytes: int,
+        result_expires_at: datetime,
+        queue_ms: int,
+        render_ms: int,
+        now: datetime,
+    ) -> JobRecord:
+        def operation(connection: sqlite3.Connection) -> JobRecord:
+            updated = connection.execute(
+                """
+                UPDATE async_jobs
+                SET status = 'succeeded', payload = NULL, artifact_key = ?,
+                    media_type = ?, filename = ?, artifact_bytes = ?,
+                    result_expires_at = ?, queue_ms = ?, render_ms = ?,
+                    completed_at = ?, error_code = NULL, error_message = NULL,
+                    error_retryable = NULL
+                WHERE id = ? AND status = 'running'
+                """,
+                (
+                    artifact_key,
+                    media_type,
+                    filename,
+                    artifact_bytes,
+                    _epoch(result_expires_at),
+                    queue_ms,
+                    render_ms,
+                    _epoch(now),
+                    job_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise JobConflictError
+            row = connection.execute(
+                "SELECT * FROM async_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            return self._from_row(row)
+
+        return await self._run(operation)
+
+    async def fail(
+        self,
+        job_id: str,
+        *,
+        code: str,
+        message: str,
+        retryable: bool,
+        now: datetime,
+    ) -> None:
+        await self._run(
+            lambda connection: connection.execute(
+                """
+                UPDATE async_jobs
+                SET status = 'failed', payload = NULL, completed_at = ?,
+                    error_code = ?, error_message = ?, error_retryable = ?
+                WHERE id = ? AND status IN ('queued', 'running')
+                """,
+                (_epoch(now), code[:64], message[:256], retryable, job_id),
+            )
+        )
+
+    async def requeue_running(self, now: datetime) -> int:
+        def operation(connection: sqlite3.Connection) -> int:
+            current = _epoch(now)
+            expired = connection.execute(
+                """
+                UPDATE async_jobs
+                SET status = 'expired', payload = NULL, completed_at = ?,
+                    error_code = 'job_queue_expired',
+                    error_message = 'The job expired before a worker could restart it.',
+                    error_retryable = 1
+                WHERE status = 'running' AND queue_expires_at <= ?
+                """,
+                (current, current),
+            ).rowcount
+            requeued = connection.execute(
+                """
+                UPDATE async_jobs
+                SET status = 'queued', available_at = ?
+                WHERE status = 'running' AND queue_expires_at > ?
+                """,
+                (current, current),
+            ).rowcount
+            return int(expired) + int(requeued)
+
+        return await self._run(operation)
+
+    async def requeue(self, job_id: str, available_at: datetime) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            current = _epoch(available_at)
+            updated = connection.execute(
+                """
+                UPDATE async_jobs
+                SET status = 'queued', available_at = ?
+                WHERE id = ? AND status = 'running' AND queue_expires_at > ?
+                """,
+                (current, job_id, current),
+            )
+            if updated.rowcount == 0:
+                connection.execute(
+                    """
+                    UPDATE async_jobs
+                    SET status = 'expired', payload = NULL, completed_at = ?,
+                        error_code = 'job_queue_expired',
+                        error_message = 'The interrupted job expired.',
+                        error_retryable = 1
+                    WHERE id = ? AND status = 'running'
+                    """,
+                    (current, job_id),
+                )
+
+        await self._run(operation)
+
+    async def maintain(self, now: datetime) -> list[str]:
+        return await self._run(self._maintain, now, self.config.metadata_ttl.total_seconds())
+
+    @staticmethod
+    def _maintain(
+        connection: sqlite3.Connection,
+        now: datetime,
+        metadata_ttl: float,
+    ) -> list[str]:
+        current = _epoch(now)
+        cutoff = current - metadata_ttl
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            keys = [
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT artifact_key FROM async_jobs
+                    WHERE status = 'succeeded' AND result_expires_at <= ?
+                      AND artifact_key IS NOT NULL
+                    UNION
+                    SELECT artifact_key FROM async_jobs
+                    WHERE status IN ('succeeded', 'failed', 'cancelled', 'expired')
+                      AND completed_at < ? AND artifact_key IS NOT NULL
+                    """,
+                    (current, cutoff),
+                ).fetchall()
+            ]
+            connection.execute(
+                """
+                UPDATE async_jobs
+                SET status = 'expired', payload = NULL, completed_at = ?,
+                    error_code = 'job_queue_expired',
+                    error_message = 'The job expired before a worker could start it.',
+                    error_retryable = 1
+                WHERE status = 'queued' AND queue_expires_at <= ?
+                """,
+                (current, current),
+            )
+            connection.execute(
+                """
+                UPDATE async_jobs
+                SET status = 'expired', artifact_key = NULL,
+                    error_code = 'async_result_expired',
+                    error_message = 'The async job result is no longer available.',
+                    error_retryable = 0
+                WHERE status = 'succeeded' AND result_expires_at <= ?
+                """,
+                (current,),
+            )
+            connection.execute(
+                """
+                DELETE FROM async_jobs
+                WHERE status IN ('succeeded', 'failed', 'cancelled', 'expired')
+                  AND completed_at < ?
+                """,
+                (cutoff,),
+            )
+            connection.execute("COMMIT")
+            return list(dict.fromkeys(keys))
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+
+
+_SAFE_KEY = re.compile(r"^[0-9a-f-]{36}\.(png|jpg|webp)$")
+
+
+class LocalArtifactStore:
+    """Atomic expiring files with JSON metadata stored outside the web root."""
+
+    def __init__(self, config: ArtifactStoreConfig) -> None:
+        self.config = config
+        self.root = config.data_dir / "job-results"
+
+    async def start(self) -> None:
+        await asyncio.to_thread(self.root.mkdir, parents=True, exist_ok=True)
+        try:
+            self.root.chmod(0o700)
+        except OSError:
+            pass
+
+    async def close(self) -> None:
+        return None
+
+    def _paths(self, key: str) -> tuple[Path, Path]:
+        if not _SAFE_KEY.fullmatch(key):
+            raise ValueError("invalid local artifact key")
+        return self.root / key, self.root / f"{key}.json"
+
+    async def put(
+        self,
+        job_id: str,
+        body: bytes,
+        *,
+        media_type: str,
+        filename: str,
+        expires_at: datetime,
+    ) -> str:
+        extension = {
+            "image/png": "png",
+            "image/jpeg": "jpg",
+            "image/webp": "webp",
+        }.get(media_type)
+        if extension is None:
+            raise ValueError("unsupported async artifact media type")
+        key = f"{uuid4()}.{extension}"
+        await asyncio.to_thread(
+            self._put,
+            key,
+            body,
+            media_type,
+            filename,
+            expires_at,
+        )
+        return key
+
+    def _put(
+        self,
+        key: str,
+        body: bytes,
+        media_type: str,
+        filename: str,
+        expires_at: datetime,
+    ) -> None:
+        data_path, metadata_path = self._paths(key)
+        token = uuid4().hex
+        data_temp = self.root / f".{key}.{token}.tmp"
+        metadata_temp = self.root / f".{key}.{token}.json.tmp"
+        try:
+            data_temp.write_bytes(body)
+            metadata_temp.write_text(
+                json.dumps(
+                    {
+                        "media_type": media_type,
+                        "filename": filename,
+                        "expires_at": expires_at.isoformat(),
+                    },
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+            data_temp.chmod(0o600)
+            metadata_temp.chmod(0o600)
+            os.replace(data_temp, data_path)
+            os.replace(metadata_temp, metadata_path)
+        finally:
+            for path in (data_temp, metadata_temp):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+
+    async def get(self, key: str) -> Artifact | None:
+        return await asyncio.to_thread(self._get, key)
+
+    def _get(self, key: str) -> Artifact | None:
+        data_path, metadata_path = self._paths(key)
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            expires_at = datetime.fromisoformat(metadata["expires_at"])
+            if expires_at <= datetime.now(UTC):
+                self._delete(key)
+                return None
+            return Artifact(
+                key=key,
+                body=data_path.read_bytes(),
+                media_type=str(metadata["media_type"]),
+                filename=str(metadata["filename"]),
+            )
+        except (FileNotFoundError, KeyError, ValueError, json.JSONDecodeError):
+            return None
+
+    async def delete(self, key: str) -> None:
+        await asyncio.to_thread(self._delete, key)
+
+    def _delete(self, key: str) -> None:
+        for path in self._paths(key):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+    async def maintain(self, now: datetime) -> None:
+        await asyncio.to_thread(self._maintain, now)
+
+    def _maintain(self, now: datetime) -> None:
+        for metadata_path in self.root.glob("*.json"):
+            key = metadata_path.name[:-5]
+            if not _SAFE_KEY.fullmatch(key):
+                continue
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                expires_at = datetime.fromisoformat(metadata["expires_at"])
+            except (OSError, KeyError, ValueError, json.JSONDecodeError):
+                continue
+            if expires_at <= now:
+                self._delete(key)
+        oldest_orphan = now.timestamp() - self.config.result_ttl.total_seconds()
+        for data_path in self.root.iterdir():
+            if not data_path.is_file() or not _SAFE_KEY.fullmatch(data_path.name):
+                continue
+            metadata_path = self.root / f"{data_path.name}.json"
+            try:
+                orphaned = (
+                    not metadata_path.exists()
+                    and data_path.stat().st_mtime <= oldest_orphan
+                )
+            except OSError:
+                continue
+            if orphaned:
+                try:
+                    data_path.unlink()
+                except FileNotFoundError:
+                    pass
+
+
+def create_sqlite_job_store(config: JobStoreConfig) -> SQLiteJobStore:
+    """Factory usable as VIPERCAPTURE_JOB_STORE_FACTORY."""
+
+    return SQLiteJobStore(config)
+
+
+def create_local_artifact_store(
+    config: ArtifactStoreConfig,
+) -> LocalArtifactStore:
+    """Factory usable as VIPERCAPTURE_ARTIFACT_STORE_FACTORY."""
+
+    return LocalArtifactStore(config)

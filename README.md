@@ -36,6 +36,8 @@ to manage browser automation code.
 - Page-level challenge detection with an explicit capture-as-displayed choice
 - Observable renders with elapsed time, active waits, cancellation, dimensions,
   file size, render duration, and request IDs
+- Durable polling-based jobs with encrypted inputs, restart recovery, expiring
+  results, and pluggable database and object-storage providers
 - Inline validation for selectors, waits, and same-origin custom headers
 
 ## Getting started
@@ -108,6 +110,33 @@ Every response includes `X-Request-Id`. Successful renders also report queue
 time, render time, and output dimensions in `X-ViperCapture-*` diagnostic
 headers. Errors use a consistent JSON object with a stable code, message,
 request ID, retryable flag, and details.
+
+### Async jobs
+
+For work that should survive a client disconnect or application restart, submit
+the same request to `POST /v1/jobs`, poll its status, and download the result:
+
+```bash
+job_id="$(
+  curl --fail-with-body --silent \
+    --header 'Content-Type: application/json' \
+    --header 'X-Request-Id: nightly-homepage' \
+    --data '{"url":"https://example.com","full_page":false}' \
+    http://127.0.0.1:8000/v1/jobs |
+  python -c 'import json,sys; print(json.load(sys.stdin)["id"])'
+)"
+
+curl --fail-with-body "http://127.0.0.1:8000/v1/jobs/$job_id"
+curl --fail-with-body "http://127.0.0.1:8000/v1/jobs/$job_id/result" \
+  --output capture.png
+```
+
+The bundled provider uses SQLite for job state and private local files for
+results. Queued request data is AES-GCM encrypted before it reaches the job
+store. Database and storage adapters are independently replaceable through
+Python factory hooks, so deployments can use PostgreSQL, Redis, S3-compatible
+storage, or another provider without changing the API or renderer. See the
+[async jobs and providers guide](docs/async-jobs.md).
 
 ### Request options
 
@@ -185,13 +214,17 @@ Start with `VIPERCAPTURE_MAX_CONCURRENCY=1`, apply memory and CPU limits, and
 measure the host before raising browser concurrency.
 
 See the [self-hosting guide](docs/self-hosting.md) for the full production
-boundary and supported capability set.
+boundary and supported capability set, and the
+[async jobs guide](docs/async-jobs.md) for durable queue configuration and
+custom providers.
 
 ## Project layout
 
 The main components are `main.py` for the FastAPI application,
 `render_contract.py` for request validation, and `render_engine.py` for
-Playwright rendering. The hosted/self-hosted interface remains in `frontend/`;
+Playwright rendering. `async_jobs.py` defines the portable queue contracts and
+`async_job_providers.py` supplies SQLite and filesystem defaults. The
+hosted/self-hosted interface remains in `frontend/`;
 the independently packaged Tauri application is in `desktop/`.
 
 ## License

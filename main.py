@@ -8,13 +8,21 @@ import subprocess
 import sys
 import time
 from typing import Awaitable, TypeVar
+from uuid import UUID
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from playwright.async_api import Browser, Playwright, async_playwright
 
+from async_jobs import (
+    AsyncJobService,
+    RenderedArtifact,
+    load_providers,
+    public_job_document,
+    settings_from_environment,
+)
 from render_contract import RenderRequest
 from render_engine import RenderEngine, RenderLimits
 from render_errors import RenderError, install_render_error_layer
@@ -77,6 +85,12 @@ MAX_SCREENSHOT_PIXELS = max(
 )
 CAPTURE_QUEUE_TIMEOUT_SECONDS = 30
 AwaitedResult = TypeVar("AwaitedResult")
+ASYNC_JOBS_ENABLED = os.getenv("VIPERCAPTURE_ASYNC_JOBS", "1") != "0"
+ASYNC_JOB_SETTINGS = (
+    settings_from_environment(default_workers=MAX_CONCURRENT_CAPTURES)
+    if ASYNC_JOBS_ENABLED
+    else None
+)
 
 if not HOSTED:
     CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
@@ -183,9 +197,24 @@ async def lifespan(app: FastAPI):
     app.state.gpu_hardware_active = await _detect_hardware_gpu(browser, GPU_MODE)
     app.state.capture_slots = asyncio.Semaphore(MAX_CONCURRENT_CAPTURES)
     app.state.browser_restart_lock = asyncio.Lock()
+    app.state.async_jobs = None
     try:
+        if ASYNC_JOBS_ENABLED:
+            if ASYNC_JOB_SETTINGS is None:
+                raise RuntimeError("async job settings were not initialized")
+            job_store, artifact_store = load_providers(ASYNC_JOB_SETTINGS)
+            service = AsyncJobService(
+                ASYNC_JOB_SETTINGS,
+                job_store,
+                artifact_store,
+                _render_async_image,
+            )
+            await service.start()
+            app.state.async_jobs = service
         yield
     finally:
+        if app.state.async_jobs is not None:
+            await app.state.async_jobs.close()
         with suppress(Exception):
             await app.state.browser.close()
         await playwright.stop()
@@ -198,9 +227,14 @@ if DESKTOP_TOKEN:
         CORSMiddleware,
         allow_origins=DESKTOP_ORIGINS,
         allow_credentials=False,
-        allow_methods=["GET", "POST"],
+        allow_methods=["GET", "POST", "DELETE"],
         allow_headers=["Authorization", "Content-Type"],
-        expose_headers=["Content-Disposition", "X-Request-ID"],
+        expose_headers=[
+            "Content-Disposition",
+            "Location",
+            "Retry-After",
+            "X-Request-ID",
+        ],
     )
 STATIC_DIR = BASE_DIR / "static"
 if STATIC_DIR.exists():
@@ -381,6 +415,36 @@ async def _check_captcha(
         )
 
 
+async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
+    await app.state.capture_slots.acquire()
+    browser: Browser = app.state.browser
+    engine = RenderEngine(
+        hosted=HOSTED,
+        challenge_checker=_check_captcha,
+        browser_replacer=lambda failed: _replace_browser(app, failed),
+    )
+    started = time.perf_counter()
+    try:
+        artifact = await engine.render_image(
+            browser,
+            payload,
+            RenderLimits(max_pixels=MAX_SCREENSHOT_PIXELS),
+        )
+    except RenderError:
+        if not browser.is_connected():
+            with suppress(Exception):
+                await _replace_browser(app, browser)
+        raise
+    finally:
+        app.state.capture_slots.release()
+    return RenderedArtifact(
+        body=artifact.body,
+        media_type=artifact.media_type,
+        filename=artifact.filename,
+        render_ms=round((time.perf_counter() - started) * 1000),
+    )
+
+
 @app.post("/v1/render", response_class=Response)
 async def render_v1(payload: RenderRequest, request: Request) -> Response:
     queue_started = time.perf_counter()
@@ -438,6 +502,109 @@ async def render_v1(payload: RenderRequest, request: Request) -> Response:
         headers={
             "Content-Disposition": f'attachment; filename="{artifact.filename}"',
             **diagnostic_headers,
+        },
+    )
+
+
+def _async_job_service() -> AsyncJobService:
+    service = getattr(app.state, "async_jobs", None)
+    if service is None:
+        raise RenderError(
+            "async_jobs_disabled",
+            "Async jobs are disabled for this ViperCapture instance.",
+            503,
+            False,
+        )
+    return service
+
+
+@app.post("/v1/jobs", status_code=202)
+async def create_render_job(
+    payload: RenderRequest,
+    request: Request,
+) -> JSONResponse:
+    job = await _async_job_service().submit(
+        payload,
+        request_id=request.state.request_id,
+    )
+    document = public_job_document(job)
+    return JSONResponse(
+        document,
+        status_code=202,
+        headers={
+            "Location": str(document["status_url"]),
+            "Retry-After": "1",
+            "Cache-Control": "private, no-store",
+        },
+    )
+
+
+@app.get("/v1/jobs/{job_id}")
+async def read_render_job(job_id: UUID) -> JSONResponse:
+    job = await _async_job_service().get(str(job_id))
+    if job is None:
+        raise RenderError(
+            "job_not_found",
+            "The async job was not found.",
+            404,
+            False,
+        )
+    return JSONResponse(
+        public_job_document(job),
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
+@app.delete("/v1/jobs/{job_id}")
+async def cancel_render_job(job_id: UUID) -> JSONResponse:
+    job = await _async_job_service().cancel(str(job_id))
+    if job is None:
+        raise RenderError(
+            "job_not_found",
+            "The async job was not found.",
+            404,
+            False,
+        )
+    return JSONResponse(
+        public_job_document(job),
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
+@app.get("/v1/jobs/{job_id}/result", response_class=Response)
+async def read_render_job_result(job_id: UUID) -> Response:
+    service = _async_job_service()
+    job = await service.get(str(job_id))
+    if job is None:
+        raise RenderError(
+            "job_not_found",
+            "The async job was not found.",
+            404,
+            False,
+        )
+    if job.status != "succeeded":
+        raise RenderError(
+            "job_not_ready",
+            "The async job result is not available.",
+            409,
+            job.status in {"queued", "running"},
+            {"status": job.status},
+            {"Retry-After": "1"} if job.status in {"queued", "running"} else None,
+        )
+    artifact = await service.result(job)
+    if artifact is None:
+        raise RenderError(
+            "async_result_expired",
+            "The async job result is no longer available.",
+            410,
+            False,
+        )
+    return Response(
+        artifact.body,
+        media_type=artifact.media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{artifact.filename}"',
+            "Cache-Control": "private, no-store",
         },
     )
 
@@ -503,6 +670,19 @@ async def app_config():
     return {
         "server_saves": not HOSTED,
         "max_screenshot_pixels": MAX_SCREENSHOT_PIXELS,
+        "async_jobs": {
+            "enabled": ASYNC_JOBS_ENABLED,
+            "workers": (
+                ASYNC_JOB_SETTINGS.worker_count
+                if ASYNC_JOB_SETTINGS is not None
+                else 0
+            ),
+            "queue_limit": (
+                ASYNC_JOB_SETTINGS.queue_limit
+                if ASYNC_JOB_SETTINGS is not None
+                else 0
+            ),
+        },
         "gpu": await _gpu_config(app),
     }
 

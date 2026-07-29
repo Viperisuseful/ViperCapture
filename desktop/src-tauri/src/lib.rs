@@ -117,11 +117,11 @@ pub fn run() {
                 .take(64)
                 .map(char::from)
                 .collect();
-            let captures_dir = app
+            let data_dir = app
                 .path()
                 .app_data_dir()
-                .map_err(|error| format!("Could not locate app data: {error}"))?
-                .join("captures");
+                .map_err(|error| format!("Could not locate app data: {error}"))?;
+            let captures_dir = data_dir.join("captures");
             std::fs::create_dir_all(&captures_dir)?;
             let browser_dir = playwright_dir(app)?;
 
@@ -132,6 +132,7 @@ pub fn run() {
                 .env("VIPERCAPTURE_DESKTOP_TOKEN", &token)
                 .env("VIPERCAPTURE_PARENT_PID", std::process::id().to_string())
                 .env("VIPERCAPTURE_CAPTURES_DIR", captures_dir.as_os_str())
+                .env("VIPERCAPTURE_DATA_DIR", data_dir.as_os_str())
                 .env("PLAYWRIGHT_BROWSERS_PATH", browser_dir.as_os_str())
                 .spawn()?;
 
