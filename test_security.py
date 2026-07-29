@@ -1,18 +1,23 @@
 import asyncio
+from base64 import b64encode
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import socket
+import threading
 import unittest
 from unittest.mock import AsyncMock, patch
 from pathlib import Path
 
+from playwright.async_api import async_playwright
 from pydantic import ValidationError
 from starlette.requests import Request
 
 from main import _is_local_control_request, gpu_launch_args, hardware_gpu_active
-from render_contract import LazyLoadMode, RenderRequest
+from render_contract import LazyLoadMode, OutputFormat, RenderRequest
 from render_engine import (
     PublicUrlValidator,
+    RenderEngine,
     RenderLimits,
-    capture_webp,
+    capture_cdp_image,
     ensure_dimensions,
     is_public_http_url,
     load_lazy_content,
@@ -20,6 +25,41 @@ from render_engine import (
     routed_headers,
 )
 from render_errors import RenderError
+
+
+class _RenderFixtureHandler(BaseHTTPRequestHandler):
+    PAGES = {
+        "/content": """<!doctype html><style>
+            html,body{margin:0;background:#fff}
+            #target{width:120px;height:80px;background:#e11d48;color:#fff}
+        </style><div id="target">ViperCapture</div>""",
+        "/blank": """<!doctype html><style>
+            html,body{margin:0;width:100%;height:100%;background:#fff}
+        </style>""",
+        "/tall": """<!doctype html><style>
+            html,body{margin:0}
+            body{height:1800px;background:linear-gradient(#2563eb,#e11d48)}
+        </style>""",
+        "/transparent": """<!doctype html><style>
+            html,body{margin:0;background:transparent}
+            #target{width:20px;height:20px;background:#e11d48}
+        </style><div id="target"></div>""",
+    }
+
+    def do_GET(self) -> None:
+        body = self.PAGES.get(self.path)
+        if body is None:
+            self.send_error(404)
+            return
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
 
 
 class SsrfTests(unittest.IsolatedAsyncioTestCase):
@@ -145,7 +185,7 @@ class CaptureOptimizationTests(unittest.IsolatedAsyncioTestCase):
 
         sleep.assert_awaited_once_with(0.2)
 
-    async def test_fast_webp_sets_cdp_speed_flag(self):
+    async def test_fast_png_sets_cdp_speed_flag(self):
         session = AsyncMock()
 
         async def send(method, _params=None):
@@ -155,10 +195,11 @@ class CaptureOptimizationTests(unittest.IsolatedAsyncioTestCase):
         page = AsyncMock()
         page.context.new_cdp_session.return_value = session
 
-        result = await capture_webp(
+        result = await capture_cdp_image(
             page,
+            output=OutputFormat.PNG,
             clip={"x": 0, "y": 0, "width": 100, "height": 100, "scale": 1},
-            quality=80,
+            quality=None,
             transparent=False,
             optimize_for_speed=True,
         )
@@ -170,6 +211,203 @@ class CaptureOptimizationTests(unittest.IsolatedAsyncioTestCase):
             if call.args[0] == "Page.captureScreenshot"
         )
         self.assertTrue(capture_call.args[1]["optimizeForSpeed"])
+        self.assertEqual(capture_call.args[1]["format"], "png")
+        self.assertNotIn("quality", capture_call.args[1])
+
+    async def test_webp_does_not_claim_fast_encoding(self):
+        session = AsyncMock()
+
+        async def send(method, _params=None):
+            return {"data": "eA=="} if method == "Page.captureScreenshot" else {}
+
+        session.send.side_effect = send
+        page = AsyncMock()
+        page.context.new_cdp_session.return_value = session
+
+        result = await capture_cdp_image(
+            page,
+            output=OutputFormat.WEBP,
+            clip={"x": 0, "y": 0, "width": 100, "height": 100, "scale": 1},
+            quality=82,
+            transparent=False,
+            optimize_for_speed=False,
+        )
+
+        self.assertEqual(result, b"x")
+        capture_call = next(
+            call
+            for call in session.send.await_args_list
+            if call.args[0] == "Page.captureScreenshot"
+        )
+        self.assertNotIn("optimizeForSpeed", capture_call.args[1])
+        self.assertEqual(capture_call.args[1]["quality"], 82)
+        evaluated = " ".join(
+            str(call.args[0]) for call in page.evaluate.await_args_list
+        )
+        self.assertNotIn("requestAnimationFrame", evaluated)
+
+
+class BrowserCaptureRegressionTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), _RenderFixtureHandler)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.base_url = f"http://127.0.0.1:{cls.server.server_port}"
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=5)
+
+    async def _pixel_stats(self, page, image: bytes, media_type: str) -> dict:
+        encoded = b64encode(image).decode("ascii")
+        return await page.evaluate(
+            """async ({ encoded, mediaType }) => {
+                const image = new Image();
+                image.src = `data:${mediaType};base64,${encoded}`;
+                await image.decode();
+                const canvas = document.createElement("canvas");
+                canvas.width = image.naturalWidth;
+                canvas.height = image.naturalHeight;
+                const context = canvas.getContext("2d");
+                context.drawImage(image, 0, 0);
+                const pixels = context.getImageData(
+                    0, 0, canvas.width, canvas.height
+                ).data;
+                const first = pixels.slice(0, 4);
+                let different = 0;
+                let transparent = 0;
+                for (let index = 0; index < pixels.length; index += 4) {
+                    if (
+                        pixels[index] !== first[0]
+                        || pixels[index + 1] !== first[1]
+                        || pixels[index + 2] !== first[2]
+                        || pixels[index + 3] !== first[3]
+                    ) different += 1;
+                    if (pixels[index + 3] === 0) transparent += 1;
+                }
+                return {
+                    width: canvas.width,
+                    height: canvas.height,
+                    different,
+                    transparent,
+                };
+            }""",
+            {"encoded": encoded, "mediaType": media_type},
+        )
+
+    async def test_fast_png_preserves_capture_semantics(self):
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                engine = RenderEngine(hosted=False)
+                limits = RenderLimits()
+                base = {
+                    "output": "png",
+                    "full_page": False,
+                    "lazy_load": "none",
+                    "image": {"optimize_for_speed": True},
+                }
+
+                content = await engine.render_image(
+                    browser,
+                    RenderRequest(url=f"{self.base_url}/content", **base),
+                    limits,
+                )
+                blank = await engine.render_image(
+                    browser,
+                    RenderRequest(url=f"{self.base_url}/blank", **base),
+                    limits,
+                )
+                selector = await engine.render_image(
+                    browser,
+                    RenderRequest(
+                        url=f"{self.base_url}/content",
+                        output="png",
+                        full_page=False,
+                        lazy_load="none",
+                        selector="#target",
+                        viewport={
+                            "width": 320,
+                            "height": 240,
+                            "device_scale_factor": 2,
+                        },
+                        image={"optimize_for_speed": True},
+                    ),
+                    limits,
+                )
+                tall = await engine.render_image(
+                    browser,
+                    RenderRequest(
+                        url=f"{self.base_url}/tall",
+                        output="png",
+                        full_page=True,
+                        lazy_load="none",
+                        viewport={"width": 320, "height": 240},
+                        image={"optimize_for_speed": True},
+                    ),
+                    limits,
+                )
+                transparent = await engine.render_image(
+                    browser,
+                    RenderRequest(
+                        url=f"{self.base_url}/transparent",
+                        output="png",
+                        full_page=False,
+                        lazy_load="none",
+                        viewport={"width": 160, "height": 120},
+                        image={
+                            "transparent_background": True,
+                            "optimize_for_speed": True,
+                        },
+                    ),
+                    limits,
+                )
+                legacy_webp = await engine.render_image(
+                    browser,
+                    RenderRequest(
+                        url=f"{self.base_url}/content",
+                        output="webp",
+                        full_page=False,
+                        lazy_load="none",
+                        image={"optimize_for_speed": True},
+                    ),
+                    limits,
+                )
+
+                decoder = await browser.new_page()
+                content_stats = await self._pixel_stats(
+                    decoder, content.body, content.media_type
+                )
+                blank_stats = await self._pixel_stats(
+                    decoder, blank.body, blank.media_type
+                )
+                selector_stats = await self._pixel_stats(
+                    decoder, selector.body, selector.media_type
+                )
+                tall_stats = await self._pixel_stats(
+                    decoder, tall.body, tall.media_type
+                )
+                transparent_stats = await self._pixel_stats(
+                    decoder, transparent.body, transparent.media_type
+                )
+
+                self.assertGreater(content_stats["different"], 0)
+                self.assertEqual(blank_stats["different"], 0)
+                self.assertEqual(
+                    (selector_stats["width"], selector_stats["height"]),
+                    (240, 160),
+                )
+                self.assertEqual(
+                    (tall_stats["width"], tall_stats["height"]),
+                    (320, 1800),
+                )
+                self.assertGreater(transparent_stats["transparent"], 0)
+                self.assertEqual(legacy_webp.media_type, "image/webp")
+            finally:
+                await browser.close()
 
 
 class GpuConfigurationTests(unittest.TestCase):
@@ -255,11 +493,18 @@ class FrontendTests(unittest.TestCase):
         root = Path(__file__).resolve().parent
         index = (root / "static" / "app" / "index.html").read_text(encoding="utf-8")
         source = (root / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
+        desktop_source = (root / "desktop" / "src" / "App.tsx").read_text(
+            encoding="utf-8"
+        )
         components = (root / "frontend" / "components.json").read_text(encoding="utf-8")
 
         self.assertIn("ViperCapture | Open-source webpage rendering", index)
         self.assertIn("/static/app/assets/", index)
         self.assertIn("GPU rendering", source)
+        self.assertIn("Fast PNG encoding", source)
+        self.assertNotIn("Fast WebP encoding", source)
+        self.assertIn('!isAndroid && output === "png"', desktop_source)
+        self.assertNotIn("Fast WebP encoding", desktop_source)
         self.assertIn('"style": "radix-nova"', components)
 
 
@@ -278,20 +523,29 @@ class ValidationTests(unittest.TestCase):
         )
         self.assertEqual(request.source_type, "url")
 
-    def test_lazy_load_modes_and_fast_webp_are_valid(self):
+    def test_lazy_load_modes_and_fast_png_are_valid(self):
         request = RenderRequest(
             url="https://example.com",
-            output="webp",
+            output="png",
             lazy_load="adaptive",
             image={"optimize_for_speed": True},
         )
         self.assertIs(request.lazy_load, LazyLoadMode.ADAPTIVE)
         self.assertTrue(request.image.optimize_for_speed)
 
-    def test_fast_encoding_is_rejected_for_png(self):
+    def test_legacy_fast_webp_flag_remains_valid(self):
+        request = RenderRequest(
+            url="https://example.com",
+            output="webp",
+            image={"optimize_for_speed": True},
+        )
+        self.assertTrue(request.image.optimize_for_speed)
+
+    def test_fast_encoding_is_rejected_for_jpeg(self):
         with self.assertRaises(ValidationError):
             RenderRequest(
                 url="https://example.com",
+                output="jpeg",
                 image={"optimize_for_speed": True},
             )
 

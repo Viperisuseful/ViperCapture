@@ -52,6 +52,8 @@ const selectorField     = document.getElementById("selectorField");
 const selectorInput     = document.getElementById("selector");
 const imageQuality      = document.getElementById("imageQuality");
 const transparentBackground = document.getElementById("transparentBackground");
+const fastEncodingField = document.getElementById("fastEncodingField");
+const optimizeForSpeed  = document.getElementById("optimizeForSpeed");
 const captchaDialog     = document.getElementById("captchaDialog");
 const captchaProvider   = document.getElementById("captchaProvider");
 
@@ -222,6 +224,9 @@ const syncOutputFormat = () => {
   imageQuality.disabled = selected === "png";
   transparentBackground.disabled = selected === "jpeg";
   if (selected === "jpeg") transparentBackground.checked = false;
+  fastEncodingField.hidden = selected !== "png";
+  optimizeForSpeed.disabled = selected !== "png";
+  if (selected !== "png") optimizeForSpeed.checked = false;
 };
 
 outputFormat.addEventListener("change", syncOutputFormat);
@@ -333,7 +338,7 @@ form.addEventListener("submit", async (e) => {
     lazy_load: String(data.get("lazy_load") || "thorough"),
     image: {
       transparent_background: Boolean(data.get("transparent_background")),
-      optimize_for_speed: imageFormat === "webp" && Boolean(data.get("optimize_for_speed")),
+      optimize_for_speed: imageFormat === "png" && Boolean(data.get("optimize_for_speed")),
     },
     headers,
     wait_for: {
