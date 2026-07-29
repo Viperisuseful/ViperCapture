@@ -427,6 +427,54 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(operation, return_exceptions=True)
             await self.store.close()
 
+    async def test_cancellation_preserves_committed_success_artifact(self):
+        settlement_started = asyncio.Event()
+        release_settlement = asyncio.Event()
+
+        async def settle_success(*_args, **_kwargs):
+            settlement_started.set()
+            await release_settlement.wait()
+
+        job_store = SimpleNamespace(
+            succeed=AsyncMock(side_effect=settle_success),
+            requeue=AsyncMock(),
+        )
+        artifact_store = SimpleNamespace(
+            put=AsyncMock(return_value="committed-result"),
+            delete=AsyncMock(),
+        )
+        service = AsyncJobService(
+            self.settings,
+            job_store,
+            artifact_store,
+            _successful_renderer,
+        )
+        now = datetime.now(UTC)
+        job_id = str(uuid4())
+        job = JobRecord(
+            id=job_id,
+            request_id="cancel-during-settlement",
+            status="running",
+            payload=service.cipher.encrypt(job_id, _payload()),
+            attempt_count=1,
+            available_at=now,
+            queue_expires_at=now + timedelta(minutes=1),
+            created_at=now,
+            started_at=now,
+        )
+
+        processing = asyncio.create_task(service._process(job))
+        await asyncio.wait_for(settlement_started.wait(), timeout=1)
+        processing.cancel()
+        await asyncio.sleep(0.02)
+        self.assertFalse(processing.done())
+        release_settlement.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await processing
+
+        artifact_store.delete.assert_not_awaited()
+        job_store.requeue.assert_not_awaited()
+
     async def test_worker_does_not_lose_wakeup_between_claim_and_wait(self):
         class InjectingStore(SQLiteJobStore):
             injected_job = None
@@ -653,3 +701,6 @@ class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/v1/jobs", paths)
         self.assertIn("/v1/jobs/{job_id}", paths)
         self.assertIn("/v1/jobs/{job_id}/result", paths)
+
+    def test_desktop_cors_allows_idempotency_header(self):
+        self.assertIn("X-Request-Id", main.DESKTOP_ALLOW_HEADERS)

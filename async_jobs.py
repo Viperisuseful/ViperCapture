@@ -485,6 +485,7 @@ class AsyncJobService:
 
     async def _process(self, job: JobRecord) -> None:
         stored_key: str | None = None
+        success_committed = False
         try:
             payload = self.cipher.decrypt(job)
             rendered = await self.renderer(payload)
@@ -503,23 +504,38 @@ class AsyncJobService:
                 if job.started_at
                 else 0,
             )
-            await self.job_store.succeed(
-                job.id,
-                artifact_key=stored_key,
-                media_type=rendered.media_type,
-                filename=rendered.filename,
-                artifact_bytes=len(rendered.body),
-                result_expires_at=result_expires_at,
-                queue_ms=queue_ms,
-                render_ms=max(0, rendered.render_ms),
-                now=now,
+            settlement = asyncio.create_task(
+                self.job_store.succeed(
+                    job.id,
+                    artifact_key=stored_key,
+                    media_type=rendered.media_type,
+                    filename=rendered.filename,
+                    artifact_bytes=len(rendered.body),
+                    result_expires_at=result_expires_at,
+                    queue_ms=queue_ms,
+                    render_ms=max(0, rendered.render_ms),
+                    now=now,
+                )
             )
+            try:
+                await asyncio.shield(settlement)
+            except asyncio.CancelledError:
+                while not settlement.done():
+                    try:
+                        await asyncio.shield(settlement)
+                    except asyncio.CancelledError:
+                        continue
+                settlement.result()
+                success_committed = True
+                raise
+            success_committed = True
         except asyncio.CancelledError:
-            if stored_key:
-                await self._safe_delete(stored_key)
-            await asyncio.shield(
-                self.job_store.requeue(job.id, datetime.now(UTC))
-            )
+            if not success_committed:
+                if stored_key:
+                    await self._safe_delete(stored_key)
+                await asyncio.shield(
+                    self.job_store.requeue(job.id, datetime.now(UTC))
+                )
             raise
         except Exception as exc:
             if stored_key:

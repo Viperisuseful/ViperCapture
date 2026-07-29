@@ -48,6 +48,11 @@ DESKTOP_ORIGINS = [
     ).split(",")
     if origin.strip()
 ]
+DESKTOP_ALLOW_HEADERS = [
+    "Authorization",
+    "Content-Type",
+    "X-Request-Id",
+]
 
 
 def _load_local_env() -> None:
@@ -228,7 +233,7 @@ if DESKTOP_TOKEN:
         allow_origins=DESKTOP_ORIGINS,
         allow_credentials=False,
         allow_methods=["GET", "POST", "DELETE"],
-        allow_headers=["Authorization", "Content-Type"],
+        allow_headers=DESKTOP_ALLOW_HEADERS,
         expose_headers=[
             "Content-Disposition",
             "Location",
