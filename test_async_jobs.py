@@ -579,6 +579,30 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         job_store.maintain.assert_awaited_once()
         artifact_store.maintain.assert_awaited_once()
 
+    async def test_job_maintenance_failure_does_not_block_status_read(self):
+        expected = SimpleNamespace(id="healthy-point-read")
+        job_store = SimpleNamespace(
+            maintain=AsyncMock(side_effect=RuntimeError("cleanup outage")),
+            acknowledge_artifact_deletion=AsyncMock(),
+            get=AsyncMock(return_value=expected),
+        )
+        artifact_store = SimpleNamespace(
+            maintain=AsyncMock(),
+            delete=AsyncMock(),
+        )
+        service = AsyncJobService(
+            self.settings,
+            job_store,
+            artifact_store,
+            _successful_renderer,
+        )
+
+        result = await service.get("healthy-point-read")
+
+        self.assertIs(result, expected)
+        job_store.maintain.assert_awaited_once()
+        job_store.get.assert_awaited_once()
+
     async def test_restart_does_not_exceed_max_attempts(self):
         settings = _settings(self.root, max_attempts=1)
         await self.store.start()
@@ -1546,6 +1570,41 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
 
         renderer.assert_not_awaited()
 
+    async def test_claim_retry_stops_when_shutdown_begins(self):
+        claim_started = asyncio.Event()
+        claim_calls = 0
+
+        async def cancellation_resistant_claim(*_args):
+            nonlocal claim_calls
+            claim_calls += 1
+            claim_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise RuntimeError("remote claim failed during shutdown")
+
+        service = AsyncJobService(
+            self.settings,
+            SimpleNamespace(
+                claim=AsyncMock(side_effect=cancellation_resistant_claim),
+                maintain=AsyncMock(return_value=[]),
+                acknowledge_artifact_deletion=AsyncMock(),
+            ),
+            SimpleNamespace(
+                maintain=AsyncMock(),
+                delete=AsyncMock(),
+            ),
+            AsyncMock(),
+        )
+
+        worker = asyncio.create_task(service._worker(0))
+        await asyncio.wait_for(claim_started.wait(), timeout=1)
+        service._closing = True
+        worker.cancel()
+        await asyncio.wait_for(worker, timeout=1)
+
+        self.assertEqual(claim_calls, 1)
+
     async def test_failure_conflict_reconciles_winning_terminal_state(self):
         now = datetime.now(UTC)
         job_id = str(uuid4())
@@ -1752,6 +1811,46 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         finally:
             await self.store.close()
+
+    async def test_symlinked_sqlite_database_is_rejected(self):
+        data_dir = self.root / "symlinked-sqlite"
+        data_dir.mkdir()
+        target = self.root / "database-target"
+        target.write_bytes(b"not a database")
+        target.chmod(0o600)
+        (data_dir / "async-jobs.sqlite3").symlink_to(target)
+        store = SQLiteJobStore(
+            JobStoreConfig(data_dir, self.settings.metadata_ttl)
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "private regular file"):
+            await store.start()
+
+        self.assertEqual(target.read_bytes(), b"not a database")
+
+    async def test_terminal_transition_scrubs_payload_history(self):
+        await self.store.start()
+        marker = b"terminal-payload-must-not-survive"
+        try:
+            now = datetime.now(UTC)
+            job = JobRecord(
+                id=str(uuid4()),
+                request_id="payload-scrub",
+                status="queued",
+                payload=marker,
+                attempt_count=0,
+                available_at=now,
+                queue_expires_at=now + timedelta(minutes=1),
+                created_at=now,
+                request_fingerprint=b"payload-scrub-fingerprint",
+            )
+            await self.store.create(job, active_limit=1)
+            await self.store.cancel(job.id, now)
+        finally:
+            await self.store.close()
+
+        for path in self.root.glob("async-jobs.sqlite3*"):
+            self.assertNotIn(marker, path.read_bytes(), str(path))
 
     async def test_sqlite_database_entry_is_synced_on_start(self):
         from async_job_providers import _sync_directory

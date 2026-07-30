@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import threading
 from uuid import uuid4
 
@@ -65,14 +66,41 @@ class SQLiteJobStore:
                 "permissions; configure an external job store on Windows."
             )
         _ensure_private_directory(self.config.data_dir)
-        descriptor = os.open(
-            self.path,
-            os.O_RDWR | os.O_CREAT,
-            0o600,
-        )
-        os.close(descriptor)
-        self.path.chmod(0o600)
-        _sync_directory(self.config.data_dir)
+        flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        created = False
+        try:
+            descriptor = os.open(
+                self.path,
+                flags | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            created = True
+        except FileExistsError:
+            try:
+                descriptor = os.open(self.path, flags)
+            except OSError as exc:
+                raise RuntimeError(
+                    "async job database must be a private regular file"
+                ) from exc
+        try:
+            information = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(information.st_mode)
+                or information.st_uid != os.getuid()
+                or (
+                    not created
+                    and stat.S_IMODE(information.st_mode) != 0o600
+                )
+            ):
+                raise RuntimeError(
+                    "async job database must be an owner-only regular file"
+                )
+            if created:
+                os.fchmod(descriptor, 0o600)
+        finally:
+            os.close(descriptor)
+        if created:
+            _sync_directory(self.config.data_dir)
         self._connection = sqlite3.connect(
             self.path,
             check_same_thread=False,
@@ -95,12 +123,19 @@ class SQLiteJobStore:
             connection, self._connection = self._connection, None
             await asyncio.to_thread(connection.close)
 
-    async def _run(self, operation, *args):
+    async def _run(self, operation, *args, scrub: bool = False):
         async with self._lock:
             if self._connection is None:
                 raise RuntimeError("SQLite job store is not started")
+
+            def execute():
+                result = operation(self._connection, *args)
+                if scrub:
+                    self._scrub_payload_history(self._connection)
+                return result
+
             operation_task = asyncio.create_task(
-                asyncio.to_thread(operation, self._connection, *args)
+                asyncio.to_thread(execute)
             )
             try:
                 return await asyncio.shield(operation_task)
@@ -110,10 +145,19 @@ class SQLiteJobStore:
                 raise
 
     @staticmethod
+    def _scrub_payload_history(connection: sqlite3.Connection) -> None:
+        checkpoint = connection.execute(
+            "PRAGMA wal_checkpoint(TRUNCATE)"
+        ).fetchone()
+        if checkpoint is not None and checkpoint[0]:
+            raise RuntimeError("SQLite payload scrub checkpoint was busy")
+
+    @staticmethod
     def _initialize(connection: sqlite3.Connection) -> None:
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=FULL")
         connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA secure_delete=ON")
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS async_jobs (
@@ -202,7 +246,7 @@ class SQLiteJobStore:
         )
 
     async def create(self, job: JobRecord, active_limit: int) -> JobRecord:
-        return await self._run(self._create, job, active_limit)
+        return await self._run(self._create, job, active_limit, scrub=True)
 
     @classmethod
     def _create(
@@ -297,6 +341,7 @@ class SQLiteJobStore:
             now,
             max_attempts,
             claim_token or str(uuid4()),
+            scrub=True,
         )
 
     @classmethod
@@ -366,7 +411,7 @@ class SQLiteJobStore:
             raise
 
     async def get(self, job_id: str, now: datetime) -> JobRecord | None:
-        return await self._run(self._get, job_id, now)
+        return await self._run(self._get, job_id, now, scrub=True)
 
     @classmethod
     def _get(
@@ -413,7 +458,7 @@ class SQLiteJobStore:
             raise
 
     async def cancel(self, job_id: str, now: datetime) -> JobRecord | None:
-        return await self._run(self._cancel, job_id, now)
+        return await self._run(self._cancel, job_id, now, scrub=True)
 
     @classmethod
     def _cancel(
@@ -589,7 +634,7 @@ class SQLiteJobStore:
             ).fetchone()
             return self._from_row(row)
 
-        return await self._run(operation)
+        return await self._run(operation, scrub=True)
 
     async def fail(
         self,
@@ -647,7 +692,7 @@ class SQLiteJobStore:
             if actual != expected:
                 raise JobConflictError
 
-        await self._run(operation)
+        await self._run(operation, scrub=True)
 
     async def requeue_running(
         self,
@@ -690,7 +735,7 @@ class SQLiteJobStore:
             ).rowcount
             return int(expired) + int(exhausted) + int(requeued)
 
-        return await self._run(operation)
+        return await self._run(operation, scrub=True)
 
     async def requeue(
         self,
@@ -724,10 +769,15 @@ class SQLiteJobStore:
                     (completed_at, job_id, expected_attempt, current),
                 )
 
-        await self._run(operation)
+        await self._run(operation, scrub=True)
 
     async def maintain(self, now: datetime) -> list[str]:
-        return await self._run(self._maintain, now, self.config.metadata_ttl.total_seconds())
+        return await self._run(
+            self._maintain,
+            now,
+            self.config.metadata_ttl.total_seconds(),
+            scrub=True,
+        )
 
     @staticmethod
     def _maintain(

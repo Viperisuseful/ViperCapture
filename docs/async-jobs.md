@@ -36,7 +36,9 @@ that ciphertext. A keyed request fingerprint enforces idempotency without
 storing the raw request.
 The bundled providers create the database, WAL sidecars, key, and result files
 with owner-only permissions. Key and result creation fsync both file contents
-and directory entries before reporting durable success.
+and directory entries before reporting durable success. SQLite enables secure
+deletion and truncates the WAL after transitions that clear queued payloads so
+coordinated backups do not retain decryptable historical request ciphertext.
 Because Python file modes do not create private Windows ACLs, the bundled
 SQLite and filesystem providers refuse to start on Windows; use external
 providers plus an explicit `VIPERCAPTURE_JOB_SECRET` there. The packaged

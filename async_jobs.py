@@ -576,7 +576,14 @@ class AsyncJobService:
                 return
             self._next_maintenance_at = loop.time() + self._maintenance_interval
             now = datetime.now(UTC)
-            keys = await self.job_store.maintain(now)
+            try:
+                keys = await self.job_store.maintain(now)
+            except Exception as exc:
+                logger.warning(
+                    "job maintenance retry error_type=%s",
+                    type(exc).__name__,
+                )
+                keys = []
             for key in keys:
                 if await self._safe_delete(key):
                     try:
@@ -665,6 +672,8 @@ class AsyncJobService:
 
     async def _claim_with_retry(self, claim_token: str) -> JobRecord | None:
         while True:
+            if self._closing:
+                return None
             try:
                 return await self.job_store.claim(
                     datetime.now(UTC),
@@ -674,6 +683,8 @@ class AsyncJobService:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if self._closing:
+                    return None
                 logger.warning(
                     "async claim retry error_type=%s",
                     type(exc).__name__,
