@@ -1073,8 +1073,9 @@ class LocalArtifactStore:
                 media_type=str(metadata["media_type"]),
                 filename=str(metadata["filename"]),
             )
+        except FileNotFoundError:
+            return None
         except (
-            OSError,
             RuntimeError,
             KeyError,
             TypeError,

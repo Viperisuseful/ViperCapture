@@ -854,6 +854,28 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.artifacts.delete(metadata_link.key)
         await self.artifacts.close()
 
+    async def test_local_artifact_read_propagates_transient_open_failure(self):
+        await self.artifacts.start()
+        stored = await self.artifacts.put(
+            str(uuid4()),
+            b"retry-after-emfile",
+            media_type="image/png",
+            filename="retry.png",
+        )
+
+        with patch(
+            "async_job_providers.os.open",
+            side_effect=OSError(errno.EMFILE, "too many open files"),
+        ):
+            with self.assertRaises(OSError) as error:
+                await self.artifacts.get(stored.key)
+
+        self.assertEqual(error.exception.errno, errno.EMFILE)
+        data_path, metadata_path = self.artifacts._paths(stored.key)
+        self.assertTrue(data_path.exists())
+        self.assertTrue(metadata_path.exists())
+        await self.artifacts.close()
+
     async def test_cancelled_local_artifact_read_waits_for_thread(self):
         read_started = threading.Event()
         release_read = threading.Event()
