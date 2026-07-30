@@ -10,8 +10,9 @@ synchronous `POST /v1/render` endpoint remains available; async clients use:
 
 Submission returns HTTP 202 with `Location` and `Retry-After` headers. Supplying
 the same valid `X-Request-Id` returns the original job, making safe submission
-retries idempotent. Statuses are `queued`, `running`, `succeeded`, `failed`,
-`cancelled`, and `expired`.
+retries idempotent. Reusing it with a different request returns HTTP 409.
+Statuses are `queued`, `running`, `succeeded`, `failed`, `cancelled`, and
+`expired`.
 
 ## Local defaults
 
@@ -31,7 +32,8 @@ running can omit committed queue state and downloadable results. Provider
 adapters need an equivalent coordinated snapshot procedure for live backups.
 The job database receives only ciphertext for request bodies, so URLs and
 custom target headers are not stored as plaintext. Terminal transitions erase
-that ciphertext.
+that ciphertext. A keyed request fingerprint enforces idempotency without
+storing the raw request.
 The bundled providers create the database, WAL sidecars, key, and result files
 with owner-only permissions. Key and result creation fsync both file contents
 and directory entries before reporting durable success.
@@ -96,6 +98,9 @@ VIPERCAPTURE_JOB_STORE_FACTORY=my_vipercapture_pg:create_job_store
 
 The adapter owns its client library, schema, connections, and migrations.
 `create` must atomically enforce the active limit and request-ID idempotency.
+It must compare `JobRecord.request_fingerprint` in constant time and raise
+`IdempotencyConflictError` when an existing request ID has a different or
+legacy-missing fingerprint.
 `claim` must atomically move one eligible job from `queued` to `running`; use
 the database's row-locking or compare-and-swap primitive. Retrying its
 `claim_token` after an ambiguous acknowledgement must return the same row

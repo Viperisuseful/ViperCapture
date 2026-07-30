@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
+import hmac
 import json
 import os
 from pathlib import Path
@@ -17,11 +18,13 @@ from async_jobs import (
     Artifact,
     ArtifactExpiredError,
     ArtifactStoreConfig,
+    IdempotencyConflictError,
     JobConflictError,
     JobRecord,
     JobStoreConfig,
     QueueFullError,
     StoredArtifact,
+    _ensure_private_directory,
 )
 
 
@@ -61,10 +64,7 @@ class SQLiteJobStore:
                 "The bundled SQLite job store requires POSIX owner-only "
                 "permissions; configure an external job store on Windows."
             )
-        self.config.data_dir.mkdir(parents=True, exist_ok=True)
-        with suppress(OSError):
-            self.config.data_dir.chmod(0o700)
-        _sync_directory(self.config.data_dir.parent)
+        _ensure_private_directory(self.config.data_dir)
         descriptor = os.open(
             self.path,
             os.O_RDWR | os.O_CREAT,
@@ -127,6 +127,7 @@ class SQLiteJobStore:
                 created_at REAL NOT NULL,
                 started_at REAL,
                 claim_token TEXT,
+                request_fingerprint BLOB,
                 completed_at REAL,
                 artifact_key TEXT,
                 media_type TEXT,
@@ -159,6 +160,10 @@ class SQLiteJobStore:
             connection.execute(
                 "ALTER TABLE async_jobs ADD COLUMN claim_token TEXT"
             )
+        if "request_fingerprint" not in columns:
+            connection.execute(
+                "ALTER TABLE async_jobs ADD COLUMN request_fingerprint BLOB"
+            )
 
     @staticmethod
     def _from_row(row: sqlite3.Row | None) -> JobRecord | None:
@@ -173,6 +178,11 @@ class SQLiteJobStore:
             available_at=_datetime(row["available_at"]),
             queue_expires_at=_datetime(row["queue_expires_at"]),
             created_at=_datetime(row["created_at"]),
+            request_fingerprint=(
+                bytes(row["request_fingerprint"])
+                if row["request_fingerprint"] is not None
+                else None
+            ),
             started_at=_datetime(row["started_at"]),
             completed_at=_datetime(row["completed_at"]),
             artifact_key=row["artifact_key"],
@@ -231,6 +241,16 @@ class SQLiteJobStore:
                 (job.request_id,),
             ).fetchone()
             if existing:
+                existing_fingerprint = existing["request_fingerprint"]
+                if (
+                    existing_fingerprint is None
+                    or job.request_fingerprint is None
+                    or not hmac.compare_digest(
+                        existing_fingerprint,
+                        job.request_fingerprint,
+                    )
+                ):
+                    raise IdempotencyConflictError
                 connection.execute("COMMIT")
                 return cls._from_row(existing)
             active = connection.execute(
@@ -245,8 +265,9 @@ class SQLiteJobStore:
                 """
                 INSERT INTO async_jobs (
                     id, request_id, status, payload, attempt_count,
-                    available_at, queue_expires_at, created_at
-                ) VALUES (?, ?, 'queued', ?, 0, ?, ?, ?)
+                    available_at, queue_expires_at, created_at,
+                    request_fingerprint
+                ) VALUES (?, ?, 'queued', ?, 0, ?, ?, ?, ?)
                 """,
                 (
                     job.id,
@@ -255,6 +276,7 @@ class SQLiteJobStore:
                     _epoch(job.available_at),
                     _epoch(job.queue_expires_at),
                     _epoch(job.created_at),
+                    job.request_fingerprint,
                 ),
             )
             connection.execute("COMMIT")
@@ -816,13 +838,11 @@ class LocalArtifactStore:
                 "The bundled local artifact store requires POSIX owner-only "
                 "permissions; configure an external artifact store on Windows."
             )
-        await asyncio.to_thread(self.root.mkdir, parents=True, exist_ok=True)
+        await asyncio.to_thread(_ensure_private_directory, self.root)
         try:
             self.root.chmod(0o700)
         except OSError:
             pass
-        await asyncio.to_thread(_sync_directory, self.config.data_dir.parent)
-        await asyncio.to_thread(self._sync_parent_directory)
 
     async def close(self) -> None:
         return None

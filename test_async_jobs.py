@@ -139,6 +139,18 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         first = await service.submit(_payload(), request_id="same-request")
         repeated = await service.submit(_payload(), request_id="same-request")
         self.assertEqual(repeated.id, first.id)
+        different = RenderRequest.model_validate(
+            {
+                "url": "https://example.com/different-report",
+                "full_page": False,
+            }
+        )
+        with self.assertRaises(RenderError) as conflict:
+            await service.submit(different, request_id="same-request")
+        self.assertEqual(
+            conflict.exception.code,
+            "idempotency_key_conflict",
+        )
         with self.assertRaises(RenderError) as error:
             await service.submit(_payload(), request_id="other-request")
         self.assertEqual(error.exception.code, "async_queue_full")
@@ -417,6 +429,7 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
                 available_at=now,
                 queue_expires_at=now + timedelta(minutes=1),
                 created_at=now,
+                request_fingerprint=b"same-fingerprint",
             )
             await self.store.create(job, active_limit=1)
             await self.store.claim(now, self.settings.max_attempts)
@@ -1138,6 +1151,59 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("expires_at", artifact_store.put.await_args.kwargs)
 
+    async def test_shutdown_stops_after_cancellation_resistant_upload(self):
+        upload_started = asyncio.Event()
+
+        async def cancellation_resistant_put(*_args, **_kwargs):
+            upload_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                return StoredArtifact(
+                    "shutdown-upload",
+                    datetime.now(UTC) + self.settings.result_ttl,
+                )
+
+        job_store = SimpleNamespace(
+            succeed=AsyncMock(),
+            requeue=AsyncMock(),
+            fail=AsyncMock(),
+        )
+        artifact_store = SimpleNamespace(
+            put=AsyncMock(side_effect=cancellation_resistant_put),
+            delete=AsyncMock(),
+        )
+        service = AsyncJobService(
+            self.settings,
+            job_store,
+            artifact_store,
+            _successful_renderer,
+        )
+        now = datetime.now(UTC)
+        job_id = str(uuid4())
+        job = JobRecord(
+            id=job_id,
+            request_id="shutdown-upload",
+            status="running",
+            payload=service.cipher.encrypt(job_id, _payload()),
+            attempt_count=1,
+            available_at=now,
+            queue_expires_at=now + timedelta(minutes=1),
+            created_at=now,
+            started_at=now,
+        )
+
+        processing = asyncio.create_task(service._process(job))
+        await asyncio.wait_for(upload_started.wait(), timeout=1)
+        service._closing = True
+        processing.cancel()
+        await asyncio.wait_for(processing, timeout=1)
+
+        job_store.succeed.assert_not_awaited()
+        job_store.requeue.assert_not_awaited()
+        job_store.fail.assert_not_awaited()
+        artifact_store.delete.assert_not_awaited()
+
     async def test_local_result_ttl_starts_after_metadata_persistence(self):
         class SlowMetadataStore(LocalArtifactStore):
             @staticmethod
@@ -1700,7 +1766,6 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         ) as sync:
             await store.start()
         try:
-            sync.assert_any_call(data_dir.parent)
             sync.assert_any_call(data_dir)
         finally:
             await store.close()
@@ -1808,15 +1873,49 @@ class ProviderLoadingTests(unittest.TestCase):
             clear=False,
         ):
             os.environ.pop("VIPERCAPTURE_JOB_SECRET", None)
-            root = Path(directory) / "new-data-directory"
+            base = Path(directory)
+            root = base / "first" / "second" / "new-data-directory"
             with patch(
                 "async_jobs._sync_directory",
                 wraps=__import__("async_jobs")._sync_directory,
             ) as sync:
                 PayloadCipher.for_data_dir(root)
 
-            sync.assert_any_call(root.parent)
+            sync.assert_any_call(base)
+            sync.assert_any_call(base / "first")
+            sync.assert_any_call(base / "first" / "second")
             sync.assert_any_call(root)
+
+    def test_insecure_existing_key_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {},
+            clear=False,
+        ):
+            os.environ.pop("VIPERCAPTURE_JOB_SECRET", None)
+            root = Path(directory)
+            key = root / "async-jobs.key"
+            key.write_bytes(b"x" * 32)
+            key.chmod(0o644)
+
+            with self.assertRaisesRegex(RuntimeError, "owner-only"):
+                PayloadCipher.for_data_dir(root)
+
+    def test_symlinked_existing_key_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {},
+            clear=False,
+        ):
+            os.environ.pop("VIPERCAPTURE_JOB_SECRET", None)
+            root = Path(directory)
+            target = root / "attacker-key"
+            target.write_bytes(b"x" * 32)
+            target.chmod(0o600)
+            (root / "async-jobs.key").symlink_to(target)
+
+            with self.assertRaisesRegex(RuntimeError, "private regular file"):
+                PayloadCipher.for_data_dir(root)
 
     def test_key_directory_sync_is_skipped_on_windows(self):
         directory = Path(".")

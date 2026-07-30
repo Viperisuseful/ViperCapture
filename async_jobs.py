@@ -8,12 +8,14 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
+import hmac
 import importlib
 import inspect
 import json
 import logging
 import os
 from pathlib import Path
+import stat
 from typing import Protocol, runtime_checkable
 from uuid import uuid4
 
@@ -62,6 +64,7 @@ class JobRecord:
     available_at: datetime
     queue_expires_at: datetime
     created_at: datetime
+    request_fingerprint: bytes | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
     artifact_key: str | None = None
@@ -106,6 +109,10 @@ class JobConflictError(Exception):
     pass
 
 
+class IdempotencyConflictError(Exception):
+    pass
+
+
 class ArtifactExpiredError(Exception):
     pass
 
@@ -116,6 +123,47 @@ def _sync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _ensure_private_directory(path: Path) -> None:
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        parent = current.parent
+        if parent == current:
+            raise RuntimeError("async job data directory has no existing ancestor")
+        current = parent
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700)
+        _sync_directory(directory.parent)
+    path.chmod(0o700)
+
+
+def _read_private_key(path: Path) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise RuntimeError("async job key must be a private regular file") from exc
+    try:
+        information = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(information.st_mode)
+            or information.st_uid != os.getuid()
+            or information.st_mode & 0o077
+        ):
+            raise RuntimeError(
+                "async job key must be an owner-only regular file"
+            )
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 65536):
+            chunks.append(chunk)
+        return b"".join(chunks)
     finally:
         os.close(descriptor)
 
@@ -274,13 +322,10 @@ def _read_or_create_key(data_dir: Path) -> bytes:
         raise RuntimeError(
             "VIPERCAPTURE_JOB_SECRET is required for async jobs on Windows"
         )
-    data_dir.mkdir(parents=True, exist_ok=True)
-    with suppress(OSError):
-        data_dir.chmod(0o700)
-    _sync_directory(data_dir.parent)
+    _ensure_private_directory(data_dir)
     path = data_dir / "async-jobs.key"
     try:
-        material = path.read_bytes()
+        material = _read_private_key(path)
     except FileNotFoundError:
         material = os.urandom(32)
         temporary = data_dir / f".async-jobs.key.{uuid4().hex}.tmp"
@@ -299,20 +344,21 @@ def _read_or_create_key(data_dir: Path) -> bytes:
                 os.link(temporary, path)
                 _sync_directory(data_dir)
             except FileExistsError:
-                material = path.read_bytes()
+                material = _read_private_key(path)
         finally:
             with suppress(FileNotFoundError):
                 temporary.unlink()
     if len(material) < 32:
         raise RuntimeError("async job key must contain at least 32 bytes")
-    with suppress(OSError):
-        path.chmod(0o600)
     return sha256(PAYLOAD_VERSION + material).digest()
 
 
 class PayloadCipher:
     def __init__(self, key: bytes) -> None:
         self._cipher = AESGCM(key)
+        self._fingerprint_key = sha256(
+            b"vipercapture-request-fingerprint\0" + key
+        ).digest()
 
     @classmethod
     def for_data_dir(cls, data_dir: Path) -> "PayloadCipher":
@@ -320,17 +366,28 @@ class PayloadCipher:
 
     def encrypt(self, job_id: str, payload: RenderRequest) -> bytes:
         nonce = os.urandom(12)
-        plaintext = json.dumps(
-            payload.model_dump(mode="json"),
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
+        plaintext = self._serialize(payload)
         return nonce + self._cipher.encrypt(
             nonce,
             plaintext,
             job_id.encode("ascii"),
         )
+
+    def fingerprint(self, payload: RenderRequest) -> bytes:
+        return hmac.digest(
+            self._fingerprint_key,
+            self._serialize(payload),
+            "sha256",
+        )
+
+    @staticmethod
+    def _serialize(payload: RenderRequest) -> bytes:
+        return json.dumps(
+            payload.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
 
     def decrypt(self, job: JobRecord) -> RenderRequest:
         if job.payload is None or len(job.payload) <= 28:
@@ -461,6 +518,7 @@ class AsyncJobService:
             available_at=now,
             queue_expires_at=now + self.settings.queue_ttl,
             created_at=now,
+            request_fingerprint=self.cipher.fingerprint(payload),
         )
         try:
             stored = await self.job_store.create(job, self.settings.queue_limit)
@@ -472,6 +530,13 @@ class AsyncJobService:
                 True,
                 {"limit": self.settings.queue_limit},
                 {"Retry-After": "5"},
+            ) from exc
+        except IdempotencyConflictError as exc:
+            raise RenderError(
+                "idempotency_key_conflict",
+                "X-Request-Id was already used for a different render.",
+                409,
+                False,
             ) from exc
         self._wake_workers()
         return stored
@@ -766,6 +831,8 @@ class AsyncJobService:
                 filename=rendered.filename,
             )
             stored_key = stored.key
+            if self._closing:
+                return
             now = datetime.now(UTC)
             result_expires_at = stored.expires_at
             queue_ms = max(
