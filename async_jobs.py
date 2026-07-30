@@ -128,18 +128,83 @@ def _sync_directory(path: Path) -> None:
 
 
 def _ensure_private_directory(path: Path) -> None:
-    missing: list[Path] = []
-    current = path
-    while not current.exists():
-        missing.append(current)
-        parent = current.parent
-        if parent == current:
-            raise RuntimeError("async job data directory has no existing ancestor")
-        current = parent
-    for directory in reversed(missing):
-        directory.mkdir(mode=0o700)
-        _sync_directory(directory.parent)
-    path.chmod(0o700)
+    target = Path(os.path.abspath(path))
+    if target == Path(target.anchor):
+        raise RuntimeError("async job data directory cannot be a filesystem root")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    current = Path(target.anchor)
+    descriptor = os.open(current, flags)
+    try:
+        for component in target.parts[1:]:
+            child = current / component
+            try:
+                child_descriptor = os.open(
+                    component,
+                    flags,
+                    dir_fd=descriptor,
+                )
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                else:
+                    _sync_directory(current)
+                try:
+                    child_descriptor = os.open(
+                        component,
+                        flags,
+                        dir_fd=descriptor,
+                    )
+                except OSError as exc:
+                    raise RuntimeError(
+                        "async job data path must contain only directories"
+                    ) from exc
+            except OSError as exc:
+                raise RuntimeError(
+                    "async job data path must contain only directories"
+                ) from exc
+            information = os.fstat(child_descriptor)
+            mode = stat.S_IMODE(information.st_mode)
+            trusted_sticky_directory = (
+                information.st_uid == 0
+                and bool(information.st_mode & stat.S_ISVTX)
+            )
+            if (
+                information.st_uid not in {0, os.getuid()}
+                or (
+                    mode & 0o022
+                    and not trusted_sticky_directory
+                    and child != target
+                )
+            ):
+                os.close(child_descriptor)
+                raise RuntimeError(
+                    "async job data path contains an unsafe directory"
+                )
+            os.close(descriptor)
+            descriptor = child_descriptor
+            current = child
+
+        information = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(information.st_mode)
+            or information.st_uid != os.getuid()
+        ):
+            raise RuntimeError(
+                "async job data directory must be owner-controlled"
+            )
+        os.fchmod(descriptor, 0o700)
+        if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o700:
+            raise RuntimeError(
+                "async job data directory must be owner-only"
+            )
+    finally:
+        os.close(descriptor)
 
 
 def _read_private_key(path: Path) -> bytes:
@@ -787,6 +852,7 @@ class AsyncJobService:
         self,
         transition: Callable[[], Awaitable[JobRecord]],
         reconcile: Callable[[], Awaitable[JobRecord | None]],
+        expected_attempt: int,
         expires_at: datetime,
     ) -> tuple[JobRecord | None, bool]:
         while True:
@@ -811,12 +877,11 @@ class AsyncJobService:
                             type(exc).__name__,
                         )
                     else:
-                        if current is None or current.status in {
-                            "succeeded",
-                            "failed",
-                            "cancelled",
-                            "expired",
-                        }:
+                        if (
+                            current is None
+                            or current.status != "running"
+                            or current.attempt_count != expected_attempt
+                        ):
                             return current, True
                     await asyncio.sleep(self.settings.poll_seconds)
             except ArtifactExpiredError as exc:
@@ -847,6 +912,8 @@ class AsyncJobService:
         try:
             payload = self.cipher.decrypt(job)
             rendered = await self.renderer(payload)
+            if self._closing:
+                return
             stored = await self.artifact_store.put(
                 job.id,
                 rendered.body,
@@ -877,6 +944,7 @@ class AsyncJobService:
                         queue_ms=queue_ms,
                     ),
                     lambda: self.job_store.get(job.id, datetime.now(UTC)),
+                    job.attempt_count,
                     result_expires_at,
                 )
             )

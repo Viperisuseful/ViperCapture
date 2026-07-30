@@ -888,11 +888,11 @@ class LocalArtifactStore:
                 "The bundled local artifact store requires POSIX owner-only "
                 "permissions; configure an external artifact store on Windows."
             )
+        await asyncio.to_thread(
+            _ensure_private_directory,
+            self.config.data_dir,
+        )
         await asyncio.to_thread(_ensure_private_directory, self.root)
-        try:
-            self.root.chmod(0o700)
-        except OSError:
-            pass
 
     async def close(self) -> None:
         return None

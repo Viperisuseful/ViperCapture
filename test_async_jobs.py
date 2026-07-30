@@ -1164,6 +1164,62 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         job_store.requeue.assert_not_awaited()
         job_store.fail.assert_not_awaited()
 
+    async def test_success_conflict_reconciles_lost_attempt_ownership(self):
+        now = datetime.now(UTC)
+        job_id = str(uuid4())
+        newer_attempt = JobRecord(
+            id=job_id,
+            request_id="newer-running-attempt",
+            status="running",
+            payload=b"newer-encrypted-payload",
+            attempt_count=2,
+            available_at=now,
+            queue_expires_at=now + timedelta(minutes=1),
+            created_at=now,
+            started_at=now,
+        )
+        job_store = SimpleNamespace(
+            succeed=AsyncMock(side_effect=JobConflictError),
+            get=AsyncMock(return_value=newer_attempt),
+            requeue=AsyncMock(),
+            fail=AsyncMock(),
+        )
+        artifact_store = SimpleNamespace(
+            put=AsyncMock(
+                return_value=StoredArtifact(
+                    "lost-ownership-result",
+                    now + self.settings.result_ttl,
+                )
+            ),
+            delete=AsyncMock(),
+        )
+        service = AsyncJobService(
+            self.settings,
+            job_store,
+            artifact_store,
+            _successful_renderer,
+        )
+        job = JobRecord(
+            id=job_id,
+            request_id="original-running-attempt",
+            status="running",
+            payload=service.cipher.encrypt(job_id, _payload()),
+            attempt_count=1,
+            available_at=now,
+            queue_expires_at=now + timedelta(minutes=1),
+            created_at=now,
+            started_at=now,
+        )
+
+        await asyncio.wait_for(service._process(job), timeout=1)
+
+        job_store.get.assert_awaited_once()
+        artifact_store.delete.assert_awaited_once_with(
+            "lost-ownership-result"
+        )
+        job_store.requeue.assert_not_awaited()
+        job_store.fail.assert_not_awaited()
+
     async def test_result_ttl_starts_after_artifact_upload(self):
         upload_completed_at = None
 
@@ -1266,6 +1322,57 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         job_store.requeue.assert_not_awaited()
         job_store.fail.assert_not_awaited()
         artifact_store.delete.assert_not_awaited()
+
+    async def test_shutdown_stops_after_cancellation_resistant_render(self):
+        render_started = asyncio.Event()
+
+        async def cancellation_resistant_renderer(_payload):
+            render_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                return await _successful_renderer(_payload)
+
+        job_store = SimpleNamespace(
+            succeed=AsyncMock(),
+            requeue=AsyncMock(),
+            fail=AsyncMock(),
+        )
+        artifact_store = SimpleNamespace(
+            put=AsyncMock(),
+            delete=AsyncMock(),
+        )
+        service = AsyncJobService(
+            self.settings,
+            job_store,
+            artifact_store,
+            cancellation_resistant_renderer,
+        )
+        now = datetime.now(UTC)
+        job_id = str(uuid4())
+        job = JobRecord(
+            id=job_id,
+            request_id="shutdown-render",
+            status="running",
+            payload=service.cipher.encrypt(job_id, _payload()),
+            attempt_count=1,
+            available_at=now,
+            queue_expires_at=now + timedelta(minutes=1),
+            created_at=now,
+            started_at=now,
+        )
+
+        processing = asyncio.create_task(service._process(job))
+        await asyncio.wait_for(render_started.wait(), timeout=1)
+        service._closing = True
+        processing.cancel()
+        await asyncio.wait_for(processing, timeout=1)
+
+        artifact_store.put.assert_not_awaited()
+        artifact_store.delete.assert_not_awaited()
+        job_store.succeed.assert_not_awaited()
+        job_store.requeue.assert_not_awaited()
+        job_store.fail.assert_not_awaited()
 
     async def test_local_result_ttl_starts_after_metadata_persistence(self):
         class SlowMetadataStore(LocalArtifactStore):
@@ -1899,6 +2006,51 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             await store.start()
 
         self.assertEqual(target.read_bytes(), b"not a database")
+
+    async def test_symlinked_local_state_directories_are_rejected(self):
+        redirected_data = self.root / "redirected-data"
+        redirected_data.mkdir()
+        symlinked_data = self.root / "symlinked-data"
+        symlinked_data.symlink_to(redirected_data, target_is_directory=True)
+        store = SQLiteJobStore(
+            JobStoreConfig(symlinked_data, self.settings.metadata_ttl)
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "only directories"):
+            await store.start()
+
+        artifact_data = self.root / "artifact-data"
+        artifact_data.mkdir(mode=0o700)
+        artifact_data.chmod(0o700)
+        redirected_results = self.root / "redirected-results"
+        redirected_results.mkdir()
+        (artifact_data / "job-results").symlink_to(
+            redirected_results,
+            target_is_directory=True,
+        )
+        artifacts = LocalArtifactStore(
+            ArtifactStoreConfig(artifact_data, self.settings.result_ttl)
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "only directories"):
+            await artifacts.start()
+
+        self.assertEqual(list(redirected_data.iterdir()), [])
+        self.assertEqual(list(redirected_results.iterdir()), [])
+
+    async def test_unsafe_local_state_ancestor_is_rejected(self):
+        unsafe_parent = self.root / "unsafe-parent"
+        unsafe_parent.mkdir(mode=0o777)
+        unsafe_parent.chmod(0o777)
+        data_dir = unsafe_parent / "private-data"
+        store = SQLiteJobStore(
+            JobStoreConfig(data_dir, self.settings.metadata_ttl)
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "unsafe directory"):
+            await store.start()
+
+        self.assertFalse(data_dir.exists())
 
     async def test_terminal_transition_scrubs_payload_history(self):
         await self.store.start()
