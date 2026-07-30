@@ -72,6 +72,7 @@ class SQLiteJobStore:
         )
         os.close(descriptor)
         self.path.chmod(0o600)
+        _sync_directory(self.config.data_dir)
         self._connection = sqlite3.connect(
             self.path,
             check_same_thread=False,

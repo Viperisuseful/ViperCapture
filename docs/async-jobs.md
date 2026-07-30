@@ -129,6 +129,8 @@ even when the metadata TTL is shorter. `requeue` receives the claimed job's
 `expected_attempt` and must use it as a compare-and-swap token. Retrying an
 already committed requeue must be accepted, while a stale retry must never
 change a newer running attempt or a terminal job.
+The service reconciles `JobConflictError` from `fail` and `requeue` by reading
+the stored attempt and stops retrying after it has moved or become terminal.
 `acknowledge_artifact_deletion` clears a returned artifact key only after the
 storage provider confirms its idempotent deletion; until then, `maintain` must
 continue returning the key.

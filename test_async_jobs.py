@@ -1392,6 +1392,62 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fail_calls, 2)
         job_store.requeue.assert_not_awaited()
 
+    async def test_failure_conflict_reconciles_winning_terminal_state(self):
+        now = datetime.now(UTC)
+        job_id = str(uuid4())
+        winning = JobRecord(
+            id=job_id,
+            request_id="winning-failure-transition",
+            status="cancelled",
+            payload=None,
+            attempt_count=1,
+            available_at=now,
+            queue_expires_at=now + timedelta(minutes=1),
+            created_at=now,
+            started_at=now,
+            completed_at=now,
+            error_code="job_cancelled",
+            error_message="Another terminal transition won.",
+            error_retryable=False,
+        )
+
+        async def rejected_renderer(_payload):
+            raise RenderError(
+                "invalid_target",
+                "The target is invalid.",
+                400,
+                False,
+            )
+
+        job_store = SimpleNamespace(
+            fail=AsyncMock(side_effect=JobConflictError),
+            get=AsyncMock(return_value=winning),
+            requeue=AsyncMock(),
+        )
+        service = AsyncJobService(
+            self.settings,
+            job_store,
+            SimpleNamespace(delete=AsyncMock()),
+            rejected_renderer,
+        )
+        job = JobRecord(
+            id=job_id,
+            request_id="winning-failure-transition",
+            status="running",
+            payload=service.cipher.encrypt(job_id, _payload()),
+            attempt_count=1,
+            available_at=now,
+            queue_expires_at=now + timedelta(minutes=1),
+            created_at=now,
+            started_at=now,
+        )
+
+        await asyncio.wait_for(service._process(job), timeout=1)
+
+        job_store.fail.assert_awaited_once()
+        job_store.get.assert_awaited_once()
+        job_store.requeue.assert_not_awaited()
+
     async def test_shutdown_retries_nonretryable_failure_once(self):
         first_failure = asyncio.Event()
         settled = asyncio.Event()
@@ -1501,6 +1557,24 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         finally:
             await self.store.close()
+
+    async def test_sqlite_database_entry_is_synced_on_start(self):
+        from async_job_providers import _sync_directory
+
+        data_dir = self.root / "new-sqlite-data"
+        store = SQLiteJobStore(
+            JobStoreConfig(data_dir, self.settings.metadata_ttl)
+        )
+        with patch(
+            "async_job_providers._sync_directory",
+            wraps=_sync_directory,
+        ) as sync:
+            await store.start()
+        try:
+            sync.assert_any_call(data_dir.parent)
+            sync.assert_any_call(data_dir)
+        finally:
+            await store.close()
 
     async def test_expired_artifact_key_remains_until_deletion_acknowledged(self):
         await self.store.start()

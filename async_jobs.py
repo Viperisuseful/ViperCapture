@@ -588,6 +588,7 @@ class AsyncJobService:
                 job.attempt_count,
                 datetime.now(UTC),
             ),
+            lambda: self._transition_conflict_resolved(job),
         )
         self._wake_workers()
 
@@ -629,6 +630,7 @@ class AsyncJobService:
         self,
         name: str,
         transition: Callable[[], Awaitable[None]],
+        reconcile: Callable[[], Awaitable[bool]],
         *,
         settle_on_cancel: bool = False,
     ) -> None:
@@ -639,6 +641,21 @@ class AsyncJobService:
                     return
                 except asyncio.CancelledError:
                     raise
+                except JobConflictError:
+                    while True:
+                        try:
+                            if await reconcile():
+                                return
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            logger.warning(
+                                "async job transition conflict reconciliation "
+                                "transition=%s error_type=%s",
+                                name,
+                                type(exc).__name__,
+                            )
+                        await asyncio.sleep(self.settings.poll_seconds)
                 except Exception as exc:
                     logger.warning(
                         "async job transition retry transition=%s error_type=%s",
@@ -669,6 +686,13 @@ class AsyncJobService:
                             type(exc).__name__,
                         )
             raise
+
+    async def _transition_conflict_resolved(self, job: JobRecord) -> bool:
+        current = await self.job_store.get(job.id, datetime.now(UTC))
+        return current is not None and (
+            current.status != "running"
+            or current.attempt_count != job.attempt_count
+        )
 
     @staticmethod
     def _consume_task_result(task: asyncio.Task) -> None:
@@ -814,6 +838,7 @@ class AsyncJobService:
                         job.attempt_count,
                         now + timedelta(seconds=min(job.attempt_count, 5)),
                     ),
+                    lambda: self._transition_conflict_resolved(job),
                 )
                 self._wake_at(
                     now + timedelta(seconds=min(job.attempt_count, 5))
@@ -828,6 +853,7 @@ class AsyncJobService:
                     message=message,
                     retryable=retryable,
                 ),
+                lambda: self._transition_conflict_resolved(job),
                 settle_on_cancel=not retryable,
             )
         finally:
