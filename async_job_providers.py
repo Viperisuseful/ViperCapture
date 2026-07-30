@@ -191,6 +191,18 @@ class SQLiteJobStore:
     ) -> JobRecord:
         connection.execute("BEGIN IMMEDIATE")
         try:
+            current = _epoch(job.created_at)
+            connection.execute(
+                """
+                UPDATE async_jobs
+                SET status = 'expired', payload = NULL, completed_at = ?,
+                    error_code = 'job_queue_expired',
+                    error_message = 'The job expired before a worker could start it.',
+                    error_retryable = 1
+                WHERE status = 'queued' AND queue_expires_at <= ?
+                """,
+                (current, current),
+            )
             existing = connection.execute(
                 "SELECT * FROM async_jobs WHERE request_id = ?",
                 (job.request_id,),
@@ -786,6 +798,7 @@ class LocalArtifactStore:
             self.root.chmod(0o700)
         except OSError:
             pass
+        await asyncio.to_thread(self._sync_parent_directory)
 
     async def close(self) -> None:
         return None
@@ -891,6 +904,15 @@ class LocalArtifactStore:
         if os.name == "nt":
             return
         descriptor = os.open(self.root, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _sync_parent_directory(self) -> None:
+        if os.name == "nt":
+            return
+        descriptor = os.open(self.root.parent, os.O_RDONLY)
         try:
             os.fsync(descriptor)
         finally:

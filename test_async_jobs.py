@@ -369,6 +369,41 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.store.close()
 
+    async def test_create_expires_overdue_jobs_before_active_limit(self):
+        await self.store.start()
+        try:
+            now = datetime.now(UTC)
+            expired = JobRecord(
+                id=str(uuid4()),
+                request_id="expired-active-slot",
+                status="queued",
+                payload=b"encrypted",
+                attempt_count=0,
+                available_at=now - timedelta(minutes=1),
+                queue_expires_at=now - timedelta(seconds=1),
+                created_at=now - timedelta(minutes=1),
+            )
+            await self.store.create(expired, active_limit=1)
+            replacement = JobRecord(
+                id=str(uuid4()),
+                request_id="replacement-active-slot",
+                status="queued",
+                payload=b"encrypted",
+                attempt_count=0,
+                available_at=now,
+                queue_expires_at=now + timedelta(minutes=1),
+                created_at=now,
+            )
+
+            created = await self.store.create(replacement, active_limit=1)
+            previous = await self.store.get(expired.id, now)
+
+            self.assertEqual(created.id, replacement.id)
+            self.assertEqual(previous.status, "expired")
+            self.assertIsNone(previous.payload)
+        finally:
+            await self.store.close()
+
     async def test_claim_fails_queued_retry_at_a_lowered_attempt_cap(self):
         await self.store.start()
         try:
@@ -638,6 +673,23 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertGreaterEqual(sync.call_count, 4)
         await self.artifacts.close()
+
+    async def test_artifact_directory_entry_is_synced_on_start(self):
+        artifacts = LocalArtifactStore(
+            ArtifactStoreConfig(
+                self.root / "new-data-dir",
+                self.settings.result_ttl,
+            )
+        )
+        artifacts.config.data_dir.mkdir()
+        with patch(
+            "async_job_providers.os.fsync",
+            wraps=os.fsync,
+        ) as sync:
+            await artifacts.start()
+
+        self.assertGreaterEqual(sync.call_count, 1)
+        await artifacts.close()
 
     async def test_artifact_maintenance_removes_abandoned_temp_files(self):
         await self.artifacts.start()
