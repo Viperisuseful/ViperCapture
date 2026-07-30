@@ -60,6 +60,40 @@ class SQLiteJobStore:
         self._connection: sqlite3.Connection | None = None
         self._lock = asyncio.Lock()
 
+    @staticmethod
+    def _validate_sidecar(
+        path: Path,
+        *,
+        secure_permissions: bool,
+    ) -> None:
+        flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise RuntimeError(
+                "async job database sidecar must be a private regular file"
+            ) from exc
+        try:
+            information = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(information.st_mode)
+                or information.st_uid != os.getuid()
+            ):
+                raise RuntimeError(
+                    "async job database sidecar must be owner-controlled"
+                )
+            if secure_permissions:
+                os.fchmod(descriptor, 0o600)
+                information = os.fstat(descriptor)
+            if stat.S_IMODE(information.st_mode) != 0o600:
+                raise RuntimeError(
+                    "async job database sidecar must be owner-only"
+                )
+        finally:
+            os.close(descriptor)
+
     async def start(self) -> None:
         if os.name == "nt":
             raise RuntimeError(
@@ -102,6 +136,12 @@ class SQLiteJobStore:
             os.close(descriptor)
         if created:
             _sync_directory(self.config.data_dir)
+        sidecars = (
+            Path(f"{self.path}-wal"),
+            Path(f"{self.path}-shm"),
+        )
+        for path in sidecars:
+            self._validate_sidecar(path, secure_permissions=False)
         self._connection = sqlite3.connect(
             self.path,
             check_same_thread=False,
@@ -109,13 +149,8 @@ class SQLiteJobStore:
         )
         self._connection.row_factory = sqlite3.Row
         await self._run(self._initialize)
-        for path in (
-            self.path,
-            Path(f"{self.path}-wal"),
-            Path(f"{self.path}-shm"),
-        ):
-            with suppress(OSError):
-                path.chmod(0o600)
+        for path in (self.path, *sidecars):
+            self._validate_sidecar(path, secure_permissions=True)
         _sync_directory(self.config.data_dir)
 
     async def close(self) -> None:

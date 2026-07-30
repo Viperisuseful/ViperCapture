@@ -2193,6 +2193,36 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(target.read_bytes(), b"not a database")
 
+    async def test_unsafe_sqlite_sidecars_are_rejected_before_recovery(self):
+        symlink_data = self.root / "symlinked-wal"
+        symlink_data.mkdir(mode=0o700)
+        symlink_data.chmod(0o700)
+        target = self.root / "wal-target"
+        target.write_bytes(b"untrusted recovery state")
+        target.chmod(0o600)
+        Path(f"{symlink_data / 'async-jobs.sqlite3'}-wal").symlink_to(target)
+        symlink_store = SQLiteJobStore(
+            JobStoreConfig(symlink_data, self.settings.metadata_ttl)
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "private regular file"):
+            await symlink_store.start()
+
+        self.assertEqual(target.read_bytes(), b"untrusted recovery state")
+
+        permissive_data = self.root / "permissive-wal"
+        permissive_data.mkdir(mode=0o700)
+        permissive_data.chmod(0o700)
+        wal = Path(f"{permissive_data / 'async-jobs.sqlite3'}-wal")
+        wal.write_bytes(b"untrusted recovery state")
+        wal.chmod(0o644)
+        permissive_store = SQLiteJobStore(
+            JobStoreConfig(permissive_data, self.settings.metadata_ttl)
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "owner-only"):
+            await permissive_store.start()
+
     async def test_symlinked_local_state_directories_are_rejected(self):
         redirected_data = self.root / "redirected-data"
         redirected_data.mkdir()
