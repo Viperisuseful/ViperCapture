@@ -986,6 +986,66 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         job_store.requeue.assert_not_awaited()
         job_store.fail.assert_not_awaited()
 
+    async def test_success_conflict_reconciles_winning_terminal_state(self):
+        now = datetime.now(UTC)
+        job_id = str(uuid4())
+        winning = JobRecord(
+            id=job_id,
+            request_id="winning-terminal-state",
+            status="failed",
+            payload=None,
+            attempt_count=1,
+            available_at=now,
+            queue_expires_at=now + timedelta(minutes=1),
+            created_at=now,
+            started_at=now,
+            completed_at=now,
+            error_code="winning_failure",
+            error_message="Another terminal transition won.",
+            error_retryable=False,
+        )
+        job_store = SimpleNamespace(
+            succeed=AsyncMock(side_effect=JobConflictError),
+            get=AsyncMock(return_value=winning),
+            requeue=AsyncMock(),
+            fail=AsyncMock(),
+        )
+        artifact_store = SimpleNamespace(
+            put=AsyncMock(
+                return_value=StoredArtifact(
+                    "unreferenced-conflicting-result",
+                    now + self.settings.result_ttl,
+                )
+            ),
+            delete=AsyncMock(),
+        )
+        service = AsyncJobService(
+            self.settings,
+            job_store,
+            artifact_store,
+            _successful_renderer,
+        )
+        job = JobRecord(
+            id=job_id,
+            request_id="winning-terminal-state",
+            status="running",
+            payload=service.cipher.encrypt(job_id, _payload()),
+            attempt_count=1,
+            available_at=now,
+            queue_expires_at=now + timedelta(minutes=1),
+            created_at=now,
+            started_at=now,
+        )
+
+        await asyncio.wait_for(service._process(job), timeout=1)
+
+        job_store.get.assert_awaited_once()
+        artifact_store.delete.assert_awaited_once_with(
+            "unreferenced-conflicting-result"
+        )
+        job_store.requeue.assert_not_awaited()
+        job_store.fail.assert_not_awaited()
+
     async def test_result_ttl_starts_after_artifact_upload(self):
         upload_completed_at = None
 
