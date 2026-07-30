@@ -281,6 +281,12 @@ class JobStore(Protocol):
         available_at: datetime,
     ) -> None: ...
     async def maintain(self, now: datetime) -> list[str]: ...
+    async def expire_result(
+        self,
+        job_id: str,
+        artifact_key: str,
+        now: datetime,
+    ) -> JobRecord | None: ...
     async def acknowledge_artifact_deletion(self, key: str) -> None: ...
 
 
@@ -630,7 +636,14 @@ class AsyncJobService:
             or job.result_expires_at <= datetime.now(UTC)
         ):
             return None
-        return await self.artifact_store.get(job.artifact_key)
+        artifact = await self.artifact_store.get(job.artifact_key)
+        if artifact is None:
+            await self.job_store.expire_result(
+                job.id,
+                job.artifact_key,
+                datetime.now(UTC),
+            )
+        return artifact
 
     async def _maintain(self, *, force: bool = False) -> None:
         if self._closing:

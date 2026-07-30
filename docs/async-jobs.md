@@ -138,6 +138,10 @@ already committed requeue must be accepted, while a stale retry must never
 change a newer running attempt or a terminal job.
 The service reconciles `JobConflictError` from `fail` and `requeue` by reading
 the stored attempt and stops retrying after it has moved or become terminal.
+`expire_result` atomically moves a still-successful job with the supplied
+artifact key to `expired` when the storage provider definitively reports that
+result missing or invalid, so later status polls no longer advertise a dead
+result URL.
 `acknowledge_artifact_deletion` clears a returned artifact key only after the
 storage provider confirms its idempotent deletion; until then, `maintain` must
 continue returning the key.

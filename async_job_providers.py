@@ -452,7 +452,7 @@ class SQLiteJobStore:
             raise
 
     async def get(self, job_id: str, now: datetime) -> JobRecord | None:
-        return await self._run(self._get, job_id, now, scrub=True)
+        return await self._run(self._get, job_id, now)
 
     @classmethod
     def _get(
@@ -464,7 +464,7 @@ class SQLiteJobStore:
         current = _epoch(now)
         connection.execute("BEGIN IMMEDIATE")
         try:
-            connection.execute(
+            expired_queue = connection.execute(
                 """
                 UPDATE async_jobs
                 SET status = 'expired', payload = NULL, completed_at = ?,
@@ -492,6 +492,8 @@ class SQLiteJobStore:
                 (job_id,),
             ).fetchone()
             connection.execute("COMMIT")
+            if expired_queue.rowcount:
+                cls._scrub_payload_history(connection)
             return cls._from_row(row)
         except BaseException:
             if connection.in_transaction:
@@ -921,6 +923,51 @@ class SQLiteJobStore:
                 (key,),
             )
         )
+
+    async def expire_result(
+        self,
+        job_id: str,
+        artifact_key: str,
+        now: datetime,
+    ) -> JobRecord | None:
+        return await self._run(
+            self._expire_result,
+            job_id,
+            artifact_key,
+            now,
+        )
+
+    @classmethod
+    def _expire_result(
+        cls,
+        connection: sqlite3.Connection,
+        job_id: str,
+        artifact_key: str,
+        now: datetime,
+    ) -> JobRecord | None:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                """
+                UPDATE async_jobs
+                SET status = 'expired',
+                    error_code = 'async_result_expired',
+                    error_message = 'The async job result is no longer available.',
+                    error_retryable = 0
+                WHERE id = ? AND status = 'succeeded' AND artifact_key = ?
+                """,
+                (job_id, artifact_key),
+            )
+            row = connection.execute(
+                "SELECT * FROM async_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            connection.execute("COMMIT")
+            return cls._from_row(row)
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
 
 
 _SAFE_KEY = re.compile(r"^[0-9a-f-]{36}\.(png|jpg|webp)$")

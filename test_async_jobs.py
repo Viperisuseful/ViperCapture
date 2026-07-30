@@ -358,6 +358,97 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.store.close()
 
+    async def test_get_scrubs_only_when_queued_payload_expires(self):
+        await self.store.start()
+        try:
+            now = datetime.now(UTC)
+            job = JobRecord(
+                id=str(uuid4()),
+                request_id="conditional-status-scrub",
+                status="queued",
+                payload=b"encrypted",
+                attempt_count=0,
+                available_at=now,
+                queue_expires_at=now + timedelta(seconds=1),
+                created_at=now,
+            )
+            await self.store.create(job, active_limit=1)
+
+            with patch.object(
+                SQLiteJobStore,
+                "_scrub_payload_history",
+                wraps=SQLiteJobStore._scrub_payload_history,
+            ) as scrub:
+                current = await self.store.get(job.id, now)
+                self.assertEqual(current.status, "queued")
+                scrub.assert_not_called()
+
+                expired = await self.store.get(
+                    job.id,
+                    now + timedelta(seconds=2),
+                )
+                self.assertEqual(expired.status, "expired")
+                scrub.assert_called_once()
+
+                repeated = await self.store.get(
+                    job.id,
+                    now + timedelta(seconds=3),
+                )
+                self.assertEqual(repeated.status, "expired")
+                scrub.assert_called_once()
+        finally:
+            await self.store.close()
+
+    async def test_missing_artifact_expires_successful_job(self):
+        await self.store.start()
+        await self.artifacts.start()
+        service = AsyncJobService(
+            self.settings,
+            self.store,
+            self.artifacts,
+            _successful_renderer,
+        )
+        try:
+            now = datetime.now(UTC)
+            job = JobRecord(
+                id=str(uuid4()),
+                request_id="missing-successful-artifact",
+                status="queued",
+                payload=b"encrypted",
+                attempt_count=0,
+                available_at=now,
+                queue_expires_at=now + timedelta(minutes=1),
+                created_at=now,
+            )
+            await self.store.create(job, active_limit=1)
+            claimed = await self.store.claim(
+                now,
+                self.settings.max_attempts,
+            )
+            artifact_key = f"{uuid4()}.png"
+            await self.store.succeed(
+                claimed.id,
+                expected_attempt=claimed.attempt_count,
+                artifact_key=artifact_key,
+                media_type="image/png",
+                filename="missing.png",
+                artifact_bytes=3,
+                result_expires_at=now + timedelta(minutes=1),
+                queue_ms=0,
+            )
+            successful = await self.store.get(job.id, now)
+            self.assertEqual(successful.status, "succeeded")
+
+            self.assertIsNone(await service.result(successful))
+
+            expired = await self.store.get(job.id, datetime.now(UTC))
+            self.assertEqual(expired.status, "expired")
+            self.assertEqual(expired.error_code, "async_result_expired")
+            self.assertEqual(expired.artifact_key, artifact_key)
+        finally:
+            await self.artifacts.close()
+            await self.store.close()
+
     async def test_cancel_normalizes_expired_queued_job(self):
         await self.store.start()
         try:
@@ -2570,6 +2661,7 @@ class ProviderLoadingTests(unittest.TestCase):
                 (
                     "start", "close", "create", "claim", "get", "cancel",
                     "succeed", "fail", "requeue_running", "requeue", "maintain",
+                    "expire_result",
                     "acknowledge_artifact_deletion",
                 ),
             ),
