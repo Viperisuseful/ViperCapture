@@ -23,10 +23,15 @@ The default providers require no external service:
 - `~/.vipercapture/async-jobs.key` protects queued request payloads with
   AES-GCM and is created with owner-only permissions.
 
-Preserve both the database and encryption key when backing up or moving an
-instance. The job database receives only ciphertext for request bodies, so URLs
-and custom target headers are not stored as plaintext. Terminal transitions
-erase that ciphertext.
+For a consistent local backup, stop ViperCapture and copy the complete
+`~/.vipercapture` directory before restarting it. The snapshot must include the
+database and any `-wal`/`-shm` sidecars, `async-jobs.key`, and the complete
+`job-results` directory; copying only the database file while the service is
+running can omit committed queue state and downloadable results. Provider
+adapters need an equivalent coordinated snapshot procedure for live backups.
+The job database receives only ciphertext for request bodies, so URLs and
+custom target headers are not stored as plaintext. Terminal transitions erase
+that ciphertext.
 The bundled providers create the database, WAL sidecars, key, and result files
 with owner-only permissions. Key and result creation fsync both file contents
 and directory entries before reporting durable success.

@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import threading
 from uuid import uuid4
 
 from async_jobs import (
@@ -771,6 +772,8 @@ class LocalArtifactStore:
     def __init__(self, config: ArtifactStoreConfig) -> None:
         self.config = config
         self.root = config.data_dir / "job-results"
+        self._publishing: set[str] = set()
+        self._publishing_lock = threading.Lock()
 
     async def start(self) -> None:
         if os.name == "nt":
@@ -828,6 +831,8 @@ class LocalArtifactStore:
         token = uuid4().hex
         data_temp = self.root / f".{key}.{token}.tmp"
         metadata_temp = self.root / f".{key}.{token}.json.tmp"
+        with self._publishing_lock:
+            self._publishing.add(key)
         try:
             self._write_durable(data_temp, body)
             os.replace(data_temp, data_path)
@@ -858,6 +863,8 @@ class LocalArtifactStore:
             expires_at = completed_at + self.config.result_ttl
             return expires_at
         finally:
+            with self._publishing_lock:
+                self._publishing.discard(key)
             for path in (data_temp, metadata_temp):
                 try:
                     path.unlink()
@@ -952,8 +959,10 @@ class LocalArtifactStore:
                 continue
             metadata_path = self.root / f"{data_path.name}.json"
             try:
+                with self._publishing_lock:
+                    publishing = data_path.name in self._publishing
                 orphaned = (
-                    not metadata_path.exists()
+                    not publishing and not metadata_path.exists()
                     and data_path.stat().st_mtime <= oldest_orphan
                 )
             except OSError:

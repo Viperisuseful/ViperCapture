@@ -651,6 +651,52 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(temporary.exists())
         await self.artifacts.close()
 
+    async def test_artifact_maintenance_preserves_active_publication(self):
+        publication_started = threading.Event()
+        release_publication = threading.Event()
+
+        class BlockingPublicationStore(LocalArtifactStore):
+            sync_count = 0
+
+            def _sync_directory(self):
+                self.sync_count += 1
+                if self.sync_count == 1:
+                    publication_started.set()
+                    release_publication.wait(timeout=2)
+                return super()._sync_directory()
+
+        artifacts = BlockingPublicationStore(
+            ArtifactStoreConfig(self.root, timedelta(seconds=-1))
+        )
+        await artifacts.start()
+        publication = asyncio.create_task(
+            artifacts.put(
+                str(uuid4()),
+                b"publishing",
+                media_type="image/png",
+                filename="publishing.png",
+            )
+        )
+        try:
+            started = await asyncio.to_thread(
+                publication_started.wait,
+                1,
+            )
+            self.assertTrue(started)
+
+            await artifacts.maintain(datetime.now(UTC))
+            release_publication.set()
+            stored = await publication
+            data_path, metadata_path = artifacts._paths(stored.key)
+
+            self.assertTrue(data_path.exists())
+            self.assertTrue(metadata_path.exists())
+        finally:
+            release_publication.set()
+            if not publication.done():
+                await publication
+            await artifacts.close()
+
     def test_artifact_directory_sync_is_skipped_on_windows(self):
         with (
             patch("async_job_providers.os.name", "nt"),
