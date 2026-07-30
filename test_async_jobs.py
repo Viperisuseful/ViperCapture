@@ -797,6 +797,30 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(sync.call_count, 4)
         await self.artifacts.close()
 
+    async def test_local_artifact_deletion_syncs_directory(self):
+        await self.artifacts.start()
+        stored = await self.artifacts.put(
+            str(uuid4()),
+            b"durably-deleted",
+            media_type="image/png",
+            filename="deleted.png",
+        )
+        data_path, metadata_path = self.artifacts._paths(stored.key)
+        with patch.object(
+            self.artifacts,
+            "_sync_directory",
+            wraps=self.artifacts._sync_directory,
+        ) as sync:
+            await self.artifacts.delete(stored.key)
+            sync.assert_called_once_with()
+            self.assertFalse(data_path.exists())
+            self.assertFalse(metadata_path.exists())
+
+            sync.reset_mock()
+            await self.artifacts.delete(stored.key)
+            sync.assert_not_called()
+        await self.artifacts.close()
+
     async def test_cancelled_local_artifact_read_waits_for_thread(self):
         read_started = threading.Event()
         release_read = threading.Event()

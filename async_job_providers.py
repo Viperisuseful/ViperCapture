@@ -1042,11 +1042,15 @@ class LocalArtifactStore:
         await asyncio.to_thread(self._delete, key)
 
     def _delete(self, key: str) -> None:
+        removed = False
         for path in self._paths(key):
             try:
                 path.unlink()
+                removed = True
             except FileNotFoundError:
                 pass
+        if removed:
+            self._sync_directory()
 
     async def maintain(self, now: datetime) -> None:
         await asyncio.to_thread(self._maintain, now)
