@@ -133,6 +133,10 @@ pub fn run() {
                 .env("VIPERCAPTURE_PARENT_PID", std::process::id().to_string())
                 .env("VIPERCAPTURE_CAPTURES_DIR", captures_dir.as_os_str())
                 .env("VIPERCAPTURE_DATA_DIR", data_dir.as_os_str())
+                .env(
+                    "VIPERCAPTURE_ASYNC_JOBS",
+                    if cfg!(target_os = "windows") { "0" } else { "1" },
+                )
                 .env("PLAYWRIGHT_BROWSERS_PATH", browser_dir.as_os_str())
                 .spawn()?;
 

@@ -106,6 +106,10 @@ class JobConflictError(Exception):
     pass
 
 
+class ArtifactExpiredError(Exception):
+    pass
+
+
 def _sync_directory(path: Path) -> None:
     if os.name == "nt":
         return
@@ -266,6 +270,10 @@ def _read_or_create_key(data_dir: Path) -> bytes:
     supplied = os.getenv("VIPERCAPTURE_JOB_SECRET")
     if supplied:
         return sha256(PAYLOAD_VERSION + supplied.encode("utf-8")).digest()
+    if os.name == "nt":
+        raise RuntimeError(
+            "VIPERCAPTURE_JOB_SECRET is required for async jobs on Windows"
+        )
     data_dir.mkdir(parents=True, exist_ok=True)
     with suppress(OSError):
         data_dir.chmod(0o700)
@@ -414,15 +422,17 @@ class AsyncJobService:
         await asyncio.gather(*self._wake_tasks, return_exceptions=True)
         self._wake_tasks.clear()
         try:
-            await self.artifact_store.close()
+            await self._close_provider(self.artifact_store)
         finally:
-            close_task = asyncio.create_task(self.job_store.close())
-            done, _pending = await asyncio.wait(
-                {close_task},
-                timeout=1.0,
-            )
-            if close_task not in done:
-                close_task.add_done_callback(self._consume_task_result)
+            await self._close_provider(self.job_store)
+
+    async def _close_provider(self, provider: object) -> None:
+        close_task = asyncio.create_task(provider.close())
+        done, _pending = await asyncio.wait({close_task}, timeout=1.0)
+        if close_task in done:
+            close_task.result()
+        else:
+            close_task.add_done_callback(self._consume_task_result)
 
     async def submit(
         self,
@@ -659,8 +669,16 @@ class AsyncJobService:
     async def _retry_success_transition(
         self,
         transition: Callable[[], Awaitable[JobRecord]],
+        expires_at: datetime,
     ) -> JobRecord:
         while True:
+            if datetime.now(UTC) >= expires_at:
+                raise RenderError(
+                    "async_result_expired",
+                    "The async result expired before settlement.",
+                    410,
+                    False,
+                )
             try:
                 return await transition()
             except asyncio.CancelledError:
@@ -670,7 +688,10 @@ class AsyncJobService:
                     "async job transition retry transition=succeed error_type=%s",
                     type(exc).__name__,
                 )
-                await asyncio.sleep(self.settings.poll_seconds)
+                remaining = (expires_at - datetime.now(UTC)).total_seconds()
+                await asyncio.sleep(
+                    max(0.0, min(self.settings.poll_seconds, remaining))
+                )
 
     async def _process(self, job: JobRecord) -> None:
         stored_key: str | None = None
@@ -703,14 +724,20 @@ class AsyncJobService:
                         artifact_bytes=len(rendered.body),
                         result_expires_at=result_expires_at,
                         queue_ms=queue_ms,
-                    )
+                    ),
+                    result_expires_at,
                 )
             )
             try:
                 await asyncio.shield(settlement)
             except asyncio.CancelledError:
                 settlement.cancel()
-                await asyncio.gather(settlement, return_exceptions=True)
+                done, _pending = await asyncio.wait(
+                    {settlement},
+                    timeout=1.0,
+                )
+                if settlement not in done:
+                    settlement.add_done_callback(self._consume_task_result)
                 raise
         except asyncio.CancelledError:
             # Leave the claimed row running. Startup recovery can distinguish

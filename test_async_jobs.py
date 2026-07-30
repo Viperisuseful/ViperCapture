@@ -1208,7 +1208,7 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
                 media_type="image/png",
                 filename="capture.png",
                 artifact_bytes=3,
-                result_expires_at=now - timedelta(seconds=1),
+                result_expires_at=now + timedelta(seconds=1),
                 queue_ms=0,
             )
             repeated = await self.store.succeed(
@@ -1218,22 +1218,23 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
                 media_type="image/png",
                 filename="capture.png",
                 artifact_bytes=3,
-                result_expires_at=now - timedelta(seconds=1),
+                result_expires_at=now + timedelta(seconds=1),
                 queue_ms=0,
             )
             self.assertEqual(repeated, succeeded)
 
-            first = await self.store.maintain(now)
-            current = await self.store.get(job.id, now)
+            maintenance_time = now + timedelta(seconds=2)
+            first = await self.store.maintain(maintenance_time)
+            current = await self.store.get(job.id, maintenance_time)
             self.assertIn("retry-delete", first)
             self.assertEqual(current.status, "expired")
             self.assertEqual(current.artifact_key, "retry-delete")
 
-            second = await self.store.maintain(now)
+            second = await self.store.maintain(maintenance_time)
             self.assertIn("retry-delete", second)
             await self.store.acknowledge_artifact_deletion("retry-delete")
-            third = await self.store.maintain(now)
-            current = await self.store.get(job.id, now)
+            third = await self.store.maintain(maintenance_time)
+            current = await self.store.get(job.id, maintenance_time)
             self.assertNotIn("retry-delete", third)
             self.assertIsNone(current.artifact_key)
         finally:

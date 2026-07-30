@@ -32,7 +32,8 @@ with owner-only permissions. Key and result creation fsync both file contents
 and directory entries before reporting durable success.
 Because Python file modes do not create private Windows ACLs, the bundled
 SQLite and filesystem providers refuse to start on Windows; use external
-providers there.
+providers plus an explicit `VIPERCAPTURE_JOB_SECRET` there. The packaged
+Windows desktop sidecar disables async jobs by default.
 
 ViperCapture leaves claimed work `running` during shutdown. At startup it
 requeues interrupted jobs unless they have already reached the configured
@@ -107,6 +108,8 @@ arguments used for an idempotent retry. During graceful shutdown, a
 non-retryable failure gets one final bounded settlement attempt before its
 worker exits, preventing a transient first write failure from becoming a retry
 after restart.
+`succeed` must reject a result whose `result_expires_at` has already passed at
+commit time.
 `requeue_running` supplies restart recovery without exceeding its
 `max_attempts` argument. `maintain` returns expired artifact keys for deletion
 and must preserve successful metadata and artifacts until `result_expires_at`,

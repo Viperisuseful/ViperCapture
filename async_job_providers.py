@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from async_jobs import (
     Artifact,
+    ArtifactExpiredError,
     ArtifactStoreConfig,
     JobConflictError,
     JobRecord,
@@ -374,6 +375,8 @@ class SQLiteJobStore:
     ) -> JobRecord:
         def operation(connection: sqlite3.Connection) -> JobRecord:
             current = datetime.now(UTC).timestamp()
+            if _epoch(result_expires_at) <= current:
+                raise ArtifactExpiredError
             running = connection.execute(
                 """
                 SELECT started_at FROM async_jobs
