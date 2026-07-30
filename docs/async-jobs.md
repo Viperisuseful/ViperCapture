@@ -110,7 +110,12 @@ non-retryable failure gets one final bounded settlement attempt before its
 worker exits, preventing a transient first write failure from becoming a retry
 after restart.
 `succeed` must reject a result whose `result_expires_at` has already passed at
-commit time.
+commit time with `ArtifactExpiredError`, but it must check for and return an
+identical previously committed success first. Other errors are treated as
+ambiguous acknowledgements and retried even after result expiry.
+`get` and `cancel` must normalize an overdue queued job to `expired`; `get`
+must likewise normalize an overdue successful result so route order cannot
+change the terminal state.
 `requeue_running` supplies restart recovery without exceeding its
 `max_attempts` argument. `maintain` returns expired artifact keys for deletion
 and must preserve successful metadata and artifacts until `result_expires_at`,

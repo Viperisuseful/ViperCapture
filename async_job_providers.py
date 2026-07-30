@@ -376,17 +376,33 @@ class SQLiteJobStore:
             if row["status"] == "running":
                 raise JobConflictError
             if row["status"] == "queued":
-                connection.execute(
-                    """
-                    UPDATE async_jobs
-                    SET status = 'cancelled', payload = NULL, completed_at = ?,
-                        error_code = 'job_cancelled',
-                        error_message = 'The queued job was cancelled.',
-                        error_retryable = 0
-                    WHERE id = ?
-                    """,
-                    (_epoch(now), job_id),
-                )
+                current = _epoch(now)
+                if row["queue_expires_at"] <= current:
+                    connection.execute(
+                        """
+                        UPDATE async_jobs
+                        SET status = 'expired', payload = NULL,
+                            completed_at = ?,
+                            error_code = 'job_queue_expired',
+                            error_message = 'The job expired before a worker could start it.',
+                            error_retryable = 1
+                        WHERE id = ?
+                        """,
+                        (current, job_id),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        UPDATE async_jobs
+                        SET status = 'cancelled', payload = NULL,
+                            completed_at = ?,
+                            error_code = 'job_cancelled',
+                            error_message = 'The queued job was cancelled.',
+                            error_retryable = 0
+                        WHERE id = ?
+                        """,
+                        (current, job_id),
+                    )
             updated = connection.execute(
                 "SELECT * FROM async_jobs WHERE id = ?",
                 (job_id,),

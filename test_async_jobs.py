@@ -345,6 +345,30 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.store.close()
 
+    async def test_cancel_normalizes_expired_queued_job(self):
+        await self.store.start()
+        try:
+            now = datetime.now(UTC)
+            job = JobRecord(
+                id=str(uuid4()),
+                request_id="cancel-expired-queue",
+                status="queued",
+                payload=b"encrypted",
+                attempt_count=0,
+                available_at=now - timedelta(minutes=1),
+                queue_expires_at=now - timedelta(seconds=1),
+                created_at=now - timedelta(minutes=1),
+            )
+            await self.store.create(job, active_limit=1)
+
+            cancelled = await self.store.cancel(job.id, now)
+
+            self.assertEqual(cancelled.status, "expired")
+            self.assertEqual(cancelled.error_code, "job_queue_expired")
+            self.assertIsNone(cancelled.payload)
+        finally:
+            await self.store.close()
+
     async def test_claim_fails_queued_retry_at_a_lowered_attempt_cap(self):
         await self.store.start()
         try:
@@ -809,6 +833,57 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
 
         await asyncio.wait_for(service._process(job), timeout=1)
         self.assertEqual(succeed_calls, 2)
+        artifact_store.delete.assert_not_awaited()
+        job_store.requeue.assert_not_awaited()
+        job_store.fail.assert_not_awaited()
+
+    async def test_ambiguous_final_success_keeps_resolving_after_expiry(self):
+        succeed_calls = 0
+
+        async def succeed(*_args, **_kwargs):
+            nonlocal succeed_calls
+            succeed_calls += 1
+            if succeed_calls <= 2:
+                raise RuntimeError("commit acknowledgement was lost")
+
+        job_store = SimpleNamespace(
+            succeed=AsyncMock(side_effect=succeed),
+            requeue=AsyncMock(),
+            fail=AsyncMock(),
+        )
+        artifact_store = SimpleNamespace(
+            put=AsyncMock(
+                return_value=StoredArtifact(
+                    "final-committed-result",
+                    datetime.now(UTC) + timedelta(milliseconds=5),
+                )
+            ),
+            delete=AsyncMock(),
+        )
+        settings = _settings(self.root, poll_seconds=0.01)
+        service = AsyncJobService(
+            settings,
+            job_store,
+            artifact_store,
+            _successful_renderer,
+        )
+        now = datetime.now(UTC)
+        job_id = str(uuid4())
+        job = JobRecord(
+            id=job_id,
+            request_id="ambiguous-final-success",
+            status="running",
+            payload=service.cipher.encrypt(job_id, _payload()),
+            attempt_count=1,
+            available_at=now,
+            queue_expires_at=now + timedelta(minutes=1),
+            created_at=now,
+            started_at=now,
+        )
+
+        await asyncio.wait_for(service._process(job), timeout=1)
+
+        self.assertEqual(succeed_calls, 3)
         artifact_store.delete.assert_not_awaited()
         job_store.requeue.assert_not_awaited()
         job_store.fail.assert_not_awaited()

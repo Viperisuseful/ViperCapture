@@ -680,20 +680,17 @@ class AsyncJobService:
         expires_at: datetime,
     ) -> JobRecord:
         while True:
-            if datetime.now(UTC) >= expires_at:
-                try:
-                    return await transition()
-                except Exception as exc:
-                    raise RenderError(
-                        "async_result_expired",
-                        "The async result expired before settlement.",
-                        410,
-                        False,
-                    ) from exc
             try:
                 return await transition()
             except asyncio.CancelledError:
                 raise
+            except ArtifactExpiredError as exc:
+                raise RenderError(
+                    "async_result_expired",
+                    "The async result expired before settlement.",
+                    410,
+                    False,
+                ) from exc
             except Exception as exc:
                 logger.warning(
                     "async job transition retry transition=succeed error_type=%s",
@@ -701,7 +698,11 @@ class AsyncJobService:
                 )
                 remaining = (expires_at - datetime.now(UTC)).total_seconds()
                 await asyncio.sleep(
-                    max(0.0, min(self.settings.poll_seconds, remaining))
+                    (
+                        min(self.settings.poll_seconds, remaining)
+                        if remaining > 0
+                        else self.settings.poll_seconds
+                    )
                 )
 
     async def _process(self, job: JobRecord) -> None:
