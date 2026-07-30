@@ -415,7 +415,14 @@ class AsyncJobService:
         for worker in self._workers:
             worker.cancel()
         if self._workers:
-            await asyncio.gather(*self._workers, return_exceptions=True)
+            done, pending = await asyncio.wait(
+                set(self._workers),
+                timeout=1.0,
+            )
+            for worker in done:
+                self._consume_task_result(worker)
+            for worker in pending:
+                worker.add_done_callback(self._consume_task_result)
         self._workers.clear()
         for task in self._wake_tasks:
             task.cancel()
@@ -673,12 +680,15 @@ class AsyncJobService:
     ) -> JobRecord:
         while True:
             if datetime.now(UTC) >= expires_at:
-                raise RenderError(
-                    "async_result_expired",
-                    "The async result expired before settlement.",
-                    410,
-                    False,
-                )
+                try:
+                    return await transition()
+                except Exception as exc:
+                    raise RenderError(
+                        "async_result_expired",
+                        "The async result expired before settlement.",
+                        410,
+                        False,
+                    ) from exc
             try:
                 return await transition()
             except asyncio.CancelledError:

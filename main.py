@@ -105,6 +105,18 @@ ASYNC_JOB_SETTINGS = (
     else None
 )
 
+
+class _SlotStreamingResponse(StreamingResponse):
+    def __init__(self, *args, release_slot, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._release_slot = release_slot
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._release_slot()
+
 if not HOSTED:
     CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -638,14 +650,23 @@ async def read_render_job_result(job_id: UUID, request: Request) -> Response:
             410,
             False,
         )
+    released = False
+
+    def release_slot() -> None:
+        nonlocal released
+        if not released:
+            released = True
+            slots.release()
+
     async def stream_body():
         try:
             yield artifact.body
         finally:
-            slots.release()
+            release_slot()
 
-    return StreamingResponse(
+    return _SlotStreamingResponse(
         stream_body(),
+        release_slot=release_slot,
         media_type=artifact.media_type,
         headers={
             "Content-Disposition": f'attachment; filename="{artifact.filename}"',

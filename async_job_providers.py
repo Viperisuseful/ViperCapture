@@ -375,6 +375,34 @@ class SQLiteJobStore:
     ) -> JobRecord:
         def operation(connection: sqlite3.Connection) -> JobRecord:
             current = datetime.now(UTC).timestamp()
+            existing = connection.execute(
+                "SELECT * FROM async_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if (
+                existing is not None
+                and existing["status"] == "succeeded"
+                and existing["attempt_count"] == expected_attempt
+            ):
+                expected = (
+                    artifact_key,
+                    media_type,
+                    filename,
+                    artifact_bytes,
+                    _epoch(result_expires_at),
+                    queue_ms,
+                )
+                actual = (
+                    existing["artifact_key"],
+                    existing["media_type"],
+                    existing["filename"],
+                    existing["artifact_bytes"],
+                    existing["result_expires_at"],
+                    existing["queue_ms"],
+                )
+                if actual != expected:
+                    raise JobConflictError
+                return self._from_row(existing)
             if _epoch(result_expires_at) <= current:
                 raise ArtifactExpiredError
             running = connection.execute(
@@ -767,6 +795,11 @@ class LocalArtifactStore:
             completed_at = datetime.now(UTC)
             timestamp = completed_at.timestamp()
             os.utime(metadata_path, (timestamp, timestamp))
+            descriptor = os.open(metadata_path, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
             self._sync_directory()
             expires_at = completed_at + self.config.result_ttl
             return expires_at
