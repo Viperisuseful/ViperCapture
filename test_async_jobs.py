@@ -258,6 +258,93 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.store.close()
 
+    async def test_retry_expiration_uses_transition_time(self):
+        await self.store.start()
+        try:
+            now = datetime.now(UTC)
+            job = JobRecord(
+                id=str(uuid4()),
+                request_id="retry-expiration-time",
+                status="queued",
+                payload=b"encrypted",
+                attempt_count=0,
+                available_at=now,
+                queue_expires_at=now + timedelta(milliseconds=10),
+                created_at=now,
+            )
+            await self.store.create(job, active_limit=1)
+            claimed = await self.store.claim(now, self.settings.max_attempts)
+            future_retry = now + timedelta(minutes=1)
+
+            before = datetime.now(UTC)
+            await self.store.requeue(
+                job.id,
+                claimed.attempt_count,
+                future_retry,
+            )
+            current = await self.store.get(job.id, future_retry)
+
+            self.assertEqual(current.status, "expired")
+            self.assertGreaterEqual(current.completed_at, before)
+            self.assertLess(current.completed_at, future_retry)
+        finally:
+            await self.store.close()
+
+    async def test_get_normalizes_queued_and_result_expiration(self):
+        await self.store.start()
+        try:
+            now = datetime.now(UTC)
+            queued = JobRecord(
+                id=str(uuid4()),
+                request_id="expired-queued-status",
+                status="queued",
+                payload=b"encrypted",
+                attempt_count=0,
+                available_at=now - timedelta(minutes=1),
+                queue_expires_at=now - timedelta(seconds=1),
+                created_at=now - timedelta(minutes=1),
+            )
+            await self.store.create(queued, active_limit=2)
+            expired_queue = await self.store.get(queued.id, now)
+            self.assertEqual(expired_queue.status, "expired")
+            self.assertEqual(expired_queue.error_code, "job_queue_expired")
+            self.assertIsNone(expired_queue.payload)
+
+            successful = JobRecord(
+                id=str(uuid4()),
+                request_id="expired-result-status",
+                status="queued",
+                payload=b"encrypted",
+                attempt_count=0,
+                available_at=now - timedelta(minutes=1),
+                queue_expires_at=now + timedelta(minutes=1),
+                created_at=now - timedelta(minutes=1),
+            )
+            await self.store.create(successful, active_limit=2)
+            await self.store.claim(now, self.settings.max_attempts)
+            await self.store.succeed(
+                successful.id,
+                expected_attempt=1,
+                artifact_key="expired-result",
+                media_type="image/png",
+                filename="capture.png",
+                artifact_bytes=3,
+                result_expires_at=now + timedelta(seconds=1),
+                queue_ms=0,
+            )
+            expired_result = await self.store.get(
+                successful.id,
+                now + timedelta(seconds=2),
+            )
+            self.assertEqual(expired_result.status, "expired")
+            self.assertEqual(
+                expired_result.error_code,
+                "async_result_expired",
+            )
+            self.assertEqual(expired_result.artifact_key, "expired-result")
+        finally:
+            await self.store.close()
+
     async def test_claim_fails_queued_retry_at_a_lowered_attempt_cap(self):
         await self.store.start()
         try:
@@ -1590,6 +1677,40 @@ class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
         job_store.close.assert_awaited_once()
         artifact_store.start.assert_not_awaited()
         artifact_store.close.assert_not_awaited()
+
+    async def test_start_failure_bounds_partially_started_provider_cleanup(self):
+        never_closed = asyncio.Event()
+
+        async def never_close():
+            await never_closed.wait()
+
+        job_store = SimpleNamespace(
+            start=AsyncMock(),
+            close=AsyncMock(side_effect=never_close),
+            requeue_running=AsyncMock(),
+            maintain=AsyncMock(return_value=[]),
+        )
+        artifact_store = SimpleNamespace(
+            start=AsyncMock(side_effect=RuntimeError("artifact start failed")),
+            close=AsyncMock(side_effect=never_close),
+        )
+        service = AsyncJobService(
+            _settings(Path(".")),
+            job_store,
+            artifact_store,
+            _successful_renderer,
+            cipher=PayloadCipher(b"\0" * 32),
+        )
+
+        with (
+            patch("async_jobs.asyncio.wait", wraps=asyncio.wait) as wait,
+            self.assertRaisesRegex(RuntimeError, "artifact start failed"),
+        ):
+            await service.start()
+
+        self.assertEqual(wait.await_count, 2)
+        artifact_store.close.assert_awaited_once()
+        job_store.close.assert_awaited_once()
 
     def test_openapi_exposes_complete_job_surface(self):
         paths = main.app.openapi()["paths"]

@@ -308,14 +308,51 @@ class SQLiteJobStore:
             raise
 
     async def get(self, job_id: str, now: datetime) -> JobRecord | None:
-        return await self._run(
-            lambda connection: self._from_row(
-                connection.execute(
-                    "SELECT * FROM async_jobs WHERE id = ?",
-                    (job_id,),
-                ).fetchone()
+        return await self._run(self._get, job_id, now)
+
+    @classmethod
+    def _get(
+        cls,
+        connection: sqlite3.Connection,
+        job_id: str,
+        now: datetime,
+    ) -> JobRecord | None:
+        current = _epoch(now)
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                """
+                UPDATE async_jobs
+                SET status = 'expired', payload = NULL, completed_at = ?,
+                    error_code = 'job_queue_expired',
+                    error_message = 'The job expired before a worker could start it.',
+                    error_retryable = 1
+                WHERE id = ? AND status = 'queued' AND queue_expires_at <= ?
+                """,
+                (current, job_id, current),
             )
-        )
+            connection.execute(
+                """
+                UPDATE async_jobs
+                SET status = 'expired',
+                    error_code = 'async_result_expired',
+                    error_message = 'The async job result is no longer available.',
+                    error_retryable = 0
+                WHERE id = ? AND status = 'succeeded'
+                  AND result_expires_at <= ?
+                """,
+                (job_id, current),
+            )
+            row = connection.execute(
+                "SELECT * FROM async_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            connection.execute("COMMIT")
+            return cls._from_row(row)
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
 
     async def cancel(self, job_id: str, now: datetime) -> JobRecord | None:
         return await self._run(self._cancel, job_id, now)
@@ -599,6 +636,7 @@ class SQLiteJobStore:
                 (current, job_id, expected_attempt, current),
             )
             if updated.rowcount == 0:
+                completed_at = datetime.now(UTC).timestamp()
                 connection.execute(
                     """
                     UPDATE async_jobs
@@ -609,7 +647,7 @@ class SQLiteJobStore:
                     WHERE id = ? AND status = 'running'
                       AND attempt_count = ? AND queue_expires_at <= ?
                     """,
-                    (current, job_id, expected_attempt, current),
+                    (completed_at, job_id, expected_attempt, current),
                 )
 
         await self._run(operation)

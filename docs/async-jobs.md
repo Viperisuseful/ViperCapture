@@ -33,7 +33,8 @@ and directory entries before reporting durable success.
 Because Python file modes do not create private Windows ACLs, the bundled
 SQLite and filesystem providers refuse to start on Windows; use external
 providers plus an explicit `VIPERCAPTURE_JOB_SECRET` there. The packaged
-Windows desktop sidecar disables async jobs by default.
+Windows desktop sidecar and the regular Windows launcher disable async jobs by
+default.
 
 ViperCapture leaves claimed work `running` during shutdown. At startup it
 requeues interrupted jobs unless they have already reached the configured
@@ -51,7 +52,7 @@ therefore includes failed attempts, retry backoff, and result persistence.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `VIPERCAPTURE_ASYNC_JOBS` | `1` | Set to `0` to disable async jobs |
+| `VIPERCAPTURE_ASYNC_JOBS` | `1` (`0` on Windows) | Set to `0` to disable async jobs |
 | `VIPERCAPTURE_DATA_DIR` | `~/.vipercapture` | Local database, key, and result root |
 | `VIPERCAPTURE_JOB_SECRET` | generated local key | Shared encryption secret for portable or external state |
 | `VIPERCAPTURE_JOB_QUEUE_LIMIT` | `30` | Maximum queued plus running jobs |

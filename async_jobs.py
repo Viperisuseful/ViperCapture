@@ -405,9 +405,10 @@ class AsyncJobService:
         except BaseException:
             if artifact_store_started:
                 with suppress(Exception):
-                    await self.artifact_store.close()
+                    await self._close_provider(self.artifact_store)
             if job_store_started:
-                await self.job_store.close()
+                with suppress(Exception):
+                    await self._close_provider(self.job_store)
             raise
 
     async def close(self) -> None:

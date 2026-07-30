@@ -98,7 +98,10 @@ MAX_SCREENSHOT_PIXELS = max(
 )
 CAPTURE_QUEUE_TIMEOUT_SECONDS = 30
 AwaitedResult = TypeVar("AwaitedResult")
-ASYNC_JOBS_ENABLED = os.getenv("VIPERCAPTURE_ASYNC_JOBS", "1") != "0"
+ASYNC_JOBS_ENABLED = os.getenv(
+    "VIPERCAPTURE_ASYNC_JOBS",
+    "0" if os.name == "nt" else "1",
+) != "0"
 ASYNC_JOB_SETTINGS = (
     settings_from_environment(default_workers=MAX_CONCURRENT_CAPTURES)
     if ASYNC_JOBS_ENABLED
