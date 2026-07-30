@@ -1366,13 +1366,14 @@ class ProviderLoadingTests(unittest.TestCase):
             self.assertEqual(mode & 0o077, 0)
 
     def test_key_directory_sync_is_skipped_on_windows(self):
+        directory = Path(".")
         with (
             patch("async_jobs.os.name", "nt"),
             patch("async_jobs.os.open") as open_file,
         ):
             from async_jobs import _sync_directory
 
-            _sync_directory(Path("."))
+            _sync_directory(directory)
         open_file.assert_not_called()
 
     def test_external_factories_receive_provider_specific_config(self):
