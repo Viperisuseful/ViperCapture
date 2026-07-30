@@ -1013,6 +1013,34 @@ class LocalArtifactStore:
     def _sync_parent_directory(self) -> None:
         _sync_directory(self.root.parent)
 
+    @staticmethod
+    def _read_private_file(path: Path) -> tuple[bytes, float]:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            raise RuntimeError(
+                "async artifact must be a private regular file"
+            ) from exc
+        try:
+            information = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(information.st_mode)
+                or information.st_uid != os.getuid()
+                or information.st_mode & 0o077
+            ):
+                raise RuntimeError(
+                    "async artifact must be an owner-only regular file"
+                )
+            chunks: list[bytes] = []
+            while chunk := os.read(descriptor, 65536):
+                chunks.append(chunk)
+            return b"".join(chunks), information.st_mtime
+        finally:
+            os.close(descriptor)
+
     async def get(self, key: str) -> Artifact | None:
         operation = asyncio.create_task(asyncio.to_thread(self._get, key))
         try:
@@ -1025,18 +1053,31 @@ class LocalArtifactStore:
     def _get(self, key: str) -> Artifact | None:
         data_path, metadata_path = self._paths(key)
         try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            expires_at = self._metadata_expiry(metadata_path, metadata)
+            metadata_body, metadata_mtime = self._read_private_file(
+                metadata_path
+            )
+            metadata = json.loads(metadata_body)
+            if not isinstance(metadata, dict):
+                raise ValueError("invalid async artifact metadata")
+            expires_at = self._metadata_expiry(metadata_mtime, metadata)
             if expires_at <= datetime.now(UTC):
                 self._delete(key)
                 return None
+            body, _data_mtime = self._read_private_file(data_path)
             return Artifact(
                 key=key,
-                body=data_path.read_bytes(),
+                body=body,
                 media_type=str(metadata["media_type"]),
                 filename=str(metadata["filename"]),
             )
-        except (FileNotFoundError, KeyError, ValueError, json.JSONDecodeError):
+        except (
+            OSError,
+            RuntimeError,
+            KeyError,
+            TypeError,
+            ValueError,
+            OverflowError,
+        ):
             return None
 
     async def delete(self, key: str) -> None:
@@ -1061,22 +1102,47 @@ class LocalArtifactStore:
             self.config.result_ttl.total_seconds(),
             3600,
         )
+        removed_temporary = False
         for temporary in self.root.glob(".*.tmp"):
             try:
                 abandoned = temporary.stat().st_mtime <= oldest_temporary
             except OSError:
                 continue
             if abandoned:
-                with suppress(FileNotFoundError):
+                try:
                     temporary.unlink()
+                    removed_temporary = True
+                except FileNotFoundError:
+                    pass
+        if removed_temporary:
+            self._sync_directory()
         for metadata_path in self.root.glob("*.json"):
             key = metadata_path.name[:-5]
             if not _SAFE_KEY.fullmatch(key):
                 continue
             try:
-                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-                expires_at = self._metadata_expiry(metadata_path, metadata)
-            except (OSError, KeyError, ValueError, json.JSONDecodeError):
+                metadata_body, metadata_mtime = self._read_private_file(
+                    metadata_path
+                )
+                metadata = json.loads(metadata_body)
+                if not isinstance(metadata, dict):
+                    raise ValueError("invalid async artifact metadata")
+                expires_at = self._metadata_expiry(
+                    metadata_mtime,
+                    metadata,
+                )
+            except FileNotFoundError:
+                continue
+            except OSError:
+                continue
+            except (
+                RuntimeError,
+                KeyError,
+                TypeError,
+                ValueError,
+                OverflowError,
+            ):
+                self._delete(key)
                 continue
             if expires_at <= now:
                 self._delete(key)
@@ -1099,12 +1165,12 @@ class LocalArtifactStore:
 
     @staticmethod
     def _metadata_expiry(
-        metadata_path: Path,
+        metadata_mtime: float,
         metadata: dict[str, object],
     ) -> datetime:
         if "ttl_seconds" in metadata:
             return datetime.fromtimestamp(
-                metadata_path.stat().st_mtime,
+                metadata_mtime,
                 UTC,
             ) + timedelta(seconds=float(metadata["ttl_seconds"]))
         return datetime.fromisoformat(str(metadata["expires_at"]))

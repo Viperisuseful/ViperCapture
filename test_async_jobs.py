@@ -821,6 +821,38 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             sync.assert_not_called()
         await self.artifacts.close()
 
+    async def test_local_artifact_reads_reject_symlinked_files(self):
+        await self.artifacts.start()
+        secret = self.root / "service-secret"
+        secret.write_bytes(b"must-not-be-returned")
+        secret.chmod(0o600)
+
+        data_link = await self.artifacts.put(
+            str(uuid4()),
+            b"original-data",
+            media_type="image/png",
+            filename="data-link.png",
+        )
+        data_path, _metadata_path = self.artifacts._paths(data_link.key)
+        data_path.unlink()
+        data_path.symlink_to(secret)
+        self.assertIsNone(await self.artifacts.get(data_link.key))
+
+        metadata_link = await self.artifacts.put(
+            str(uuid4()),
+            b"original-metadata",
+            media_type="image/png",
+            filename="metadata-link.png",
+        )
+        _data_path, metadata_path = self.artifacts._paths(metadata_link.key)
+        metadata_path.unlink()
+        metadata_path.symlink_to(secret)
+        self.assertIsNone(await self.artifacts.get(metadata_link.key))
+
+        await self.artifacts.delete(data_link.key)
+        await self.artifacts.delete(metadata_link.key)
+        await self.artifacts.close()
+
     async def test_cancelled_local_artifact_read_waits_for_thread(self):
         read_started = threading.Event()
         release_read = threading.Event()
@@ -905,6 +937,30 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             await self.artifacts.maintain(datetime.now(UTC))
 
         self.assertFalse(orphan.exists())
+        sync.assert_called_once_with()
+        await self.artifacts.close()
+
+    async def test_artifact_maintenance_removes_malformed_metadata(self):
+        await self.artifacts.start()
+        stored = await self.artifacts.put(
+            str(uuid4()),
+            b"corrupt-metadata-result",
+            media_type="image/png",
+            filename="corrupt.png",
+        )
+        data_path, metadata_path = self.artifacts._paths(stored.key)
+        metadata_path.write_bytes(b"{not-json")
+        metadata_path.chmod(0o600)
+
+        with patch.object(
+            self.artifacts,
+            "_sync_directory",
+            wraps=self.artifacts._sync_directory,
+        ) as sync:
+            await self.artifacts.maintain(datetime.now(UTC))
+
+        self.assertFalse(data_path.exists())
+        self.assertFalse(metadata_path.exists())
         sync.assert_called_once_with()
         await self.artifacts.close()
 
