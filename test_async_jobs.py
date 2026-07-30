@@ -404,6 +404,48 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.store.close()
 
+    async def test_idempotent_create_normalizes_expired_result(self):
+        await self.store.start()
+        try:
+            now = datetime.now(UTC)
+            job = JobRecord(
+                id=str(uuid4()),
+                request_id="expired-idempotent-result",
+                status="queued",
+                payload=b"encrypted",
+                attempt_count=0,
+                available_at=now,
+                queue_expires_at=now + timedelta(minutes=1),
+                created_at=now,
+            )
+            await self.store.create(job, active_limit=1)
+            await self.store.claim(now, self.settings.max_attempts)
+            await self.store.succeed(
+                job.id,
+                expected_attempt=1,
+                artifact_key="expired-idempotent-result",
+                media_type="image/png",
+                filename="capture.png",
+                artifact_bytes=3,
+                result_expires_at=now + timedelta(seconds=1),
+                queue_ms=0,
+            )
+            repeated = JobRecord(
+                **{
+                    **job.__dict__,
+                    "id": str(uuid4()),
+                    "created_at": now + timedelta(seconds=2),
+                }
+            )
+
+            existing = await self.store.create(repeated, active_limit=1)
+
+            self.assertEqual(existing.id, job.id)
+            self.assertEqual(existing.status, "expired")
+            self.assertEqual(existing.error_code, "async_result_expired")
+        finally:
+            await self.store.close()
+
     async def test_claim_fails_queued_retry_at_a_lowered_attempt_cap(self):
         await self.store.start()
         try:
@@ -1392,6 +1434,52 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fail_calls, 2)
         job_store.requeue.assert_not_awaited()
 
+    async def test_worker_does_not_render_claim_returned_during_shutdown(self):
+        claim_started = asyncio.Event()
+        claimed_job = JobRecord(
+            id=str(uuid4()),
+            request_id="shutdown-claim",
+            status="running",
+            payload=b"encrypted",
+            attempt_count=1,
+            available_at=datetime.now(UTC),
+            queue_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+            created_at=datetime.now(UTC),
+            started_at=datetime.now(UTC),
+        )
+
+        async def cancellation_resistant_claim(*_args):
+            claim_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                return claimed_job
+
+        job_store = SimpleNamespace(
+            claim=AsyncMock(side_effect=cancellation_resistant_claim),
+            maintain=AsyncMock(return_value=[]),
+            acknowledge_artifact_deletion=AsyncMock(),
+        )
+        artifact_store = SimpleNamespace(
+            maintain=AsyncMock(),
+            delete=AsyncMock(),
+        )
+        renderer = AsyncMock()
+        service = AsyncJobService(
+            self.settings,
+            job_store,
+            artifact_store,
+            renderer,
+        )
+
+        worker = asyncio.create_task(service._worker(0))
+        await asyncio.wait_for(claim_started.wait(), timeout=1)
+        service._closing = True
+        worker.cancel()
+        await asyncio.wait_for(worker, timeout=1)
+
+        renderer.assert_not_awaited()
+
     async def test_failure_conflict_reconciles_winning_terminal_state(self):
         now = datetime.now(UTC)
         job_id = str(uuid4())
@@ -1433,6 +1521,47 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         job = JobRecord(
             id=job_id,
             request_id="winning-failure-transition",
+            status="running",
+            payload=service.cipher.encrypt(job_id, _payload()),
+            attempt_count=1,
+            available_at=now,
+            queue_expires_at=now + timedelta(minutes=1),
+            created_at=now,
+            started_at=now,
+        )
+
+        await asyncio.wait_for(service._process(job), timeout=1)
+
+        job_store.fail.assert_awaited_once()
+        job_store.get.assert_awaited_once()
+        job_store.requeue.assert_not_awaited()
+
+    async def test_failure_conflict_accepts_deleted_winner(self):
+        now = datetime.now(UTC)
+        job_id = str(uuid4())
+
+        async def rejected_renderer(_payload):
+            raise RenderError(
+                "invalid_target",
+                "The target is invalid.",
+                400,
+                False,
+            )
+
+        job_store = SimpleNamespace(
+            fail=AsyncMock(side_effect=JobConflictError),
+            get=AsyncMock(return_value=None),
+            requeue=AsyncMock(),
+        )
+        service = AsyncJobService(
+            self.settings,
+            job_store,
+            SimpleNamespace(delete=AsyncMock()),
+            rejected_renderer,
+        )
+        job = JobRecord(
+            id=job_id,
+            request_id="deleted-conflict-winner",
             status="running",
             payload=service.cipher.encrypt(job_id, _payload()),
             attempt_count=1,
@@ -1933,6 +2062,44 @@ class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(error.exception.code, "client_disconnected")
+        await asyncio.wait_for(slots.acquire(), timeout=0.1)
+        slots.release()
+        self.service.result.assert_not_awaited()
+
+    async def test_result_slot_is_released_on_request_cancellation(self):
+        succeeded = self.job.__class__(
+            **{
+                **self.job.__dict__,
+                "status": "succeeded",
+                "payload": None,
+                "artifact_key": "external-key",
+                "media_type": "image/png",
+                "filename": "capture.png",
+                "artifact_bytes": 3,
+                "result_expires_at": datetime.now(UTC) + timedelta(minutes=5),
+                "completed_at": datetime.now(UTC),
+            }
+        )
+        self.service.get.return_value = succeeded
+        slots = asyncio.Semaphore(0)
+        main.app.state.async_result_slots = slots
+        disconnect_probe = asyncio.Event()
+
+        async def is_disconnected():
+            slots.release()
+            await asyncio.sleep(0)
+            disconnect_probe.set()
+            await asyncio.Event().wait()
+
+        request = SimpleNamespace(is_disconnected=is_disconnected)
+        reading = asyncio.create_task(
+            main.read_render_job_result(self.job.id, request)
+        )
+        await asyncio.wait_for(disconnect_probe.wait(), timeout=1)
+        reading.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await reading
+
         await asyncio.wait_for(slots.acquire(), timeout=0.1)
         slots.release()
         self.service.result.assert_not_awaited()

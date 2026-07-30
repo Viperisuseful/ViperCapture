@@ -631,29 +631,35 @@ async def read_render_job_result(job_id: UUID, request: Request) -> Response:
             {"Retry-After": "1"} if job.status in {"queued", "running"} else None,
         )
     slots = app.state.async_result_slots
-    await _await_while_connected(request, slots.acquire())
-    is_disconnected = getattr(request, "is_disconnected", None)
-    if callable(is_disconnected) and await is_disconnected():
-        slots.release()
-        raise RenderError(
-            "client_disconnected",
-            "The result download was cancelled.",
-            499,
-            False,
-        )
+    acquire_task = asyncio.create_task(slots.acquire())
+    acquired = False
     try:
+        await _await_while_connected(request, acquire_task)
+        acquired = True
+        is_disconnected = getattr(request, "is_disconnected", None)
+        if callable(is_disconnected) and await is_disconnected():
+            raise RenderError(
+                "client_disconnected",
+                "The result download was cancelled.",
+                499,
+                False,
+            )
         artifact = await service.result(job)
+        if artifact is None:
+            raise RenderError(
+                "async_result_expired",
+                "The async job result is no longer available.",
+                410,
+                False,
+            )
     except BaseException:
-        slots.release()
+        if acquired:
+            slots.release()
+        elif acquire_task.done() and not acquire_task.cancelled():
+            with suppress(BaseException):
+                if acquire_task.result():
+                    slots.release()
         raise
-    if artifact is None:
-        slots.release()
-        raise RenderError(
-            "async_result_expired",
-            "The async job result is no longer available.",
-            410,
-            False,
-        )
     released = False
 
     def release_slot() -> None:

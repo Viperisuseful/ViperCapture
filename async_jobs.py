@@ -558,6 +558,8 @@ class AsyncJobService:
                     )
                     await asyncio.sleep(self.settings.poll_seconds)
                     continue
+                if self._closing:
+                    return
                 if job is None:
                     try:
                         await asyncio.wait_for(
@@ -689,7 +691,7 @@ class AsyncJobService:
 
     async def _transition_conflict_resolved(self, job: JobRecord) -> bool:
         current = await self.job_store.get(job.id, datetime.now(UTC))
-        return current is not None and (
+        return current is None or (
             current.status != "running"
             or current.attempt_count != job.attempt_count
         )
@@ -704,10 +706,10 @@ class AsyncJobService:
         transition: Callable[[], Awaitable[JobRecord]],
         reconcile: Callable[[], Awaitable[JobRecord | None]],
         expires_at: datetime,
-    ) -> JobRecord:
+    ) -> tuple[JobRecord | None, bool]:
         while True:
             try:
-                return await transition()
+                return await transition(), False
             except asyncio.CancelledError:
                 raise
             except JobConflictError:
@@ -723,13 +725,13 @@ class AsyncJobService:
                             type(exc).__name__,
                         )
                     else:
-                        if current is not None and current.status in {
+                        if current is None or current.status in {
                             "succeeded",
                             "failed",
                             "cancelled",
                             "expired",
                         }:
-                            return current
+                            return current, True
                     await asyncio.sleep(self.settings.poll_seconds)
             except ArtifactExpiredError as exc:
                 raise RenderError(
@@ -789,7 +791,7 @@ class AsyncJobService:
                 )
             )
             try:
-                settled = await asyncio.shield(settlement)
+                settled, reconciled = await asyncio.shield(settlement)
             except asyncio.CancelledError:
                 settlement.cancel()
                 done, _pending = await asyncio.wait(
@@ -800,9 +802,10 @@ class AsyncJobService:
                     settlement.add_done_callback(self._consume_task_result)
                 raise
             if (
-                isinstance(settled, JobRecord)
+                reconciled
                 and (
-                    settled.status != "succeeded"
+                    settled is None
+                    or settled.status != "succeeded"
                     or settled.artifact_key != stored_key
                 )
             ):

@@ -215,6 +215,17 @@ class SQLiteJobStore:
                 """,
                 (current, current),
             )
+            connection.execute(
+                """
+                UPDATE async_jobs
+                SET status = 'expired',
+                    error_code = 'async_result_expired',
+                    error_message = 'The async job result is no longer available.',
+                    error_retryable = 0
+                WHERE status = 'succeeded' AND result_expires_at <= ?
+                """,
+                (current,),
+            )
             existing = connection.execute(
                 "SELECT * FROM async_jobs WHERE request_id = ?",
                 (job.request_id,),

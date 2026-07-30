@@ -3,7 +3,7 @@ use rand::{distr::Alphanumeric, Rng};
 #[cfg(desktop)]
 use serde::Serialize;
 #[cfg(desktop)]
-use std::{net::TcpListener, path::PathBuf, sync::Mutex};
+use std::{env, net::TcpListener, path::PathBuf, sync::Mutex};
 #[cfg(desktop)]
 use tauri::{AppHandle, Manager, RunEvent, State};
 #[cfg(desktop)]
@@ -125,18 +125,21 @@ pub fn run() {
             std::fs::create_dir_all(&captures_dir)?;
             let browser_dir = playwright_dir(app)?;
 
-            let (mut events, child) = app
+            let mut sidecar = app
                 .shell()
                 .sidecar("vipercapture-sidecar")?
                 .env("VIPERCAPTURE_PORT", port.to_string())
                 .env("VIPERCAPTURE_DESKTOP_TOKEN", &token)
                 .env("VIPERCAPTURE_PARENT_PID", std::process::id().to_string())
                 .env("VIPERCAPTURE_CAPTURES_DIR", captures_dir.as_os_str())
-                .env("VIPERCAPTURE_DATA_DIR", data_dir.as_os_str())
-                .env(
+                .env("VIPERCAPTURE_DATA_DIR", data_dir.as_os_str());
+            if env::var_os("VIPERCAPTURE_ASYNC_JOBS").is_none() {
+                sidecar = sidecar.env(
                     "VIPERCAPTURE_ASYNC_JOBS",
                     if cfg!(target_os = "windows") { "0" } else { "1" },
-                )
+                );
+            }
+            let (mut events, child) = sidecar
                 .env("PLAYWRIGHT_BROWSERS_PATH", browser_dir.as_os_str())
                 .spawn()?;
 
