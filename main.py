@@ -314,7 +314,8 @@ async def _await_while_connected(
             if operation_task in done:
                 return await operation_task
             if await is_disconnected():
-                operation_task.cancel()
+                if operation_task.done() or not operation_task.cancel():
+                    return await operation_task
                 with suppress(asyncio.CancelledError):
                     await operation_task
                 raise RenderError(

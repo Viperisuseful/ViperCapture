@@ -36,6 +36,16 @@ def _datetime(value: float | None) -> datetime | None:
     return datetime.fromtimestamp(value, UTC) if value is not None else None
 
 
+def _sync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 class SQLiteJobStore:
     """Single-process durable queue using Python's bundled SQLite driver."""
 
@@ -54,6 +64,7 @@ class SQLiteJobStore:
         self.config.data_dir.mkdir(parents=True, exist_ok=True)
         with suppress(OSError):
             self.config.data_dir.chmod(0o700)
+        _sync_directory(self.config.data_dir.parent)
         descriptor = os.open(
             self.path,
             os.O_RDWR | os.O_CREAT,
@@ -798,6 +809,7 @@ class LocalArtifactStore:
             self.root.chmod(0o700)
         except OSError:
             pass
+        await asyncio.to_thread(_sync_directory, self.config.data_dir.parent)
         await asyncio.to_thread(self._sync_parent_directory)
 
     async def close(self) -> None:
@@ -901,22 +913,10 @@ class LocalArtifactStore:
             os.close(descriptor)
 
     def _sync_directory(self) -> None:
-        if os.name == "nt":
-            return
-        descriptor = os.open(self.root, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        _sync_directory(self.root)
 
     def _sync_parent_directory(self) -> None:
-        if os.name == "nt":
-            return
-        descriptor = os.open(self.root.parent, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        _sync_directory(self.root.parent)
 
     async def get(self, key: str) -> Artifact | None:
         return await asyncio.to_thread(self._get, key)

@@ -1538,6 +1538,23 @@ class ProviderLoadingTests(unittest.TestCase):
             mode = (root / "async-jobs.key").stat().st_mode & 0o777
             self.assertEqual(mode & 0o077, 0)
 
+    def test_new_key_data_directory_entry_is_synced(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {},
+            clear=False,
+        ):
+            os.environ.pop("VIPERCAPTURE_JOB_SECRET", None)
+            root = Path(directory) / "new-data-directory"
+            with patch(
+                "async_jobs._sync_directory",
+                wraps=__import__("async_jobs")._sync_directory,
+            ) as sync:
+                PayloadCipher.for_data_dir(root)
+
+            sync.assert_any_call(root.parent)
+            sync.assert_any_call(root)
+
     def test_key_directory_sync_is_skipped_on_windows(self):
         directory = Path(".")
         with (
@@ -1745,6 +1762,45 @@ class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
             await main.read_render_job_result(self.job.id, request)
 
         self.assertEqual(error.exception.code, "client_disconnected")
+        self.service.result.assert_not_awaited()
+
+    async def test_result_slot_is_released_when_disconnect_loses_race(self):
+        succeeded = self.job.__class__(
+            **{
+                **self.job.__dict__,
+                "status": "succeeded",
+                "payload": None,
+                "artifact_key": "external-key",
+                "media_type": "image/png",
+                "filename": "capture.png",
+                "artifact_bytes": 3,
+                "result_expires_at": datetime.now(UTC) + timedelta(minutes=5),
+                "completed_at": datetime.now(UTC),
+            }
+        )
+        self.service.get.return_value = succeeded
+        slots = asyncio.Semaphore(0)
+        main.app.state.async_result_slots = slots
+        disconnect_checks = 0
+
+        async def is_disconnected():
+            nonlocal disconnect_checks
+            disconnect_checks += 1
+            if disconnect_checks == 1:
+                slots.release()
+                await asyncio.sleep(0)
+            return True
+
+        request = SimpleNamespace(is_disconnected=is_disconnected)
+        with self.assertRaises(RenderError) as error:
+            await asyncio.wait_for(
+                main.read_render_job_result(self.job.id, request),
+                timeout=1,
+            )
+
+        self.assertEqual(error.exception.code, "client_disconnected")
+        await asyncio.wait_for(slots.acquire(), timeout=0.1)
+        slots.release()
         self.service.result.assert_not_awaited()
 
     async def test_missing_job_raises_stable_error(self):

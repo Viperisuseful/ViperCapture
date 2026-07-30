@@ -277,6 +277,7 @@ def _read_or_create_key(data_dir: Path) -> bytes:
     data_dir.mkdir(parents=True, exist_ok=True)
     with suppress(OSError):
         data_dir.chmod(0o700)
+    _sync_directory(data_dir.parent)
     path = data_dir / "async-jobs.key"
     try:
         material = path.read_bytes()
