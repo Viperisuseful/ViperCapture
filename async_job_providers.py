@@ -1001,7 +1001,13 @@ class LocalArtifactStore:
         _sync_directory(self.root.parent)
 
     async def get(self, key: str) -> Artifact | None:
-        return await asyncio.to_thread(self._get, key)
+        operation = asyncio.create_task(asyncio.to_thread(self._get, key))
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            with suppress(Exception):
+                await asyncio.shield(operation)
+            raise
 
     def _get(self, key: str) -> Artifact | None:
         data_path, metadata_path = self._paths(key)

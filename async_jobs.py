@@ -714,6 +714,8 @@ class AsyncJobService:
     ) -> None:
         try:
             while True:
+                if self._closing:
+                    return
                 try:
                     await transition()
                     return
@@ -721,6 +723,8 @@ class AsyncJobService:
                     raise
                 except JobConflictError:
                     while True:
+                        if self._closing:
+                            return
                         try:
                             if await reconcile():
                                 return
@@ -735,6 +739,8 @@ class AsyncJobService:
                             )
                         await asyncio.sleep(self.settings.poll_seconds)
                 except Exception as exc:
+                    if self._closing:
+                        return
                     logger.warning(
                         "async job transition retry transition=%s error_type=%s",
                         name,
@@ -784,12 +790,16 @@ class AsyncJobService:
         expires_at: datetime,
     ) -> tuple[JobRecord | None, bool]:
         while True:
+            if self._closing:
+                raise asyncio.CancelledError
             try:
                 return await transition(), False
             except asyncio.CancelledError:
                 raise
             except JobConflictError:
                 while True:
+                    if self._closing:
+                        raise asyncio.CancelledError
                     try:
                         current = await reconcile()
                     except asyncio.CancelledError:
@@ -817,6 +827,8 @@ class AsyncJobService:
                     False,
                 ) from exc
             except Exception as exc:
+                if self._closing:
+                    raise asyncio.CancelledError
                 logger.warning(
                     "async job transition retry transition=succeed error_type=%s",
                     type(exc).__name__,

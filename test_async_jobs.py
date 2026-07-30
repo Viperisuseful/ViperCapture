@@ -753,6 +753,45 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(sync.call_count, 4)
         await self.artifacts.close()
 
+    async def test_cancelled_local_artifact_read_waits_for_thread(self):
+        read_started = threading.Event()
+        release_read = threading.Event()
+
+        class BlockingReadStore(LocalArtifactStore):
+            def _get(self, key):
+                read_started.set()
+                release_read.wait(timeout=2)
+                return super()._get(key)
+
+        artifacts = BlockingReadStore(
+            ArtifactStoreConfig(self.root, self.settings.result_ttl)
+        )
+        await artifacts.start()
+        stored = await artifacts.put(
+            str(uuid4()),
+            b"bounded-read",
+            media_type="image/png",
+            filename="bounded.png",
+        )
+        reading = asyncio.create_task(artifacts.get(stored.key))
+        try:
+            started = await asyncio.to_thread(read_started.wait, 1)
+            self.assertTrue(started)
+
+            reading.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(reading.done())
+
+            release_read.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(reading, timeout=1)
+        finally:
+            release_read.set()
+            if not reading.done():
+                reading.cancel()
+                await asyncio.gather(reading, return_exceptions=True)
+            await artifacts.close()
+
     async def test_artifact_directory_entry_is_synced_on_start(self):
         artifacts = LocalArtifactStore(
             ArtifactStoreConfig(
@@ -1604,6 +1643,39 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(worker, timeout=1)
 
         self.assertEqual(claim_calls, 1)
+
+    async def test_transition_retry_stops_when_shutdown_begins(self):
+        transition_started = asyncio.Event()
+        transition_calls = 0
+
+        async def cancellation_resistant_transition():
+            nonlocal transition_calls
+            transition_calls += 1
+            transition_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise RuntimeError("remote transition failed during shutdown")
+
+        service = AsyncJobService(
+            self.settings,
+            SimpleNamespace(),
+            SimpleNamespace(),
+            AsyncMock(),
+        )
+        transition = asyncio.create_task(
+            service._retry_state_transition(
+                "fail",
+                cancellation_resistant_transition,
+                AsyncMock(return_value=False),
+            )
+        )
+        await asyncio.wait_for(transition_started.wait(), timeout=1)
+        service._closing = True
+        transition.cancel()
+        await asyncio.wait_for(transition, timeout=1)
+
+        self.assertEqual(transition_calls, 1)
 
     async def test_failure_conflict_reconciles_winning_terminal_state(self):
         now = datetime.now(UTC)
