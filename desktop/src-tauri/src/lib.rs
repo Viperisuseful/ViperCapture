@@ -131,8 +131,10 @@ pub fn run() {
                 .env("VIPERCAPTURE_PORT", port.to_string())
                 .env("VIPERCAPTURE_DESKTOP_TOKEN", &token)
                 .env("VIPERCAPTURE_PARENT_PID", std::process::id().to_string())
-                .env("VIPERCAPTURE_CAPTURES_DIR", captures_dir.as_os_str())
-                .env("VIPERCAPTURE_DATA_DIR", data_dir.as_os_str());
+                .env("VIPERCAPTURE_CAPTURES_DIR", captures_dir.as_os_str());
+            if env::var_os("VIPERCAPTURE_DATA_DIR").is_none() {
+                sidecar = sidecar.env("VIPERCAPTURE_DATA_DIR", data_dir.as_os_str());
+            }
             if env::var_os("VIPERCAPTURE_ASYNC_JOBS").is_none() {
                 sidecar = sidecar.env(
                     "VIPERCAPTURE_ASYNC_JOBS",

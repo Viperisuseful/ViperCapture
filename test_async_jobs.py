@@ -381,6 +381,50 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.store.close()
 
+    async def test_cancel_normalizes_expired_successful_result(self):
+        await self.store.start()
+        try:
+            now = datetime.now(UTC)
+            job = JobRecord(
+                id=str(uuid4()),
+                request_id="cancel-expired-result",
+                status="queued",
+                payload=b"encrypted",
+                attempt_count=0,
+                available_at=now,
+                queue_expires_at=now + timedelta(minutes=1),
+                created_at=now,
+            )
+            await self.store.create(job, active_limit=1)
+            await self.store.claim(now, self.settings.max_attempts)
+            await self.store.succeed(
+                job.id,
+                expected_attempt=1,
+                artifact_key="cancel-expired-result",
+                media_type="image/png",
+                filename="capture.png",
+                artifact_bytes=3,
+                result_expires_at=now + timedelta(seconds=1),
+                queue_ms=0,
+            )
+
+            cancelled = await self.store.cancel(
+                job.id,
+                now + timedelta(seconds=2),
+            )
+
+            self.assertEqual(cancelled.status, "expired")
+            self.assertEqual(
+                cancelled.error_code,
+                "async_result_expired",
+            )
+            self.assertEqual(
+                cancelled.artifact_key,
+                "cancel-expired-result",
+            )
+        finally:
+            await self.store.close()
+
     async def test_create_expires_overdue_jobs_before_active_limit(self):
         await self.store.start()
         try:

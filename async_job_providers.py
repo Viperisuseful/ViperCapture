@@ -469,6 +469,19 @@ class SQLiteJobStore:
     ) -> JobRecord | None:
         connection.execute("BEGIN IMMEDIATE")
         try:
+            current = _epoch(now)
+            connection.execute(
+                """
+                UPDATE async_jobs
+                SET status = 'expired',
+                    error_code = 'async_result_expired',
+                    error_message = 'The async job result is no longer available.',
+                    error_retryable = 0
+                WHERE id = ? AND status = 'succeeded'
+                  AND result_expires_at <= ?
+                """,
+                (job_id, current),
+            )
             row = connection.execute(
                 "SELECT * FROM async_jobs WHERE id = ?",
                 (job_id,),
@@ -479,7 +492,6 @@ class SQLiteJobStore:
             if row["status"] == "running":
                 raise JobConflictError
             if row["status"] == "queued":
-                current = _epoch(now)
                 if row["queue_expires_at"] <= current:
                     connection.execute(
                         """
