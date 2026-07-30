@@ -633,6 +633,8 @@ class AsyncJobService:
         return await self.artifact_store.get(job.artifact_key)
 
     async def _maintain(self, *, force: bool = False) -> None:
+        if self._closing:
+            return
         loop = asyncio.get_running_loop()
         if not force and loop.time() < self._next_maintenance_at:
             return
@@ -649,8 +651,14 @@ class AsyncJobService:
                     type(exc).__name__,
                 )
                 keys = []
+            if self._closing:
+                return
             for key in keys:
+                if self._closing:
+                    return
                 if await self._safe_delete(key):
+                    if self._closing:
+                        return
                     try:
                         await self.job_store.acknowledge_artifact_deletion(key)
                     except Exception as exc:
@@ -658,6 +666,10 @@ class AsyncJobService:
                             "artifact deletion acknowledgement retry error_type=%s",
                             type(exc).__name__,
                         )
+                    if self._closing:
+                        return
+            if self._closing:
+                return
             try:
                 await self.artifact_store.maintain(now)
             except Exception as exc:

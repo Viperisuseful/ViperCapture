@@ -644,7 +644,10 @@ async def read_render_job_result(job_id: UUID, request: Request) -> Response:
                 499,
                 False,
             )
-        artifact = await service.result(job)
+        artifact = await _await_while_connected(
+            request,
+            service.result(job),
+        )
         if artifact is None:
             raise RenderError(
                 "async_result_expired",

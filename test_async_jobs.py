@@ -624,6 +624,75 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         job_store.maintain.assert_awaited_once()
         artifact_store.maintain.assert_awaited_once()
 
+    async def test_maintenance_stops_after_shutdown_during_job_store_call(self):
+        maintenance_started = asyncio.Event()
+
+        async def cancellation_resistant_maintenance(_now):
+            maintenance_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                return ["must-not-delete"]
+
+        job_store = SimpleNamespace(
+            maintain=AsyncMock(side_effect=cancellation_resistant_maintenance),
+            acknowledge_artifact_deletion=AsyncMock(),
+        )
+        artifact_store = SimpleNamespace(
+            maintain=AsyncMock(),
+            delete=AsyncMock(),
+        )
+        service = AsyncJobService(
+            self.settings,
+            job_store,
+            artifact_store,
+            _successful_renderer,
+        )
+
+        maintenance = asyncio.create_task(service._maintain(force=True))
+        await asyncio.wait_for(maintenance_started.wait(), timeout=1)
+        service._closing = True
+        maintenance.cancel()
+        await asyncio.wait_for(maintenance, timeout=1)
+
+        artifact_store.delete.assert_not_awaited()
+        job_store.acknowledge_artifact_deletion.assert_not_awaited()
+        artifact_store.maintain.assert_not_awaited()
+
+    async def test_maintenance_stops_after_shutdown_during_artifact_delete(self):
+        deletion_started = asyncio.Event()
+
+        async def cancellation_resistant_delete(_key):
+            deletion_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                return None
+
+        job_store = SimpleNamespace(
+            maintain=AsyncMock(return_value=["shutdown-delete"]),
+            acknowledge_artifact_deletion=AsyncMock(),
+        )
+        artifact_store = SimpleNamespace(
+            maintain=AsyncMock(),
+            delete=AsyncMock(side_effect=cancellation_resistant_delete),
+        )
+        service = AsyncJobService(
+            self.settings,
+            job_store,
+            artifact_store,
+            _successful_renderer,
+        )
+
+        maintenance = asyncio.create_task(service._maintain(force=True))
+        await asyncio.wait_for(deletion_started.wait(), timeout=1)
+        service._closing = True
+        maintenance.cancel()
+        await asyncio.wait_for(maintenance, timeout=1)
+
+        job_store.acknowledge_artifact_deletion.assert_not_awaited()
+        artifact_store.maintain.assert_not_awaited()
+
     async def test_job_maintenance_failure_does_not_block_status_read(self):
         expected = SimpleNamespace(id="healthy-point-read")
         job_store = SimpleNamespace(
@@ -2223,6 +2292,19 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "owner-only"):
             await permissive_store.start()
 
+        journal_data = self.root / "permissive-journal"
+        journal_data.mkdir(mode=0o700)
+        journal_data.chmod(0o700)
+        journal = Path(f"{journal_data / 'async-jobs.sqlite3'}-journal")
+        journal.write_bytes(b"untrusted rollback state")
+        journal.chmod(0o644)
+        journal_store = SQLiteJobStore(
+            JobStoreConfig(journal_data, self.settings.metadata_ttl)
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "owner-only"):
+            await journal_store.start()
+
     async def test_symlinked_local_state_directories_are_rejected(self):
         redirected_data = self.root / "redirected-data"
         redirected_data.mkdir()
@@ -2752,6 +2834,58 @@ class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(slots.acquire(), timeout=0.1)
         slots.release()
         self.service.result.assert_not_awaited()
+
+    async def test_result_disconnect_waits_for_fetch_cancellation_cleanup(self):
+        succeeded = self.job.__class__(
+            **{
+                **self.job.__dict__,
+                "status": "succeeded",
+                "payload": None,
+                "artifact_key": "slow-external-key",
+                "media_type": "image/png",
+                "filename": "capture.png",
+                "artifact_bytes": 3,
+                "result_expires_at": datetime.now(UTC) + timedelta(minutes=5),
+                "completed_at": datetime.now(UTC),
+            }
+        )
+        self.service.get.return_value = succeeded
+        fetch_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def cancellation_resistant_result(_job):
+            fetch_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release_cleanup.wait()
+                raise
+
+        self.service.result.side_effect = cancellation_resistant_result
+        slots = asyncio.Semaphore(1)
+        main.app.state.async_result_slots = slots
+
+        async def is_disconnected():
+            return fetch_started.is_set()
+
+        reading = asyncio.create_task(
+            main.read_render_job_result(
+                self.job.id,
+                SimpleNamespace(is_disconnected=is_disconnected),
+            )
+        )
+        await asyncio.wait_for(fetch_started.wait(), timeout=1)
+        slot_waiter = asyncio.create_task(slots.acquire())
+        await asyncio.sleep(0.15)
+        self.assertFalse(reading.done())
+        self.assertFalse(slot_waiter.done())
+
+        release_cleanup.set()
+        with self.assertRaises(RenderError) as error:
+            await asyncio.wait_for(reading, timeout=1)
+        self.assertEqual(error.exception.code, "client_disconnected")
+        await asyncio.wait_for(slot_waiter, timeout=1)
+        slots.release()
 
     async def test_missing_job_raises_stable_error(self):
         self.service.get.return_value = None

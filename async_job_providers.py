@@ -140,7 +140,11 @@ class SQLiteJobStore:
             Path(f"{self.path}-wal"),
             Path(f"{self.path}-shm"),
         )
-        for path in sidecars:
+        recovery_files = (
+            *sidecars,
+            Path(f"{self.path}-journal"),
+        )
+        for path in recovery_files:
             self._validate_sidecar(path, secure_permissions=False)
         self._connection = sqlite3.connect(
             self.path,
@@ -149,7 +153,7 @@ class SQLiteJobStore:
         )
         self._connection.row_factory = sqlite3.Row
         await self._run(self._initialize)
-        for path in (self.path, *sidecars):
+        for path in (self.path, *recovery_files):
             self._validate_sidecar(path, secure_permissions=True)
         _sync_directory(self.config.data_dir)
 
