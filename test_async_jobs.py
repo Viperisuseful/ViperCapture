@@ -889,6 +889,25 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(temporary.exists())
         await self.artifacts.close()
 
+    async def test_artifact_maintenance_durably_removes_orphan(self):
+        await self.artifacts.start()
+        key = f"{uuid4()}.png"
+        orphan = self.artifacts.root / key
+        orphan.write_bytes(b"uncommitted-upload")
+        old = datetime.now(UTC) - self.settings.result_ttl - timedelta(seconds=1)
+        os.utime(orphan, (old.timestamp(), old.timestamp()))
+
+        with patch.object(
+            self.artifacts,
+            "_sync_directory",
+            wraps=self.artifacts._sync_directory,
+        ) as sync:
+            await self.artifacts.maintain(datetime.now(UTC))
+
+        self.assertFalse(orphan.exists())
+        sync.assert_called_once_with()
+        await self.artifacts.close()
+
     async def test_artifact_maintenance_preserves_active_publication(self):
         publication_started = threading.Event()
         release_publication = threading.Event()
@@ -2144,20 +2163,31 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         for path in self.root.glob("async-jobs.sqlite3*"):
             self.assertNotIn(marker, path.read_bytes(), str(path))
 
-    async def test_sqlite_database_entry_is_synced_on_start(self):
+    async def test_sqlite_database_and_wal_entries_are_synced_on_start(self):
         from async_job_providers import _sync_directory
 
         data_dir = self.root / "new-sqlite-data"
         store = SQLiteJobStore(
             JobStoreConfig(data_dir, self.settings.metadata_ttl)
         )
+        sync_states = []
+
+        def track_sync(path):
+            sync_states.append(
+                (
+                    path,
+                    Path(f"{store.path}-wal").exists(),
+                )
+            )
+            _sync_directory(path)
+
         with patch(
             "async_job_providers._sync_directory",
-            wraps=_sync_directory,
-        ) as sync:
+            side_effect=track_sync,
+        ):
             await store.start()
         try:
-            sync.assert_any_call(data_dir)
+            self.assertIn((data_dir, True), sync_states)
         finally:
             await store.close()
 

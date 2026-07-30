@@ -115,6 +115,7 @@ class SQLiteJobStore:
         ):
             with suppress(OSError):
                 path.chmod(0o600)
+        _sync_directory(self.config.data_dir)
 
     async def close(self) -> None:
         if self._connection is None:
@@ -1094,10 +1095,7 @@ class LocalArtifactStore:
             except OSError:
                 continue
             if orphaned:
-                try:
-                    data_path.unlink()
-                except FileNotFoundError:
-                    pass
+                self._delete(data_path.name)
 
     @staticmethod
     def _metadata_expiry(
