@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
+import errno
 import hmac
 import json
 import os
@@ -1021,9 +1022,11 @@ class LocalArtifactStore:
         except FileNotFoundError:
             raise
         except OSError as exc:
-            raise RuntimeError(
-                "async artifact must be a private regular file"
-            ) from exc
+            if exc.errno == errno.ELOOP:
+                raise RuntimeError(
+                    "async artifact must be a private regular file"
+                ) from exc
+            raise
         try:
             information = os.fstat(descriptor)
             if (

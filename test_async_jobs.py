@@ -1,6 +1,7 @@
 import asyncio
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
+import errno
 import json
 import os
 import sqlite3
@@ -962,6 +963,26 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(data_path.exists())
         self.assertFalse(metadata_path.exists())
         sync.assert_called_once_with()
+        await self.artifacts.close()
+
+    async def test_artifact_maintenance_preserves_transient_open_failure(self):
+        await self.artifacts.start()
+        stored = await self.artifacts.put(
+            str(uuid4()),
+            b"preserve-on-emfile",
+            media_type="image/png",
+            filename="preserved.png",
+        )
+        data_path, metadata_path = self.artifacts._paths(stored.key)
+
+        with patch(
+            "async_job_providers.os.open",
+            side_effect=OSError(errno.EMFILE, "too many open files"),
+        ):
+            await self.artifacts.maintain(datetime.now(UTC))
+
+        self.assertTrue(data_path.exists())
+        self.assertTrue(metadata_path.exists())
         await self.artifacts.close()
 
     async def test_artifact_maintenance_preserves_active_publication(self):
