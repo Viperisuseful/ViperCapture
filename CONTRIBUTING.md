@@ -45,6 +45,8 @@ The main files are:
 - `render_contract.py` — request validation
 - `render_engine.py` — Playwright rendering and network controls
 - `render_errors.py` — stable API errors
+- `async_jobs.py` — provider-neutral queue contracts and worker lifecycle
+- `async_job_providers.py` — bundled SQLite and filesystem adapters
 - `templates/` and `static/` — local browser interface
 
 ## Tests

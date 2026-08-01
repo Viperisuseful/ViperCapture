@@ -16,6 +16,8 @@ Playwright Chromium, starts the application, and opens the local interface.
 - Apply container or systemd memory, PID, and CPU limits.
 - Enforce network egress rules that block private ranges and cloud metadata endpoints.
 - Do not place credentials in the repository or browser-facing JavaScript.
+- Put all `/v1/jobs` routes behind the same reverse-proxy authentication as
+  `/v1/render`; opaque job IDs are not an authorization mechanism.
 
 ## Optional GPU rendering
 
@@ -52,6 +54,13 @@ and restart the service normally.
 ## Capability boundary
 
 The public engine supports a public URL source, PNG/JPEG/WebP output, viewport/full-page/selector capture, image quality, transparency, wait conditions, and same-origin target headers. It blocks detected page-level challenges by default. Callers may set `proceed_on_captcha: true` to capture the visible challenge as displayed; ViperCapture never solves or bypasses CAPTCHAs.
+
+Polling-based jobs are enabled by default and use the same rendering contract,
+SSRF controls, concurrency semaphore, and pixel limits as `/v1/render`. The
+local defaults keep encrypted state and expiring results under
+`~/.vipercapture`. Set `VIPERCAPTURE_ASYNC_JOBS=0` to disable the subsystem, or
+follow the [async jobs guide](async-jobs.md) to change retention, capacity, and
+providers.
 
 ## Selectors and waits
 
