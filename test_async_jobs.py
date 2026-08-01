@@ -686,6 +686,54 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.store.close()
 
+    async def test_claim_scrubs_only_when_attempts_clear_payload(self):
+        await self.store.start()
+        try:
+            now = datetime.now(UTC)
+            with patch.object(
+                SQLiteJobStore,
+                "_scrub_payload_history",
+                wraps=SQLiteJobStore._scrub_payload_history,
+            ) as scrub:
+                self.assertIsNone(await self.store.claim(now, max_attempts=3))
+                scrub.assert_not_called()
+
+            job = JobRecord(
+                id=str(uuid4()),
+                request_id="conditional-claim-scrub",
+                status="queued",
+                payload=b"encrypted",
+                attempt_count=0,
+                available_at=now,
+                queue_expires_at=now + timedelta(minutes=1),
+                created_at=now,
+            )
+            await self.store.create(job, active_limit=1)
+            with patch.object(
+                SQLiteJobStore,
+                "_scrub_payload_history",
+                wraps=SQLiteJobStore._scrub_payload_history,
+            ) as scrub:
+                claimed = await self.store.claim(now, max_attempts=3)
+                self.assertEqual(claimed.status, "running")
+                scrub.assert_not_called()
+
+            await self.store.requeue(job.id, claimed.attempt_count, now)
+            with patch.object(
+                SQLiteJobStore,
+                "_scrub_payload_history",
+                wraps=SQLiteJobStore._scrub_payload_history,
+            ) as scrub:
+                self.assertIsNone(await self.store.claim(now, max_attempts=1))
+                scrub.assert_called_once()
+
+            failed = await self.store.get(job.id, now)
+            self.assertEqual(failed.status, "failed")
+            self.assertEqual(failed.error_code, "job_attempts_exhausted")
+            self.assertIsNone(failed.payload)
+        finally:
+            await self.store.close()
+
     async def test_claim_token_recovers_a_lost_acknowledgement(self):
         await self.store.start()
         try:

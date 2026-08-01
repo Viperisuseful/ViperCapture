@@ -382,7 +382,6 @@ class SQLiteJobStore:
             now,
             max_attempts,
             claim_token or str(uuid4()),
-            scrub=True,
         )
 
     @classmethod
@@ -406,7 +405,7 @@ class SQLiteJobStore:
             if existing is not None:
                 connection.execute("COMMIT")
                 return cls._from_row(existing)
-            connection.execute(
+            exhausted_queue = connection.execute(
                 """
                 UPDATE async_jobs
                 SET status = 'failed', payload = NULL, completed_at = ?,
@@ -429,6 +428,8 @@ class SQLiteJobStore:
             ).fetchone()
             if row is None:
                 connection.execute("COMMIT")
+                if exhausted_queue.rowcount:
+                    cls._scrub_payload_history(connection)
                 return None
             started_at = row["started_at"] or current
             connection.execute(
@@ -445,6 +446,8 @@ class SQLiteJobStore:
                 (row["id"],),
             ).fetchone()
             connection.execute("COMMIT")
+            if exhausted_queue.rowcount:
+                cls._scrub_payload_history(connection)
             return cls._from_row(updated)
         except BaseException:
             if connection.in_transaction:
