@@ -59,6 +59,7 @@ class SQLiteJobStore:
         self.path = config.data_dir / "async-jobs.sqlite3"
         self._connection: sqlite3.Connection | None = None
         self._lock = asyncio.Lock()
+        self._scrub_pending = False
 
     @staticmethod
     def _validate_sidecar(
@@ -152,6 +153,7 @@ class SQLiteJobStore:
             isolation_level=None,
         )
         self._connection.row_factory = sqlite3.Row
+        self._scrub_pending = not created
         await self._run(self._initialize)
         for path in (self.path, *recovery_files):
             self._validate_sidecar(path, secure_permissions=True)
@@ -164,15 +166,28 @@ class SQLiteJobStore:
             connection, self._connection = self._connection, None
             await asyncio.to_thread(connection.close)
 
-    async def _run(self, operation, *args, scrub: bool = False):
+    async def _run(
+        self,
+        operation,
+        *args,
+        scrub: bool = False,
+        conditional_scrub: bool = False,
+    ):
         async with self._lock:
             if self._connection is None:
                 raise RuntimeError("SQLite job store is not started")
 
             def execute():
                 result = operation(self._connection, *args)
-                if scrub:
+                requested_scrub = scrub
+                if conditional_scrub:
+                    result, requested_scrub = result
+                self._scrub_pending = (
+                    self._scrub_pending or requested_scrub
+                )
+                if self._scrub_pending:
                     self._scrub_payload_history(self._connection)
+                    self._scrub_pending = False
                 return result
 
             operation_task = asyncio.create_task(
@@ -287,7 +302,12 @@ class SQLiteJobStore:
         )
 
     async def create(self, job: JobRecord, active_limit: int) -> JobRecord:
-        return await self._run(self._create, job, active_limit, scrub=True)
+        return await self._run(
+            self._create,
+            job,
+            active_limit,
+            conditional_scrub=True,
+        )
 
     @classmethod
     def _create(
@@ -295,11 +315,11 @@ class SQLiteJobStore:
         connection: sqlite3.Connection,
         job: JobRecord,
         active_limit: int,
-    ) -> JobRecord:
+    ) -> tuple[JobRecord, bool]:
         connection.execute("BEGIN IMMEDIATE")
         try:
             current = _epoch(job.created_at)
-            connection.execute(
+            expired_queue = connection.execute(
                 """
                 UPDATE async_jobs
                 SET status = 'expired', payload = NULL, completed_at = ?,
@@ -337,7 +357,7 @@ class SQLiteJobStore:
                 ):
                     raise IdempotencyConflictError
                 connection.execute("COMMIT")
-                return cls._from_row(existing)
+                return cls._from_row(existing), bool(expired_queue.rowcount)
             active = connection.execute(
                 """
                 SELECT count(*) FROM async_jobs
@@ -365,7 +385,7 @@ class SQLiteJobStore:
                 ),
             )
             connection.execute("COMMIT")
-            return job
+            return job, bool(expired_queue.rowcount)
         except BaseException:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
@@ -382,6 +402,7 @@ class SQLiteJobStore:
             now,
             max_attempts,
             claim_token or str(uuid4()),
+            conditional_scrub=True,
         )
 
     @classmethod
@@ -391,7 +412,7 @@ class SQLiteJobStore:
         now: datetime,
         max_attempts: int,
         claim_token: str,
-    ) -> JobRecord | None:
+    ) -> tuple[JobRecord | None, bool]:
         current = _epoch(now)
         connection.execute("BEGIN IMMEDIATE")
         try:
@@ -404,7 +425,7 @@ class SQLiteJobStore:
             ).fetchone()
             if existing is not None:
                 connection.execute("COMMIT")
-                return cls._from_row(existing)
+                return cls._from_row(existing), False
             exhausted_queue = connection.execute(
                 """
                 UPDATE async_jobs
@@ -428,9 +449,7 @@ class SQLiteJobStore:
             ).fetchone()
             if row is None:
                 connection.execute("COMMIT")
-                if exhausted_queue.rowcount:
-                    cls._scrub_payload_history(connection)
-                return None
+                return None, bool(exhausted_queue.rowcount)
             started_at = row["started_at"] or current
             connection.execute(
                 """
@@ -446,16 +465,19 @@ class SQLiteJobStore:
                 (row["id"],),
             ).fetchone()
             connection.execute("COMMIT")
-            if exhausted_queue.rowcount:
-                cls._scrub_payload_history(connection)
-            return cls._from_row(updated)
+            return cls._from_row(updated), bool(exhausted_queue.rowcount)
         except BaseException:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
             raise
 
     async def get(self, job_id: str, now: datetime) -> JobRecord | None:
-        return await self._run(self._get, job_id, now)
+        return await self._run(
+            self._get,
+            job_id,
+            now,
+            conditional_scrub=True,
+        )
 
     @classmethod
     def _get(
@@ -463,7 +485,7 @@ class SQLiteJobStore:
         connection: sqlite3.Connection,
         job_id: str,
         now: datetime,
-    ) -> JobRecord | None:
+    ) -> tuple[JobRecord | None, bool]:
         current = _epoch(now)
         connection.execute("BEGIN IMMEDIATE")
         try:
@@ -495,16 +517,19 @@ class SQLiteJobStore:
                 (job_id,),
             ).fetchone()
             connection.execute("COMMIT")
-            if expired_queue.rowcount:
-                cls._scrub_payload_history(connection)
-            return cls._from_row(row)
+            return cls._from_row(row), bool(expired_queue.rowcount)
         except BaseException:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
             raise
 
     async def cancel(self, job_id: str, now: datetime) -> JobRecord | None:
-        return await self._run(self._cancel, job_id, now, scrub=True)
+        return await self._run(
+            self._cancel,
+            job_id,
+            now,
+            conditional_scrub=True,
+        )
 
     @classmethod
     def _cancel(
@@ -512,7 +537,7 @@ class SQLiteJobStore:
         connection: sqlite3.Connection,
         job_id: str,
         now: datetime,
-    ) -> JobRecord | None:
+    ) -> tuple[JobRecord | None, bool]:
         connection.execute("BEGIN IMMEDIATE")
         try:
             current = _epoch(now)
@@ -534,7 +559,7 @@ class SQLiteJobStore:
             ).fetchone()
             if row is None:
                 connection.execute("COMMIT")
-                return None
+                return None, False
             if row["status"] == "running":
                 raise JobConflictError
             if row["status"] == "queued":
@@ -569,7 +594,7 @@ class SQLiteJobStore:
                 (job_id,),
             ).fetchone()
             connection.execute("COMMIT")
-            return cls._from_row(updated)
+            return cls._from_row(updated), row["status"] == "queued"
         except BaseException:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
@@ -587,7 +612,9 @@ class SQLiteJobStore:
         result_expires_at: datetime,
         queue_ms: int,
     ) -> JobRecord:
-        def operation(connection: sqlite3.Connection) -> JobRecord:
+        def operation(
+            connection: sqlite3.Connection,
+        ) -> tuple[JobRecord, bool]:
             current = datetime.now(UTC).timestamp()
             existing = connection.execute(
                 "SELECT * FROM async_jobs WHERE id = ?",
@@ -616,7 +643,7 @@ class SQLiteJobStore:
                 )
                 if actual != expected:
                     raise JobConflictError
-                return self._from_row(existing)
+                return self._from_row(existing), False
             if _epoch(result_expires_at) <= current:
                 raise ArtifactExpiredError
             running = connection.execute(
@@ -685,14 +712,14 @@ class SQLiteJobStore:
                 )
                 if actual != expected:
                     raise JobConflictError
-                return self._from_row(existing)
+                return self._from_row(existing), False
             row = connection.execute(
                 "SELECT * FROM async_jobs WHERE id = ?",
                 (job_id,),
             ).fetchone()
-            return self._from_row(row)
+            return self._from_row(row), True
 
-        return await self._run(operation, scrub=True)
+        return await self._run(operation, conditional_scrub=True)
 
     async def fail(
         self,
@@ -703,7 +730,9 @@ class SQLiteJobStore:
         message: str,
         retryable: bool,
     ) -> None:
-        def operation(connection: sqlite3.Connection) -> None:
+        def operation(
+            connection: sqlite3.Connection,
+        ) -> tuple[None, bool]:
             code_value = code[:64]
             message_value = message[:256]
             completed_at = datetime.now(UTC).timestamp()
@@ -724,7 +753,7 @@ class SQLiteJobStore:
                 ),
             )
             if updated.rowcount == 1:
-                return
+                return None, True
             existing = connection.execute(
                 "SELECT * FROM async_jobs WHERE id = ?",
                 (job_id,),
@@ -749,15 +778,18 @@ class SQLiteJobStore:
             )
             if actual != expected:
                 raise JobConflictError
+            return None, False
 
-        await self._run(operation, scrub=True)
+        await self._run(operation, conditional_scrub=True)
 
     async def requeue_running(
         self,
         now: datetime,
         max_attempts: int,
     ) -> int:
-        def operation(connection: sqlite3.Connection) -> int:
+        def operation(
+            connection: sqlite3.Connection,
+        ) -> tuple[int, bool]:
             current = _epoch(now)
             expired = connection.execute(
                 """
@@ -791,9 +823,12 @@ class SQLiteJobStore:
                 """,
                 (current, current, max_attempts),
             ).rowcount
-            return int(expired) + int(exhausted) + int(requeued)
+            return (
+                int(expired) + int(exhausted) + int(requeued),
+                bool(expired or exhausted),
+            )
 
-        return await self._run(operation, scrub=True)
+        return await self._run(operation, conditional_scrub=True)
 
     async def requeue(
         self,
@@ -801,7 +836,9 @@ class SQLiteJobStore:
         expected_attempt: int,
         available_at: datetime,
     ) -> None:
-        def operation(connection: sqlite3.Connection) -> None:
+        def operation(
+            connection: sqlite3.Connection,
+        ) -> tuple[None, bool]:
             current = _epoch(available_at)
             updated = connection.execute(
                 """
@@ -812,9 +849,10 @@ class SQLiteJobStore:
                 """,
                 (current, job_id, expected_attempt, current),
             )
+            expired = 0
             if updated.rowcount == 0:
                 completed_at = datetime.now(UTC).timestamp()
-                connection.execute(
+                expired = connection.execute(
                     """
                     UPDATE async_jobs
                     SET status = 'expired', payload = NULL, completed_at = ?,
@@ -825,15 +863,17 @@ class SQLiteJobStore:
                       AND attempt_count = ? AND queue_expires_at <= ?
                     """,
                     (completed_at, job_id, expected_attempt, current),
-                )
+                ).rowcount
+            return None, bool(expired)
 
-        await self._run(operation, scrub=True)
+        await self._run(operation, conditional_scrub=True)
 
     async def maintain(self, now: datetime) -> list[str]:
         return await self._run(
             self._maintain,
             now,
             self.config.metadata_ttl.total_seconds(),
+            conditional_scrub=True,
         )
 
     @classmethod
@@ -842,7 +882,7 @@ class SQLiteJobStore:
         connection: sqlite3.Connection,
         now: datetime,
         metadata_ttl: float,
-    ) -> list[str]:
+    ) -> tuple[list[str], bool]:
         current = _epoch(now)
         cutoff = current - metadata_ttl
         connection.execute("BEGIN IMMEDIATE")
@@ -908,9 +948,10 @@ class SQLiteJobStore:
                 (cutoff,),
             )
             connection.execute("COMMIT")
-            if expired_queue.rowcount:
-                cls._scrub_payload_history(connection)
-            return list(dict.fromkeys(keys))
+            return (
+                list(dict.fromkeys(keys)),
+                bool(expired_queue.rowcount),
+            )
         except BaseException:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")

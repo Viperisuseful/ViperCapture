@@ -637,35 +637,54 @@ class AsyncJobService:
             job.status != "succeeded"
             or job.artifact_key is None
             or job.result_expires_at is None
-            or job.result_expires_at <= datetime.now(UTC)
         ):
+            return None
+        now = datetime.now(UTC)
+        if job.result_expires_at <= now:
+            await self._expire_result(job, now, delete_artifact=True)
             return None
         artifact = await self.artifact_store.get(job.artifact_key)
         now = datetime.now(UTC)
         if artifact is None or job.result_expires_at <= now:
-            expired = await self.job_store.expire_result(
-                job.id,
-                job.artifact_key,
+            await self._expire_result(
+                job,
                 now,
+                delete_artifact=artifact is not None,
             )
-            if (
-                artifact is not None
-                and expired is not None
-                and expired.status == "expired"
-                and expired.artifact_key == job.artifact_key
-                and await self._safe_delete(job.artifact_key)
-            ):
-                try:
-                    await self.job_store.acknowledge_artifact_deletion(
-                        job.artifact_key
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "artifact deletion acknowledgement retry error_type=%s",
-                        type(exc).__name__,
-                    )
             return None
         return artifact
+
+    async def _expire_result(
+        self,
+        job: JobRecord,
+        now: datetime,
+        *,
+        delete_artifact: bool,
+    ) -> None:
+        if job.artifact_key is None:
+            return
+        expired = await self.job_store.expire_result(
+            job.id,
+            job.artifact_key,
+            now,
+        )
+        if (
+            not delete_artifact
+            or expired is None
+            or expired.status != "expired"
+            or expired.artifact_key != job.artifact_key
+            or not await self._safe_delete(job.artifact_key)
+        ):
+            return
+        try:
+            await self.job_store.acknowledge_artifact_deletion(
+                job.artifact_key
+            )
+        except Exception as exc:
+            logger.warning(
+                "artifact deletion acknowledgement retry error_type=%s",
+                type(exc).__name__,
+            )
 
     async def _maintain(self, *, force: bool = False) -> None:
         if self._closing:

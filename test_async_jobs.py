@@ -511,6 +511,63 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             await self.artifacts.close()
             await self.store.close()
 
+    async def test_result_expired_before_fetch_updates_and_deletes(self):
+        now = datetime.now(UTC)
+        deadline = now + timedelta(minutes=1)
+        artifact_key = f"{uuid4()}.png"
+        job = JobRecord(
+            id=str(uuid4()),
+            request_id="expired-before-fetch",
+            status="succeeded",
+            payload=None,
+            attempt_count=1,
+            available_at=now,
+            queue_expires_at=deadline,
+            created_at=now,
+            completed_at=now,
+            artifact_key=artifact_key,
+            media_type="image/png",
+            filename="expired.png",
+            artifact_bytes=3,
+            result_expires_at=deadline,
+        )
+        expired = JobRecord(
+            **{
+                **job.__dict__,
+                "status": "expired",
+                "error_code": "async_result_expired",
+            }
+        )
+        job_store = SimpleNamespace(
+            expire_result=AsyncMock(return_value=expired),
+            acknowledge_artifact_deletion=AsyncMock(),
+        )
+        artifact_store = SimpleNamespace(
+            get=AsyncMock(),
+            delete=AsyncMock(),
+        )
+        service = AsyncJobService(
+            self.settings,
+            job_store,
+            artifact_store,
+            _successful_renderer,
+        )
+
+        with patch("async_jobs.datetime", wraps=datetime) as clock:
+            clock.now.return_value = deadline + timedelta(seconds=1)
+            self.assertIsNone(await service.result(job))
+
+        artifact_store.get.assert_not_awaited()
+        job_store.expire_result.assert_awaited_once_with(
+            job.id,
+            artifact_key,
+            deadline + timedelta(seconds=1),
+        )
+        artifact_store.delete.assert_awaited_once_with(artifact_key)
+        job_store.acknowledge_artifact_deletion.assert_awaited_once_with(
+            artifact_key
+        )
+
     async def test_cancel_normalizes_expired_queued_job(self):
         await self.store.start()
         try:
@@ -786,6 +843,111 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(expired.payload)
         finally:
             await self.store.close()
+
+    async def test_create_scrubs_only_when_expiring_queued_payload(self):
+        await self.store.start()
+        try:
+            now = datetime.now(UTC)
+            expiring = JobRecord(
+                id=str(uuid4()),
+                request_id="create-scrub-expiring",
+                status="queued",
+                payload=b"encrypted",
+                attempt_count=0,
+                available_at=now,
+                queue_expires_at=now + timedelta(seconds=1),
+                created_at=now,
+            )
+            replacement = JobRecord(
+                id=str(uuid4()),
+                request_id="create-scrub-replacement",
+                status="queued",
+                payload=b"replacement-encrypted",
+                attempt_count=0,
+                available_at=now + timedelta(seconds=2),
+                queue_expires_at=now + timedelta(minutes=1),
+                created_at=now + timedelta(seconds=2),
+            )
+            with patch.object(
+                SQLiteJobStore,
+                "_scrub_payload_history",
+                wraps=SQLiteJobStore._scrub_payload_history,
+            ) as scrub:
+                await self.store.create(expiring, active_limit=1)
+                scrub.assert_not_called()
+
+                await self.store.create(replacement, active_limit=1)
+                scrub.assert_called_once()
+
+            expired = await self.store.get(
+                expiring.id,
+                now + timedelta(seconds=2),
+            )
+            self.assertEqual(expired.status, "expired")
+            self.assertIsNone(expired.payload)
+        finally:
+            await self.store.close()
+
+    async def test_busy_scrub_is_retried_without_another_payload_update(self):
+        await self.store.start()
+        try:
+            now = datetime.now(UTC)
+            job = JobRecord(
+                id=str(uuid4()),
+                request_id="busy-scrub-retry",
+                status="queued",
+                payload=b"encrypted",
+                attempt_count=0,
+                available_at=now,
+                queue_expires_at=now + timedelta(seconds=1),
+                created_at=now,
+            )
+            await self.store.create(job, active_limit=1)
+            with patch.object(
+                SQLiteJobStore,
+                "_scrub_payload_history",
+                side_effect=(
+                    RuntimeError("SQLite payload scrub checkpoint was busy"),
+                    None,
+                ),
+            ) as scrub:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "checkpoint was busy",
+                ):
+                    await self.store.maintain(now + timedelta(seconds=2))
+                self.assertTrue(self.store._scrub_pending)
+
+                self.assertEqual(
+                    await self.store.maintain(now + timedelta(seconds=3)),
+                    [],
+                )
+                self.assertEqual(scrub.call_count, 2)
+                self.assertFalse(self.store._scrub_pending)
+
+            expired = await self.store.get(
+                job.id,
+                now + timedelta(seconds=3),
+            )
+            self.assertEqual(expired.status, "expired")
+            self.assertIsNone(expired.payload)
+        finally:
+            await self.store.close()
+
+    async def test_existing_database_scrubs_recovery_wal_on_start(self):
+        await self.store.start()
+        await self.store.close()
+        reopened = SQLiteJobStore(
+            JobStoreConfig(self.root, self.settings.metadata_ttl)
+        )
+        with patch.object(
+            SQLiteJobStore,
+            "_scrub_payload_history",
+            wraps=SQLiteJobStore._scrub_payload_history,
+        ) as scrub:
+            await reopened.start()
+            scrub.assert_called_once()
+        await reopened.close()
 
     async def test_claim_token_recovers_a_lost_acknowledgement(self):
         await self.store.start()
