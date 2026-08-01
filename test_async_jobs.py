@@ -734,6 +734,59 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.store.close()
 
+    async def test_maintenance_scrubs_only_when_queue_expiry_clears_payload(self):
+        await self.store.start()
+        try:
+            now = datetime.now(UTC)
+            with patch.object(
+                SQLiteJobStore,
+                "_scrub_payload_history",
+                wraps=SQLiteJobStore._scrub_payload_history,
+            ) as scrub:
+                self.assertEqual(await self.store.maintain(now), [])
+                scrub.assert_not_called()
+
+            job = JobRecord(
+                id=str(uuid4()),
+                request_id="conditional-maintenance-scrub",
+                status="queued",
+                payload=b"encrypted",
+                attempt_count=0,
+                available_at=now,
+                queue_expires_at=now + timedelta(seconds=1),
+                created_at=now,
+            )
+            await self.store.create(job, active_limit=1)
+            with patch.object(
+                SQLiteJobStore,
+                "_scrub_payload_history",
+                wraps=SQLiteJobStore._scrub_payload_history,
+            ) as scrub:
+                self.assertEqual(await self.store.maintain(now), [])
+                scrub.assert_not_called()
+
+                self.assertEqual(
+                    await self.store.maintain(now + timedelta(seconds=2)),
+                    [],
+                )
+                scrub.assert_called_once()
+
+                self.assertEqual(
+                    await self.store.maintain(now + timedelta(seconds=3)),
+                    [],
+                )
+                scrub.assert_called_once()
+
+            expired = await self.store.get(
+                job.id,
+                now + timedelta(seconds=3),
+            )
+            self.assertEqual(expired.status, "expired")
+            self.assertEqual(expired.error_code, "job_queue_expired")
+            self.assertIsNone(expired.payload)
+        finally:
+            await self.store.close()
+
     async def test_claim_token_recovers_a_lost_acknowledgement(self):
         await self.store.start()
         try:

@@ -834,11 +834,11 @@ class SQLiteJobStore:
             self._maintain,
             now,
             self.config.metadata_ttl.total_seconds(),
-            scrub=True,
         )
 
-    @staticmethod
+    @classmethod
     def _maintain(
+        cls,
         connection: sqlite3.Connection,
         now: datetime,
         metadata_ttl: float,
@@ -876,7 +876,7 @@ class SQLiteJobStore:
                     (current, cutoff, current),
                 ).fetchall()
             ]
-            connection.execute(
+            expired_queue = connection.execute(
                 """
                 UPDATE async_jobs
                 SET status = 'expired', payload = NULL, completed_at = ?,
@@ -908,6 +908,8 @@ class SQLiteJobStore:
                 (cutoff,),
             )
             connection.execute("COMMIT")
+            if expired_queue.rowcount:
+                cls._scrub_payload_history(connection)
             return list(dict.fromkeys(keys))
         except BaseException:
             if connection.in_transaction:
