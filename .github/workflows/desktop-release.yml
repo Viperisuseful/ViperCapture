@@ -6,7 +6,7 @@ on:
       tag:
         description: Release tag
         required: true
-        default: desktop-v0.1.4
+        default: desktop-v0.1.5
       publish:
         description: Publish a GitHub release after all builds pass
         required: true
