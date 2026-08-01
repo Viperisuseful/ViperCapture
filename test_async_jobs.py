@@ -1076,6 +1076,57 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.artifacts.delete(metadata_link.key)
         await self.artifacts.close()
 
+    @unittest.skipUnless(
+        hasattr(os, "mkfifo") and hasattr(os, "O_NONBLOCK"),
+        "FIFO open flags are POSIX-only",
+    )
+    async def test_local_artifact_fifo_candidates_open_nonblocking(self):
+        await self.artifacts.start()
+        original_open = os.open
+        candidates: set[str] = set()
+        opened: set[str] = set()
+
+        def checked_open(path, flags, *args, **kwargs):
+            candidate = os.fspath(path)
+            if candidate in candidates:
+                self.assertTrue(flags & os.O_NONBLOCK)
+                opened.add(candidate)
+            return original_open(path, flags, *args, **kwargs)
+
+        data_fifo = await self.artifacts.put(
+            str(uuid4()),
+            b"replace-data-with-fifo",
+            media_type="image/png",
+            filename="data-fifo.png",
+        )
+        data_path, _metadata_path = self.artifacts._paths(data_fifo.key)
+        data_path.unlink()
+        os.mkfifo(data_path, 0o600)
+        candidates.add(os.fspath(data_path))
+
+        metadata_fifo = await self.artifacts.put(
+            str(uuid4()),
+            b"replace-metadata-with-fifo",
+            media_type="image/png",
+            filename="metadata-fifo.png",
+        )
+        _data_path, metadata_path = self.artifacts._paths(metadata_fifo.key)
+        metadata_path.unlink()
+        os.mkfifo(metadata_path, 0o600)
+        candidates.add(os.fspath(metadata_path))
+
+        with patch(
+            "async_job_providers.os.open",
+            side_effect=checked_open,
+        ):
+            self.assertIsNone(await self.artifacts.get(data_fifo.key))
+            await self.artifacts.maintain(datetime.now(UTC))
+
+        self.assertEqual(opened, candidates)
+        await self.artifacts.delete(data_fifo.key)
+        await self.artifacts.delete(metadata_fifo.key)
+        await self.artifacts.close()
+
     async def test_local_artifact_read_propagates_transient_open_failure(self):
         await self.artifacts.start()
         stored = await self.artifacts.put(
