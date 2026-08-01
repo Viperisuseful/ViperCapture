@@ -449,6 +449,68 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             await self.artifacts.close()
             await self.store.close()
 
+    async def test_result_expiring_during_fetch_is_not_returned(self):
+        await self.store.start()
+        await self.artifacts.start()
+        service = AsyncJobService(
+            self.settings,
+            self.store,
+            self.artifacts,
+            _successful_renderer,
+        )
+        try:
+            now = datetime.now(UTC)
+            job = JobRecord(
+                id=str(uuid4()),
+                request_id="expires-during-fetch",
+                status="queued",
+                payload=b"encrypted",
+                attempt_count=0,
+                available_at=now,
+                queue_expires_at=now + timedelta(minutes=1),
+                created_at=now,
+            )
+            await self.store.create(job, active_limit=1)
+            claimed = await self.store.claim(
+                now,
+                self.settings.max_attempts,
+            )
+            stored = await self.artifacts.put(
+                job.id,
+                b"expires-after-fetch-starts",
+                media_type="image/png",
+                filename="expiring.png",
+            )
+            await self.store.succeed(
+                claimed.id,
+                expected_attempt=claimed.attempt_count,
+                artifact_key=stored.key,
+                media_type="image/png",
+                filename="expiring.png",
+                artifact_bytes=25,
+                result_expires_at=stored.expires_at,
+                queue_ms=0,
+            )
+            successful = await self.store.get(job.id, now)
+
+            with patch("async_jobs.datetime", wraps=datetime) as clock:
+                clock.now.side_effect = (
+                    now,
+                    stored.expires_at + timedelta(seconds=1),
+                )
+                self.assertIsNone(await service.result(successful))
+
+            expired = await self.store.get(job.id, now)
+            self.assertEqual(expired.status, "expired")
+            self.assertEqual(expired.error_code, "async_result_expired")
+            self.assertIsNone(expired.artifact_key)
+            data_path, metadata_path = self.artifacts._paths(stored.key)
+            self.assertFalse(data_path.exists())
+            self.assertFalse(metadata_path.exists())
+        finally:
+            await self.artifacts.close()
+            await self.store.close()
+
     async def test_cancel_normalizes_expired_queued_job(self):
         await self.store.start()
         try:
@@ -2639,6 +2701,31 @@ class ProviderLoadingTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "private regular file"):
                 PayloadCipher.for_data_dir(root)
+
+    @unittest.skipUnless(
+        hasattr(os, "mkfifo") and hasattr(os, "O_NONBLOCK"),
+        "FIFO open flags are POSIX-only",
+    )
+    def test_fifo_key_candidate_is_opened_nonblocking(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {},
+            clear=False,
+        ):
+            os.environ.pop("VIPERCAPTURE_JOB_SECRET", None)
+            root = Path(directory)
+            key = root / "async-jobs.key"
+            os.mkfifo(key, 0o600)
+            original_open = os.open
+
+            def checked_open(path, flags, *args, **kwargs):
+                if os.fspath(path) == os.fspath(key):
+                    self.assertTrue(flags & os.O_NONBLOCK)
+                return original_open(path, flags, *args, **kwargs)
+
+            with patch("async_jobs.os.open", side_effect=checked_open):
+                with self.assertRaisesRegex(RuntimeError, "regular file"):
+                    PayloadCipher.for_data_dir(root)
 
     def test_key_directory_sync_is_skipped_on_windows(self):
         directory = Path(".")

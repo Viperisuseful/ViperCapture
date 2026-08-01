@@ -208,7 +208,11 @@ def _ensure_private_directory(path: Path) -> None:
 
 
 def _read_private_key(path: Path) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         descriptor = os.open(path, flags)
     except FileNotFoundError:
@@ -637,12 +641,30 @@ class AsyncJobService:
         ):
             return None
         artifact = await self.artifact_store.get(job.artifact_key)
-        if artifact is None:
-            await self.job_store.expire_result(
+        now = datetime.now(UTC)
+        if artifact is None or job.result_expires_at <= now:
+            expired = await self.job_store.expire_result(
                 job.id,
                 job.artifact_key,
-                datetime.now(UTC),
+                now,
             )
+            if (
+                artifact is not None
+                and expired is not None
+                and expired.status == "expired"
+                and expired.artifact_key == job.artifact_key
+                and await self._safe_delete(job.artifact_key)
+            ):
+                try:
+                    await self.job_store.acknowledge_artifact_deletion(
+                        job.artifact_key
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "artifact deletion acknowledgement retry error_type=%s",
+                        type(exc).__name__,
+                    )
+            return None
         return artifact
 
     async def _maintain(self, *, force: bool = False) -> None:
