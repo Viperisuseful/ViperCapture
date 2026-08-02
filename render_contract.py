@@ -246,6 +246,12 @@ class Action(StrictModel):
 
     @model_validator(mode="after")
     def validate_action(self) -> "Action":
+        if self.values and any(
+            len(value) > MAX_ACTION_VALUE_CHARS for value in self.values
+        ):
+            raise ValueError(
+                f"select values may not exceed {MAX_ACTION_VALUE_CHARS} characters"
+            )
         selector_actions = {
             ActionType.CLICK,
             ActionType.HOVER,

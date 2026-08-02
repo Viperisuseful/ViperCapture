@@ -1050,7 +1050,7 @@ class RenderEngine:
                         blocked_urls.append(request_url)
                         await route.abort("blockedbyclient")
                         return
-                    if any(
+                    if not main_document and any(
                         fnmatchcase(request_url, pattern)
                         for pattern in request.network.block_url_patterns
                     ):
@@ -1059,7 +1059,7 @@ class RenderEngine:
                         return
                     if self.cleanup_hooks:
                         category = self.cleanup_hooks.blocked_category(request_url, request.cleanup)
-                        if category:
+                        if category and not main_document:
                             blocked_urls.append(request_url)
                             await route.abort("blockedbyclient")
                             return

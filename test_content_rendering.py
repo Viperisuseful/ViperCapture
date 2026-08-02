@@ -134,6 +134,7 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(printed.media_type, "application/pdf")
         self.assertEqual(print_page.pdf_options["format"], "A4")
+        self.assertEqual(print_page.pdf_options["page_ranges"], "1-51")
         self.assertEqual(print_page.emulated_media, "print")
 
         single_page = FakePage()

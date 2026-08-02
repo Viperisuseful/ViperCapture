@@ -38,7 +38,7 @@ from page_cleanup import (
     setup_autoconsent,
     should_block_resource,
 )
-from render_contract import RenderRequest
+from render_contract import OutputFormat, RenderRequest
 from render_engine import CleanupHooks, RenderArtifact, RenderEngine, RenderLimits
 from render_cache import RenderCache
 from render_errors import RenderError, install_render_error_layer
@@ -770,10 +770,11 @@ async def render_signed(
         secret=SIGNING_SECRET,
     )
     response = await _render_response(render_request, request)
-    disposition = response.headers.get("Content-Disposition", "")
-    response.headers["Content-Disposition"] = disposition.replace(
-        "attachment", "inline", 1
-    )
+    if render_request.output is not OutputFormat.HTML:
+        disposition = response.headers.get("Content-Disposition", "")
+        response.headers["Content-Disposition"] = disposition.replace(
+            "attachment", "inline", 1
+        )
     response.headers["Cache-Control"] = "private, no-store"
     return response
 

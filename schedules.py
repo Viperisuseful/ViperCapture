@@ -105,6 +105,9 @@ class ScheduleStore:
                 "the bundled schedule store cannot enforce private Windows ACLs; "
                 "set VIPERCAPTURE_SCHEDULES=0"
             )
+        await asyncio.to_thread(self._start)
+
+    def _start(self) -> None:
         _ensure_private_directory(self.path.parent)
         existed = self.path.exists()
         if existed and os.name != "nt":
@@ -155,9 +158,22 @@ class ScheduleStore:
                     os.chmod(candidate, 0o600)
 
     async def close(self) -> None:
+        async with self.lock:
+            await asyncio.to_thread(self._close)
+
+    def _close(self) -> None:
         if self.connection is not None:
             self.connection.close()
             self.connection = None
+
+    async def _run(self, operation, *args):
+        async with self.lock:
+            task = asyncio.create_task(asyncio.to_thread(operation, *args))
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                await asyncio.shield(task)
+                raise
 
     def _require(self) -> sqlite3.Connection:
         if self.connection is None:
@@ -182,106 +198,122 @@ class ScheduleStore:
         )
 
     async def create(self, record: ScheduleRecord) -> ScheduleRecord:
-        async with self.lock:
-            connection = self._require()
-            connection.execute(
-                """INSERT INTO schedules
-                (id,name,cron,timezone,enabled,payload,next_run_at,last_run_at,
-                 last_job_id,last_error,created_at,updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    record.id,
-                    record.name,
-                    record.cron,
-                    record.timezone,
-                    int(record.enabled),
-                    record.payload,
-                    record.next_run_at.isoformat(),
-                    None,
-                    None,
-                    None,
-                    record.created_at.isoformat(),
-                    record.updated_at.isoformat(),
-                ),
-            )
-            connection.commit()
+        await self._run(self._create, record)
         return record
 
+    def _create(self, record: ScheduleRecord) -> None:
+        connection = self._require()
+        connection.execute(
+            """INSERT INTO schedules
+            (id,name,cron,timezone,enabled,payload,next_run_at,last_run_at,
+             last_job_id,last_error,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                record.id,
+                record.name,
+                record.cron,
+                record.timezone,
+                int(record.enabled),
+                record.payload,
+                record.next_run_at.isoformat(),
+                None,
+                None,
+                None,
+                record.created_at.isoformat(),
+                record.updated_at.isoformat(),
+            ),
+        )
+        connection.commit()
+
     async def get(self, schedule_id: str) -> ScheduleRecord | None:
-        async with self.lock:
-            row = self._require().execute(
-                "SELECT * FROM schedules WHERE id = ?", (schedule_id,)
-            ).fetchone()
+        row = await self._run(self._get, schedule_id)
         return self._record(row) if row else None
 
+    def _get(self, schedule_id: str) -> sqlite3.Row | None:
+        return self._require().execute(
+            "SELECT * FROM schedules WHERE id = ?", (schedule_id,)
+        ).fetchone()
+
     async def list(self) -> list[ScheduleRecord]:
-        async with self.lock:
-            rows = self._require().execute(
-                "SELECT * FROM schedules ORDER BY created_at, id"
-            ).fetchall()
+        rows = await self._run(self._list)
         return [self._record(row) for row in rows]
 
+    def _list(self) -> list[sqlite3.Row]:
+        return self._require().execute(
+            "SELECT * FROM schedules ORDER BY created_at, id"
+        ).fetchall()
+
     async def update(self, record: ScheduleRecord) -> ScheduleRecord:
-        async with self.lock:
-            connection = self._require()
-            cursor = connection.execute(
-                """UPDATE schedules SET name=?,cron=?,timezone=?,enabled=?,payload=?,
-                next_run_at=?,updated_at=? WHERE id=?""",
-                (
-                    record.name,
-                    record.cron,
-                    record.timezone,
-                    int(record.enabled),
-                    record.payload,
-                    record.next_run_at.isoformat(),
-                    record.updated_at.isoformat(),
-                    record.id,
-                ),
-            )
-            connection.commit()
-        if cursor.rowcount != 1:
+        if not await self._run(self._update, record):
             raise KeyError(record.id)
         return record
 
+    def _update(self, record: ScheduleRecord) -> bool:
+        connection = self._require()
+        cursor = connection.execute(
+            """UPDATE schedules SET name=?,cron=?,timezone=?,enabled=?,payload=?,
+            next_run_at=?,updated_at=? WHERE id=?""",
+            (
+                record.name,
+                record.cron,
+                record.timezone,
+                int(record.enabled),
+                record.payload,
+                record.next_run_at.isoformat(),
+                record.updated_at.isoformat(),
+                record.id,
+            ),
+        )
+        connection.commit()
+        return cursor.rowcount == 1
+
     async def delete(self, schedule_id: str) -> bool:
-        async with self.lock:
-            connection = self._require()
-            cursor = connection.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
-            connection.commit()
+        return await self._run(self._delete, schedule_id)
+
+    def _delete(self, schedule_id: str) -> bool:
+        connection = self._require()
+        cursor = connection.execute(
+            "DELETE FROM schedules WHERE id = ?", (schedule_id,)
+        )
+        connection.commit()
         return cursor.rowcount == 1
 
     async def claim_due(self, now: datetime) -> list[tuple[ScheduleRecord, datetime]]:
+        return await self._run(self._claim_due, now)
+
+    def _claim_due(
+        self, now: datetime
+    ) -> list[tuple[ScheduleRecord, datetime]]:
         claimed = []
-        async with self.lock:
-            connection = self._require()
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                rows = connection.execute(
-                    "SELECT * FROM schedules WHERE enabled = 1 AND next_run_at <= ? "
-                    "ORDER BY next_run_at LIMIT 100",
-                    (now.isoformat(),),
-                ).fetchall()
-                for row in rows:
-                    record = self._record(row)
-                    due_at = record.next_run_at
-                    following = next_run(record.cron, record.timezone, now)
-                    cursor = connection.execute(
-                        """UPDATE schedules SET next_run_at=?,last_run_at=?,
-                        last_error=NULL,updated_at=? WHERE id=? AND next_run_at=?""",
-                        (
-                            following.isoformat(),
-                            due_at.isoformat(),
-                            now.isoformat(),
-                            record.id,
-                            due_at.isoformat(),
-                        ),
-                    )
-                    if cursor.rowcount == 1:
-                        claimed.append((record, due_at))
-                connection.commit()
-            except BaseException:
-                connection.rollback()
-                raise
+        connection = self._require()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            rows = connection.execute(
+                "SELECT * FROM schedules WHERE enabled = 1 AND next_run_at <= ? "
+                "ORDER BY next_run_at LIMIT 100",
+                (now.isoformat(),),
+            ).fetchall()
+            for row in rows:
+                record = self._record(row)
+                due_at = record.next_run_at
+                following = next_run(record.cron, record.timezone, now)
+                cursor = connection.execute(
+                    """UPDATE schedules SET next_run_at=?,last_run_at=?,
+                    last_error=NULL,updated_at=? WHERE id=? AND next_run_at=?""",
+                    (
+                        following.isoformat(),
+                        due_at.isoformat(),
+                        now.isoformat(),
+                        record.id,
+                        due_at.isoformat(),
+                    ),
+                )
+                if cursor.rowcount == 1:
+                    claimed.append((record, due_at))
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
         return claimed
 
     async def record_result(
@@ -291,13 +323,25 @@ class ScheduleStore:
         job_id: str | None,
         error: str | None,
     ) -> None:
-        async with self.lock:
-            connection = self._require()
-            connection.execute(
-                "UPDATE schedules SET last_job_id=?,last_error=?,updated_at=? WHERE id=?",
-                (job_id, error, datetime.now(UTC).isoformat(), schedule_id),
-            )
-            connection.commit()
+        await self._run(
+            self._record_result,
+            schedule_id,
+            job_id,
+            error,
+        )
+
+    def _record_result(
+        self,
+        schedule_id: str,
+        job_id: str | None,
+        error: str | None,
+    ) -> None:
+        connection = self._require()
+        connection.execute(
+            "UPDATE schedules SET last_job_id=?,last_error=?,updated_at=? WHERE id=?",
+            (job_id, error, datetime.now(UTC).isoformat(), schedule_id),
+        )
+        connection.commit()
 
 
 class ScheduleService:

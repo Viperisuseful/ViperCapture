@@ -63,6 +63,27 @@ class VisualDiffTests(unittest.TestCase):
             0,
         )
 
+    def test_exif_orientation_is_applied_before_comparison(self):
+        oriented = io.BytesIO()
+        normalized = io.BytesIO()
+        source = Image.new("RGB", (2, 1), "red")
+        exif = source.getexif()
+        exif[274] = 6
+        source.save(oriented, "JPEG", exif=exif, quality=100, subsampling=0)
+        Image.new("RGB", (1, 2), "red").save(
+            normalized,
+            "JPEG",
+            quality=100,
+            subsampling=0,
+        )
+        self.assertEqual(
+            compare_images(
+                oriented.getvalue(),
+                normalized.getvalue(),
+            ).changed_pixels,
+            0,
+        )
+
     def test_expanded_pixel_working_set_is_bounded(self):
         side = int(MAX_DIFF_PIXELS**0.5) + 1
         with self.assertRaises(RenderError) as raised:

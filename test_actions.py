@@ -71,6 +71,19 @@ class ActionContractTests(unittest.TestCase):
                     "network": {"proxy": {"server": "file:///tmp/proxy"}},
                 }
             )
+        with self.assertRaises(ValidationError):
+            RenderRequest.model_validate(
+                {
+                    "url": "https://example.com",
+                    "actions": [
+                        {
+                            "type": "select",
+                            "selector": "select",
+                            "values": ["x" * 65_537],
+                        }
+                    ],
+                }
+            )
 
 
 class ActionExecutionTests(unittest.IsolatedAsyncioTestCase):

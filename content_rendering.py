@@ -134,6 +134,10 @@ async def _render_pdf(page, request: RenderRequest) -> RenderArtifact:
         )
     else:
         common["format"] = options.paper_size.value
+        # Render one sentinel page beyond the public limit. Chromium may
+        # paginate due to fragmentation rules that scroll-height preflight
+        # cannot predict, but never needs to emit the full document.
+        common["page_ranges"] = f"1-{MAX_PRINT_PAGES + 1}"
         await page.emulate_media(media="print")
         dimensions = await page.evaluate("""() => {
             const forced = new Set(["always", "page", "left", "right", "recto", "verso"]);

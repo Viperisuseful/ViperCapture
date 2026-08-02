@@ -193,7 +193,8 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
                 {
                     "url": "https://example.com",
                     "network": {
-                        "block_resource_types": ["document", "script"]
+                        "block_resource_types": ["document", "script"],
+                        "block_url_patterns": ["**/*"],
                     },
                 }
             ),

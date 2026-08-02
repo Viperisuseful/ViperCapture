@@ -3,7 +3,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from async_jobs import PayloadCipher
 from render_contract import RenderRequest
@@ -91,6 +91,17 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(await self.store.list()), 1)
         self.assertTrue(await self.store.delete(record.id))
         self.assertIsNone(await self.store.get(record.id))
+
+    async def test_sqlite_operations_run_off_the_event_loop(self):
+        def run_inline(operation, *args):
+            return operation(*args)
+
+        with patch(
+            "schedules.asyncio.to_thread",
+            AsyncMock(side_effect=run_inline),
+        ) as to_thread:
+            self.assertEqual(await self.store.list(), [])
+        to_thread.assert_awaited_once()
 
     async def test_due_schedule_submits_once_and_advances_first(self):
         record = await self.service.create(

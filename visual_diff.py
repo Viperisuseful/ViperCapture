@@ -7,7 +7,7 @@ import io
 import json
 import zipfile
 
-from PIL import Image, ImageChops, ImageDraw, UnidentifiedImageError
+from PIL import Image, ImageChops, ImageDraw, ImageOps, UnidentifiedImageError
 
 from render_errors import RenderError
 
@@ -48,9 +48,10 @@ def _open_image(body: bytes, label: str) -> Image.Image:
         )
     try:
         image = Image.open(io.BytesIO(body))
+        image.load()
+        image = ImageOps.exif_transpose(image)
         if image.width * image.height > MAX_DIFF_PIXELS:
             raise RenderError("diff_pixel_limit_exceeded", "Visual diff input exceeds the pixel limit.", 413, False)
-        image.load()
     except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
         raise RenderError("diff_input_invalid", f"{label} is not a safe supported image.", 422, False) from exc
     return image.convert("RGBA")

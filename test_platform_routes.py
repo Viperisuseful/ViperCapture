@@ -78,6 +78,32 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
                 await main.create_signed_url(payload, request)
         self.assertEqual(raised.exception.code, "delivery_requires_async_job")
 
+    async def test_signed_html_remains_an_attachment(self):
+        html_request = RenderRequest.model_validate(
+            {"url": "https://example.com", "output": "html"}
+        )
+        rendered = main.Response(
+            b"<script>unsafe()</script>",
+            media_type="text/html",
+            headers={
+                "Content-Disposition": 'attachment; filename="capture.html"'
+            },
+        )
+        with (
+            patch("main.SIGNING_SECRET", "s" * 32),
+            patch("main.verify_render_request", return_value=html_request),
+            patch("main._render_response", AsyncMock(return_value=rendered)),
+        ):
+            response = await main.render_signed(
+                SimpleNamespace(),
+                "payload",
+                1,
+                "signature",
+            )
+        self.assertTrue(
+            response.headers["content-disposition"].startswith("attachment")
+        )
+
     async def test_bulk_webhook_validation_failure_is_per_item(self):
         original_service = getattr(main.app.state, "async_jobs", None)
         original_dispatcher = getattr(main.app.state, "webhooks", None)
