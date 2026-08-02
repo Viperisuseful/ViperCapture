@@ -8,7 +8,7 @@ import hmac
 import json
 import time
 
-from render_contract import RenderRequest
+from render_contract import RenderRequest, canonical_render_document
 from render_errors import RenderError
 
 
@@ -19,7 +19,11 @@ MAX_SIGNED_URL_PAYLOAD_CHARS = 32 * 1024
 
 def encode_render_request(request: RenderRequest) -> str:
     body = json.dumps(
-        request.model_dump(mode="json", exclude_none=True, exclude_defaults=True),
+        canonical_render_document(
+            request,
+            exclude_none=True,
+            exclude_defaults=True,
+        ),
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,

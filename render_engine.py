@@ -699,31 +699,32 @@ class RenderEngine:
         for index, action in enumerate(request.actions):
             timeout = min(action.timeout_ms, limits.wait_timeout_ms)
             try:
-                locator = page.locator(action.selector).first if action.selector else None
+                locator = page.locator(action.selector) if action.selector else None
+                first = locator.first if locator is not None else None
                 if action.type is ActionType.CLICK:
-                    await locator.click(timeout=timeout)
+                    await first.click(timeout=timeout)
                 elif action.type is ActionType.HOVER:
-                    await locator.hover(timeout=timeout)
+                    await first.hover(timeout=timeout)
                 elif action.type is ActionType.FILL:
-                    await locator.fill(action.value or "", timeout=timeout)
+                    await first.fill(action.value or "", timeout=timeout)
                 elif action.type is ActionType.PRESS:
-                    if locator is not None:
-                        await locator.press(action.key or "", timeout=timeout)
+                    if first is not None:
+                        await first.press(action.key or "", timeout=timeout)
                     else:
                         await page.keyboard.press(action.key or "")
                 elif action.type is ActionType.SELECT:
-                    await locator.select_option(action.values or [], timeout=timeout)
+                    await first.select_option(action.values or [], timeout=timeout)
                 elif action.type is ActionType.SCROLL:
-                    if locator is not None:
-                        await locator.scroll_into_view_if_needed(timeout=timeout)
+                    if first is not None:
+                        await first.scroll_into_view_if_needed(timeout=timeout)
                     if action.x is not None or action.y is not None:
                         await page.evaluate(
                             "([x, y]) => window.scrollBy({left: x, top: y, behavior: 'instant'})",
                             [action.x or 0, action.y or 0],
                         )
                 elif action.type is ActionType.WAIT:
-                    if locator is not None:
-                        await locator.wait_for(state="visible", timeout=timeout)
+                    if first is not None:
+                        await first.wait_for(state="visible", timeout=timeout)
                     if action.value is not None:
                         await page.wait_for_function(
                             "text => Boolean(document.body?.innerText.includes(text))",

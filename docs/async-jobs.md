@@ -39,6 +39,8 @@ callback cannot occupy render workers or delay API requests and startup
 maintenance. Only that encrypted URL remains until successful delivery is
 acknowledged; pending delivery is excluded from metadata expiry. A keyed
 request fingerprint enforces idempotency without storing the raw request.
+Failed callback rows receive exponential retry delays, so an unavailable
+destination cannot monopolize the bounded delivery batch or starve newer jobs.
 The bundled providers create the database, WAL sidecars, key, and result files
 with owner-only permissions. Key and result creation fsync both file contents
 and directory entries before reporting durable success. SQLite enables secure

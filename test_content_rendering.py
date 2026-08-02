@@ -26,10 +26,18 @@ def pdf_with_pages(count):
 
 
 class FakePage:
-    def __init__(self, *, html="<html><body><main>Hello document body with useful words.</main></body></html>", pdf=None, height=900):
+    def __init__(
+        self,
+        *,
+        html="<html><body><main>Hello document body with useful words.</main></body></html>",
+        pdf=None,
+        height=900,
+        forced_breaks=0,
+    ):
         self.html = html
         self.pdf_bytes = pdf or pdf_with_pages(1)
         self.height = height
+        self.forced_breaks = forced_breaks
         self.pdf_options = None
         self.emulated_media = None
 
@@ -37,7 +45,11 @@ class FakePage:
         return self.html
 
     async def evaluate(self, _script):
-        return {"width": 800, "height": self.height}
+        return {
+            "width": 800,
+            "height": self.height,
+            "forcedBreaks": self.forced_breaks,
+        }
 
     async def pdf(self, **options):
         self.pdf_options = options
@@ -76,6 +88,18 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"Hello document", html.body)
         self.assertEqual(markdown.media_type, "text/markdown; charset=utf-8")
         self.assertIn(b"Hello document", markdown.body)
+
+    async def test_markdown_hydrated_dom_size_is_bounded(self):
+        page = FakePage(html="x" * (5 * 1024 * 1024 + 1))
+        with self.assertRaises(RenderError) as raised:
+            await render_document_output(
+                page,
+                RenderRequest.model_validate(
+                    {"url": "https://example.com", "output": "markdown"}
+                ),
+                LIMITS,
+            )
+        self.assertEqual(raised.exception.code, "document_too_large")
 
     async def test_article_html_and_markdown_outputs(self):
         body = " ".join(["A substantial article sentence."] * 20)
@@ -171,6 +195,18 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(preflight.exception.code, "pdf_page_limit_exceeded")
         self.assertIsNone(print_page.pdf_options)
+
+        forced_breaks = FakePage(height=100, forced_breaks=50)
+        with self.assertRaises(RenderError) as fragmented:
+            await render_document_output(
+                forced_breaks,
+                RenderRequest.model_validate(
+                    {"url": "https://example.com", "output": "pdf"}
+                ),
+                LIMITS,
+            )
+        self.assertEqual(fragmented.exception.code, "pdf_page_limit_exceeded")
+        self.assertIsNone(forced_breaks.pdf_options)
 
     def test_pdf_costs_two_credits(self):
         request = RenderRequest.model_validate({"html": "Hello", "output": "pdf"})

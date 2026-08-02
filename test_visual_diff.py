@@ -53,6 +53,16 @@ class VisualDiffTests(unittest.TestCase):
             1,
         )
 
+    def test_hidden_rgb_in_transparent_pixels_is_ignored(self):
+        first = io.BytesIO()
+        second = io.BytesIO()
+        Image.new("RGBA", (1, 1), (255, 0, 0, 0)).save(first, "PNG")
+        Image.new("RGBA", (1, 1), (0, 0, 255, 0)).save(second, "PNG")
+        self.assertEqual(
+            compare_images(first.getvalue(), second.getvalue()).changed_pixels,
+            0,
+        )
+
     def test_expanded_pixel_working_set_is_bounded(self):
         side = int(MAX_DIFF_PIXELS**0.5) + 1
         with self.assertRaises(RenderError) as raised:

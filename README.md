@@ -123,10 +123,12 @@ delivery outbox survives process restarts.
 
 Keep the service on loopback or place every route behind the same authenticated,
 rate-limited reverse proxy. Job and schedule UUIDs are locators, not access
-control. Hosted mode blocks private targets, redirect/DNS rebinding, unsafe
-subresources, cross-origin credential headers, proxy use, and cross-site
-cookies. Self-host mode intentionally permits operators to reach internal pages
-and use proxies; isolate Chromium and enforce host/container egress rules.
+control. Hosted mode rejects targets and redirects that resolve privately at
+validation time, unsafe subresources, cross-origin credential headers, proxy
+use, and cross-site cookies. Because browser DNS can change after validation,
+deployments must also enforce host/container egress rules to block rebinding.
+Self-host mode intentionally permits operators to reach internal pages and use
+proxies; isolate Chromium accordingly.
 
 JavaScript actions are disabled unless `VIPERCAPTURE_ALLOW_SCRIPTS=1`. Render
 inputs can contain credentials and private page data. Async and scheduled inputs

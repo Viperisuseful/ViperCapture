@@ -21,7 +21,7 @@ from uuid import uuid4
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from render_contract import RenderRequest
+from render_contract import RenderRequest, canonical_render_document
 from render_errors import RenderError
 
 
@@ -67,6 +67,8 @@ class JobRecord:
     request_fingerprint: bytes | None = None
     webhook_payload: bytes | None = None
     webhook_event_status: str | None = None
+    webhook_attempt_count: int = 0
+    webhook_available_at: datetime | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
     artifact_key: str | None = None
@@ -295,7 +297,15 @@ class JobStore(Protocol):
         now: datetime,
     ) -> JobRecord | None: ...
     async def acknowledge_artifact_deletion(self, key: str) -> None: ...
-    async def pending_notifications(self, limit: int = 100) -> list[JobRecord]: ...
+    async def pending_notifications(
+        self, now: datetime, limit: int = 100
+    ) -> list[JobRecord]: ...
+    async def defer_notification(
+        self,
+        job_id: str,
+        webhook_payload: bytes,
+        available_at: datetime,
+    ) -> None: ...
     async def acknowledge_notification(
         self, job_id: str, webhook_payload: bytes
     ) -> None: ...
@@ -488,7 +498,7 @@ class PayloadCipher:
     @staticmethod
     def _serialize(payload: RenderRequest) -> bytes:
         return json.dumps(
-            payload.model_dump(mode="json"),
+            canonical_render_document(payload),
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
@@ -820,7 +830,9 @@ class AsyncJobService:
             return
         async with self._notification_lock:
             try:
-                pending = await self.job_store.pending_notifications()
+                pending = await self.job_store.pending_notifications(
+                    datetime.now(UTC)
+                )
             except Exception as exc:
                 logger.warning(
                     "webhook outbox lookup failed error_type=%s",
@@ -854,6 +866,15 @@ class AsyncJobService:
                         "async job webhook delivery failed job_id=%s error_type=%s",
                         job.id,
                         type(exc).__name__,
+                    )
+                    delay = min(
+                        3600,
+                        0.1 * (2 ** min(job.webhook_attempt_count, 15)),
+                    )
+                    await self.job_store.defer_notification(
+                        job.id,
+                        job.webhook_payload,
+                        datetime.now(UTC) + timedelta(seconds=delay),
                     )
                     continue
                 await self.job_store.acknowledge_notification(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from html import escape
 from io import BytesIO
 import math
@@ -19,6 +20,7 @@ from render_errors import RenderError
 
 MAX_PRINT_PAGES = 50
 MAX_SINGLE_PAGE_HEIGHT = 20_000
+MAX_MARKDOWN_HTML_BYTES = 5 * 1024 * 1024
 PAPER_INCHES = {
     "A4": (8.27, 11.69),
     "Letter": (8.5, 11.0),
@@ -133,10 +135,22 @@ async def _render_pdf(page, request: RenderRequest) -> RenderArtifact:
     else:
         common["format"] = options.paper_size.value
         await page.emulate_media(media="print")
-        dimensions = await page.evaluate("""() => ({
-            width: Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth || 0),
-            height: Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0)
-        })""")
+        dimensions = await page.evaluate("""() => {
+            const forced = new Set(["always", "page", "left", "right", "recto", "verso"]);
+            let forcedBreaks = 0;
+            for (const element of document.querySelectorAll("*")) {
+                const style = getComputedStyle(element);
+                if (forced.has(style.breakBefore) || forced.has(style.breakAfter) ||
+                    style.pageBreakBefore === "always" || style.pageBreakAfter === "always") {
+                    forcedBreaks += 1;
+                }
+            }
+            return {
+                width: Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth || 0),
+                height: Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0),
+                forcedBreaks
+            };
+        }""")
         _paper_width, paper_height = PAPER_INCHES[options.paper_size.value]
         if options.orientation.value == "landscape":
             paper_height = _paper_width
@@ -144,8 +158,9 @@ async def _render_pdf(page, request: RenderRequest) -> RenderArtifact:
             1,
             (paper_height - options.margins.top - options.margins.bottom) * 96,
         )
-        estimated_pages = math.ceil(
-            max(1, float(dimensions["height"])) / printable_height
+        estimated_pages = max(
+            math.ceil(max(1, float(dimensions["height"])) / printable_height),
+            int(dimensions.get("forcedBreaks", 0)) + 1,
         )
         if estimated_pages > MAX_PRINT_PAGES:
             raise RenderError(
@@ -178,15 +193,31 @@ async def render_document_output(
 
     try:
         document_html = await page.content()
+        if (
+            request.output is OutputFormat.MARKDOWN
+            and len(document_html.encode("utf-8")) > MAX_MARKDOWN_HTML_BYTES
+        ):
+            raise RenderError(
+                "document_too_large",
+                "The hydrated document is too large for Markdown conversion.",
+                413,
+                False,
+                {"max_bytes": MAX_MARKDOWN_HTML_BYTES},
+            )
         selected_html = (
-            _article_html(document_html)
+            await asyncio.to_thread(_article_html, document_html)
             if request.extract_mode is ExtractMode.ARTICLE
             else document_html
         )
         if request.output is OutputFormat.HTML:
             body = selected_html.encode("utf-8")
             return RenderArtifact(body, "text/html; charset=utf-8", "vipercapture.html")
-        body = markdownify(selected_html, heading_style="ATX").encode("utf-8")
+        markdown = await asyncio.to_thread(
+            markdownify,
+            selected_html,
+            heading_style="ATX",
+        )
+        body = markdown.encode("utf-8")
         return RenderArtifact(body, "text/markdown; charset=utf-8", "vipercapture.md")
     except RenderError:
         raise

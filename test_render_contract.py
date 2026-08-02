@@ -2,10 +2,31 @@ import unittest
 
 from pydantic import ValidationError
 
-from render_contract import DevicePreset, LazyLoadMode, OutputFormat, RenderRequest
+from render_contract import (
+    DevicePreset,
+    LazyLoadMode,
+    OutputFormat,
+    RenderRequest,
+    canonical_render_document,
+)
 
 
 class RenderContractTest(unittest.TestCase):
+    def test_resource_type_serialization_is_canonical(self):
+        request = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "network": {
+                    "block_resource_types": ["script", "font", "image"]
+                },
+            }
+        )
+        document = canonical_render_document(request)
+        self.assertEqual(
+            document["network"]["block_resource_types"],
+            ["font", "image", "script"],
+        )
+
     def test_url_image_request_is_supported(self):
         request = RenderRequest.model_validate(
             {

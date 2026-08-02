@@ -152,7 +152,9 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.01)
         self.assertEqual(current.status, "succeeded")
         self.assertIsNone(current.payload)
-        pending = await self.store.pending_notifications()
+        pending = await self.store.pending_notifications(
+            datetime.now(UTC) + timedelta(seconds=1)
+        )
         self.assertEqual([item.id for item in pending], [job.id])
         self.assertNotIn(b"hooks.example", self.store.path.read_bytes())
         await service.close()
@@ -181,7 +183,10 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             url, event_job = delivered.await_args.args
             self.assertEqual(url, "https://hooks.example/callback")
             self.assertEqual(event_job.status, "succeeded")
-            self.assertEqual(await recovered_store.pending_notifications(), [])
+            self.assertEqual(
+                await recovered_store.pending_notifications(datetime.now(UTC)),
+                [],
+            )
         finally:
             await recovered.close()
 
@@ -222,6 +227,52 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(current.status, "succeeded")
         finally:
             release_notifier.set()
+            await service.close()
+
+    async def test_failed_webhook_backoff_allows_later_delivery(self):
+        first_attempted = asyncio.Event()
+        second_delivered = asyncio.Event()
+
+        async def notifier(url, _job):
+            if url.endswith("/failing"):
+                first_attempted.set()
+                raise RuntimeError("unavailable")
+            second_delivered.set()
+
+        service = AsyncJobService(
+            self.settings,
+            self.store,
+            self.artifacts,
+            _successful_renderer,
+            notifier=notifier,
+        )
+        await service.start()
+        try:
+            await service.submit(
+                RenderRequest.model_validate(
+                    {
+                        "url": "https://example.com/first",
+                        "delivery": {
+                            "webhook_url": "https://hooks.example/failing"
+                        },
+                    }
+                ),
+                request_id="failing-webhook",
+            )
+            await asyncio.wait_for(first_attempted.wait(), timeout=1)
+            await service.submit(
+                RenderRequest.model_validate(
+                    {
+                        "url": "https://example.com/second",
+                        "delivery": {
+                            "webhook_url": "https://hooks.example/working"
+                        },
+                    }
+                ),
+                request_id="working-webhook",
+            )
+            await asyncio.wait_for(second_delivered.wait(), timeout=1)
+        finally:
             await service.close()
 
     async def test_request_id_is_idempotent_and_queue_limit_is_atomic(self):
@@ -3232,6 +3283,7 @@ class ProviderLoadingTests(unittest.TestCase):
                     "expire_result",
                     "acknowledge_artifact_deletion",
                     "pending_notifications",
+                    "defer_notification",
                     "acknowledge_notification",
                 ),
             ),

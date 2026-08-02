@@ -78,7 +78,23 @@ def compare_images(
             {"baseline": list(baseline.size), "current": list(current.size)},
         )
 
-    difference = ImageChops.difference(baseline, current)
+    def visible_rgba(image: Image.Image) -> Image.Image:
+        red, green, blue, alpha = image.split()
+        visible = alpha.point(lambda value: 255 if value else 0)
+        return Image.merge(
+            "RGBA",
+            (
+                ImageChops.multiply(red, visible),
+                ImageChops.multiply(green, visible),
+                ImageChops.multiply(blue, visible),
+                alpha,
+            ),
+        )
+
+    difference = ImageChops.difference(
+        visible_rgba(baseline),
+        visible_rgba(current),
+    )
     # A difference in any color or alpha channel changes the rendered pixel.
     channel_masks = [
         channel.point(lambda value: 255 if value > pixel_threshold else 0)

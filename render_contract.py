@@ -527,3 +527,19 @@ class RenderRequest(StrictModel):
     @property
     def recorded_output_type(self) -> str:
         return "zip" if self.viewports is not None else self.output.value
+
+
+def canonical_render_document(
+    request: RenderRequest,
+    **dump_options,
+) -> dict[str, object]:
+    """Serialize request collections deterministically across processes."""
+    document = request.model_dump(mode="json", **dump_options)
+    network = document.get("network")
+    if isinstance(network, dict) and isinstance(
+        network.get("block_resource_types"), list
+    ):
+        network["block_resource_types"] = sorted(
+            network["block_resource_types"]
+        )
+    return document

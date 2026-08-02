@@ -116,6 +116,27 @@ class ActionExecutionTests(unittest.IsolatedAsyncioTestCase):
         )
         page.evaluate.assert_awaited_once_with("() => 42")
 
+    async def test_hide_uses_the_complete_locator(self):
+        page = MagicMock()
+        locator = MagicMock()
+        locator.first = MagicMock()
+        locator.evaluate_all = AsyncMock()
+        locator.first.evaluate_all = AsyncMock()
+        page.locator.return_value = locator
+        request = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "actions": [{"type": "hide", "selector": ".overlay"}],
+            }
+        )
+        await RenderEngine(hosted=False)._run_actions(
+            page,
+            request,
+            RenderLimits(),
+        )
+        locator.evaluate_all.assert_awaited_once()
+        locator.first.evaluate_all.assert_not_awaited()
+
     async def test_content_and_request_assertions_fail_closed(self):
         page, _locator = action_page()
         page.evaluate.side_effect = [False]

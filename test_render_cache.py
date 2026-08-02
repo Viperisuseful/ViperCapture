@@ -36,6 +36,18 @@ class RenderCacheTests(unittest.IsolatedAsyncioTestCase):
             second = RenderRequest(html="two", cache=True)
             self.assertNotEqual(cache.key(first), cache.key(second))
 
+    async def test_total_byte_budget_evicts_oldest_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = RenderCache(Path(directory), max_bytes=700)
+            await cache.start()
+            first = RenderRequest(html="one", cache=True)
+            second = RenderRequest(html="two", cache=True)
+            artifact = RenderArtifact(b"x" * 400, "image/png", "capture.png")
+            await cache.put(first, artifact)
+            await cache.put(second, artifact)
+            self.assertIsNone(await cache.get(first))
+            self.assertIsNotNone(await cache.get(second))
+
 
 if __name__ == "__main__":
     unittest.main()

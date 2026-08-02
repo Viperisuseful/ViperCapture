@@ -154,6 +154,10 @@ CACHE_DIRECTORY = Path(
 ).expanduser()
 CACHE_TTL_SECONDS = max(1, int(os.getenv("VIPERCAPTURE_CACHE_TTL_SECONDS", "900")))
 CACHE_MAX_ENTRIES = max(1, int(os.getenv("VIPERCAPTURE_CACHE_MAX_ENTRIES", "1000")))
+CACHE_MAX_BYTES = max(
+    1,
+    int(os.getenv("VIPERCAPTURE_CACHE_MAX_BYTES", str(512 * 1024 * 1024))),
+)
 
 
 class _SlotStreamingResponse(StreamingResponse):
@@ -280,6 +284,7 @@ async def lifespan(app: FastAPI):
         CACHE_DIRECTORY,
         ttl_seconds=CACHE_TTL_SECONDS,
         max_entries=CACHE_MAX_ENTRIES,
+        max_bytes=CACHE_MAX_BYTES,
     )
     try:
         await app.state.render_cache.start()

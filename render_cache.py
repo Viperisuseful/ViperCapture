@@ -12,7 +12,7 @@ from pathlib import Path
 import stat
 import tempfile
 
-from render_contract import RenderRequest
+from render_contract import RenderRequest, canonical_render_document
 from render_engine import RenderArtifact
 from async_jobs import _ensure_private_directory
 
@@ -21,10 +21,18 @@ UTC = timezone.utc
 
 
 class RenderCache:
-    def __init__(self, directory: Path, *, ttl_seconds: int = 900, max_entries: int = 1_000) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        *,
+        ttl_seconds: int = 900,
+        max_entries: int = 1_000,
+        max_bytes: int = 512 * 1024 * 1024,
+    ) -> None:
         self.directory = directory
         self.ttl = timedelta(seconds=max(1, ttl_seconds))
         self.max_entries = max(1, max_entries)
+        self.max_bytes = max(1, max_bytes)
         self.lock = asyncio.Lock()
         self._fingerprint_key: bytes | None = None
 
@@ -76,7 +84,7 @@ class RenderCache:
     def key(self, request: RenderRequest) -> str:
         if self._fingerprint_key is None:
             raise RuntimeError("render cache is not started")
-        document = request.model_dump(mode="json")
+        document = canonical_render_document(request)
         document["cache"] = False
         # Delivery affects notification, not pixels; never persist its URL in cache metadata.
         document["delivery"] = {"webhook_url": None}
@@ -178,12 +186,23 @@ class RenderCache:
             self.directory.glob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True
         )
         now = datetime.now(UTC)
+        retained_bytes = 0
         for index, metadata_path in enumerate(metadata_files):
             remove = index >= self.max_entries
             if not remove:
                 try:
                     document = json.loads(metadata_path.read_text("utf-8"))
                     remove = now - datetime.fromisoformat(document["created_at"]) > self.ttl
+                    if not remove:
+                        body_path = metadata_path.with_suffix(".bin")
+                        entry_bytes = (
+                            metadata_path.stat().st_size
+                            + body_path.stat().st_size
+                        )
+                        if retained_bytes + entry_bytes > self.max_bytes:
+                            remove = True
+                        else:
+                            retained_bytes += entry_bytes
                 except Exception:
                     remove = True
             if remove:

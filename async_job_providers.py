@@ -223,6 +223,8 @@ class SQLiteJobStore:
                 payload BLOB,
                 webhook_payload BLOB,
                 webhook_event_status TEXT,
+                webhook_attempt_count INTEGER NOT NULL DEFAULT 0,
+                webhook_available_at REAL,
                 attempt_count INTEGER NOT NULL DEFAULT 0,
                 available_at REAL NOT NULL,
                 queue_expires_at REAL NOT NULL,
@@ -274,6 +276,21 @@ class SQLiteJobStore:
             connection.execute(
                 "ALTER TABLE async_jobs ADD COLUMN webhook_event_status TEXT"
             )
+        if "webhook_attempt_count" not in columns:
+            connection.execute(
+                "ALTER TABLE async_jobs ADD COLUMN webhook_attempt_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if "webhook_available_at" not in columns:
+            connection.execute(
+                "ALTER TABLE async_jobs ADD COLUMN webhook_available_at REAL"
+            )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS async_jobs_webhook_idx
+            ON async_jobs(webhook_available_at, completed_at)
+            WHERE webhook_payload IS NOT NULL
+            """
+        )
 
     @staticmethod
     def _from_row(row: sqlite3.Row | None) -> JobRecord | None:
@@ -299,6 +316,8 @@ class SQLiteJobStore:
                 else None
             ),
             webhook_event_status=row["webhook_event_status"],
+            webhook_attempt_count=int(row["webhook_attempt_count"] or 0),
+            webhook_available_at=_datetime(row["webhook_available_at"]),
             started_at=_datetime(row["started_at"]),
             completed_at=_datetime(row["completed_at"]),
             artifact_key=row["artifact_key"],
@@ -452,13 +471,16 @@ class SQLiteJobStore:
                     webhook_event_status = CASE
                         WHEN webhook_payload IS NOT NULL THEN 'failed'
                         ELSE NULL END,
+                    webhook_attempt_count = 0,
+                    webhook_available_at = CASE
+                        WHEN webhook_payload IS NOT NULL THEN ? ELSE NULL END,
                     completed_at = ?,
                     error_code = 'job_attempts_exhausted',
                     error_message = 'The queued job exhausted its retry attempts.',
                     error_retryable = 0
                 WHERE status = 'queued' AND attempt_count >= ?
                 """,
-                (current, max_attempts),
+                (current, current, max_attempts),
             )
             row = connection.execute(
                 """
@@ -708,6 +730,9 @@ class SQLiteJobStore:
                     webhook_event_status = CASE
                         WHEN webhook_payload IS NOT NULL THEN 'succeeded'
                         ELSE NULL END,
+                    webhook_attempt_count = 0,
+                    webhook_available_at = CASE
+                        WHEN webhook_payload IS NOT NULL THEN ? ELSE NULL END,
                     artifact_key = ?,
                     media_type = ?, filename = ?, artifact_bytes = ?,
                     result_expires_at = ?, queue_ms = ?, render_ms = ?,
@@ -716,6 +741,7 @@ class SQLiteJobStore:
                 WHERE id = ? AND status = 'running' AND attempt_count = ?
                 """,
                 (
+                    current,
                     artifact_key,
                     media_type,
                     filename,
@@ -790,11 +816,15 @@ class SQLiteJobStore:
                     webhook_event_status = CASE
                         WHEN webhook_payload IS NOT NULL THEN 'failed'
                         ELSE NULL END,
+                    webhook_attempt_count = 0,
+                    webhook_available_at = CASE
+                        WHEN webhook_payload IS NOT NULL THEN ? ELSE NULL END,
                     completed_at = ?,
                     error_code = ?, error_message = ?, error_retryable = ?
                 WHERE id = ? AND status = 'running' AND attempt_count = ?
                 """,
                 (
+                    completed_at,
                     completed_at,
                     code_value,
                     message_value,
@@ -862,6 +892,9 @@ class SQLiteJobStore:
                     webhook_event_status = CASE
                         WHEN webhook_payload IS NOT NULL THEN 'failed'
                         ELSE NULL END,
+                    webhook_attempt_count = 0,
+                    webhook_available_at = CASE
+                        WHEN webhook_payload IS NOT NULL THEN ? ELSE NULL END,
                     completed_at = ?,
                     error_code = 'job_attempts_exhausted',
                     error_message = 'The interrupted job exhausted its retry attempts.',
@@ -869,7 +902,7 @@ class SQLiteJobStore:
                 WHERE status = 'running' AND queue_expires_at > ?
                   AND attempt_count >= ?
                 """,
-                (current, current, max_attempts),
+                (current, current, current, max_attempts),
             ).rowcount
             requeued = connection.execute(
                 """
@@ -1020,28 +1053,51 @@ class SQLiteJobStore:
             raise
 
     async def pending_notifications(
-        self, limit: int = 100
+        self, now: datetime, limit: int = 100
     ) -> list[JobRecord]:
         return await self._run(
             self._pending_notifications,
+            now,
             max(1, min(limit, 100)),
         )
 
     @classmethod
     def _pending_notifications(
-        cls, connection: sqlite3.Connection, limit: int
+        cls,
+        connection: sqlite3.Connection,
+        now: datetime,
+        limit: int,
     ) -> list[JobRecord]:
         rows = connection.execute(
             """
             SELECT * FROM async_jobs
             WHERE webhook_payload IS NOT NULL
               AND webhook_event_status IN ('succeeded', 'failed')
-            ORDER BY completed_at, id
+              AND COALESCE(webhook_available_at, completed_at, 0) <= ?
+            ORDER BY COALESCE(webhook_available_at, completed_at, 0), id
             LIMIT ?
             """,
-            (limit,),
+            (_epoch(now), limit),
         ).fetchall()
         return [cls._from_row(row) for row in rows]
+
+    async def defer_notification(
+        self,
+        job_id: str,
+        webhook_payload: bytes,
+        available_at: datetime,
+    ) -> None:
+        await self._run(
+            lambda connection: connection.execute(
+                """
+                UPDATE async_jobs
+                SET webhook_attempt_count = webhook_attempt_count + 1,
+                    webhook_available_at = ?
+                WHERE id = ? AND webhook_payload = ?
+                """,
+                (_epoch(available_at), job_id, webhook_payload),
+            )
+        )
 
     async def acknowledge_notification(
         self, job_id: str, webhook_payload: bytes
@@ -1050,7 +1106,8 @@ class SQLiteJobStore:
             lambda connection: connection.execute(
                 """
                 UPDATE async_jobs
-                SET webhook_payload = NULL, webhook_event_status = NULL
+                SET webhook_payload = NULL, webhook_event_status = NULL,
+                    webhook_attempt_count = 0, webhook_available_at = NULL
                 WHERE id = ? AND webhook_payload = ?
                 """,
                 (job_id, webhook_payload),
