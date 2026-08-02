@@ -1,0 +1,24 @@
+[
+  {
+    "name": "local-viewport",
+    "request": {
+      "url": "http://127.0.0.1:8099/viewport.html",
+      "output": "png",
+      "viewport": {"width": 1280, "height": 720, "device_scale_factor": 1},
+      "full_page": false,
+      "lazy_load": "none",
+      "wait_for": {"event": "load"}
+    }
+  },
+  {
+    "name": "local-full-page",
+    "request": {
+      "url": "http://127.0.0.1:8099/full-page.html",
+      "output": "png",
+      "viewport": {"width": 1280, "height": 720, "device_scale_factor": 1},
+      "full_page": true,
+      "lazy_load": "none",
+      "wait_for": {"event": "load"}
+    }
+  }
+]

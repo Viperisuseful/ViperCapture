@@ -1,6 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime
+import hmac
 import os
 from pathlib import Path
 import re
@@ -8,6 +9,7 @@ import subprocess
 import sys
 import time
 from typing import Awaitable, TypeVar
+from urllib.parse import urlencode
 from uuid import UUID
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -28,9 +30,28 @@ from async_jobs import (
     public_job_document,
     settings_from_environment,
 )
+from bulk_jobs import BulkJobRequest
+from page_cleanup import (
+    CleanupOptions,
+    apply_visual_cleanup,
+    finish_autoconsent,
+    setup_autoconsent,
+    should_block_resource,
+)
 from render_contract import RenderRequest
-from render_engine import RenderEngine, RenderLimits
+from render_engine import CleanupHooks, RenderArtifact, RenderEngine, RenderLimits
+from render_cache import RenderCache
 from render_errors import RenderError, install_render_error_layer
+from schedules import (
+    ScheduleCreate,
+    ScheduleService,
+    ScheduleStore,
+    ScheduleUpdate,
+    public_schedule_document,
+)
+from signed_urls import sign_render_request, verify_render_request
+from webhooks import WebhookDispatcher
+from visual_diff import MAX_DIFF_INPUT_BYTES, compare_images, create_diff_bundle
 
 
 if sys.platform.startswith("win"):
@@ -78,6 +99,16 @@ def _load_local_env() -> None:
 _load_local_env()
 
 HOSTED = os.getenv("VIPERCAPTURE_HOSTED") == "1"
+ALLOW_SCRIPTS = os.getenv("VIPERCAPTURE_ALLOW_SCRIPTS") == "1"
+SIGNING_SECRET = os.getenv("VIPERCAPTURE_SIGNING_SECRET", "")
+SIGNING_ADMIN_TOKEN = os.getenv("VIPERCAPTURE_SIGNING_ADMIN_TOKEN", "")
+PUBLIC_URL = os.getenv("VIPERCAPTURE_PUBLIC_URL", "").rstrip("/")
+WEBHOOK_SECRET = os.getenv("VIPERCAPTURE_WEBHOOK_SECRET", "")
+ALLOW_PRIVATE_WEBHOOKS = os.getenv("VIPERCAPTURE_ALLOW_PRIVATE_WEBHOOKS") == "1"
+if SIGNING_SECRET and len(SIGNING_SECRET.encode("utf-8")) < 32:
+    raise ValueError("VIPERCAPTURE_SIGNING_SECRET must contain at least 32 bytes")
+if WEBHOOK_SECRET and len(WEBHOOK_SECRET.encode("utf-8")) < 32:
+    raise ValueError("VIPERCAPTURE_WEBHOOK_SECRET must contain at least 32 bytes")
 GPU_MODE = os.getenv(
     "VIPERCAPTURE_GPU_MODE",
     "auto" if os.getenv("VIPERCAPTURE_ENABLE_GPU") == "1" else "off",
@@ -107,6 +138,15 @@ ASYNC_JOB_SETTINGS = (
     if ASYNC_JOBS_ENABLED
     else None
 )
+SCHEDULES_ENABLED = os.getenv("VIPERCAPTURE_SCHEDULES", "1") != "0"
+CACHE_DIRECTORY = Path(
+    os.getenv(
+        "VIPERCAPTURE_CACHE_DIR",
+        str((ASYNC_JOB_SETTINGS.data_dir if ASYNC_JOB_SETTINGS else BASE_DIR / ".vipercapture") / "cache"),
+    )
+).expanduser()
+CACHE_TTL_SECONDS = max(1, int(os.getenv("VIPERCAPTURE_CACHE_TTL_SECONDS", "900")))
+CACHE_MAX_ENTRIES = max(1, int(os.getenv("VIPERCAPTURE_CACHE_MAX_ENTRIES", "1000")))
 
 
 class _SlotStreamingResponse(StreamingResponse):
@@ -227,6 +267,28 @@ async def lifespan(app: FastAPI):
     app.state.async_result_slots = asyncio.Semaphore(MAX_ASYNC_RESULT_DOWNLOADS)
     app.state.browser_restart_lock = asyncio.Lock()
     app.state.async_jobs = None
+    app.state.schedules = None
+    app.state.render_cache = RenderCache(
+        CACHE_DIRECTORY,
+        ttl_seconds=CACHE_TTL_SECONDS,
+        max_entries=CACHE_MAX_ENTRIES,
+    )
+    try:
+        await app.state.render_cache.start()
+    except BaseException:
+        with suppress(Exception):
+            await browser.close()
+        await playwright.stop()
+        raise
+    app.state.webhooks = (
+        WebhookDispatcher(
+            secret=WEBHOOK_SECRET,
+            public_url=PUBLIC_URL,
+            allow_private=ALLOW_PRIVATE_WEBHOOKS,
+        )
+        if WEBHOOK_SECRET
+        else None
+    )
     try:
         if ASYNC_JOBS_ENABLED:
             if ASYNC_JOB_SETTINGS is None:
@@ -237,12 +299,23 @@ async def lifespan(app: FastAPI):
                 job_store,
                 artifact_store,
                 _render_async_image,
+                notifier=_notify_job if app.state.webhooks is not None else None,
             )
             await service.start()
             app.state.async_jobs = service
+            if SCHEDULES_ENABLED:
+                scheduler = ScheduleService(
+                    ScheduleStore(ASYNC_JOB_SETTINGS.data_dir / "schedules.sqlite3"),
+                    service,
+                    service.cipher,
+                )
+                await scheduler.start()
+                app.state.schedules = scheduler
         yield
     finally:
         try:
+            if app.state.schedules is not None:
+                await app.state.schedules.close()
             if app.state.async_jobs is not None:
                 await app.state.async_jobs.close()
         finally:
@@ -447,21 +520,51 @@ async def _check_captcha(
         )
 
 
+def _page_cleanup_options(options) -> CleanupOptions:
+    return CleanupOptions(
+        consent_mode=options.consent_mode.value,
+        block_ads=options.block_ads,
+        block_trackers=options.block_trackers,
+        block_chats=options.block_chats,
+        block_newsletters=options.block_newsletters,
+    )
+
+
+async def _apply_page_cleanup(page, options) -> dict[str, int]:
+    await apply_visual_cleanup(page, _page_cleanup_options(options))
+    return {}
+
+
+def _blocked_resource_category(url: str, options) -> str | None:
+    return should_block_resource(url, _page_cleanup_options(options))
+
+
+def _render_engine() -> RenderEngine:
+    playwright = getattr(app.state, "playwright", None)
+    return RenderEngine(
+        hosted=HOSTED,
+        cleanup_hooks=CleanupHooks(
+            setup=setup_autoconsent,
+            finish=finish_autoconsent,
+            apply=_apply_page_cleanup,
+            blocked_category=_blocked_resource_category,
+        ),
+        challenge_checker=_check_captcha,
+        browser_replacer=lambda failed: _replace_browser(app, failed),
+        device_descriptors=(
+            dict(playwright.devices) if playwright is not None else None
+        ),
+        allow_scripts=ALLOW_SCRIPTS,
+    )
+
+
 async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
     started = time.perf_counter()
     await app.state.capture_slots.acquire()
     browser: Browser = app.state.browser
-    engine = RenderEngine(
-        hosted=HOSTED,
-        challenge_checker=_check_captcha,
-        browser_replacer=lambda failed: _replace_browser(app, failed),
-    )
+    engine = _render_engine()
     try:
-        artifact = await engine.render_image(
-            browser,
-            payload,
-            RenderLimits(max_pixels=MAX_SCREENSHOT_PIXELS),
-        )
+        artifact, _cache_hit = await _render_with_cache(engine, browser, payload)
     except RenderError:
         if not browser.is_connected():
             with suppress(Exception):
@@ -477,8 +580,44 @@ async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
     )
 
 
-@app.post("/v1/render", response_class=Response)
-async def render_v1(payload: RenderRequest, request: Request) -> Response:
+async def _render_with_cache(
+    engine: RenderEngine,
+    browser: Browser,
+    payload: RenderRequest,
+) -> tuple[RenderArtifact, bool]:
+    cache = getattr(app.state, "render_cache", None)
+    if payload.cache and cache is not None:
+        cached = await cache.get(payload)
+        if cached is not None:
+            return cached, True
+    artifact = await engine.render_image(
+        browser,
+        payload,
+        RenderLimits(max_pixels=MAX_SCREENSHOT_PIXELS),
+    )
+    if payload.cache and cache is not None:
+        await cache.put(payload, artifact)
+    return artifact, False
+
+
+async def _notify_job(payload: RenderRequest, job) -> None:
+    dispatcher = getattr(app.state, "webhooks", None)
+    if dispatcher is None or payload.delivery.webhook_url is None:
+        return
+    await dispatcher.deliver(
+        str(payload.delivery.webhook_url),
+        public_job_document(job),
+    )
+
+
+async def _render_response(payload: RenderRequest, request: Request) -> Response:
+    if payload.delivery.webhook_url is not None:
+        raise RenderError(
+            "delivery_requires_async_job",
+            "Webhook delivery is accepted only by POST /v1/jobs.",
+            422,
+            False,
+        )
     queue_started = time.perf_counter()
     try:
         await _await_while_connected(
@@ -492,20 +631,12 @@ async def render_v1(payload: RenderRequest, request: Request) -> Response:
         raise RenderError("capture_queue_busy", "The render queue is busy.", 503, True) from exc
     queue_ms = round((time.perf_counter() - queue_started) * 1000)
     browser: Browser = app.state.browser
-    engine = RenderEngine(
-        hosted=HOSTED,
-        challenge_checker=_check_captcha,
-        browser_replacer=lambda failed: _replace_browser(app, failed),
-    )
+    engine = _render_engine()
     render_started = time.perf_counter()
     try:
-        artifact = await _await_while_connected(
+        artifact, cache_hit = await _await_while_connected(
             request,
-            engine.render_image(
-                browser,
-                payload,
-                RenderLimits(max_pixels=MAX_SCREENSHOT_PIXELS),
-            ),
+            _render_with_cache(engine, browser, payload),
         )
     except RenderError:
         if not browser.is_connected():
@@ -519,6 +650,7 @@ async def render_v1(payload: RenderRequest, request: Request) -> Response:
     diagnostic_headers = {
         "X-ViperCapture-Queue-Ms": str(max(0, queue_ms)),
         "X-ViperCapture-Render-Ms": str(max(0, render_ms)),
+        "X-ViperCapture-Cache": "hit" if cache_hit else ("miss" if payload.cache else "disabled"),
     }
     for key, header in (
         ("width", "X-ViperCapture-Width"),
@@ -535,6 +667,115 @@ async def render_v1(payload: RenderRequest, request: Request) -> Response:
             "Content-Disposition": f'attachment; filename="{artifact.filename}"',
             **diagnostic_headers,
         },
+    )
+
+
+@app.post("/v1/render", response_class=Response)
+async def render_v1(payload: RenderRequest, request: Request) -> Response:
+    return await _render_response(payload, request)
+
+
+@app.post("/v1/diff", response_class=Response)
+async def visual_diff(
+    baseline: UploadFile = File(...),
+    current: UploadFile = File(...),
+    pixel_threshold: int = Form(0),
+    max_difference_ratio: float = Form(0),
+) -> Response:
+    baseline_body = await baseline.read(MAX_DIFF_INPUT_BYTES + 1)
+    current_body = await current.read(MAX_DIFF_INPUT_BYTES + 1)
+    try:
+        result = compare_images(
+            baseline_body,
+            current_body,
+            pixel_threshold=pixel_threshold,
+            max_difference_ratio=max_difference_ratio,
+        )
+    except ValueError as exc:
+        raise RenderError("diff_options_invalid", str(exc), 422, False) from exc
+    return Response(
+        create_diff_bundle(result),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": 'attachment; filename="visual-diff.zip"',
+            "X-ViperCapture-Diff-Passed": str(result.passed).lower(),
+            "X-ViperCapture-Difference-Ratio": f"{result.ratio:.8f}",
+            "Cache-Control": "private, no-store",
+        },
+    )
+
+
+@app.get("/v1/render/signed", response_class=Response)
+async def render_signed(
+    request: Request,
+    payload: str,
+    expires: int,
+    signature: str,
+) -> Response:
+    if not SIGNING_SECRET:
+        raise RenderError(
+            "signed_urls_disabled",
+            "Signed render URLs are disabled for this ViperCapture instance.",
+            503,
+            False,
+        )
+    render_request = verify_render_request(
+        payload,
+        expires,
+        signature,
+        secret=SIGNING_SECRET,
+    )
+    response = await _render_response(render_request, request)
+    disposition = response.headers.get("Content-Disposition", "")
+    response.headers["Content-Disposition"] = disposition.replace(
+        "attachment", "inline", 1
+    )
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
+
+
+@app.post("/v1/signed-url")
+async def create_signed_url(
+    payload: RenderRequest,
+    request: Request,
+    ttl_seconds: int = 3600,
+) -> JSONResponse:
+    if not SIGNING_SECRET:
+        raise RenderError(
+            "signed_urls_disabled",
+            "Signed render URLs are disabled for this ViperCapture instance.",
+            503,
+            False,
+        )
+    expected_token = SIGNING_ADMIN_TOKEN or SIGNING_SECRET
+    supplied = request.headers.get("authorization", "")
+    prefix = "Bearer "
+    if not supplied.startswith(prefix) or not hmac.compare_digest(
+        supplied[len(prefix):], expected_token
+    ):
+        raise RenderError(
+            "signing_unauthorized",
+            "A valid signing administrator token is required.",
+            401,
+            False,
+        )
+    try:
+        encoded, expires, signature = sign_render_request(
+            payload,
+            secret=SIGNING_SECRET,
+            ttl_seconds=ttl_seconds,
+        )
+    except ValueError as exc:
+        raise RenderError("signed_url_invalid", str(exc), 422, False) from exc
+    path = "/v1/render/signed?" + urlencode(
+        {"payload": encoded, "expires": expires, "signature": signature}
+    )
+    return JSONResponse(
+        {
+            "url": f"{PUBLIC_URL}{path}" if PUBLIC_URL else path,
+            "expires": expires,
+        },
+        headers={"Cache-Control": "private, no-store"},
     )
 
 
@@ -555,6 +796,16 @@ async def create_render_job(
     payload: RenderRequest,
     request: Request,
 ) -> JSONResponse:
+    if payload.delivery.webhook_url is not None:
+        dispatcher = getattr(app.state, "webhooks", None)
+        if dispatcher is None:
+            raise RenderError(
+                "webhooks_disabled",
+                "Webhook delivery is disabled for this ViperCapture instance.",
+                503,
+                False,
+            )
+        await dispatcher.validate_url(str(payload.delivery.webhook_url))
     job = await _async_job_service().submit(
         payload,
         request_id=request.state.request_id,
@@ -569,6 +820,142 @@ async def create_render_job(
             "Cache-Control": "private, no-store",
         },
     )
+
+
+@app.post("/v1/jobs/bulk", status_code=202)
+async def create_bulk_render_jobs(
+    payload: BulkJobRequest,
+    request: Request,
+) -> JSONResponse:
+    service = _async_job_service()
+    dispatcher = getattr(app.state, "webhooks", None)
+    for item in payload.items:
+        if item.render.delivery.webhook_url is None:
+            continue
+        if dispatcher is None:
+            raise RenderError(
+                "webhooks_disabled",
+                "Webhook delivery is disabled for this ViperCapture instance.",
+                503,
+                False,
+            )
+        await dispatcher.validate_url(str(item.render.delivery.webhook_url))
+
+    results = []
+    failures = 0
+    for index, item in enumerate(payload.items):
+        request_id = item.request_id or f"{request.state.request_id}-{index + 1}"
+        try:
+            job = await service.submit(item.render, request_id=request_id)
+            results.append(
+                {
+                    "index": index,
+                    "id": item.id,
+                    "accepted": True,
+                    "job": public_job_document(job),
+                    "error": None,
+                }
+            )
+        except RenderError as exc:
+            failures += 1
+            results.append(
+                {
+                    "index": index,
+                    "id": item.id,
+                    "accepted": False,
+                    "job": None,
+                    "error": {
+                        "code": exc.code,
+                        "message": exc.message,
+                        "retryable": exc.retryable,
+                        "details": exc.details,
+                    },
+                }
+            )
+    return JSONResponse(
+        {
+            "count": len(results),
+            "accepted": len(results) - failures,
+            "failed": failures,
+            "results": results,
+        },
+        status_code=207 if failures else 202,
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
+def _schedule_service() -> ScheduleService:
+    service = getattr(app.state, "schedules", None)
+    if service is None:
+        raise RenderError(
+            "schedules_disabled",
+            "Schedules are disabled for this ViperCapture instance.",
+            503,
+            False,
+        )
+    return service
+
+
+async def _validate_webhook(payload: RenderRequest) -> None:
+    if payload.delivery.webhook_url is None:
+        return
+    dispatcher = getattr(app.state, "webhooks", None)
+    if dispatcher is None:
+        raise RenderError(
+            "webhooks_disabled",
+            "Webhook delivery is disabled for this ViperCapture instance.",
+            503,
+            False,
+        )
+    await dispatcher.validate_url(str(payload.delivery.webhook_url))
+
+
+@app.post("/v1/schedules", status_code=201)
+async def create_schedule(payload: ScheduleCreate) -> JSONResponse:
+    await _validate_webhook(payload.render)
+    record = await _schedule_service().create(payload)
+    return JSONResponse(
+        public_schedule_document(record),
+        status_code=201,
+        headers={"Location": f"/v1/schedules/{record.id}", "Cache-Control": "private, no-store"},
+    )
+
+
+@app.get("/v1/schedules")
+async def list_schedules() -> JSONResponse:
+    records = await _schedule_service().store.list()
+    return JSONResponse(
+        {"count": len(records), "schedules": [public_schedule_document(item) for item in records]},
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
+@app.get("/v1/schedules/{schedule_id}")
+async def read_schedule(schedule_id: UUID) -> JSONResponse:
+    record = await _schedule_service().store.get(str(schedule_id))
+    if record is None:
+        raise RenderError("schedule_not_found", "The schedule was not found.", 404, False)
+    return JSONResponse(public_schedule_document(record), headers={"Cache-Control": "private, no-store"})
+
+
+@app.patch("/v1/schedules/{schedule_id}")
+async def update_schedule(schedule_id: UUID, payload: ScheduleUpdate) -> JSONResponse:
+    service = _schedule_service()
+    record = await service.store.get(str(schedule_id))
+    if record is None:
+        raise RenderError("schedule_not_found", "The schedule was not found.", 404, False)
+    if payload.render is not None:
+        await _validate_webhook(payload.render)
+    updated = await service.update(record, payload)
+    return JSONResponse(public_schedule_document(updated), headers={"Cache-Control": "private, no-store"})
+
+
+@app.delete("/v1/schedules/{schedule_id}", status_code=204)
+async def delete_schedule(schedule_id: UUID) -> Response:
+    deleted = await _schedule_service().store.delete(str(schedule_id))
+    if not deleted:
+        raise RenderError("schedule_not_found", "The schedule was not found.", 404, False)
+    return Response(status_code=204)
 
 
 @app.get("/v1/jobs/{job_id}")

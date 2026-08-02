@@ -47,10 +47,9 @@ import { InputGroup, InputGroupAddon, InputGroupTextarea } from "@/components/ui
 import { Progress } from "@/components/ui/progress"
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 
-type Output = "png" | "jpeg" | "webp"
+type Output = "png" | "jpeg" | "webp" | "pdf" | "html" | "markdown" | "metadata" | "webm"
 type Capture = {
   name: string
   url: string
@@ -95,7 +94,10 @@ const blockedHeaderPrefixes = ["proxy-", "sec-", "x-forwarded-"]
 const headerNamePattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/
 
 function extension(output: Output) {
-  return output === "jpeg" ? "jpg" : output
+  if (output === "jpeg") return "jpg"
+  if (output === "markdown") return "md"
+  if (output === "metadata") return "json"
+  return output
 }
 
 function formatBytes(bytes: number) {
@@ -205,6 +207,9 @@ export default function App() {
   const [transparent, setTransparent] = useState(false)
   const [lazyLoad, setLazyLoad] = useState("thorough")
   const [optimizePng, setOptimizePng] = useState(false)
+  const [diagnostics, setDiagnostics] = useState(false)
+  const [videoDuration, setVideoDuration] = useState(5)
+  const [videoScroll, setVideoScroll] = useState(false)
   const [waitEvent, setWaitEvent] = useState("load")
   const [waitDelay, setWaitDelay] = useState(1)
   const [waitSelector, setWaitSelector] = useState("")
@@ -250,6 +255,7 @@ export default function App() {
   }, [busy])
 
   const maxPixels = config?.max_screenshot_pixels ?? 50_000_000
+  const imageOutput = output === "png" || output === "jpeg" || output === "webp"
   const gpuEnabled = config?.gpu?.mode !== "off"
   const gpuCopy = useMemo(() => {
     if (!gpuEnabled) return "Uses Chromium's default software-compatible mode."
@@ -300,6 +306,9 @@ export default function App() {
     setTransparent(false)
     setLazyLoad("thorough")
     setOptimizePng(false)
+    setDiagnostics(false)
+    setVideoDuration(5)
+    setVideoScroll(false)
     setWaitEvent("load")
     setWaitDelay(1)
     setWaitSelector("")
@@ -352,15 +361,17 @@ export default function App() {
       url: normalized,
       output,
       viewport: { width, height, device_scale_factor: density },
-      full_page: selector ? false : fullPage,
-      preserve_viewport_width: !selector && fullPage && preserveViewportWidth,
+      full_page: imageOutput && selector ? false : fullPage,
+      preserve_viewport_width: imageOutput && !selector && fullPage && preserveViewportWidth,
       lazy_load: lazyLoad,
-      selector: selector || null,
+      selector: imageOutput ? selector || null : null,
       image: {
-        quality: output === "png" ? null : quality,
-        transparent_background: output !== "jpeg" && transparent,
+        quality: output === "jpeg" || output === "webp" ? quality : null,
+        transparent_background: (output === "png" || output === "webp") && transparent,
         optimize_for_speed: output === "png" && optimizePng,
       },
+      diagnostics: { bundle: diagnostics },
+      video: output === "webm" ? { duration_ms: videoDuration * 1000, scroll: videoScroll } : null,
       headers: customHeaders,
       wait_for: {
         event: waitEvent,
@@ -475,14 +486,14 @@ export default function App() {
             <Badge variant="outline" className="mb-4"><Sparkles data-icon="inline-start" />Local Chromium renderer</Badge>
             <h1 className="page-title">The whole webpage, in one capture.</h1>
             <p className="mt-4 max-w-2xl text-base leading-7 text-muted-foreground sm:text-lg">
-              Render a public URL as PNG, JPEG, or WebP with the same focused workspace as ViperCapture Cloud.
+              Self-host screenshots, documents, metadata, and WebM video with the same render contract as ViperCapture Cloud.
             </p>
           </div>
           <div className="grid grid-cols-3 gap-2">
             {[
               [Gauge, "Local", "Private"],
               [Zap, "Fast", "Chromium"],
-              [ImageIcon, "3", "Formats"],
+              [ImageIcon, "8", "Outputs"],
             ].map(([Icon, value, label]) => (
               <Card key={String(label)} size="sm" className="min-w-24">
                 <CardContent className="flex items-center gap-2">
@@ -519,9 +530,14 @@ export default function App() {
                 <FieldSet>
                   <FieldLegend>Output</FieldLegend>
                   <Field>
-                    <Tabs value={output} onValueChange={(value: string) => setOutput(value as Output)}>
-                      <TabsList className="w-full"><TabsTrigger value="png">PNG</TabsTrigger><TabsTrigger value="jpeg">JPEG</TabsTrigger><TabsTrigger value="webp">WebP</TabsTrigger></TabsList>
-                    </Tabs>
+                    <Select value={output} onValueChange={(value: string) => setOutput(value as Output)}>
+                      <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                      <SelectContent><SelectGroup>
+                        <SelectItem value="png">PNG image</SelectItem><SelectItem value="jpeg">JPEG image</SelectItem><SelectItem value="webp">WebP image</SelectItem>
+                        <SelectItem value="pdf">PDF document</SelectItem><SelectItem value="html">Hydrated HTML</SelectItem><SelectItem value="markdown">Markdown</SelectItem>
+                        <SelectItem value="metadata">Metadata JSON</SelectItem><SelectItem value="webm">WebM video</SelectItem>
+                      </SelectGroup></SelectContent>
+                    </Select>
                   </Field>
                 </FieldSet>
 
@@ -592,9 +608,11 @@ export default function App() {
                         </Field>
                         <Field><FieldLabel htmlFor="wait-text">Wait text</FieldLabel><Input id="wait-text" value={waitText} onChange={(event) => setWaitText(event.target.value)} placeholder="Loaded" /></Field>
                       </div>
-                      {output !== "png" && <Field><FieldLabel htmlFor="quality">Image quality</FieldLabel><Input id="quality" type="number" min={1} max={100} value={quality} onChange={(event) => setQuality(Number(event.target.value))} /></Field>}
-                      {output !== "jpeg" && <Field orientation="horizontal"><FieldLabel htmlFor="transparent">Transparent background</FieldLabel><Switch id="transparent" checked={transparent} onCheckedChange={setTransparent} /></Field>}
+                      {(output === "jpeg" || output === "webp") && <Field><FieldLabel htmlFor="quality">Image quality</FieldLabel><Input id="quality" type="number" min={1} max={100} value={quality} onChange={(event) => setQuality(Number(event.target.value))} /></Field>}
+                      {(output === "png" || output === "webp") && <Field orientation="horizontal"><FieldLabel htmlFor="transparent">Transparent background</FieldLabel><Switch id="transparent" checked={transparent} onCheckedChange={setTransparent} /></Field>}
                       {output === "png" && <Field orientation="horizontal"><FieldLabel htmlFor="optimize-png"><span><span className="block">Fast PNG encoding</span><FieldDescription>Uses less encoding work, with a larger file.</FieldDescription></span></FieldLabel><Switch id="optimize-png" checked={optimizePng} onCheckedChange={setOptimizePng} /></Field>}
+                      {output === "webm" && <><Field><FieldLabel htmlFor="video-duration">Video duration (seconds)</FieldLabel><Input id="video-duration" type="number" min={1} max={30} value={videoDuration} onChange={(event) => setVideoDuration(Number(event.target.value))} /></Field><Field orientation="horizontal"><FieldLabel htmlFor="video-scroll">Scroll while recording</FieldLabel><Switch id="video-scroll" checked={videoScroll} onCheckedChange={setVideoScroll} /></Field></>}
+                      <Field orientation="horizontal"><FieldLabel htmlFor="diagnostics"><span><span className="block">Diagnostic bundle</span><FieldDescription>ZIP the artifact with console and network reports.</FieldDescription></span></FieldLabel><Switch id="diagnostics" checked={diagnostics} onCheckedChange={setDiagnostics} /></Field>
                       <Field data-invalid={headersTouched && Boolean(headersValidation.error)}>
                         <FieldLabel htmlFor="headers">Same-origin headers · <a href={`${docsUrl}#custom-headers`} target="_blank" rel="noreferrer">Docs</a></FieldLabel>
                         <Input id="headers" value={headers} onChange={(event) => setHeaders(event.target.value)} onBlur={() => setHeadersTouched(true)} placeholder={'{"Authorization":"Bearer …"}'} aria-invalid={headersTouched && Boolean(headersValidation.error)} />
@@ -634,8 +652,10 @@ export default function App() {
                       </Button>
                     </CardFooter>
                   </Card>
-                ) : latest ? (
+                ) : latest && latest.type.startsWith("image/") ? (
                   <img src={latest.url} alt="Latest ViperCapture result" className="max-h-[580px] max-w-full rounded-lg border bg-background object-contain shadow-xl" />
+                ) : latest ? (
+                  <div className="max-w-sm text-center"><div className="mx-auto flex size-12 items-center justify-center rounded-xl border bg-background"><Download className="size-5 text-muted-foreground" /></div><p className="mt-4 font-medium">{latest.name}</p><p className="mt-1 text-sm leading-6 text-muted-foreground">This output is ready to open or download below.</p></div>
                 ) : (
                   <div className="max-w-sm text-center"><div className="mx-auto flex size-12 items-center justify-center rounded-xl border bg-background"><ImageIcon className="size-5 text-muted-foreground" /></div><p className="mt-4 font-medium">Your capture will appear here</p><p className="mt-1 text-sm leading-6 text-muted-foreground">Choose a URL and capture settings, then run the renderer.</p></div>
                 )}

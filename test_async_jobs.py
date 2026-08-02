@@ -3444,18 +3444,20 @@ class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
         manager = SimpleNamespace(start=AsyncMock(return_value=playwright))
         test_app = SimpleNamespace(state=SimpleNamespace())
 
-        with (
-            patch("main.async_playwright", return_value=manager),
-            patch("main._launch_browser", AsyncMock(return_value=browser)),
-            patch("main._detect_hardware_gpu", AsyncMock(return_value=False)),
-            patch("main.ASYNC_JOBS_ENABLED", True),
-            patch("main.ASYNC_JOB_SETTINGS", _settings(Path("."))),
-            patch("main.load_providers", return_value=(object(), object())),
-            patch("main.AsyncJobService", return_value=service),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "provider close failed"):
-                async with main.lifespan(test_app):
-                    pass
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch("main.async_playwright", return_value=manager),
+                patch("main._launch_browser", AsyncMock(return_value=browser)),
+                patch("main._detect_hardware_gpu", AsyncMock(return_value=False)),
+                patch("main.ASYNC_JOBS_ENABLED", True),
+                patch("main.ASYNC_JOB_SETTINGS", _settings(Path("."))),
+                patch("main.CACHE_DIRECTORY", Path(directory) / "cache"),
+                patch("main.load_providers", return_value=(object(), object())),
+                patch("main.AsyncJobService", return_value=service),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "provider close failed"):
+                    async with main.lifespan(test_app):
+                        pass
 
         service.close.assert_awaited_once()
         browser.close.assert_awaited_once()

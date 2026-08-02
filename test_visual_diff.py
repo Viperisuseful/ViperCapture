@@ -1,0 +1,58 @@
+import io
+import json
+import unittest
+import zipfile
+
+from PIL import Image
+
+from render_errors import RenderError
+from visual_diff import compare_images, create_diff_bundle
+
+
+def png(color, size=(4, 3)):
+    output = io.BytesIO()
+    Image.new("RGB", size, color).save(output, "PNG")
+    return output.getvalue()
+
+
+class VisualDiffTests(unittest.TestCase):
+    def test_identical_images_pass(self):
+        body = png("white")
+        result = compare_images(body, body)
+        self.assertTrue(result.passed)
+        self.assertEqual(result.changed_pixels, 0)
+        self.assertIsNone(result.bounding_box)
+
+    def test_changed_image_reports_ratio_and_bundle(self):
+        baseline = png("white")
+        current_image = Image.new("RGB", (4, 3), "white")
+        current_image.putpixel((1, 1), (255, 0, 0))
+        output = io.BytesIO()
+        current_image.save(output, "PNG")
+        result = compare_images(baseline, output.getvalue(), max_difference_ratio=0.05)
+        self.assertFalse(result.passed)
+        self.assertEqual(result.changed_pixels, 1)
+        self.assertAlmostEqual(result.ratio, 1 / 12)
+        with zipfile.ZipFile(io.BytesIO(create_diff_bundle(result))) as archive:
+            self.assertEqual(set(archive.namelist()), {"report.json", "diff.png"})
+            self.assertEqual(json.loads(archive.read("report.json"))["changed_pixels"], 1)
+
+    def test_threshold_and_dimension_validation(self):
+        self.assertTrue(compare_images(png((0, 0, 0)), png((2, 2, 2)), pixel_threshold=2).passed)
+        with self.assertRaises(RenderError) as raised:
+            compare_images(png("white"), png("white", (2, 2)))
+        self.assertEqual(raised.exception.code, "diff_dimensions_mismatch")
+
+    def test_alpha_changes_are_visible(self):
+        opaque = io.BytesIO()
+        transparent = io.BytesIO()
+        Image.new("RGBA", (1, 1), (255, 0, 0, 255)).save(opaque, "PNG")
+        Image.new("RGBA", (1, 1), (255, 0, 0, 0)).save(transparent, "PNG")
+        self.assertEqual(
+            compare_images(opaque.getvalue(), transparent.getvalue()).changed_pixels,
+            1,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

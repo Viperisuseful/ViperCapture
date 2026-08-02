@@ -1,0 +1,39 @@
+services:
+  vipercapture:
+    environment:
+      VIPERCAPTURE_S3_BUCKET: vipercapture
+      VIPERCAPTURE_S3_ENDPOINT_URL: http://minio:9000
+      VIPERCAPTURE_S3_REGION: us-east-1
+      VIPERCAPTURE_S3_ADDRESSING_STYLE: path
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-vipercapture}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+
+  minio:
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-vipercapture}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
+    volumes:
+      - vipercapture-objects:/data
+    restart: unless-stopped
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-07-21T05-28-08Z
+    depends_on:
+      - minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-vipercapture}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        until mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"; do sleep 1; done
+        mc mb --ignore-existing local/vipercapture
+
+volumes:
+  vipercapture-objects:

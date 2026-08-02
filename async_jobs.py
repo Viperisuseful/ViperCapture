@@ -314,6 +314,7 @@ class ArtifactStore(Protocol):
 
 
 RenderJob = Callable[[RenderRequest], Awaitable[RenderedArtifact]]
+JobNotifier = Callable[[RenderRequest, JobRecord], Awaitable[None]]
 
 
 def _positive_int(name: str, default: int) -> int:
@@ -370,6 +371,8 @@ def load_providers(settings: JobSettings) -> tuple[JobStore, ArtifactStore]:
 
     job_spec = os.getenv("VIPERCAPTURE_JOB_STORE_FACTORY")
     artifact_spec = os.getenv("VIPERCAPTURE_ARTIFACT_STORE_FACTORY")
+    if not artifact_spec and os.getenv("VIPERCAPTURE_S3_BUCKET"):
+        artifact_spec = "s3_artifact_store:create_s3_artifact_store"
     job_config = JobStoreConfig(settings.data_dir, settings.metadata_ttl)
     artifact_config = ArtifactStoreConfig(settings.data_dir, settings.result_ttl)
     job_store = (
@@ -498,12 +501,14 @@ class AsyncJobService:
         renderer: RenderJob,
         *,
         cipher: PayloadCipher | None = None,
+        notifier: JobNotifier | None = None,
     ) -> None:
         self.settings = settings
         self.job_store = job_store
         self.artifact_store = artifact_store
         self.renderer = renderer
         self.cipher = cipher or PayloadCipher.for_data_dir(settings.data_dir)
+        self.notifier = notifier
         self._wakeups = [
             asyncio.Event() for _ in range(settings.worker_count)
         ]
@@ -975,6 +980,7 @@ class AsyncJobService:
 
     async def _process(self, job: JobRecord) -> None:
         stored_key: str | None = None
+        payload: RenderRequest | None = None
         try:
             payload = self.cipher.decrypt(job)
             rendered = await self.renderer(payload)
@@ -1036,6 +1042,8 @@ class AsyncJobService:
                 await self._safe_delete(stored_key)
                 stored_key = None
                 return
+            if settled is not None:
+                await self._notify(payload, settled)
         except asyncio.CancelledError:
             # Leave the claimed row running. Startup recovery can distinguish
             # a committed success from interrupted work and enforce attempts.
@@ -1083,8 +1091,34 @@ class AsyncJobService:
                 lambda: self._transition_conflict_resolved(job),
                 settle_on_cancel=not retryable,
             )
+            if (
+                self.notifier is not None
+                and payload is not None
+                and payload.delivery.webhook_url is not None
+            ):
+                try:
+                    terminal = await self.job_store.get(job.id, datetime.now(UTC))
+                    if terminal is not None and terminal.status == "failed":
+                        await self._notify(payload, terminal)
+                except Exception as notify_exc:
+                    logger.warning(
+                        "async job webhook lookup failed error_type=%s",
+                        type(notify_exc).__name__,
+                    )
         finally:
             self._wake_workers()
+
+    async def _notify(self, payload: RenderRequest, job: JobRecord) -> None:
+        if self.notifier is None or payload.delivery.webhook_url is None:
+            return
+        try:
+            await self.notifier(payload, job)
+        except Exception as exc:
+            logger.warning(
+                "async job webhook delivery failed job_id=%s error_type=%s",
+                job.id,
+                type(exc).__name__,
+            )
 
 
 def public_job_document(job: JobRecord) -> dict[str, object]:

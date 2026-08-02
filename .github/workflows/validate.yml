@@ -41,6 +41,21 @@ jobs:
       - name: Test renderer
         run: python -m unittest -v
 
+      - name: Smoke reproducible benchmark
+        run: |
+          python -m http.server 8099 --directory benchmarks/fixtures >/tmp/vipercapture-fixture.log 2>&1 &
+          fixture_pid=$!
+          uvicorn main:app --host 127.0.0.1 --port 8000 >/tmp/vipercapture-api.log 2>&1 &
+          api_pid=$!
+          trap 'kill "$fixture_pid" "$api_pid"' EXIT
+          for attempt in $(seq 1 30); do
+            curl --fail --silent http://127.0.0.1:8000/health >/dev/null && break
+            sleep 1
+          done
+          python benchmarks/run.py --provider viper=http://127.0.0.1:8000 \
+            --scenarios benchmarks/scenarios-local.json --runs 1 --warmups 0 \
+            --output /tmp/vipercapture-benchmark.json
+
       - name: Validate web frontend
         run: |
           npm run lint --prefix frontend
