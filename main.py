@@ -142,7 +142,10 @@ ASYNC_JOB_SETTINGS = (
     if ASYNC_JOBS_ENABLED
     else None
 )
-SCHEDULES_ENABLED = os.getenv("VIPERCAPTURE_SCHEDULES", "1") != "0"
+SCHEDULES_ENABLED = os.getenv(
+    "VIPERCAPTURE_SCHEDULES",
+    "0" if os.name == "nt" else "1",
+) != "0"
 CACHE_DIRECTORY = Path(
     os.getenv(
         "VIPERCAPTURE_CACHE_DIR",
@@ -839,17 +842,8 @@ async def create_render_job(
     payload: RenderRequest,
     request: Request,
 ) -> JSONResponse:
-    if payload.delivery.webhook_url is not None:
-        dispatcher = getattr(app.state, "webhooks", None)
-        if dispatcher is None:
-            raise RenderError(
-                "webhooks_disabled",
-                "Webhook delivery is disabled for this ViperCapture instance.",
-                503,
-                False,
-            )
-        await dispatcher.validate_url(str(payload.delivery.webhook_url))
-    job = await _async_job_service().submit(
+    job = await _submit_job(
+        _async_job_service(),
         payload,
         request_id=request.state.request_id,
     )
@@ -871,24 +865,16 @@ async def create_bulk_render_jobs(
     request: Request,
 ) -> JSONResponse:
     service = _async_job_service()
-    dispatcher = getattr(app.state, "webhooks", None)
     results = []
     failures = 0
     for index, item in enumerate(payload.items):
         request_id = item.request_id or f"{request.state.request_id}-{index + 1}"
         try:
-            if item.render.delivery.webhook_url is not None:
-                if dispatcher is None:
-                    raise RenderError(
-                        "webhooks_disabled",
-                        "Webhook delivery is disabled for this ViperCapture instance.",
-                        503,
-                        False,
-                    )
-                await dispatcher.validate_url(
-                    str(item.render.delivery.webhook_url)
-                )
-            job = await service.submit(item.render, request_id=request_id)
+            job = await _submit_job(
+                service,
+                item.render,
+                request_id=request_id,
+            )
             results.append(
                 {
                     "index": index,
@@ -950,6 +936,27 @@ async def _validate_webhook(payload: RenderRequest) -> None:
             False,
         )
     await dispatcher.validate_url(str(payload.delivery.webhook_url))
+
+
+async def _submit_job(
+    service: AsyncJobService,
+    payload: RenderRequest,
+    *,
+    request_id: str,
+):
+    existing = await service.existing(payload, request_id=request_id)
+    if existing is not None:
+        return existing
+    try:
+        await _validate_webhook(payload)
+    except RenderError:
+        # A concurrent request may have committed while validation was in
+        # flight. Preserve idempotent replay semantics in that race too.
+        existing = await service.existing(payload, request_id=request_id)
+        if existing is not None:
+            return existing
+        raise
+    return await service.submit(payload, request_id=request_id)
 
 
 @app.post("/v1/schedules", status_code=201)

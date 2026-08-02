@@ -502,6 +502,22 @@ class SQLiteJobStore:
             conditional_scrub=True,
         )
 
+    async def get_by_request_id(self, request_id: str) -> JobRecord | None:
+        return await self._run(self._get_by_request_id, request_id)
+
+    @classmethod
+    def _get_by_request_id(
+        cls,
+        connection: sqlite3.Connection,
+        request_id: str,
+    ) -> JobRecord | None:
+        return cls._from_row(
+            connection.execute(
+                "SELECT * FROM async_jobs WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+        )
+
     @classmethod
     def _get(
         cls,
@@ -989,6 +1005,7 @@ class SQLiteJobStore:
                 WHERE status IN ('failed', 'cancelled', 'expired')
                   AND completed_at < ?
                   AND artifact_key IS NULL
+                  AND webhook_payload IS NULL
                 """,
                 (cutoff,),
             )
@@ -1099,7 +1116,20 @@ class SQLiteJobStore:
             raise
 
 
-_SAFE_KEY = re.compile(r"^[0-9a-f-]{36}\.(png|jpg|webp)$")
+_SAFE_KEY = re.compile(
+    r"^[0-9a-f-]{36}\.(png|jpg|webp|pdf|html|md|json|zip|webm)$"
+)
+_ARTIFACT_EXTENSIONS = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/webp": "webp",
+    "application/pdf": "pdf",
+    "text/html; charset=utf-8": "html",
+    "text/markdown; charset=utf-8": "md",
+    "application/json": "json",
+    "application/zip": "zip",
+    "video/webm": "webm",
+}
 
 
 class LocalArtifactStore:
@@ -1139,11 +1169,7 @@ class LocalArtifactStore:
         media_type: str,
         filename: str,
     ) -> StoredArtifact:
-        extension = {
-            "image/png": "png",
-            "image/jpeg": "jpg",
-            "image/webp": "webp",
-        }.get(media_type)
+        extension = _ARTIFACT_EXTENSIONS.get(media_type)
         if extension is None:
             raise ValueError("unsupported async artifact media type")
         key = f"{uuid4()}.{extension}"

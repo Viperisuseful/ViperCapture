@@ -438,11 +438,24 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
                     "description": "Description",
                     "headings": [{"level": 1, "text": "Hello"}],
                     "links": {"total": 0, "sample": []},
+                    "images": {
+                        "total": 1,
+                        "sample": [
+                            {
+                                "src": "https://example.com/image.png",
+                                "alt": "Example",
+                                "width": 640,
+                                "height": 480,
+                            }
+                        ],
+                    },
                 }
 
         artifact = await render_metadata(MetadataPage())
         self.assertEqual(artifact.media_type, "application/json")
-        self.assertEqual(json.loads(artifact.body)["title"], "Example")
+        document = json.loads(artifact.body)
+        self.assertEqual(document["title"], "Example")
+        self.assertEqual(document["images"]["total"], 1)
 
     async def test_selector_transparency_quality_and_waits(self):
         request = RenderRequest.model_validate(
@@ -520,6 +533,34 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(checker.await_count, 2)
         self.assertTrue(all(call.args[1] is True for call in checker.await_args_list))
+
+    async def test_assertions_run_after_full_page_lazy_loading(self):
+        events = []
+
+        async def lazy(*_args):
+            events.append("lazy")
+
+        async def assertions(*_args):
+            events.append("assertions")
+
+        request = RenderRequest.model_validate(
+            {"url": "https://example.com", "full_page": True}
+        )
+        engine = RenderEngine(hosted=False)
+        with (
+            patch("render_engine.load_lazy_content", side_effect=lazy),
+            patch.object(engine, "_check_assertions", side_effect=assertions),
+        ):
+            await engine.render_image(
+                FakeBrowser(),
+                request,
+                RenderLimits(
+                    max_width=1920,
+                    max_height=1080,
+                    max_pixels=2_073_600,
+                ),
+            )
+        self.assertEqual(events, ["lazy", "assertions"])
 
     async def test_failed_context_cleanup_restarts_browser(self):
         class BrokenCloseContext(FakeContext):

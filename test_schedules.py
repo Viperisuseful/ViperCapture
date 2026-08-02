@@ -3,6 +3,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from async_jobs import PayloadCipher
 from render_contract import RenderRequest
@@ -30,6 +31,15 @@ class FakeJobs:
 
 
 class ScheduleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_bundled_store_refuses_windows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ScheduleStore(Path(directory) / "schedules.sqlite3")
+            with (
+                patch("schedules.os.name", "nt"),
+                self.assertRaisesRegex(RuntimeError, "Windows ACLs"),
+            ):
+                await store.start()
+
     def test_cron_and_timezone_validation(self):
         validate_cron("*/5 * * * *", "America/New_York")
         with self.assertRaises(ValueError):

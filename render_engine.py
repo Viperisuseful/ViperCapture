@@ -593,6 +593,7 @@ async def render_metadata(page: Page) -> RenderArtifact:
                 return result;
             };
             const links = [...document.querySelectorAll("a[href]")];
+            const images = [...document.images];
             return {
                 title: clean(document.title),
                 description: attr('meta[name="description"]'),
@@ -622,6 +623,15 @@ async def render_metadata(page: Page) -> RenderArtifact:
                     sample: links.slice(0, maxItems).map((element) => ({
                         text: clean(element.textContent, 512),
                         href: clean(element.href)
+                    }))
+                },
+                images: {
+                    total: images.length,
+                    sample: images.slice(0, maxItems).map((element) => ({
+                        src: clean(element.currentSrc || element.src),
+                        alt: clean(element.alt, 512),
+                        width: Number(element.naturalWidth || element.width || 0),
+                        height: Number(element.naturalHeight || element.height || 0)
                     }))
                 }
             };
@@ -1188,7 +1198,6 @@ class RenderEngine:
                 await self._run_actions(page, request, limits)
                 if self.cleanup_hooks:
                     await self.cleanup_hooks.apply(page, request.cleanup)
-                await self._check_assertions(page, request, failed_requests)
                 if self.challenge_checker:
                     await self.challenge_checker(page, request.proceed_on_captcha, navigation_status)
                 if request.full_page:
@@ -1212,6 +1221,7 @@ class RenderEngine:
                         await self.cleanup_hooks.apply(page, request.cleanup)
                     if self.challenge_checker:
                         await self.challenge_checker(page, request.proceed_on_captcha, navigation_status)
+                await self._check_assertions(page, request, failed_requests)
 
                 if request.output is OutputFormat.WEBM:
                     options = request.video

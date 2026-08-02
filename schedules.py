@@ -100,6 +100,11 @@ class ScheduleStore:
         self.lock = asyncio.Lock()
 
     async def start(self) -> None:
+        if os.name == "nt":
+            raise RuntimeError(
+                "the bundled schedule store cannot enforce private Windows ACLs; "
+                "set VIPERCAPTURE_SCHEDULES=0"
+            )
         _ensure_private_directory(self.path.parent)
         existed = self.path.exists()
         if existed and os.name != "nt":

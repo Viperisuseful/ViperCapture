@@ -69,6 +69,11 @@ local defaults keep encrypted state and expiring results under
 follow the [async jobs guide](async-jobs.md) to change retention, capacity, and
 providers.
 
+Schedules are enabled by default on Unix hosts. The bundled SQLite schedule
+store cannot enforce private ACLs on Windows, so `VIPERCAPTURE_SCHEDULES`
+defaults to `0` there and the bundled store refuses direct startup. Use an
+external scheduler on Windows or keep the feature disabled.
+
 ## Selectors and waits
 
 `selector` captures the first visible matching element and requires

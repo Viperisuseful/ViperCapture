@@ -252,6 +252,7 @@ class JobStore(Protocol):
         max_attempts: int,
         claim_token: str,
     ) -> JobRecord | None: ...
+    async def get_by_request_id(self, request_id: str) -> JobRecord | None: ...
     async def get(self, job_id: str, now: datetime) -> JobRecord | None: ...
     async def cancel(self, job_id: str, now: datetime) -> JobRecord | None: ...
     async def succeed(
@@ -543,6 +544,8 @@ class AsyncJobService:
         self._closing = False
         self._maintenance_lock = asyncio.Lock()
         self._notification_lock = asyncio.Lock()
+        self._notification_wakeup = asyncio.Event()
+        self._notification_task: asyncio.Task | None = None
         self._next_maintenance_at = 0.0
         self._maintenance_interval = max(1.0, settings.poll_seconds)
 
@@ -560,6 +563,12 @@ class AsyncJobService:
                 self.settings.max_attempts,
             )
             await self._maintain(force=True)
+            if self.notifier is not None:
+                self._notification_wakeup.set()
+                self._notification_task = asyncio.create_task(
+                    self._notification_worker(),
+                    name="vipercapture-webhook-worker",
+                )
             self._workers = [
                 asyncio.create_task(
                     self._worker(index),
@@ -578,6 +587,12 @@ class AsyncJobService:
 
     async def close(self) -> None:
         self._closing = True
+        if self._notification_task is not None:
+            self._notification_task.cancel()
+            await asyncio.gather(
+                self._notification_task, return_exceptions=True
+            )
+            self._notification_task = None
         for worker in self._workers:
             worker.cancel()
         if self._workers:
@@ -654,6 +669,36 @@ class AsyncJobService:
             ) from exc
         self._wake_workers()
         return stored
+
+    async def existing(
+        self,
+        payload: RenderRequest,
+        *,
+        request_id: str,
+    ) -> JobRecord | None:
+        """Return an idempotent replay before repeating external validation."""
+        await self._maintain()
+        current = await self.job_store.get_by_request_id(request_id)
+        if current is None:
+            return None
+        current = await self.job_store.get(current.id, datetime.now(UTC))
+        if current is None:
+            return None
+        fingerprint = self.cipher.fingerprint(payload)
+        if (
+            current.request_fingerprint is None
+            or not hmac.compare_digest(
+                current.request_fingerprint,
+                fingerprint,
+            )
+        ):
+            raise RenderError(
+                "idempotency_key_conflict",
+                "X-Request-Id was already used for a different render.",
+                409,
+                False,
+            )
+        return current
 
     async def get(self, job_id: str) -> JobRecord | None:
         await self._maintain()
@@ -770,8 +815,6 @@ class AsyncJobService:
                     "artifact maintenance retry error_type=%s",
                     type(exc).__name__,
                 )
-            await self._drain_notifications()
-
     async def _drain_notifications(self) -> None:
         if self.notifier is None or self._closing:
             return
@@ -816,6 +859,27 @@ class AsyncJobService:
                 await self.job_store.acknowledge_notification(
                     job.id, job.webhook_payload
                 )
+
+    async def _notification_worker(self) -> None:
+        try:
+            while not self._closing:
+                self._notification_wakeup.clear()
+                try:
+                    await self._drain_notifications()
+                except Exception as exc:
+                    logger.warning(
+                        "webhook outbox worker retry error_type=%s",
+                        type(exc).__name__,
+                    )
+                try:
+                    await asyncio.wait_for(
+                        self._notification_wakeup.wait(),
+                        timeout=self.settings.poll_seconds,
+                    )
+                except TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            raise
 
     async def _safe_delete(self, key: str) -> bool:
         try:
@@ -1123,7 +1187,7 @@ class AsyncJobService:
                 stored_key = None
                 return
             if settled is not None:
-                await self._drain_notifications()
+                self._notification_wakeup.set()
         except asyncio.CancelledError:
             # Leave the claimed row running. Startup recovery can distinguish
             # a committed success from interrupted work and enforce attempts.
@@ -1171,7 +1235,7 @@ class AsyncJobService:
                 lambda: self._transition_conflict_resolved(job),
                 settle_on_cancel=not retryable,
             )
-            await self._drain_notifications()
+            self._notification_wakeup.set()
         finally:
             self._wake_workers()
 

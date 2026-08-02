@@ -92,7 +92,10 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
             queue_expires_at=now + timedelta(minutes=1),
             created_at=now,
         )
-        service = SimpleNamespace(submit=AsyncMock(return_value=job))
+        service = SimpleNamespace(
+            submit=AsyncMock(return_value=job),
+            existing=AsyncMock(return_value=None),
+        )
         dispatcher = SimpleNamespace(
             validate_url=AsyncMock(
                 side_effect=[

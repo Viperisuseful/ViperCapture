@@ -31,6 +31,7 @@ class FakePage:
         self.pdf_bytes = pdf or pdf_with_pages(1)
         self.height = height
         self.pdf_options = None
+        self.emulated_media = None
 
     async def content(self):
         return self.html
@@ -41,6 +42,9 @@ class FakePage:
     async def pdf(self, **options):
         self.pdf_options = options
         return self.pdf_bytes
+
+    async def emulate_media(self, *, media):
+        self.emulated_media = media
 
 
 class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
@@ -106,6 +110,7 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(printed.media_type, "application/pdf")
         self.assertEqual(print_page.pdf_options["format"], "A4")
+        self.assertEqual(print_page.emulated_media, "print")
 
         single_page = FakePage()
         single = await render_document_output(
@@ -119,6 +124,23 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(single_page.pdf_options["page_ranges"], "1")
         self.assertEqual(single_page.pdf_options["width"], "877px")
         self.assertEqual(single_page.pdf_options["height"], "977px")
+
+        landscape = FakePage()
+        await render_document_output(
+            landscape,
+            RenderRequest.model_validate(
+                {
+                    "url": "https://example.com",
+                    "output": "pdf",
+                    "pdf": {
+                        "mode": "single_page",
+                        "orientation": "landscape",
+                    },
+                }
+            ),
+            LIMITS,
+        )
+        self.assertFalse(landscape.pdf_options["landscape"])
 
     async def test_pdf_page_and_height_limits(self):
         with self.assertRaises(RenderError) as pages:
@@ -137,6 +159,18 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
                 LIMITS,
             )
         self.assertEqual(height.exception.code, "pdf_page_too_tall")
+
+        print_page = FakePage(height=100_000)
+        with self.assertRaises(RenderError) as preflight:
+            await render_document_output(
+                print_page,
+                RenderRequest.model_validate(
+                    {"url": "https://example.com", "output": "pdf"}
+                ),
+                LIMITS,
+            )
+        self.assertEqual(preflight.exception.code, "pdf_page_limit_exceeded")
+        self.assertIsNone(print_page.pdf_options)
 
     def test_pdf_costs_two_credits(self):
         request = RenderRequest.model_validate({"html": "Hello", "output": "pdf"})

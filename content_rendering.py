@@ -19,6 +19,10 @@ from render_errors import RenderError
 
 MAX_PRINT_PAGES = 50
 MAX_SINGLE_PAGE_HEIGHT = 20_000
+PAPER_INCHES = {
+    "A4": (8.27, 11.69),
+    "Letter": (8.5, 11.0),
+}
 MARKDOWN = MarkdownIt("commonmark", {"html": True})
 
 
@@ -95,6 +99,7 @@ async def _render_pdf(page, request: RenderRequest) -> RenderArtifact:
     }
     single_page = options.mode is PdfMode.SINGLE_PAGE
     if single_page:
+        common["landscape"] = False
         dimensions = await page.evaluate("""() => ({
             width: Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth || 0),
             height: Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0)
@@ -127,6 +132,32 @@ async def _render_pdf(page, request: RenderRequest) -> RenderArtifact:
         )
     else:
         common["format"] = options.paper_size.value
+        await page.emulate_media(media="print")
+        dimensions = await page.evaluate("""() => ({
+            width: Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth || 0),
+            height: Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0)
+        })""")
+        _paper_width, paper_height = PAPER_INCHES[options.paper_size.value]
+        if options.orientation.value == "landscape":
+            paper_height = _paper_width
+        printable_height = max(
+            1,
+            (paper_height - options.margins.top - options.margins.bottom) * 96,
+        )
+        estimated_pages = math.ceil(
+            max(1, float(dimensions["height"])) / printable_height
+        )
+        if estimated_pages > MAX_PRINT_PAGES:
+            raise RenderError(
+                "pdf_page_limit_exceeded",
+                f"The PDF exceeds the {MAX_PRINT_PAGES}-page limit.",
+                413,
+                False,
+                {
+                    "max_pages": MAX_PRINT_PAGES,
+                    "estimated_pages": estimated_pages,
+                },
+            )
     pdf = await page.pdf(**common)
     pages = _validate_pdf(pdf, single_page=single_page)
     return RenderArtifact(pdf, "application/pdf", "vipercapture.pdf", {"pages": pages})

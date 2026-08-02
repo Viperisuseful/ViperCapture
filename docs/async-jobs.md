@@ -34,9 +34,11 @@ The job database receives only ciphertext for request bodies, so URLs and
 custom target headers are not stored as plaintext. Terminal transitions erase
 that request ciphertext. When webhook delivery is requested, its URL is stored
 as separate AES-GCM ciphertext and the terminal transition atomically marks an
-outbox event. Only that encrypted URL remains until successful delivery is
-acknowledged; a keyed request fingerprint enforces idempotency without storing
-the raw request.
+outbox event. A separate notification worker drains that outbox, so a slow
+callback cannot occupy render workers or delay API requests and startup
+maintenance. Only that encrypted URL remains until successful delivery is
+acknowledged; pending delivery is excluded from metadata expiry. A keyed
+request fingerprint enforces idempotency without storing the raw request.
 The bundled providers create the database, WAL sidecars, key, and result files
 with owner-only permissions. Key and result creation fsync both file contents
 and directory entries before reporting durable success. SQLite enables secure
@@ -52,9 +54,10 @@ ViperCapture leaves claimed work `running` during shutdown. At startup it
 requeues interrupted jobs unless they have already reached the configured
 attempt limit; a success committed just before shutdown remains successful.
 Retryable render failures are attempted up to three times by default. A queued
-job has 15 minutes to be claimed. Local results expire after one hour and
-terminal metadata after 24 hours. Expired and orphaned local artifacts are
-removed during routine queue maintenance.
+job has 15 minutes to be claimed. Local results—including PNG, JPEG, WebP, PDF,
+HTML, Markdown, JSON metadata, ZIP bundles, and WebM video—expire after one
+hour and terminal metadata after 24 hours. Expired and orphaned local artifacts
+are removed during routine queue maintenance.
 
 Successful job timings report queue time through the first claim and render
 time from that first claim through final settlement. The render duration

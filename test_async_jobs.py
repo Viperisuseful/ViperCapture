@@ -173,6 +173,10 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         await recovered.start()
         try:
+            for _ in range(100):
+                if delivered.await_count:
+                    break
+                await asyncio.sleep(0.01)
             delivered.assert_awaited_once()
             url, event_job = delivered.await_args.args
             self.assertEqual(url, "https://hooks.example/callback")
@@ -180,6 +184,45 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await recovered_store.pending_notifications(), [])
         finally:
             await recovered.close()
+
+    async def test_slow_webhook_does_not_block_render_workers(self):
+        notifier_started = asyncio.Event()
+        release_notifier = asyncio.Event()
+
+        async def slow_notifier(_url, _job):
+            notifier_started.set()
+            await release_notifier.wait()
+
+        service = AsyncJobService(
+            self.settings,
+            self.store,
+            self.artifacts,
+            _successful_renderer,
+            notifier=slow_notifier,
+        )
+        await service.start()
+        webhook_payload = RenderRequest.model_validate(
+            {
+                "url": "https://example.com/first",
+                "delivery": {"webhook_url": "https://hooks.example/slow"},
+            }
+        )
+        try:
+            await service.submit(webhook_payload, request_id="slow-webhook")
+            await asyncio.wait_for(notifier_started.wait(), timeout=1)
+            second = await service.submit(
+                RenderRequest(url="https://example.com/second"),
+                request_id="render-while-webhook-slow",
+            )
+            for _ in range(100):
+                current = await service.get(second.id)
+                if current and current.status == "succeeded":
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(current.status, "succeeded")
+        finally:
+            release_notifier.set()
+            await service.close()
 
     async def test_request_id_is_idempotent_and_queue_limit_is_atomic(self):
         await self.store.start()
@@ -1336,6 +1379,34 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(sync.call_count, 4)
         await self.artifacts.close()
 
+    async def test_local_artifact_store_accepts_every_render_output(self):
+        await self.artifacts.start()
+        media = {
+            "image/png": "png",
+            "image/jpeg": "jpg",
+            "image/webp": "webp",
+            "application/pdf": "pdf",
+            "text/html; charset=utf-8": "html",
+            "text/markdown; charset=utf-8": "md",
+            "application/json": "json",
+            "application/zip": "zip",
+            "video/webm": "webm",
+        }
+        try:
+            for media_type, extension in media.items():
+                stored = await self.artifacts.put(
+                    str(uuid4()),
+                    b"artifact",
+                    media_type=media_type,
+                    filename=f"capture.{extension}",
+                )
+                self.assertTrue(stored.key.endswith(f".{extension}"))
+                artifact = await self.artifacts.get(stored.key)
+                self.assertEqual(artifact.media_type, media_type)
+                self.assertEqual(artifact.body, b"artifact")
+        finally:
+            await self.artifacts.close()
+
     async def test_local_artifact_deletion_syncs_directory(self):
         await self.artifacts.start()
         stored = await self.artifacts.put(
@@ -1694,6 +1765,48 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("still-live", expired_keys)
             self.assertEqual(current.status, "succeeded")
             self.assertEqual(current.artifact_key, "still-live")
+        finally:
+            await store.close()
+
+    async def test_metadata_cleanup_preserves_pending_webhook(self):
+        settings = _settings(self.root, metadata_ttl=timedelta(seconds=1))
+        store = SQLiteJobStore(
+            JobStoreConfig(self.root, settings.metadata_ttl)
+        )
+        await store.start()
+        try:
+            now = datetime.now(UTC)
+            job = JobRecord(
+                id=str(uuid4()),
+                request_id="pending-webhook",
+                status="queued",
+                payload=b"encrypted",
+                webhook_payload=b"encrypted-webhook",
+                attempt_count=0,
+                available_at=now - timedelta(seconds=3),
+                queue_expires_at=now + timedelta(minutes=1),
+                created_at=now - timedelta(seconds=3),
+                request_fingerprint=b"pending-webhook-fingerprint",
+            )
+            await store.create(job, active_limit=1)
+            await store.claim(
+                now - timedelta(seconds=3),
+                settings.max_attempts,
+                "pending-webhook-claim",
+            )
+            await store.fail(
+                job.id,
+                expected_attempt=1,
+                code="render_failed",
+                message="failed",
+                retryable=False,
+            )
+
+            await store.maintain(now)
+            current = await store.get_by_request_id(job.request_id)
+            self.assertIsNotNone(current)
+            self.assertEqual(current.webhook_event_status, "failed")
+            self.assertEqual(current.webhook_payload, b"encrypted-webhook")
         finally:
             await store.close()
 
@@ -3113,7 +3226,8 @@ class ProviderLoadingTests(unittest.TestCase):
             (
                 job_store,
                 (
-                    "start", "close", "create", "claim", "get", "cancel",
+                    "start", "close", "create", "claim", "get_by_request_id",
+                    "get", "cancel",
                     "succeed", "fail", "requeue_running", "requeue", "maintain",
                     "expire_result",
                     "acknowledge_artifact_deletion",
@@ -3178,6 +3292,7 @@ class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
         )
         self.service = SimpleNamespace(
             submit=AsyncMock(),
+            existing=AsyncMock(return_value=None),
             get=AsyncMock(),
             cancel=AsyncMock(),
             result=AsyncMock(),
@@ -3239,6 +3354,30 @@ class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status_code, 200)
         body = b"".join([chunk async for chunk in result.body_iterator])
         self.assertEqual(body, b"png")
+
+    async def test_idempotent_webhook_replay_skips_new_validation(self):
+        original_webhooks = getattr(main.app.state, "webhooks", None)
+        main.app.state.webhooks = None
+        payload = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "delivery": {
+                    "webhook_url": "https://callback.example/hook"
+                },
+            }
+        )
+        self.service.existing.return_value = self.job
+        try:
+            response = await main.create_render_job(
+                payload,
+                SimpleNamespace(
+                    state=SimpleNamespace(request_id="route-job")
+                ),
+            )
+        finally:
+            main.app.state.webhooks = original_webhooks
+        self.assertEqual(response.status_code, 202)
+        self.service.submit.assert_not_awaited()
 
     async def test_result_downloads_hold_a_concurrency_slot_while_streaming(self):
         succeeded = self.job.__class__(
