@@ -109,8 +109,21 @@ async def _render_pdf(page, request: RenderRequest) -> RenderArtifact:
                 False,
                 {"max_height": MAX_SINGLE_PAGE_HEIGHT},
             )
+        # Playwright treats width and height as the entire sheet. Include the
+        # margins so the measured document remains the printable area instead
+        # of silently overflowing past page one.
+        sheet_width = width + math.ceil(
+            (options.margins.left + options.margins.right) * 96
+        )
+        sheet_height = height + math.ceil(
+            (options.margins.top + options.margins.bottom) * 96
+        )
         common.update(
-            {"width": f"{width}px", "height": f"{height}px", "page_ranges": "1"}
+            {
+                "width": f"{sheet_width}px",
+                "height": f"{sheet_height}px",
+                "page_ranges": "1",
+            }
         )
     else:
         common["format"] = options.paper_size.value

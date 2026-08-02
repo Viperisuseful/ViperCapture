@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 import os
 from pathlib import PurePosixPath
 import re
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import boto3
 from botocore.config import Config
@@ -19,6 +19,7 @@ from async_jobs import Artifact, ArtifactStoreConfig, StoredArtifact
 
 UTC = timezone.utc
 NOT_FOUND_CODES = {"NoSuchKey", "404", "NotFound"}
+OWNER_METADATA = "vipercapture-v1"
 
 
 def _safe_extension(filename: str) -> str:
@@ -81,9 +82,15 @@ class S3ArtifactStore:
         media_type: str,
         filename: str,
     ) -> StoredArtifact:
+        try:
+            normalized_job_id = str(UUID(job_id))
+        except ValueError as exc:
+            raise ValueError("job_id must be a UUID") from exc
         expires_at = datetime.now(UTC) + self.config.result_ttl
         name = f"{uuid4().hex}{_safe_extension(filename)}"
-        key = "/".join(part for part in (self.prefix, job_id, name) if part)
+        key = "/".join(
+            part for part in (self.prefix, normalized_job_id, name) if part
+        )
         await asyncio.to_thread(
             self.client.put_object,
             Bucket=self.bucket,
@@ -93,6 +100,7 @@ class S3ArtifactStore:
             Metadata={
                 "filename": _encode_filename(filename),
                 "expires": str(int(expires_at.timestamp())),
+                "owner": OWNER_METADATA,
             },
         )
         return StoredArtifact(key=key, expires_at=expires_at)
@@ -152,16 +160,50 @@ class S3ArtifactStore:
                 arguments["ContinuationToken"] = continuation
             response = await asyncio.to_thread(self.client.list_objects_v2, **arguments)
             for item in response.get("Contents", []):
-                modified = item.get("LastModified")
-                if modified is None:
+                key = item.get("Key")
+                if not isinstance(key, str) or not self._owned_key_shape(key):
                     continue
-                if modified.tzinfo is None:
-                    modified = modified.replace(tzinfo=UTC)
-                if modified + self.config.result_ttl <= now:
-                    await self.delete(item["Key"])
+                try:
+                    head = await asyncio.to_thread(
+                        self.client.head_object,
+                        Bucket=self.bucket,
+                        Key=key,
+                    )
+                except ClientError as exc:
+                    if exc.response.get("Error", {}).get("Code") in NOT_FOUND_CODES:
+                        continue
+                    raise
+                metadata = head.get("Metadata", {})
+                try:
+                    expires = int(metadata.get("expires", "0"))
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    metadata.get("owner") == OWNER_METADATA
+                    and expires > 0
+                    and expires <= int(now.timestamp())
+                ):
+                    await self.delete(key)
             if not response.get("IsTruncated"):
                 break
             continuation = response.get("NextContinuationToken")
+
+    def _owned_key_shape(self, key: str) -> bool:
+        relative = key
+        if self.prefix:
+            marker = f"{self.prefix}/"
+            if not relative.startswith(marker):
+                return False
+            relative = relative[len(marker):]
+        parts = relative.split("/")
+        if len(parts) != 2:
+            return False
+        try:
+            if str(UUID(parts[0])) != parts[0].lower():
+                return False
+        except ValueError:
+            return False
+        return bool(re.fullmatch(r"[0-9a-f]{32}\.[a-z0-9]{1,10}", parts[1]))
 
 
 def create_s3_artifact_store(config: ArtifactStoreConfig) -> S3ArtifactStore:

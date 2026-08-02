@@ -6,7 +6,7 @@ import zipfile
 from PIL import Image
 
 from render_errors import RenderError
-from visual_diff import compare_images, create_diff_bundle
+from visual_diff import MAX_DIFF_PIXELS, compare_images, create_diff_bundle
 
 
 def png(color, size=(4, 3)):
@@ -52,6 +52,12 @@ class VisualDiffTests(unittest.TestCase):
             compare_images(opaque.getvalue(), transparent.getvalue()).changed_pixels,
             1,
         )
+
+    def test_expanded_pixel_working_set_is_bounded(self):
+        side = int(MAX_DIFF_PIXELS**0.5) + 1
+        with self.assertRaises(RenderError) as raised:
+            compare_images(png("white", (side, side)), png("white", (side, side)))
+        self.assertEqual(raised.exception.code, "diff_pixel_limit_exceeded")
 
 
 if __name__ == "__main__":

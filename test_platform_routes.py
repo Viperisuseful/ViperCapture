@@ -1,6 +1,16 @@
+import asyncio
+from datetime import datetime, timedelta, timezone
+import json
+from types import SimpleNamespace
 import unittest
+from unittest.mock import AsyncMock, patch
 
 import main
+from async_jobs import JobRecord
+from bulk_jobs import BulkJobRequest
+from render_contract import RenderRequest
+from render_engine import RenderArtifact
+from render_errors import RenderError
 
 
 class PlatformRouteTests(unittest.TestCase):
@@ -19,6 +29,130 @@ class PlatformRouteTests(unittest.TestCase):
         for path, methods in expected.items():
             self.assertIn(path, paths)
             self.assertTrue(methods.issubset(paths[path]), path)
+
+    def test_desktop_cors_allows_schedule_updates(self):
+        self.assertIn("PATCH", main.DESKTOP_ALLOW_METHODS)
+
+
+class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cached_render_bypasses_saturated_chromium_slots(self):
+        original_cache = getattr(main.app.state, "render_cache", None)
+        original_slots = getattr(main.app.state, "capture_slots", None)
+        main.app.state.render_cache = SimpleNamespace(
+            get=AsyncMock(
+                return_value=RenderArtifact(
+                    b"cached", "image/png", "capture.png", {}
+                )
+            )
+        )
+        main.app.state.capture_slots = asyncio.Semaphore(0)
+        request = SimpleNamespace(
+            is_disconnected=AsyncMock(return_value=False)
+        )
+        try:
+            response = await asyncio.wait_for(
+                main._render_response(
+                    RenderRequest(html="cached", cache=True), request
+                ),
+                timeout=0.25,
+            )
+        finally:
+            main.app.state.render_cache = original_cache
+            main.app.state.capture_slots = original_slots
+        self.assertEqual(response.body, b"cached")
+        self.assertEqual(response.headers["x-vipercapture-cache"], "hit")
+
+    async def test_signed_url_rejects_webhook_delivery(self):
+        payload = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "delivery": {"webhook_url": "https://hooks.example/test"},
+            }
+        )
+        request = SimpleNamespace(headers={"authorization": "Bearer admin"})
+        with (
+            patch("main.SIGNING_SECRET", "s" * 32),
+            patch("main.SIGNING_ADMIN_TOKEN", "admin"),
+        ):
+            with self.assertRaises(RenderError) as raised:
+                await main.create_signed_url(payload, request)
+        self.assertEqual(raised.exception.code, "delivery_requires_async_job")
+
+    async def test_bulk_webhook_validation_failure_is_per_item(self):
+        original_service = getattr(main.app.state, "async_jobs", None)
+        original_dispatcher = getattr(main.app.state, "webhooks", None)
+        now = datetime.now(timezone.utc)
+        job = JobRecord(
+            id="00000000-0000-0000-0000-000000000001",
+            request_id="bulk-2",
+            status="queued",
+            payload=b"encrypted",
+            attempt_count=0,
+            available_at=now,
+            queue_expires_at=now + timedelta(minutes=1),
+            created_at=now,
+        )
+        service = SimpleNamespace(submit=AsyncMock(return_value=job))
+        dispatcher = SimpleNamespace(
+            validate_url=AsyncMock(
+                side_effect=[
+                    RenderError(
+                        "webhook_url_not_public", "blocked", 422, False
+                    ),
+                    None,
+                ]
+            )
+        )
+        main.app.state.async_jobs = service
+        main.app.state.webhooks = dispatcher
+        payload = BulkJobRequest.model_validate(
+            {
+                "items": [
+                    {
+                        "id": "bad",
+                        "render": {
+                            "url": "https://example.com/one",
+                            "delivery": {
+                                "webhook_url": "https://bad.example/hook"
+                            },
+                        },
+                    },
+                    {
+                        "id": "good",
+                        "render": {
+                            "url": "https://example.com/two",
+                            "delivery": {
+                                "webhook_url": "https://good.example/hook"
+                            },
+                        },
+                    },
+                ]
+            }
+        )
+        try:
+            response = await main.create_bulk_render_jobs(
+                payload,
+                SimpleNamespace(state=SimpleNamespace(request_id="bulk")),
+            )
+        finally:
+            main.app.state.async_jobs = original_service
+            main.app.state.webhooks = original_dispatcher
+        document = json.loads(response.body)
+        self.assertEqual(response.status_code, 207)
+        self.assertFalse(document["results"][0]["accepted"])
+        self.assertTrue(document["results"][1]["accepted"])
+        service.submit.assert_awaited_once()
+
+    async def test_visual_diff_queue_is_bounded(self):
+        original_slots = getattr(main.app.state, "diff_slots", None)
+        main.app.state.diff_slots = asyncio.Semaphore(0)
+        try:
+            with patch("main.CAPTURE_QUEUE_TIMEOUT_SECONDS", 0.01):
+                with self.assertRaises(RenderError) as raised:
+                    await main.visual_diff(None, None)
+        finally:
+            main.app.state.diff_slots = original_slots
+        self.assertEqual(raised.exception.code, "diff_queue_busy")
 
 
 if __name__ == "__main__":

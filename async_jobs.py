@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import hmac
@@ -65,6 +65,8 @@ class JobRecord:
     queue_expires_at: datetime
     created_at: datetime
     request_fingerprint: bytes | None = None
+    webhook_payload: bytes | None = None
+    webhook_event_status: str | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
     artifact_key: str | None = None
@@ -292,6 +294,10 @@ class JobStore(Protocol):
         now: datetime,
     ) -> JobRecord | None: ...
     async def acknowledge_artifact_deletion(self, key: str) -> None: ...
+    async def pending_notifications(self, limit: int = 100) -> list[JobRecord]: ...
+    async def acknowledge_notification(
+        self, job_id: str, webhook_payload: bytes
+    ) -> None: ...
 
 
 @runtime_checkable
@@ -314,7 +320,7 @@ class ArtifactStore(Protocol):
 
 
 RenderJob = Callable[[RenderRequest], Awaitable[RenderedArtifact]]
-JobNotifier = Callable[[RenderRequest, JobRecord], Awaitable[None]]
+JobNotifier = Callable[[str, JobRecord], Awaitable[None]]
 
 
 def _positive_int(name: str, default: int) -> int:
@@ -458,6 +464,26 @@ class PayloadCipher:
             "sha256",
         )
 
+    def encrypt_webhook(self, job_id: str, url: str) -> bytes:
+        nonce = os.urandom(12)
+        return nonce + self._cipher.encrypt(
+            nonce,
+            url.encode("utf-8"),
+            job_id.encode("ascii") + b"\0webhook",
+        )
+
+    def decrypt_webhook(self, job: JobRecord) -> str:
+        encrypted = job.webhook_payload
+        if encrypted is None or len(encrypted) <= 28:
+            raise ValueError("webhook payload is unavailable")
+        nonce, ciphertext = encrypted[:12], encrypted[12:]
+        plaintext = self._cipher.decrypt(
+            nonce,
+            ciphertext,
+            job.id.encode("ascii") + b"\0webhook",
+        )
+        return plaintext.decode("utf-8")
+
     @staticmethod
     def _serialize(payload: RenderRequest) -> bytes:
         return json.dumps(
@@ -516,6 +542,7 @@ class AsyncJobService:
         self._wake_tasks: set[asyncio.Task] = set()
         self._closing = False
         self._maintenance_lock = asyncio.Lock()
+        self._notification_lock = asyncio.Lock()
         self._next_maintenance_at = 0.0
         self._maintenance_interval = max(1.0, settings.poll_seconds)
 
@@ -599,6 +626,13 @@ class AsyncJobService:
             queue_expires_at=now + self.settings.queue_ttl,
             created_at=now,
             request_fingerprint=self.cipher.fingerprint(payload),
+            webhook_payload=(
+                self.cipher.encrypt_webhook(
+                    job_id, str(payload.delivery.webhook_url)
+                )
+                if payload.delivery.webhook_url is not None
+                else None
+            ),
         )
         try:
             stored = await self.job_store.create(job, self.settings.queue_limit)
@@ -735,6 +769,52 @@ class AsyncJobService:
                 logger.warning(
                     "artifact maintenance retry error_type=%s",
                     type(exc).__name__,
+                )
+            await self._drain_notifications()
+
+    async def _drain_notifications(self) -> None:
+        if self.notifier is None or self._closing:
+            return
+        async with self._notification_lock:
+            try:
+                pending = await self.job_store.pending_notifications()
+            except Exception as exc:
+                logger.warning(
+                    "webhook outbox lookup failed error_type=%s",
+                    type(exc).__name__,
+                )
+                return
+            for job in pending:
+                if self._closing or job.webhook_payload is None:
+                    return
+                try:
+                    url = self.cipher.decrypt_webhook(job)
+                except Exception as exc:
+                    logger.error(
+                        "webhook outbox payload invalid job_id=%s error_type=%s",
+                        job.id,
+                        type(exc).__name__,
+                    )
+                    await self.job_store.acknowledge_notification(
+                        job.id, job.webhook_payload
+                    )
+                    continue
+                try:
+                    event_job = (
+                        replace(job, status=job.webhook_event_status)
+                        if job.webhook_event_status is not None
+                        else job
+                    )
+                    await self.notifier(url, event_job)
+                except Exception as exc:
+                    logger.warning(
+                        "async job webhook delivery failed job_id=%s error_type=%s",
+                        job.id,
+                        type(exc).__name__,
+                    )
+                    continue
+                await self.job_store.acknowledge_notification(
+                    job.id, job.webhook_payload
                 )
 
     async def _safe_delete(self, key: str) -> bool:
@@ -1043,7 +1123,7 @@ class AsyncJobService:
                 stored_key = None
                 return
             if settled is not None:
-                await self._notify(payload, settled)
+                await self._drain_notifications()
         except asyncio.CancelledError:
             # Leave the claimed row running. Startup recovery can distinguish
             # a committed success from interrupted work and enforce attempts.
@@ -1091,35 +1171,9 @@ class AsyncJobService:
                 lambda: self._transition_conflict_resolved(job),
                 settle_on_cancel=not retryable,
             )
-            if (
-                self.notifier is not None
-                and payload is not None
-                and payload.delivery.webhook_url is not None
-            ):
-                try:
-                    terminal = await self.job_store.get(job.id, datetime.now(UTC))
-                    if terminal is not None and terminal.status == "failed":
-                        await self._notify(payload, terminal)
-                except Exception as notify_exc:
-                    logger.warning(
-                        "async job webhook lookup failed error_type=%s",
-                        type(notify_exc).__name__,
-                    )
+            await self._drain_notifications()
         finally:
             self._wake_workers()
-
-    async def _notify(self, payload: RenderRequest, job: JobRecord) -> None:
-        if self.notifier is None or payload.delivery.webhook_url is None:
-            return
-        try:
-            await self.notifier(payload, job)
-        except Exception as exc:
-            logger.warning(
-                "async job webhook delivery failed job_id=%s error_type=%s",
-                job.id,
-                type(exc).__name__,
-            )
-
 
 def public_job_document(job: JobRecord) -> dict[str, object]:
     result = None

@@ -115,7 +115,9 @@ docker compose -f docker-compose.yml -f docker-compose.s3.yml up --build
 Set `VIPERCAPTURE_WEBHOOK_SECRET` to enable callbacks. Each body is canonical
 JSON signed with HMAC-SHA256 in `X-ViperCapture-Webhook-Signature`, with timestamp and
 event-ID headers for verification and deduplication. Private callback targets
-are rejected unless the operator explicitly opts in.
+are rejected unless the operator explicitly opts in. Public DNS results are
+pinned through the callback connection to prevent rebinding, and the encrypted
+delivery outbox survives process restarts.
 
 ## Security boundary
 

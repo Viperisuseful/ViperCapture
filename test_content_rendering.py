@@ -117,6 +117,8 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(single.metadata["pages"], 1)
         self.assertEqual(single_page.pdf_options["page_ranges"], "1")
+        self.assertEqual(single_page.pdf_options["width"], "877px")
+        self.assertEqual(single_page.pdf_options["height"], "977px")
 
     async def test_pdf_page_and_height_limits(self):
         with self.assertRaises(RenderError) as pages:

@@ -32,8 +32,11 @@ running can omit committed queue state and downloadable results. Provider
 adapters need an equivalent coordinated snapshot procedure for live backups.
 The job database receives only ciphertext for request bodies, so URLs and
 custom target headers are not stored as plaintext. Terminal transitions erase
-that ciphertext. A keyed request fingerprint enforces idempotency without
-storing the raw request.
+that request ciphertext. When webhook delivery is requested, its URL is stored
+as separate AES-GCM ciphertext and the terminal transition atomically marks an
+outbox event. Only that encrypted URL remains until successful delivery is
+acknowledged; a keyed request fingerprint enforces idempotency without storing
+the raw request.
 The bundled providers create the database, WAL sidecars, key, and result files
 with owner-only permissions. Key and result creation fsync both file contents
 and directory entries before reporting durable success. SQLite enables secure
@@ -161,6 +164,11 @@ The application encrypts the serialized request before calling `create` and
 decrypts it only after `claim`. Adapters must treat `JobRecord.payload` as
 opaque bytes. Set the same `VIPERCAPTURE_JOB_SECRET` whenever state can move
 between machines or processes.
+
+Durable job-store adapters also implement `pending_notifications` and
+`acknowledge_notification`. Terminal success/failure and creation of the
+encrypted webhook outbox record must be one atomic state transition. Delivery
+is at least once, so consumers should deduplicate the stable webhook ID.
 
 ## Storage adapters
 

@@ -128,6 +128,59 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await service.close()
 
+    async def test_webhook_outbox_survives_restart_and_clears_after_delivery(self):
+        failing_notifier = AsyncMock(side_effect=RuntimeError("offline"))
+        service = AsyncJobService(
+            self.settings,
+            self.store,
+            self.artifacts,
+            _successful_renderer,
+            notifier=failing_notifier,
+        )
+        await service.start()
+        payload = RenderRequest.model_validate(
+            {
+                "url": "https://example.com/report",
+                "delivery": {"webhook_url": "https://hooks.example/callback"},
+            }
+        )
+        job = await service.submit(payload, request_id="durable-webhook")
+        for _ in range(100):
+            current = await service.get(job.id)
+            if current and current.status == "succeeded":
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(current.status, "succeeded")
+        self.assertIsNone(current.payload)
+        pending = await self.store.pending_notifications()
+        self.assertEqual([item.id for item in pending], [job.id])
+        self.assertNotIn(b"hooks.example", self.store.path.read_bytes())
+        await service.close()
+
+        recovered_store = SQLiteJobStore(
+            JobStoreConfig(self.root, self.settings.metadata_ttl)
+        )
+        recovered_artifacts = LocalArtifactStore(
+            ArtifactStoreConfig(self.root, self.settings.result_ttl)
+        )
+        delivered = AsyncMock()
+        recovered = AsyncJobService(
+            self.settings,
+            recovered_store,
+            recovered_artifacts,
+            _successful_renderer,
+            notifier=delivered,
+        )
+        await recovered.start()
+        try:
+            delivered.assert_awaited_once()
+            url, event_job = delivered.await_args.args
+            self.assertEqual(url, "https://hooks.example/callback")
+            self.assertEqual(event_job.status, "succeeded")
+            self.assertEqual(await recovered_store.pending_notifications(), [])
+        finally:
+            await recovered.close()
+
     async def test_request_id_is_idempotent_and_queue_limit_is_atomic(self):
         await self.store.start()
         await self.artifacts.start()
@@ -3064,6 +3117,8 @@ class ProviderLoadingTests(unittest.TestCase):
                     "succeed", "fail", "requeue_running", "requeue", "maintain",
                     "expire_result",
                     "acknowledge_artifact_deletion",
+                    "pending_notifications",
+                    "acknowledge_notification",
                 ),
             ),
             (

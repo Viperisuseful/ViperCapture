@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import socket
+from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 import zipfile
@@ -143,6 +144,65 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await is_public_http_url("https://example.com"))
             self.assertFalse(await is_public_http_url("https://example.com"))
         self.assertEqual(resolve.call_count, 2)
+
+    async def test_blocked_resources_are_counted_without_aborting_main_document(self):
+        class RoutedRequest:
+            def __init__(self, url, resource_type, *, main=False):
+                self.url = url
+                self.resource_type = resource_type
+                self.headers = {}
+                self.frame = SimpleNamespace(
+                    parent_frame=None if main else object()
+                )
+                self.main = main
+
+            def is_navigation_request(self):
+                return self.main
+
+        class Route:
+            def __init__(self, request):
+                self.request = request
+                self.aborted = False
+                self.continued = False
+
+            async def abort(self, _reason):
+                self.aborted = True
+
+            async def continue_(self, **_kwargs):
+                self.continued = True
+
+        context = FakeContext()
+
+        class RoutingPage(FakePage):
+            async def goto(self, url, **options):
+                main_route = Route(RoutedRequest(url, "document", main=True))
+                script_route = Route(
+                    RoutedRequest(f"{url}/application.js", "script")
+                )
+                await context.route_handler(main_route)
+                await context.route_handler(script_route)
+                self.main_route = main_route
+                self.script_route = script_route
+                return await super().goto(url, **options)
+
+        page = RoutingPage()
+        context.page = page
+        artifact = await RenderEngine(hosted=False).render(
+            FakeBrowser(context),
+            RenderRequest.model_validate(
+                {
+                    "url": "https://example.com",
+                    "network": {
+                        "block_resource_types": ["document", "script"]
+                    },
+                }
+            ),
+            RenderLimits(max_width=1920, max_height=1080, max_pixels=10_000_000),
+        )
+        self.assertTrue(page.main_route.continued)
+        self.assertFalse(page.main_route.aborted)
+        self.assertTrue(page.script_route.aborted)
+        self.assertEqual(artifact.metadata["blocked_subresources"], 1)
 
     async def test_public_address_resolution_has_a_hard_timeout(self):
         def slow_to_thread(*_args, **_kwargs):

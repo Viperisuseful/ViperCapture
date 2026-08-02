@@ -79,6 +79,7 @@ DESKTOP_ALLOW_HEADERS = [
     "Content-Type",
     "X-Request-Id",
 ]
+DESKTOP_ALLOW_METHODS = ["GET", "POST", "PATCH", "DELETE"]
 
 
 def _load_local_env() -> None:
@@ -126,6 +127,9 @@ MAX_ASYNC_RESULT_DOWNLOADS = max(
 )
 MAX_SCREENSHOT_PIXELS = max(
     1, int(os.getenv("VIPERCAPTURE_MAX_PIXELS", "50000000"))
+)
+MAX_DIFF_CONCURRENCY = max(
+    1, int(os.getenv("VIPERCAPTURE_DIFF_CONCURRENCY", "1"))
 )
 CAPTURE_QUEUE_TIMEOUT_SECONDS = 30
 AwaitedResult = TypeVar("AwaitedResult")
@@ -264,6 +268,7 @@ async def lifespan(app: FastAPI):
     app.state.gpu_mode = GPU_MODE
     app.state.gpu_hardware_active = await _detect_hardware_gpu(browser, GPU_MODE)
     app.state.capture_slots = asyncio.Semaphore(MAX_CONCURRENT_CAPTURES)
+    app.state.diff_slots = asyncio.Semaphore(MAX_DIFF_CONCURRENCY)
     app.state.async_result_slots = asyncio.Semaphore(MAX_ASYNC_RESULT_DOWNLOADS)
     app.state.browser_restart_lock = asyncio.Lock()
     app.state.async_jobs = None
@@ -331,7 +336,7 @@ if DESKTOP_TOKEN:
         CORSMiddleware,
         allow_origins=DESKTOP_ORIGINS,
         allow_credentials=False,
-        allow_methods=["GET", "POST", "DELETE"],
+        allow_methods=DESKTOP_ALLOW_METHODS,
         allow_headers=DESKTOP_ALLOW_HEADERS,
         expose_headers=[
             "Content-Disposition",
@@ -600,12 +605,12 @@ async def _render_with_cache(
     return artifact, False
 
 
-async def _notify_job(payload: RenderRequest, job) -> None:
+async def _notify_job(webhook_url: str, job) -> None:
     dispatcher = getattr(app.state, "webhooks", None)
-    if dispatcher is None or payload.delivery.webhook_url is None:
+    if dispatcher is None:
         return
     await dispatcher.deliver(
-        str(payload.delivery.webhook_url),
+        webhook_url,
         public_job_document(job),
     )
 
@@ -618,34 +623,52 @@ async def _render_response(payload: RenderRequest, request: Request) -> Response
             422,
             False,
         )
-    queue_started = time.perf_counter()
-    try:
-        await _await_while_connected(
-            request,
-            asyncio.wait_for(
-                app.state.capture_slots.acquire(),
-                timeout=CAPTURE_QUEUE_TIMEOUT_SECONDS,
-            ),
-        )
-    except TimeoutError as exc:
-        raise RenderError("capture_queue_busy", "The render queue is busy.", 503, True) from exc
-    queue_ms = round((time.perf_counter() - queue_started) * 1000)
-    browser: Browser = app.state.browser
-    engine = _render_engine()
-    render_started = time.perf_counter()
-    try:
-        artifact, cache_hit = await _await_while_connected(
-            request,
-            _render_with_cache(engine, browser, payload),
-        )
-    except RenderError:
-        if not browser.is_connected():
-            with suppress(Exception):
-                await _replace_browser(app, browser)
-        raise
-    finally:
-        app.state.capture_slots.release()
-    render_ms = round((time.perf_counter() - render_started) * 1000)
+    cache = getattr(app.state, "render_cache", None)
+    artifact = None
+    cache_hit = False
+    queue_ms = 0
+    render_ms = 0
+    if payload.cache and cache is not None:
+        artifact = await _await_while_connected(request, cache.get(payload))
+        cache_hit = artifact is not None
+
+    if artifact is None:
+        queue_started = time.perf_counter()
+        try:
+            await _await_while_connected(
+                request,
+                asyncio.wait_for(
+                    app.state.capture_slots.acquire(),
+                    timeout=CAPTURE_QUEUE_TIMEOUT_SECONDS,
+                ),
+            )
+        except TimeoutError as exc:
+            raise RenderError(
+                "capture_queue_busy", "The render queue is busy.", 503, True
+            ) from exc
+        queue_ms = round((time.perf_counter() - queue_started) * 1000)
+        browser: Browser = app.state.browser
+        engine = _render_engine()
+        render_started = time.perf_counter()
+        try:
+            artifact = await _await_while_connected(
+                request,
+                engine.render_image(
+                    browser,
+                    payload,
+                    RenderLimits(max_pixels=MAX_SCREENSHOT_PIXELS),
+                ),
+            )
+            if payload.cache and cache is not None:
+                await cache.put(payload, artifact)
+        except RenderError:
+            if not browser.is_connected():
+                with suppress(Exception):
+                    await _replace_browser(app, browser)
+            raise
+        finally:
+            app.state.capture_slots.release()
+        render_ms = round((time.perf_counter() - render_started) * 1000)
     metadata = artifact.metadata or {}
     diagnostic_headers = {
         "X-ViperCapture-Queue-Ms": str(max(0, queue_ms)),
@@ -682,19 +705,32 @@ async def visual_diff(
     pixel_threshold: int = Form(0),
     max_difference_ratio: float = Form(0),
 ) -> Response:
-    baseline_body = await baseline.read(MAX_DIFF_INPUT_BYTES + 1)
-    current_body = await current.read(MAX_DIFF_INPUT_BYTES + 1)
     try:
-        result = compare_images(
+        await asyncio.wait_for(
+            app.state.diff_slots.acquire(),
+            timeout=CAPTURE_QUEUE_TIMEOUT_SECONDS,
+        )
+    except TimeoutError as exc:
+        raise RenderError(
+            "diff_queue_busy", "The visual diff queue is busy.", 503, True
+        ) from exc
+    try:
+        baseline_body = await baseline.read(MAX_DIFF_INPUT_BYTES + 1)
+        current_body = await current.read(MAX_DIFF_INPUT_BYTES + 1)
+        result = await asyncio.to_thread(
+            compare_images,
             baseline_body,
             current_body,
             pixel_threshold=pixel_threshold,
             max_difference_ratio=max_difference_ratio,
         )
+        bundle = await asyncio.to_thread(create_diff_bundle, result)
     except ValueError as exc:
         raise RenderError("diff_options_invalid", str(exc), 422, False) from exc
+    finally:
+        app.state.diff_slots.release()
     return Response(
-        create_diff_bundle(result),
+        bundle,
         media_type="application/zip",
         headers={
             "Content-Disposition": 'attachment; filename="visual-diff.zip"',
@@ -757,6 +793,13 @@ async def create_signed_url(
             "signing_unauthorized",
             "A valid signing administrator token is required.",
             401,
+            False,
+        )
+    if payload.delivery.webhook_url is not None:
+        raise RenderError(
+            "delivery_requires_async_job",
+            "Webhook delivery is accepted only by POST /v1/jobs.",
+            422,
             False,
         )
     try:
@@ -829,23 +872,22 @@ async def create_bulk_render_jobs(
 ) -> JSONResponse:
     service = _async_job_service()
     dispatcher = getattr(app.state, "webhooks", None)
-    for item in payload.items:
-        if item.render.delivery.webhook_url is None:
-            continue
-        if dispatcher is None:
-            raise RenderError(
-                "webhooks_disabled",
-                "Webhook delivery is disabled for this ViperCapture instance.",
-                503,
-                False,
-            )
-        await dispatcher.validate_url(str(item.render.delivery.webhook_url))
-
     results = []
     failures = 0
     for index, item in enumerate(payload.items):
         request_id = item.request_id or f"{request.state.request_id}-{index + 1}"
         try:
+            if item.render.delivery.webhook_url is not None:
+                if dispatcher is None:
+                    raise RenderError(
+                        "webhooks_disabled",
+                        "Webhook delivery is disabled for this ViperCapture instance.",
+                        503,
+                        False,
+                    )
+                await dispatcher.validate_url(
+                    str(item.render.delivery.webhook_url)
+                )
             job = await service.submit(item.render, request_id=request_id)
             results.append(
                 {

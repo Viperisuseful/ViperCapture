@@ -12,8 +12,11 @@ from PIL import Image, ImageChops, ImageDraw, UnidentifiedImageError
 from render_errors import RenderError
 
 
-MAX_DIFF_INPUT_BYTES = 50 * 1024 * 1024
-MAX_DIFF_PIXELS = 50_000_000
+MAX_DIFF_INPUT_BYTES = 20 * 1024 * 1024
+# Pillow expands compressed inputs into several simultaneous RGBA/mask
+# buffers. Eight million pixels keeps the bounded single-worker peak well
+# below the approximately 1 GiB worst case of the former 50 MP allowance.
+MAX_DIFF_PIXELS = 8_000_000
 
 
 @dataclass(frozen=True)

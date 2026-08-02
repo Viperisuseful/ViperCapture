@@ -11,7 +11,11 @@ import ipaddress
 import io
 import json
 import math
+import os
+import re
+import shutil
 import socket
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -56,6 +60,99 @@ MAX_METADATA_ITEMS = 100
 MAX_METADATA_VALUE_CHARS = 2_048
 DNS_RESOLUTION_TIMEOUT_SECONDS = 5
 MAX_DIAGNOSTIC_EVENTS = 500
+
+
+def _ffmpeg_executable() -> Path:
+    installed = shutil.which("ffmpeg")
+    if installed:
+        return Path(installed)
+    roots = []
+    configured = os.getenv("PLAYWRIGHT_BROWSERS_PATH")
+    if configured:
+        roots.append(Path(configured))
+    roots.append(Path.home() / ".cache" / "ms-playwright")
+    for root in roots:
+        for candidate in sorted(root.glob("ffmpeg-*/ffmpeg-*")):
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate
+    raise RenderError(
+        "video_encoder_unavailable",
+        "The Playwright FFmpeg runtime is unavailable.",
+        503,
+        False,
+    )
+
+
+def _timestamp_ms(value: str) -> int:
+    hours, minutes, seconds = value.split(":")
+    return round(
+        (int(hours) * 3600 + int(minutes) * 60 + float(seconds)) * 1000
+    )
+
+
+def _webm_duration_ms(ffmpeg: Path, path: Path) -> int:
+    probe = subprocess.run(
+        [str(ffmpeg), "-hide_banner", "-i", str(path)],
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    diagnostic = probe.stderr.decode("utf-8", "replace")
+    match = re.search(r"Duration:\s*(\d{2}:\d{2}:\d{2}(?:\.\d+)?)", diagnostic)
+    if match is None:
+        raise RenderError(
+            "video_duration_unavailable",
+            "The encoded WebM duration could not be verified.",
+            502,
+            True,
+        )
+    return _timestamp_ms(match.group(1))
+
+
+def _trim_webm(
+    source: Path,
+    destination: Path,
+    *,
+    duration_ms: int,
+) -> int:
+    ffmpeg = _ffmpeg_executable()
+    source_duration_ms = _webm_duration_ms(ffmpeg, source)
+    start_ms = max(0, source_duration_ms - duration_ms)
+    command = [
+        str(ffmpeg),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        f"{start_ms / 1000:.3f}",
+        "-i",
+        str(source),
+        "-t",
+        f"{duration_ms / 1000:.3f}",
+        "-an",
+        "-c:v",
+        "libvpx",
+        "-deadline",
+        "realtime",
+        "-cpu-used",
+        "8",
+        "-y",
+        str(destination),
+    ]
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        check=False,
+        timeout=45,
+    )
+    if completed.returncode != 0 or not destination.is_file():
+        raise RenderError(
+            "video_encode_failed",
+            "The requested WebM recording window could not be encoded.",
+            502,
+            True,
+        )
+    return _webm_duration_ms(ffmpeg, destination)
 
 
 def diagnostic_url(value: str) -> str:
@@ -930,20 +1027,29 @@ class RenderEngine:
                     if scheme in ALLOWED_INTERNAL_SCHEMES:
                         await route.continue_()
                         return
-                    if route.request.resource_type in {
+                    blocked_by_type = route.request.resource_type in {
                         resource.value for resource in request.network.block_resource_types
-                    }:
+                    }
+                    main_document = (
+                        route.request.resource_type == "document"
+                        and route.request.is_navigation_request()
+                        and route.request.frame.parent_frame is None
+                    )
+                    if blocked_by_type and not main_document:
+                        blocked_urls.append(request_url)
                         await route.abort("blockedbyclient")
                         return
                     if any(
                         fnmatchcase(request_url, pattern)
                         for pattern in request.network.block_url_patterns
                     ):
+                        blocked_urls.append(request_url)
                         await route.abort("blockedbyclient")
                         return
                     if self.cleanup_hooks:
                         category = self.cleanup_hooks.blocked_category(request_url, request.cleanup)
                         if category:
+                            blocked_urls.append(request_url)
                             await route.abort("blockedbyclient")
                             return
                     if self.hosted and not await public_urls.is_public(request_url):
@@ -1111,6 +1217,8 @@ class RenderEngine:
                     options = request.video
                     if options is None or page.video is None:
                         raise RenderError("video_unavailable", "Chromium video recording is unavailable.", 500, True)
+                    if video_directory is None:
+                        raise RenderError("video_unavailable", "Video recording did not start.", 500, True)
                     if options.scroll:
                         elapsed = 0
                         while elapsed < options.duration_ms:
@@ -1129,7 +1237,14 @@ class RenderEngine:
                     await context.close()
                     context = None
                     path = await video.path()
-                    body = Path(path).read_bytes()
+                    trimmed_path = Path(video_directory.name) / "trimmed.webm"
+                    actual_duration_ms = await asyncio.to_thread(
+                        _trim_webm,
+                        Path(path),
+                        trimmed_path,
+                        duration_ms=options.duration_ms,
+                    )
+                    body = trimmed_path.read_bytes()
                     if not body:
                         raise RenderError("empty_output", "The renderer produced an empty video.", 502, True)
                     if len(body) > limits.output_bytes:
@@ -1141,7 +1256,7 @@ class RenderEngine:
                         {
                             "width": request.viewport.width,
                             "height": request.viewport.height,
-                            "duration_ms": options.duration_ms,
+                            "duration_ms": actual_duration_ms,
                             "navigation_status": navigation_status,
                             "final_url": final_url,
                             "blocked_subresources": len(blocked_urls),

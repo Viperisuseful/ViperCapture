@@ -489,6 +489,28 @@ class BrowserCaptureRegressionTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await browser.close()
 
+    async def test_webm_contains_only_the_post_preparation_window(self):
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                artifact = await RenderEngine(hosted=False).render(
+                    browser,
+                    RenderRequest.model_validate(
+                        {
+                            "html": "<h1>Timed recording</h1>",
+                            "output": "webm",
+                            "wait_for": {"delay_ms": 500},
+                            "video": {"duration_ms": 1000},
+                        }
+                    ),
+                    RenderLimits(deadline_seconds=30),
+                )
+            finally:
+                await browser.close()
+        self.assertEqual(artifact.body[:4], bytes.fromhex("1a45dfa3"))
+        self.assertGreaterEqual(artifact.metadata["duration_ms"], 850)
+        self.assertLessEqual(artifact.metadata["duration_ms"], 1_100)
+
 
 class CaptureCancellationTests(unittest.IsolatedAsyncioTestCase):
     async def test_completed_work_returns_without_waiting_on_disconnect_poll(self):

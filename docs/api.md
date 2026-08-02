@@ -14,11 +14,14 @@ All request models reject unknown fields. Exactly one of `url`, `html`, or
 | `html` | UTF-8 HTML | Fully rendered document or article extraction |
 | `markdown` | UTF-8 Markdown | Document or readability-based article extraction |
 | `metadata` | JSON | Title, description, canonical URL, headings, links, images |
-| `webm` | video | 1–30 seconds, stationary or stepped scrolling |
+| `webm` | video | 1–30 second post-preparation window, stationary or stepped scrolling |
 
 `viewports` accepts two or three named image viewports and returns a ZIP with a
 manifest. `diagnostics.bundle` returns a ZIP containing the normal artifact,
 manifest, and optionally bounded console and network event files.
+WebM setup/navigation frames are trimmed from the recording with Playwright's
+FFmpeg runtime, and `duration_ms` reports the verified encoded duration rather
+than merely echoing the request.
 
 ## Browser preparation
 
@@ -142,7 +145,11 @@ assert hmac.compare_digest(expected, signature_header)
 
 Callbacks have a stable event ID, never follow redirects, and retry bounded
 transport, 429, and server failures. Delivery failure does not rerender or
-change a successfully completed job.
+change a successfully completed job. DNS is resolved once per delivery and the
+connection is pinned to the validated address while retaining the original
+Host and TLS server name. A terminal transition atomically creates an encrypted
+outbox entry; failed delivery remains pending across restarts until it is
+acknowledged.
 
 ## S3, R2, and MinIO
 
@@ -156,9 +163,11 @@ Set `VIPERCAPTURE_S3_BUCKET`. Optional variables:
 | `VIPERCAPTURE_S3_PREFIX` | Object key prefix |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | Standard SDK credentials |
 
-The adapter writes exclusive, unguessable object keys and expiry metadata.
-ViperCapture deletes expired objects during maintenance; also configure a
-provider lifecycle rule as crash-safe defense in depth.
+The adapter writes exclusive, unguessable object keys plus ViperCapture owner
+and expiry metadata. Maintenance deletes only objects with the expected
+prefix/UUID key shape and owner marker; unrelated objects under a shared prefix
+are never selected solely because of age. Also configure a provider lifecycle
+rule as crash-safe defense in depth.
 
 ## Visual differences
 
@@ -169,7 +178,10 @@ curl http://127.0.0.1:8000/v1/diff \
   --output visual-diff.zip
 ```
 
-Inputs must have identical dimensions and remain within the byte/pixel limits.
+Inputs must have identical dimensions, be no larger than 20 MiB each, and
+contain no more than 8 million expanded pixels each. Diff computation runs in
+a bounded worker lane (`VIPERCAPTURE_DIFF_CONCURRENCY`, default 1) because
+decoded RGBA and mask buffers are substantially larger than compressed inputs.
 `report.json` records changed/total pixels, difference ratio, pass/fail, and
 the changed bounding box. `diff.png` highlights changes in magenta.
 
