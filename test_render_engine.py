@@ -10,6 +10,7 @@ import zipfile
 from render_contract import LazyLoadMode, RenderRequest
 from render_engine import (
     PublicUrlValidator,
+    RenderArtifact,
     RenderEngine,
     RenderLimits,
     ensure_dimensions,
@@ -430,6 +431,73 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
             )
             manifest = json.loads(archive.read("manifest.json"))
         self.assertEqual(manifest["count"], 2)
+
+    async def test_viewport_pack_aborts_when_archive_budget_is_exceeded(self):
+        # Three individually valid 4 KiB artifacts exceed a 4 KiB archive
+        # budget: the pack must abort mid-sequence instead of rendering every
+        # viewport and only then discovering the archive cannot fit.
+        request = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "full_page": False,
+                "viewports": [
+                    {"name": "one", "width": 800, "height": 600},
+                    {"name": "two", "width": 800, "height": 600},
+                    {"name": "three", "width": 800, "height": 600},
+                ],
+            }
+        )
+        engine = RenderEngine(hosted=False)
+        renders = 0
+
+        async def fake_render(_browser, _single, _limits):
+            nonlocal renders
+            renders += 1
+            return RenderArtifact(b"x" * 4096, "image/png", "capture.png", {})
+
+        limits = RenderLimits(
+            max_width=1920,
+            max_height=1080,
+            max_pixels=10_000_000,
+            output_bytes=4 * 1024,
+        )
+        with (
+            patch.object(engine, "_render_single", side_effect=fake_render),
+            self.assertRaises(RenderError) as raised,
+        ):
+            await engine.render(FakeBrowser(), request, limits)
+        self.assertEqual(raised.exception.code, "output_too_large")
+        # One viewport fits; the second crosses the budget and aborts before
+        # the third is ever rendered.
+        self.assertEqual(renders, 2)
+
+    async def test_asserted_failure_after_sample_cap_still_fails(self):
+        engine = RenderEngine(hosted=False)
+        request = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "assertions": {"request_failures": ["https://api.example.com/*"]},
+            }
+        )
+        page = FakePage()
+        # The diagnostic sample is full of unrelated failures; the asserted
+        # failure only exists in the assertion tracker.
+        failed_requests = [
+            {"url": f"https://cdn.example.com/{index}.png", "status": 500}
+            for index in range(200)
+        ]
+        assertion_matches = [
+            {"url": "https://api.example.com/users", "status": 500}
+        ]
+        with self.assertRaises(RenderError) as raised:
+            await engine._check_assertions(
+                page, request, failed_requests, assertion_matches
+            )
+        self.assertEqual(raised.exception.code, "request_assertion_failed")
+        self.assertEqual(
+            raised.exception.details["failures"][0]["url"],
+            "https://api.example.com/users",
+        )
 
     async def test_metadata_output_is_bounded_json(self):
         class MetadataPage:

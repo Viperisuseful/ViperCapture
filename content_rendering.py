@@ -20,6 +20,11 @@ from render_errors import RenderError
 
 MAX_PRINT_PAGES = 50
 MAX_SINGLE_PAGE_HEIGHT = 20_000
+# Single-page PDF sheets are bounded in width and total area before being
+# passed to Chromium, so a compact page cannot force an arbitrarily wide PDF
+# surface through the renderer.
+MAX_SINGLE_PAGE_WIDTH = 20_000
+MAX_SINGLE_PAGE_AREA = 100_000_000
 MAX_MARKDOWN_HTML_BYTES = 5 * 1024 * 1024
 PAPER_INCHES = {
     "A4": (8.27, 11.69),
@@ -116,6 +121,22 @@ async def _render_pdf(page, request: RenderRequest) -> RenderArtifact:
                 False,
                 {"max_height": MAX_SINGLE_PAGE_HEIGHT},
             )
+        if width > MAX_SINGLE_PAGE_WIDTH:
+            raise RenderError(
+                "pdf_page_too_wide",
+                "Single-page PDF content exceeds 20000 CSS pixels wide.",
+                413,
+                False,
+                {"max_width": MAX_SINGLE_PAGE_WIDTH},
+            )
+        if width * height > MAX_SINGLE_PAGE_AREA:
+            raise RenderError(
+                "pdf_page_too_large",
+                "Single-page PDF content exceeds the 100 million CSS pixel area limit.",
+                413,
+                False,
+                {"max_area": MAX_SINGLE_PAGE_AREA},
+            )
         # Playwright treats width and height as the entire sheet. Include the
         # margins so the measured document remains the printable area instead
         # of silently overflowing past page one.
@@ -187,7 +208,6 @@ async def render_document_output(
     request: RenderRequest,
     limits: RenderLimits,
 ) -> RenderArtifact:
-    del limits
     if request.output is OutputFormat.PDF:
         return await _render_pdf(page, request)
     if request.output not in {OutputFormat.HTML, OutputFormat.MARKDOWN}:
@@ -195,7 +215,37 @@ async def render_document_output(
             "unsupported_output", "The output format is not supported.", 422, False
         )
 
+    hydrated_limit = (
+        MAX_MARKDOWN_HTML_BYTES
+        if request.output is OutputFormat.MARKDOWN
+        else limits.output_bytes
+    )
     try:
+        # Bounded preflight inside the page: reject an oversized hydrated DOM
+        # before page.content() materializes the serialized document, and a
+        # second full-sized UTF-8 copy, in this process. A non-numeric result
+        # falls through to the post-serialization limits rather than failing
+        # the guard itself.
+        try:
+            hydrated_bytes = await page.evaluate(
+                "() => {"
+                " const root = document.documentElement;"
+                " return root ? new Blob([root.outerHTML]).size : 0;"
+                "}"
+            )
+        except Exception:
+            hydrated_bytes = None
+        if (
+            isinstance(hydrated_bytes, (int, float))
+            and hydrated_bytes > hydrated_limit
+        ):
+            raise RenderError(
+                "document_too_large",
+                "The hydrated document exceeds the output limit.",
+                413,
+                False,
+                {"max_bytes": hydrated_limit},
+            )
         document_html = await page.content()
         if (
             request.output is OutputFormat.MARKDOWN

@@ -123,3 +123,41 @@ class S3ArtifactStoreTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn(unrelated, client.objects)
         self.assertIn(malformed, client.objects)
+
+    async def test_maintenance_skips_head_for_recent_objects(self):
+        class HeadTrackingS3(FakeS3):
+            def __init__(self):
+                super().__init__()
+                self.headed = []
+
+            def head_object(self, *, Key, **kwargs):
+                self.headed.append(Key)
+                return super().head_object(Key=Key, **kwargs)
+
+        client = HeadTrackingS3()
+        store = S3ArtifactStore(
+            ArtifactStoreConfig(Path("/tmp/unused"), timedelta(hours=4)),
+            bucket="captures",
+            client=client,
+        )
+        recent = await store.put(
+            str(uuid4()),
+            b"fresh",
+            media_type="application/octet-stream",
+            filename="fresh.bin",
+        )
+        stale = await store.put(
+            str(uuid4()),
+            b"stale",
+            media_type="application/octet-stream",
+            filename="stale.bin",
+        )
+        # Only the stale object can be expired; the recent upload must not be
+        # headed at all on a maintenance pass.
+        client.objects[stale.key]["LastModified"] = datetime.now(UTC) - timedelta(hours=5)
+
+        await store.maintain(datetime.now(UTC))
+
+        self.assertEqual(client.headed, [stale.key])
+        self.assertIn(recent.key, client.objects)
+        self.assertIn(stale.key, client.objects)

@@ -32,21 +32,29 @@ class FakePage:
         html="<html><body><main>Hello document body with useful words.</main></body></html>",
         pdf=None,
         height=900,
+        width=800,
         forced_breaks=0,
+        hydrated_bytes=None,
     ):
         self.html = html
         self.pdf_bytes = pdf or pdf_with_pages(1)
         self.height = height
+        self.width = width
         self.forced_breaks = forced_breaks
+        self.hydrated_bytes = hydrated_bytes
         self.pdf_options = None
         self.emulated_media = None
 
     async def content(self):
         return self.html
 
-    async def evaluate(self, _script):
+    async def evaluate(self, script):
+        if "outerHTML" in script:
+            if self.hydrated_bytes is not None:
+                return self.hydrated_bytes
+            return len(self.html.encode("utf-8"))
         return {
-            "width": 800,
+            "width": self.width,
             "height": self.height,
             "forcedBreaks": self.forced_breaks,
         }
@@ -212,6 +220,53 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
     def test_pdf_costs_two_credits(self):
         request = RenderRequest.model_validate({"html": "Hello", "output": "pdf"})
         self.assertEqual(request.credit_cost, 2)
+
+    async def test_single_page_pdf_width_and_area_are_bounded(self):
+        wide = FakePage(width=20_001)
+        with self.assertRaises(RenderError) as width_error:
+            await render_document_output(
+                wide,
+                RenderRequest.model_validate(
+                    {"url": "https://example.com", "output": "pdf", "pdf": {"mode": "single_page"}}
+                ),
+                LIMITS,
+            )
+        self.assertEqual(width_error.exception.code, "pdf_page_too_wide")
+        self.assertIsNone(wide.pdf_options)
+
+        # 12000 x 9000 = 108M CSS pixels: each dimension fits its own bound
+        # but the sheet area does not.
+        large = FakePage(width=12_000, height=9_000)
+        with self.assertRaises(RenderError) as area_error:
+            await render_document_output(
+                large,
+                RenderRequest.model_validate(
+                    {"url": "https://example.com", "output": "pdf", "pdf": {"mode": "single_page"}}
+                ),
+                LIMITS,
+            )
+        self.assertEqual(area_error.exception.code, "pdf_page_too_large")
+        self.assertIsNone(large.pdf_options)
+
+    async def test_html_output_rejects_oversized_dom_before_serialization(self):
+        class PreflightPage(FakePage):
+            def __init__(self):
+                super().__init__(hydrated_bytes=LIMITS.output_bytes + 1)
+                self.content_called = False
+
+            async def content(self):
+                self.content_called = True
+                return await super().content()
+
+        page = PreflightPage()
+        with self.assertRaises(RenderError) as raised:
+            await render_document_output(
+                page,
+                RenderRequest.model_validate({"url": "https://example.com", "output": "html"}),
+                LIMITS,
+            )
+        self.assertEqual(raised.exception.code, "document_too_large")
+        self.assertFalse(page.content_called)
 
 
 if __name__ == "__main__":

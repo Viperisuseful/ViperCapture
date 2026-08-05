@@ -67,6 +67,14 @@ class ScheduleRecord:
     last_error: str | None = None
 
 
+# Columns needed by public schedule documents; the encrypted payload is never
+# selected for listings.
+SCHEDULE_SUMMARY_COLUMNS = (
+    "id,name,cron,timezone,enabled,next_run_at,last_run_at,last_job_id,"
+    "last_error,created_at,updated_at"
+)
+
+
 def validate_cron(expression: str, timezone_name: str) -> None:
     try:
         zone = ZoneInfo(timezone_name)
@@ -243,29 +251,113 @@ class ScheduleStore:
             "SELECT * FROM schedules ORDER BY created_at, id"
         ).fetchall()
 
-    async def update(self, record: ScheduleRecord) -> ScheduleRecord:
-        if not await self._run(self._update, record):
-            raise KeyError(record.id)
-        return record
+    async def list_page(
+        self, *, after: str | None = None, limit: int = 100
+    ) -> list[dict[str, object]]:
+        return await self._run(self._list_page, after, limit)
 
-    def _update(self, record: ScheduleRecord) -> bool:
+    def _list_page(
+        self, after: str | None, limit: int
+    ) -> list[dict[str, object]]:
+        if after is not None:
+            rows = self._require().execute(
+                f"SELECT {SCHEDULE_SUMMARY_COLUMNS} FROM schedules WHERE id > ? "
+                "ORDER BY id LIMIT ?",
+                (after, limit),
+            ).fetchall()
+        else:
+            rows = self._require().execute(
+                f"SELECT {SCHEDULE_SUMMARY_COLUMNS} FROM schedules "
+                "ORDER BY id LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [self._summary(row) for row in rows]
+
+    @staticmethod
+    def _summary(row: sqlite3.Row) -> dict[str, object]:
+        next_run_at = _as_utc(row["next_run_at"])
+        last_run_at = _as_utc(row["last_run_at"])
+        created_at = _as_utc(row["created_at"])
+        updated_at = _as_utc(row["updated_at"])
+        assert next_run_at is not None
+        assert created_at is not None
+        assert updated_at is not None
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "cron": row["cron"],
+            "timezone": row["timezone"],
+            "enabled": bool(row["enabled"]),
+            "next_run_at": next_run_at.isoformat(),
+            "last_run_at": last_run_at.isoformat() if last_run_at else None,
+            "last_job_id": row["last_job_id"],
+            "last_error": row["last_error"],
+            "created_at": created_at.isoformat(),
+            "updated_at": updated_at.isoformat(),
+        }
+
+    async def update(
+        self, record: ScheduleRecord, *, clock_changed: bool = True
+    ) -> ScheduleRecord:
+        updated = await self._run(self._update, record, clock_changed)
+        if updated is None:
+            raise KeyError(record.id)
+        return updated
+
+    def _update(
+        self, record: ScheduleRecord, clock_changed: bool
+    ) -> ScheduleRecord | None:
         connection = self._require()
-        cursor = connection.execute(
-            """UPDATE schedules SET name=?,cron=?,timezone=?,enabled=?,payload=?,
-            next_run_at=?,updated_at=? WHERE id=?""",
-            (
-                record.name,
-                record.cron,
-                record.timezone,
-                int(record.enabled),
-                record.payload,
-                record.next_run_at.isoformat(),
-                record.updated_at.isoformat(),
-                record.id,
-            ),
-        )
-        connection.commit()
-        return cursor.rowcount == 1
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = connection.execute(
+                "SELECT * FROM schedules WHERE id = ?", (record.id,)
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return None
+            live = self._record(row)
+            # Scheduler claims (claim_due), run results (record_result), and
+            # the PATCH route's earlier read all serialize through this lock,
+            # so a record fetched before the update cannot be stale — still,
+            # when the clock did not change, preserve the live next_run_at
+            # and terminal fields rather than overwriting them from the
+            # earlier snapshot.
+            merged = ScheduleRecord(
+                id=record.id,
+                name=record.name,
+                cron=record.cron,
+                timezone=record.timezone,
+                enabled=record.enabled,
+                payload=record.payload,
+                next_run_at=(
+                    record.next_run_at if clock_changed else live.next_run_at
+                ),
+                created_at=live.created_at,
+                updated_at=record.updated_at,
+                last_run_at=live.last_run_at,
+                last_job_id=live.last_job_id,
+                last_error=live.last_error,
+            )
+            cursor = connection.execute(
+                """UPDATE schedules SET name=?,cron=?,timezone=?,enabled=?,payload=?,
+                next_run_at=?,updated_at=? WHERE id=?""",
+                (
+                    merged.name,
+                    merged.cron,
+                    merged.timezone,
+                    int(merged.enabled),
+                    merged.payload,
+                    merged.next_run_at.isoformat(),
+                    merged.updated_at.isoformat(),
+                    merged.id,
+                ),
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        return merged if cursor.rowcount == 1 else None
 
     async def delete(self, schedule_id: str) -> bool:
         return await self._run(self._delete, schedule_id)
@@ -420,7 +512,7 @@ class ScheduleService:
                 "updated_at": now,
             }
         )
-        return await self.store.update(updated)
+        return await self.store.update(updated, clock_changed=changed_clock)
 
     async def run_due(self, now: datetime | None = None) -> int:
         current = now or datetime.now(UTC)

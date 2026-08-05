@@ -48,10 +48,13 @@ def _open_image(body: bytes, label: str) -> Image.Image:
         )
     try:
         image = Image.open(io.BytesIO(body))
-        image.load()
-        image = ImageOps.exif_transpose(image)
+        # Header dimensions are available before decoding; enforce the pixel
+        # budget first so a compact, highly compressible upload cannot expand
+        # into hundreds of megabytes of RGBA buffers via load().
         if image.width * image.height > MAX_DIFF_PIXELS:
             raise RenderError("diff_pixel_limit_exceeded", "Visual diff input exceeds the pixel limit.", 413, False)
+        image.load()
+        image = ImageOps.exif_transpose(image)
     except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
         raise RenderError("diff_input_invalid", f"{label} is not a safe supported image.", 422, False) from exc
     return image.convert("RGBA")

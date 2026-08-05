@@ -35,3 +35,18 @@ class BulkJobContractTests(unittest.TestCase):
             BulkJobRequest.model_validate(
                 {"items": [{"render": {"url": "https://example.com"}}] * 101}
             )
+
+    def test_bulk_aggregate_source_is_bounded(self):
+        # 5 x 5 MiB embedded sources are each individually valid (per-item cap
+        # is 5 MiB) but exceed the 20 MiB aggregate budget in one request.
+        items = [
+            {"render": {"html": "x" * (5 * 1024 * 1024)}}
+            for _ in range(5)
+        ]
+        with self.assertRaises(ValidationError):
+            BulkJobRequest.model_validate({"items": items})
+
+        accepted = BulkJobRequest.model_validate(
+            {"items": [{"render": {"html": "x" * (5 * 1024 * 1024)}} for _ in range(4)]}
+        )
+        self.assertEqual(len(accepted.items), 4)

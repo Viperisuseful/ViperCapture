@@ -20,6 +20,14 @@ from async_jobs import Artifact, ArtifactStoreConfig, StoredArtifact
 UTC = timezone.utc
 NOT_FOUND_CODES = {"NoSuchKey", "404", "NotFound"}
 OWNER_METADATA = "vipercapture-v1"
+# Listing pages are capped at 1000 keys by S3; two pages bound each
+# maintenance pass to at most 2000 listed objects so the frequent
+# submission/status-driven maintenance cadence cannot degenerate into a
+# bucket-wide scan. A continuation cursor carries the scan forward across
+# passes, and only objects older than the result TTL get a HeadObject —
+# anything newer cannot be expired yet.
+MAINTENANCE_LIST_PAGES = 2
+MAINTENANCE_PAGE_SIZE = 1000
 
 
 def _safe_extension(filename: str) -> str:
@@ -52,6 +60,7 @@ class S3ArtifactStore:
         self.config = config
         self.bucket = bucket
         self.prefix = prefix.strip("/")
+        self._maintenance_continuation: str | None = None
         self.client = client or boto3.client(
             "s3",
             endpoint_url=os.getenv("VIPERCAPTURE_S3_ENDPOINT_URL") or None,
@@ -150,18 +159,30 @@ class S3ArtifactStore:
         )
 
     async def maintain(self, now: datetime) -> None:
-        continuation = None
-        while True:
+        # Objects younger than the TTL cannot be expired yet; skip their
+        # HeadObject calls entirely so each pass costs list calls plus heads
+        # only for expiry candidates.
+        candidate_cutoff = now - self.config.result_ttl
+        pages = 0
+        while pages < MAINTENANCE_LIST_PAGES:
             arguments = {
                 "Bucket": self.bucket,
                 "Prefix": f"{self.prefix}/" if self.prefix else "",
             }
-            if continuation:
-                arguments["ContinuationToken"] = continuation
+            if self._maintenance_continuation:
+                arguments["ContinuationToken"] = self._maintenance_continuation
             response = await asyncio.to_thread(self.client.list_objects_v2, **arguments)
+            pages += 1
             for item in response.get("Contents", []):
                 key = item.get("Key")
                 if not isinstance(key, str) or not self._owned_key_shape(key):
+                    continue
+                last_modified = item.get("LastModified")
+                if (
+                    isinstance(last_modified, datetime)
+                    and last_modified.tzinfo is not None
+                    and last_modified > candidate_cutoff
+                ):
                     continue
                 try:
                     head = await asyncio.to_thread(
@@ -185,8 +206,9 @@ class S3ArtifactStore:
                 ):
                     await self.delete(key)
             if not response.get("IsTruncated"):
+                self._maintenance_continuation = None
                 break
-            continuation = response.get("NextContinuationToken")
+            self._maintenance_continuation = response.get("NextContinuationToken")
 
     def _owned_key_shape(self, key: str) -> bool:
         relative = key

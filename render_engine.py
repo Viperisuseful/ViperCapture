@@ -60,6 +60,11 @@ MAX_METADATA_ITEMS = 100
 MAX_METADATA_VALUE_CHARS = 2_048
 DNS_RESOLUTION_TIMEOUT_SECONDS = 5
 MAX_DIAGNOSTIC_EVENTS = 500
+# Assertion matches are tracked across every request event, independent of the
+# bounded diagnostic sample, so a specifically asserted failure that arrives
+# after the sample is full still fails the render.
+MAX_FAILED_REQUEST_EVENTS = 200
+MAX_ASSERTION_MATCHES = 200
 
 
 def _ffmpeg_executable() -> Path:
@@ -773,6 +778,7 @@ class RenderEngine:
         page: Page,
         request: RenderRequest,
         failed_requests: list[dict[str, object]],
+        assertion_matches: list[dict[str, object]] | None = None,
     ) -> None:
         for expected in request.assertions.content_includes:
             present = await page.evaluate(
@@ -801,12 +807,19 @@ class RenderEngine:
                     {"assertion": "content_excludes", "value": forbidden},
                 )
         for pattern in request.assertions.request_failures:
-            matching = [
+            matched = [
                 failure
-                for failure in failed_requests
+                for failure in assertion_matches or []
                 if fnmatchcase(str(failure.get("url", "")), pattern)
             ]
-            if matching:
+            seen = {id(item) for item in matched}
+            matched.extend(
+                failure
+                for failure in failed_requests
+                if id(failure) not in seen
+                and fnmatchcase(str(failure.get("url", "")), pattern)
+            )
+            if matched:
                 raise RenderError(
                     "request_assertion_failed",
                     "A matching page request failed.",
@@ -814,7 +827,7 @@ class RenderEngine:
                     True,
                     {
                         "pattern": pattern,
-                        "failures": matching[:10],
+                        "failures": matched[:10],
                     },
                 )
 
@@ -830,6 +843,7 @@ class RenderEngine:
         try:
             async with asyncio.timeout(limits.deadline_seconds):
                 outputs: list[tuple[str, RenderArtifact]] = []
+                cumulative_bytes = 0
                 for viewport in request.viewports:
                     environment = request.environment.model_copy(
                         update={"device": viewport.device}
@@ -845,9 +859,20 @@ class RenderEngine:
                             "environment": environment,
                         }
                     )
-                    outputs.append(
-                        (viewport.name, await self._render_single(browser, single, limits))
-                    )
+                    artifact = await self._render_single(browser, single, limits)
+                    # The archive is stored uncompressed, so the cumulative
+                    # artifact bytes are a lower bound on the final body. Abort
+                    # before retaining or rendering work that cannot fit the
+                    # archive budget.
+                    if cumulative_bytes + len(artifact.body) > limits.output_bytes:
+                        raise RenderError(
+                            "output_too_large",
+                            "The viewport archive exceeds the output limit.",
+                            413,
+                            False,
+                        )
+                    cumulative_bytes += len(artifact.body)
+                    outputs.append((viewport.name, artifact))
 
                 manifest_outputs = []
                 archive_buffer = io.BytesIO()
@@ -942,6 +967,8 @@ class RenderEngine:
         video_directory = None
         blocked_urls: list[str] = []
         failed_requests: list[dict[str, object]] = []
+        assertion_patterns = tuple(request.assertions.request_failures)
+        assertion_matches: list[dict[str, object]] = []
         console_events: list[dict[str, object]] = []
         network_events: list[dict[str, object]] = []
         try:
@@ -1107,25 +1134,38 @@ class RenderEngine:
                     page.on("console", record_console)
                     page.on("response", record_network)
 
+                def record_failure(url: str, detail: dict[str, object]) -> None:
+                    # Diagnostic sampling stays bounded, but assertion matches
+                    # are tracked across every event so a specifically asserted
+                    # failure arriving after the sample is full still fails.
+                    if len(failed_requests) < MAX_FAILED_REQUEST_EVENTS:
+                        failed_requests.append(detail)
+                    if assertion_patterns:
+                        for pattern in assertion_patterns:
+                            if fnmatchcase(url, pattern):
+                                if len(assertion_matches) < MAX_ASSERTION_MATCHES:
+                                    assertion_matches.append(detail)
+                                break
+
                 def record_failed(page_request) -> None:
-                    if len(failed_requests) >= 200:
-                        return
                     failure = page_request.failure
-                    failed_requests.append(
+                    record_failure(
+                        page_request.url[:2_048],
                         {
                             "url": page_request.url[:2_048],
                             "error": str(failure or "request_failed")[:512],
-                        }
+                        },
                     )
 
                 def record_error_response(response) -> None:
-                    if response.status < 400 or len(failed_requests) >= 200:
+                    if response.status < 400:
                         return
-                    failed_requests.append(
+                    record_failure(
+                        response.url[:2_048],
                         {
                             "url": response.url[:2_048],
                             "status": response.status,
-                        }
+                        },
                     )
 
                 page.on("requestfailed", record_failed)
@@ -1222,7 +1262,9 @@ class RenderEngine:
                         await self.cleanup_hooks.apply(page, request.cleanup)
                     if self.challenge_checker:
                         await self.challenge_checker(page, request.proceed_on_captcha, navigation_status)
-                await self._check_assertions(page, request, failed_requests)
+                await self._check_assertions(
+                    page, request, failed_requests, assertion_matches
+                )
 
                 if request.output is OutputFormat.WEBM:
                     options = request.video
@@ -1255,11 +1297,14 @@ class RenderEngine:
                         trimmed_path,
                         duration_ms=options.duration_ms,
                     )
-                    body = trimmed_path.read_bytes()
-                    if not body:
+                    # Stat before reading so an oversized recording is rejected
+                    # without allocating its full body in this process.
+                    trimmed_size = await asyncio.to_thread(os.path.getsize, trimmed_path)
+                    if trimmed_size == 0:
                         raise RenderError("empty_output", "The renderer produced an empty video.", 502, True)
-                    if len(body) > limits.output_bytes:
+                    if trimmed_size > limits.output_bytes:
                         raise RenderError("output_too_large", "The rendered video exceeds the output limit.", 413, False)
+                    body = await asyncio.to_thread(trimmed_path.read_bytes)
                     artifact = RenderArtifact(
                         body,
                         "video/webm",

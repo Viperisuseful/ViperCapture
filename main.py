@@ -12,7 +12,7 @@ from typing import Awaitable, TypeVar
 from urllib.parse import urlencode
 from uuid import UUID
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
     FileResponse,
@@ -977,10 +977,23 @@ async def create_schedule(payload: ScheduleCreate) -> JSONResponse:
 
 
 @app.get("/v1/schedules")
-async def list_schedules() -> JSONResponse:
-    records = await _schedule_service().store.list()
+async def list_schedules(
+    after: UUID | None = None,
+    limit: int = Query(default=100, ge=1, le=100),
+) -> JSONResponse:
+    # Metadata-only pages: encrypted render payloads stay in the store and are
+    # never materialized for listings.
+    documents = await _schedule_service().store.list_page(
+        after=str(after) if after is not None else None,
+        limit=limit,
+    )
+    next_cursor = documents[-1]["id"] if len(documents) == limit else None
     return JSONResponse(
-        {"count": len(records), "schedules": [public_schedule_document(item) for item in records]},
+        {
+            "count": len(documents),
+            "schedules": documents,
+            "next_cursor": next_cursor,
+        },
         headers={"Cache-Control": "private, no-store"},
     )
 
