@@ -89,7 +89,8 @@ class RenderCacheTests(unittest.IsolatedAsyncioTestCase):
             )
             await self_hosted.start()
             hosted = RenderCache(
-                root, security_namespace="hosted=1;scripts=0"
+                root,
+                security_namespace="hosted=1;scripts=0;max_pixels=1000000",
             )
             await hosted.start()
             request = RenderRequest(url="https://example.com", cache=True)
@@ -97,6 +98,23 @@ class RenderCacheTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotEqual(
                 self_hosted.key(request), hosted.key(request)
             )
+
+    async def test_pixel_limit_changes_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            larger = RenderCache(
+                root,
+                security_namespace="hosted=1;scripts=0;max_pixels=200",
+            )
+            smaller = RenderCache(
+                root,
+                security_namespace="hosted=1;scripts=0;max_pixels=100",
+            )
+            await larger.start()
+            await smaller.start()
+            request = RenderRequest(url="https://example.com", cache=True)
+
+            self.assertNotEqual(larger.key(request), smaller.key(request))
 
     async def test_total_byte_budget_evicts_oldest_entries(self):
         with tempfile.TemporaryDirectory() as directory:

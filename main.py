@@ -305,7 +305,8 @@ async def lifespan(app: FastAPI):
         max_entries=CACHE_MAX_ENTRIES,
         max_bytes=CACHE_MAX_BYTES,
         security_namespace=(
-            f"hosted={int(HOSTED)};scripts={int(ALLOW_SCRIPTS)}"
+            f"hosted={int(HOSTED)};scripts={int(ALLOW_SCRIPTS)};"
+            f"max_pixels={MAX_SCREENSHOT_PIXELS}"
         ),
     )
     try:

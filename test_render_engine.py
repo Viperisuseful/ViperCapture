@@ -223,6 +223,33 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.code, "selector_invalid")
         self.assertFalse(raised.exception.retryable)
 
+    async def test_malformed_wait_selector_is_not_retryable(self):
+        class BrokenLocator(FakeLocator):
+            async def wait_for(self, **_options):
+                raise PlaywrightError(
+                    "Unexpected token while parsing css selector"
+                )
+
+        class BrokenPage(FakePage):
+            def locator(self, _selector):
+                return BrokenLocator(self)
+
+        with self.assertRaises(RenderError) as raised:
+            await RenderEngine(hosted=False).render(
+                FakeBrowser(FakeContext(BrokenPage())),
+                RenderRequest(
+                    url="https://example.com",
+                    wait_for={"selector": "div["},
+                ),
+                RenderLimits(
+                    max_width=1920,
+                    max_height=1080,
+                    max_pixels=2_073_600,
+                ),
+            )
+        self.assertEqual(raised.exception.code, "wait_selector_invalid")
+        self.assertFalse(raised.exception.retryable)
+
     async def test_full_page_capture_uses_validated_rectangle(self):
         page = FakePage()
         with patch(

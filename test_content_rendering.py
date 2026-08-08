@@ -213,6 +213,7 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(single_page.pdf_options["page_ranges"], "1")
         self.assertEqual(single_page.pdf_options["width"], "877px")
         self.assertEqual(single_page.pdf_options["height"], "977px")
+        self.assertEqual(single_page.emulated_media, "print")
 
         landscape = FakePage()
         await render_document_output(

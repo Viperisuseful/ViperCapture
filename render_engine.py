@@ -749,6 +749,15 @@ class RenderEngine:
                     504,
                     True,
                 ) from exc
+            except PlaywrightError as exc:
+                if _invalid_selector_error(exc):
+                    raise RenderError(
+                        "wait_selector_invalid",
+                        "The wait selector is invalid.",
+                        422,
+                        False,
+                    ) from exc
+                raise
         if wait.text:
             try:
                 await page.wait_for_function(

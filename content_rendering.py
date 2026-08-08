@@ -110,6 +110,7 @@ async def _render_pdf(
     single_page = options.mode is PdfMode.SINGLE_PAGE
     if single_page:
         common["landscape"] = False
+        await page.emulate_media(media="print")
         dimensions = await page.evaluate("""() => ({
             width: Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth || 0),
             height: Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0)
