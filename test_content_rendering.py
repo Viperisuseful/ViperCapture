@@ -306,17 +306,19 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(preflight.exception.code, "pdf_page_limit_exceeded")
         self.assertIsNone(print_page.pdf_options)
 
-        forced_breaks = FakePage(height=100, forced_breaks=50)
-        with self.assertRaises(RenderError) as fragmented:
-            await render_document_output(
-                forced_breaks,
-                RenderRequest.model_validate(
-                    {"url": "https://example.com", "output": "pdf"}
-                ),
-                LIMITS,
-            )
-        self.assertEqual(fragmented.exception.code, "pdf_page_limit_exceeded")
-        self.assertIsNone(forced_breaks.pdf_options)
+        redundant_breaks = FakePage(
+            height=100,
+            forced_breaks=98,
+            pdf=pdf_with_pages(MAX_PRINT_PAGES),
+        )
+        fragmented = await render_document_output(
+            redundant_breaks,
+            RenderRequest.model_validate(
+                {"url": "https://example.com", "output": "pdf"}
+            ),
+            LIMITS,
+        )
+        self.assertEqual(fragmented.metadata["pages"], MAX_PRINT_PAGES)
 
     def test_pdf_costs_two_credits(self):
         request = RenderRequest.model_validate({"html": "Hello", "output": "pdf"})

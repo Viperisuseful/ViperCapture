@@ -165,19 +165,9 @@ async def _render_pdf(
         common["page_ranges"] = f"1-{MAX_PRINT_PAGES + 1}"
         await page.emulate_media(media="print")
         dimensions = await page.evaluate("""() => {
-            const forced = new Set(["always", "page", "left", "right", "recto", "verso"]);
-            let forcedBreaks = 0;
-            for (const element of document.querySelectorAll("*")) {
-                const style = getComputedStyle(element);
-                if (forced.has(style.breakBefore) || forced.has(style.breakAfter) ||
-                    style.pageBreakBefore === "always" || style.pageBreakAfter === "always") {
-                    forcedBreaks += 1;
-                }
-            }
             return {
                 width: Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth || 0),
-                height: Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0),
-                forcedBreaks
+                height: Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0)
             };
         }""")
         _paper_width, paper_height = PAPER_INCHES[options.paper_size.value]
@@ -187,9 +177,8 @@ async def _render_pdf(
             1,
             (paper_height - options.margins.top - options.margins.bottom) * 96,
         )
-        estimated_pages = max(
-            math.ceil(max(1, float(dimensions["height"])) / printable_height),
-            int(dimensions.get("forcedBreaks", 0)) + 1,
+        estimated_pages = math.ceil(
+            max(1, float(dimensions["height"])) / printable_height
         )
         if estimated_pages > MAX_PRINT_PAGES:
             raise RenderError(

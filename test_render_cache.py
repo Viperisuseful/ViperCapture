@@ -1,8 +1,10 @@
 import asyncio
+import os
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from render_cache import RenderCache
 from render_contract import RenderRequest
@@ -10,6 +12,26 @@ from render_engine import RenderArtifact
 
 
 class RenderCacheTests(unittest.IsolatedAsyncioTestCase):
+    async def test_interrupted_key_creation_does_not_publish_partial_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original_write = os.write
+
+            def interrupted_write(descriptor, body):
+                original_write(descriptor, body[:1])
+                raise OSError("interrupted")
+
+            with patch("render_cache.os.write", side_effect=interrupted_write):
+                with self.assertRaises(OSError):
+                    await RenderCache(root).start()
+
+            self.assertFalse((root / ".fingerprint-key").exists())
+            recovered = RenderCache(root)
+            await recovered.start()
+            self.assertEqual(
+                len((root / ".fingerprint-key").read_bytes()), 32
+            )
+
     async def test_start_removes_interrupted_publication_files(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

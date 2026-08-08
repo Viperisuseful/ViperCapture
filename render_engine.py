@@ -1321,7 +1321,7 @@ class RenderEngine:
                         )
                     else:
                         navigation = None
-                        document = await asyncio.to_thread(input_document, request)
+                        document = await _settled_thread(input_document, request)
                         if len(document.encode("utf-8")) > limits.output_bytes:
                             raise RenderError(
                                 "document_too_large",

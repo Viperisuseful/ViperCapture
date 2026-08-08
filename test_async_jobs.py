@@ -276,6 +276,61 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await service.close()
 
+    async def test_slow_webhook_does_not_block_later_outbox_rows(self):
+        store = SimpleNamespace(
+            pending_notifications=AsyncMock(),
+            acknowledge_notification=AsyncMock(),
+            defer_notification=AsyncMock(),
+        )
+        slow_started = asyncio.Event()
+        release_slow = asyncio.Event()
+        healthy_delivered = asyncio.Event()
+
+        async def notifier(url, _job):
+            if url.endswith("/slow"):
+                slow_started.set()
+                await release_slow.wait()
+            else:
+                healthy_delivered.set()
+
+        service = AsyncJobService(
+            self.settings,
+            store,
+            self.artifacts,
+            _successful_renderer,
+            notifier=notifier,
+        )
+        now = datetime.now(UTC)
+
+        def pending_job(name):
+            job_id = str(uuid4())
+            return JobRecord(
+                id=job_id,
+                request_id=f"outbox-{name}",
+                status="succeeded",
+                payload=None,
+                attempt_count=1,
+                available_at=now,
+                queue_expires_at=now,
+                created_at=now,
+                webhook_payload=service.cipher.encrypt_webhook(
+                    job_id, f"https://hooks.example/{name}"
+                ),
+                webhook_event_status="succeeded",
+            )
+
+        store.pending_notifications.return_value = [
+            pending_job("slow"),
+            pending_job("healthy"),
+        ]
+        operation = asyncio.create_task(service._drain_notifications())
+        try:
+            await asyncio.wait_for(slow_started.wait(), timeout=1)
+            await asyncio.wait_for(healthy_delivered.wait(), timeout=1)
+        finally:
+            release_slow.set()
+            await operation
+
     async def test_webhook_is_dead_lettered_after_tenth_failure(self):
         store = SimpleNamespace(
             pending_notifications=AsyncMock(),

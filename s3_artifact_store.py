@@ -120,19 +120,27 @@ class S3ArtifactStore:
             raise
         ttl_seconds = self.config.result_ttl.total_seconds()
         try:
-            await asyncio.to_thread(
-                self.client.copy_object,
-                Bucket=self.bucket,
-                Key=key,
-                CopySource={"Bucket": self.bucket, "Key": key},
-                ContentType=media_type,
-                MetadataDirective="REPLACE",
-                Metadata={
-                    "filename": _encode_filename(filename),
-                    "ttl": repr(ttl_seconds),
-                    "owner": OWNER_METADATA,
-                },
+            publication = asyncio.create_task(
+                asyncio.to_thread(
+                    self.client.copy_object,
+                    Bucket=self.bucket,
+                    Key=key,
+                    CopySource={"Bucket": self.bucket, "Key": key},
+                    ContentType=media_type,
+                    MetadataDirective="REPLACE",
+                    Metadata={
+                        "filename": _encode_filename(filename),
+                        "ttl": repr(ttl_seconds),
+                        "owner": OWNER_METADATA,
+                    },
+                )
             )
+            try:
+                await asyncio.shield(publication)
+            except asyncio.CancelledError:
+                with suppress(Exception):
+                    await asyncio.shield(publication)
+                raise
             persisted = await asyncio.to_thread(
                 self.client.head_object,
                 Bucket=self.bucket,

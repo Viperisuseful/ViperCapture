@@ -27,6 +27,7 @@ from render_errors import RenderError
 UTC = timezone.utc
 PAYLOAD_VERSION = b"vipercapture-open-async-v1\0"
 MAX_WEBHOOK_ATTEMPTS = 10
+MAX_WEBHOOK_CONCURRENCY = 4
 logger = logging.getLogger("vipercapture.async_jobs")
 
 
@@ -840,6 +841,77 @@ class AsyncJobService:
                     "artifact maintenance retry error_type=%s",
                     type(exc).__name__,
                 )
+    async def _deliver_notification(self, job: JobRecord) -> None:
+        if self.notifier is None or self._closing or job.webhook_payload is None:
+            return
+        try:
+            url = self.cipher.decrypt_webhook(job)
+        except Exception as exc:
+            logger.error(
+                "webhook outbox payload invalid job_id=%s error_type=%s",
+                job.id,
+                type(exc).__name__,
+            )
+            await self.job_store.acknowledge_notification(
+                job.id, job.webhook_payload
+            )
+            return
+        try:
+            event_job = (
+                replace(
+                    job,
+                    status=job.webhook_event_status,
+                    error_code=(
+                        None
+                        if job.webhook_event_status == "succeeded"
+                        else job.error_code
+                    ),
+                    error_message=(
+                        None
+                        if job.webhook_event_status == "succeeded"
+                        else job.error_message
+                    ),
+                    error_retryable=(
+                        None
+                        if job.webhook_event_status == "succeeded"
+                        else job.error_retryable
+                    ),
+                )
+                if job.webhook_event_status is not None
+                else job
+            )
+            await self.notifier(url, event_job)
+        except Exception as exc:
+            logger.warning(
+                "async job webhook delivery failed job_id=%s error_type=%s",
+                job.id,
+                type(exc).__name__,
+            )
+            if (
+                getattr(exc, "retryable", True) is False
+                or job.webhook_attempt_count + 1 >= MAX_WEBHOOK_ATTEMPTS
+            ):
+                logger.error(
+                    "async job webhook dead-lettered job_id=%s", job.id
+                )
+                await self.job_store.acknowledge_notification(
+                    job.id, job.webhook_payload
+                )
+                return
+            delay = min(
+                3600,
+                0.1 * (2 ** min(job.webhook_attempt_count, 15)),
+            )
+            await self.job_store.defer_notification(
+                job.id,
+                job.webhook_payload,
+                datetime.now(UTC) + timedelta(seconds=delay),
+            )
+            return
+        await self.job_store.acknowledge_notification(
+            job.id, job.webhook_payload
+        )
+
     async def _drain_notifications(self) -> None:
         if self.notifier is None or self._closing:
             return
@@ -854,77 +926,13 @@ class AsyncJobService:
                     type(exc).__name__,
                 )
                 return
-            for job in pending:
-                if self._closing or job.webhook_payload is None:
-                    return
-                try:
-                    url = self.cipher.decrypt_webhook(job)
-                except Exception as exc:
-                    logger.error(
-                        "webhook outbox payload invalid job_id=%s error_type=%s",
-                        job.id,
-                        type(exc).__name__,
-                    )
-                    await self.job_store.acknowledge_notification(
-                        job.id, job.webhook_payload
-                    )
-                    continue
-                try:
-                    event_job = (
-                        replace(
-                            job,
-                            status=job.webhook_event_status,
-                            error_code=(
-                                None
-                                if job.webhook_event_status == "succeeded"
-                                else job.error_code
-                            ),
-                            error_message=(
-                                None
-                                if job.webhook_event_status == "succeeded"
-                                else job.error_message
-                            ),
-                            error_retryable=(
-                                None
-                                if job.webhook_event_status == "succeeded"
-                                else job.error_retryable
-                            ),
-                        )
-                        if job.webhook_event_status is not None
-                        else job
-                    )
-                    await self.notifier(url, event_job)
-                except Exception as exc:
-                    logger.warning(
-                        "async job webhook delivery failed job_id=%s error_type=%s",
-                        job.id,
-                        type(exc).__name__,
-                    )
-                    if (
-                        getattr(exc, "retryable", True) is False
-                        or job.webhook_attempt_count + 1
-                        >= MAX_WEBHOOK_ATTEMPTS
-                    ):
-                        logger.error(
-                            "async job webhook dead-lettered job_id=%s", job.id
-                        )
-                        await self.job_store.acknowledge_notification(
-                            job.id, job.webhook_payload
-                        )
-                        continue
-                    delay = min(
-                        3600,
-                        0.1 * (2 ** min(job.webhook_attempt_count, 15)),
-                    )
-                    await self.job_store.defer_notification(
-                        job.id,
-                        job.webhook_payload,
-                        datetime.now(UTC) + timedelta(seconds=delay),
-                    )
-                    continue
-                await self.job_store.acknowledge_notification(
-                    job.id, job.webhook_payload
-                )
+            slots = asyncio.Semaphore(MAX_WEBHOOK_CONCURRENCY)
+
+            async def deliver(job: JobRecord) -> None:
+                async with slots:
+                    await self._deliver_notification(job)
+
+            await asyncio.gather(*(deliver(job) for job in pending))
 
     async def _notification_worker(self) -> None:
         try:

@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
 
-from async_jobs import _ensure_private_directory
+from async_jobs import _ensure_private_directory, _sync_directory
 from render_contract import RenderRequest, canonical_render_document
 from render_engine import RenderArtifact
 
@@ -57,9 +57,13 @@ class RenderCache:
         try:
             descriptor = os.open(path, flags)
         except FileNotFoundError:
-            create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            descriptor, temporary_name = tempfile.mkstemp(
+                dir=self.directory,
+                prefix=".fingerprint-key.",
+                suffix=".tmp",
+            )
+            temporary = Path(temporary_name)
             try:
-                descriptor = os.open(path, create_flags, 0o600)
                 material = os.urandom(32)
                 try:
                     remaining = memoryview(material)
@@ -68,9 +72,14 @@ class RenderCache:
                     os.fsync(descriptor)
                 finally:
                     os.close(descriptor)
-                descriptor = os.open(path, flags)
-            except FileExistsError:
-                descriptor = os.open(path, flags)
+                try:
+                    os.link(temporary, path)
+                    _sync_directory(self.directory)
+                except FileExistsError:
+                    pass
+            finally:
+                temporary.unlink(missing_ok=True)
+            descriptor = os.open(path, flags)
         try:
             information = os.fstat(descriptor)
             if not stat.S_ISREG(information.st_mode) or (
@@ -210,6 +219,8 @@ class RenderCache:
                 path.unlink(missing_ok=True)
 
     def _trim(self) -> None:
+        for temporary in self.directory.glob(".fingerprint-key.*.tmp"):
+            temporary.unlink(missing_ok=True)
         for temporary in self.directory.glob(".cache-*"):
             temporary.unlink(missing_ok=True)
         for body_path in self.directory.glob("*.bin"):

@@ -918,6 +918,35 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
                 )
         self.assertEqual(raised.exception.code, "document_too_large")
 
+    async def test_cancelled_markdown_input_conversion_settles_thread(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocked_input(_request):
+            started.set()
+            release.wait(timeout=2)
+            return "<p>markdown</p>"
+
+        with patch("content_rendering.input_document", side_effect=blocked_input):
+            operation = asyncio.create_task(
+                RenderEngine(hosted=False).render(
+                    FakeBrowser(),
+                    RenderRequest(markdown="# title"),
+                    RenderLimits(
+                        max_width=1920,
+                        max_height=1080,
+                        max_pixels=2_073_600,
+                    ),
+                )
+            )
+            self.assertTrue(await asyncio.to_thread(started.wait, 1))
+            operation.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(operation.done())
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await operation
+
     async def test_selector_transparency_quality_and_waits(self):
         request = RenderRequest.model_validate(
             {

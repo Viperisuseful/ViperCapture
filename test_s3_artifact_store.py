@@ -71,6 +71,40 @@ class FakeS3:
 
 
 class S3ArtifactStoreTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelled_metadata_publication_settles_before_delete(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        class BlockingS3(FakeS3):
+            def copy_object(self, **kwargs):
+                started.set()
+                release.wait()
+                super().copy_object(**kwargs)
+
+        client = BlockingS3()
+        store = S3ArtifactStore(
+            ArtifactStoreConfig(Path("/tmp/unused"), timedelta(hours=1)),
+            bucket="captures",
+            client=client,
+        )
+        task = asyncio.create_task(
+            store.put(
+                str(uuid4()),
+                b"data",
+                media_type="image/png",
+                filename="x.png",
+            )
+        )
+        await asyncio.to_thread(started.wait)
+        task.cancel()
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+        self.assertEqual(len(client.objects), 1)
+        release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(client.objects, {})
+
     async def test_cancelled_upload_settles_and_deletes_zero_expiry_object(self):
         started = threading.Event()
         release = threading.Event()
