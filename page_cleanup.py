@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -181,8 +182,25 @@ async def setup_autoconsent(page, mode: ConsentMode) -> AutoConsentSession | Non
             session.outcome["error"] = True
             session.done.set()
 
-    await page.expose_function("autoconsentSendMessage", handle_message)
-    await page.add_init_script(script)
+    binding_name = f"__vipercaptureAutoconsent_{secrets.token_hex(16)}"
+    await page.expose_function(binding_name, handle_message)
+    bridge_script = f"""(() => {{
+        let calls = 0;
+        const bridgeName = {json.dumps(binding_name)};
+        const bridge = window[bridgeName];
+        Reflect.deleteProperty(window, bridgeName);
+        Object.defineProperty(window, "autoconsentSendMessage", {{
+            configurable: false,
+            writable: false,
+            value(message) {{
+                if (calls >= 256) return;
+                calls += 1;
+                return bridge(message);
+            }}
+        }});
+    }})();
+    """
+    await page.add_init_script(bridge_script + script)
     return session
 
 

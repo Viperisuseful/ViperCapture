@@ -63,6 +63,23 @@ MAX_DNS_CONCURRENCY = 8
 MAX_DNS_ORIGINS = 100
 PUBLIC_DNS_SLOTS = asyncio.Semaphore(MAX_DNS_CONCURRENCY)
 MAX_DIAGNOSTIC_EVENTS = 500
+CDP_CAPTURE_PREPARE_SCRIPT = """() => {
+    for (const animation of document.getAnimations()) {
+        try {
+            const timing = animation.effect?.getComputedTiming();
+            if (timing && Number.isFinite(timing.endTime)) animation.finish();
+            else animation.cancel();
+        } catch { animation.cancel(); }
+    }
+    const style = document.createElement("style");
+    style.dataset.vipercaptureScreenshot = "true";
+    style.textContent = "*, *::before, *::after { caret-color: transparent !important; }";
+    document.documentElement.append(style);
+    void document.documentElement.offsetWidth;
+}"""
+CDP_CAPTURE_CLEANUP_SCRIPT = """() => document.querySelectorAll(
+    "style[data-vipercapture-screenshot]"
+).forEach((style) => style.remove())"""
 
 
 def _ffmpeg_executable() -> Path:
@@ -73,7 +90,15 @@ def _ffmpeg_executable() -> Path:
     configured = os.getenv("PLAYWRIGHT_BROWSERS_PATH")
     if configured:
         roots.append(Path(configured))
-    roots.append(Path.home() / ".cache" / "ms-playwright")
+    roots.extend(
+        (
+            Path.home() / ".cache" / "ms-playwright",
+            Path.home() / "Library" / "Caches" / "ms-playwright",
+        )
+    )
+    local_app_data = os.getenv("LOCALAPPDATA")
+    if local_app_data:
+        roots.append(Path(local_app_data) / "ms-playwright")
     for root in roots:
         for candidate in sorted(root.glob("ffmpeg-*/ffmpeg-*")):
             if candidate.is_file() and os.access(candidate, os.X_OK):
@@ -552,22 +577,9 @@ async def capture_cdp_image(
     if output not in {OutputFormat.PNG, OutputFormat.WEBP}:
         raise ValueError("CDP capture supports only PNG and WebP")
     session = await page.context.new_cdp_session(page)
-    fast_png = output is OutputFormat.PNG and optimize_for_speed
     try:
         with suppress(Exception):
-            if fast_png:
-                await page.evaluate("""() => {
-                    document.getAnimations().forEach((animation) => animation.pause());
-                    const style = document.createElement("style");
-                    style.dataset.vipercaptureScreenshot = "true";
-                    style.textContent = "*, *::before, *::after { caret-color: transparent !important; }";
-                    document.documentElement.append(style);
-                    void document.documentElement.offsetWidth;
-                }""")
-            else:
-                await page.evaluate(
-                    "() => document.getAnimations().forEach(a => a.pause())"
-                )
+            await page.evaluate(CDP_CAPTURE_PREPARE_SCRIPT)
         if transparent:
             await session.send(
                 "Emulation.setDefaultBackgroundColorOverride",
@@ -586,13 +598,8 @@ async def capture_cdp_image(
         result = await session.send("Page.captureScreenshot", options)
         return b64decode(result["data"])
     finally:
-        if fast_png:
-            with suppress(Exception):
-                await page.evaluate(
-                    """() => document.querySelectorAll(
-                        "style[data-vipercapture-screenshot]"
-                    ).forEach((style) => style.remove())"""
-                )
+        with suppress(Exception):
+            await page.evaluate(CDP_CAPTURE_CLEANUP_SCRIPT)
         if transparent:
             with suppress(Exception):
                 await session.send("Emulation.setDefaultBackgroundColorOverride")
@@ -631,14 +638,7 @@ async def capture_clipped_image(
     session = await page.context.new_cdp_session(page)
     try:
         with suppress(Exception):
-            await page.evaluate("""() => {
-                document.getAnimations().forEach((animation) => animation.pause());
-                const style = document.createElement("style");
-                style.dataset.vipercaptureScreenshot = "true";
-                style.textContent = "*, *::before, *::after { caret-color: transparent !important; }";
-                document.documentElement.append(style);
-                void document.documentElement.offsetWidth;
-            }""")
+            await page.evaluate(CDP_CAPTURE_PREPARE_SCRIPT)
         if transparent:
             await session.send(
                 "Emulation.setDefaultBackgroundColorOverride",
@@ -656,11 +656,7 @@ async def capture_clipped_image(
         return b64decode(result["data"])
     finally:
         with suppress(Exception):
-            await page.evaluate(
-                """() => document.querySelectorAll(
-                    "style[data-vipercapture-screenshot]"
-                ).forEach((style) => style.remove())"""
-            )
+            await page.evaluate(CDP_CAPTURE_CLEANUP_SCRIPT)
         if transparent:
             with suppress(Exception):
                 await session.send("Emulation.setDefaultBackgroundColorOverride")

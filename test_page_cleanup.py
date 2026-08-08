@@ -46,10 +46,12 @@ class CleanupPolicyTest(unittest.IsolatedAsyncioTestCase):
         class Page:
             def __init__(self):
                 self.callback = None
+                self.binding_name = None
                 self.init_script = ""
                 self.messages = []
 
-            async def expose_function(self, _name, callback):
+            async def expose_function(self, name, callback):
+                self.binding_name = name
                 self.callback = callback
 
             async def add_init_script(self, script):
@@ -64,6 +66,9 @@ class CleanupPolicyTest(unittest.IsolatedAsyncioTestCase):
         session = await setup_autoconsent(page, "reject")
         self.assertIsNotNone(session)
         self.assertIn("autoconsentReceiveMessage", page.init_script)
+        self.assertNotEqual(page.binding_name, "autoconsentSendMessage")
+        self.assertIn("if (calls >= 256) return", page.init_script)
+        self.assertIn("Reflect.deleteProperty", page.init_script)
         await page.callback({"type": "init"})
         init = page.messages[-1]
         self.assertEqual(init["type"], "initResp")

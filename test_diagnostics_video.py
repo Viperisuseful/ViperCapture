@@ -1,9 +1,12 @@
 import asyncio
 import io
 import json
+import os
+import tempfile
 import threading
 import unittest
 import zipfile
+from pathlib import Path
 from unittest.mock import patch
 
 from pydantic import ValidationError
@@ -12,12 +15,40 @@ from render_contract import RenderRequest
 from render_engine import (
     RenderArtifact,
     RenderLimits,
+    _ffmpeg_executable,
     diagnostic_bundle,
     diagnostic_url,
 )
 
 
 class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
+    def test_ffmpeg_discovery_checks_native_playwright_caches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidates = (
+                root / "Library" / "Caches" / "ms-playwright" / "ffmpeg-1" / "ffmpeg-mac",
+                root / "local" / "ms-playwright" / "ffmpeg-1" / "ffmpeg-win64.exe",
+            )
+            for candidate in candidates:
+                candidate.parent.mkdir(parents=True)
+                candidate.write_bytes(b"ffmpeg")
+                candidate.chmod(0o700)
+
+            with (
+                patch("render_engine.shutil.which", return_value=None),
+                patch("render_engine.Path.home", return_value=root),
+                patch.dict(os.environ, {"LOCALAPPDATA": str(root / "local")}, clear=True),
+            ):
+                self.assertEqual(_ffmpeg_executable(), candidates[0])
+
+            candidates[0].unlink()
+            with (
+                patch("render_engine.shutil.which", return_value=None),
+                patch("render_engine.Path.home", return_value=root),
+                patch.dict(os.environ, {"LOCALAPPDATA": str(root / "local")}, clear=True),
+            ):
+                self.assertEqual(_ffmpeg_executable(), candidates[1])
+
     def test_diagnostic_urls_drop_secrets(self):
         sanitized = diagnostic_url("https://user:pass@example.com/path?token=secret#fragment")
         self.assertEqual(sanitized, "https://example.com/path")

@@ -168,6 +168,8 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
             transparent=False,
         )
         self.assertIn("caret-color: transparent", evaluations[0])
+        self.assertIn("animation.finish()", evaluations[0])
+        self.assertIn("animation.cancel()", evaluations[0])
         self.assertIn("style[data-vipercapture-screenshot]", evaluations[-1])
 
     async def test_action_transport_failure_remains_retryable(self):
