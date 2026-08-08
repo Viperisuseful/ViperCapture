@@ -289,6 +289,48 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
         stored = await self.store.get(record.id)
         self.assertEqual(stored.last_job_id, "job-1")
 
+    async def test_deleted_claim_is_revalidated_before_submission(self):
+        record = await self.service.create(
+            ScheduleCreate(
+                name="Delete race",
+                cron="* * * * *",
+                render=RenderRequest(html="do not submit"),
+            )
+        )
+        now = datetime.now(UTC) + timedelta(minutes=2)
+        claimed = await self.store.claim_due(now)
+        self.assertTrue(await self.service.delete(record.id))
+        self.store.claim_due = AsyncMock(return_value=claimed)
+
+        await self.service.run_due(now)
+
+        self.assertEqual(self.jobs.calls, [])
+
+    async def test_disabling_schedule_clears_pending_retry_counter(self):
+        record = await self.service.create(
+            ScheduleCreate(
+                name="Disable retry",
+                cron="* * * * *",
+                render=RenderRequest(html="pending"),
+            )
+        )
+        now = datetime.now(UTC) + timedelta(minutes=2)
+        due_at = (await self.store.claim_due(now))[0][1]
+        self.assertTrue(
+            await self.store.advance_occurrence_attempt(
+                record.id,
+                due_at=due_at,
+                expected_attempt=0,
+            )
+        )
+        pending = await self.store.get(record.id)
+        self.assertEqual(pending.pending_attempt, 1)
+
+        await self.service.update(pending, ScheduleUpdate(enabled=False))
+
+        disabled = await self.store.get(record.id)
+        self.assertEqual(disabled.pending_attempt, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

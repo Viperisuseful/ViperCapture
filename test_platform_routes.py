@@ -102,6 +102,34 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.body, b"cached")
         self.assertEqual(response.headers["x-vipercapture-cache"], "hit")
 
+    async def test_cache_miss_is_rechecked_after_chromium_slot(self):
+        original_cache = getattr(main.app.state, "render_cache", None)
+        original_slots = getattr(main.app.state, "capture_slots", None)
+        original_browser = getattr(main.app.state, "browser", None)
+        cached = RenderArtifact(b"cached", "image/png", "capture.png")
+        cache = SimpleNamespace(
+            get=AsyncMock(side_effect=[None, cached]),
+            put=AsyncMock(),
+        )
+        main.app.state.render_cache = cache
+        main.app.state.capture_slots = asyncio.Semaphore(1)
+        main.app.state.browser = SimpleNamespace(is_connected=lambda: True)
+        engine = SimpleNamespace(render_image=AsyncMock())
+        request = SimpleNamespace(is_disconnected=AsyncMock(return_value=False))
+        try:
+            with patch("main._render_engine", return_value=engine):
+                response = await main._render_response(
+                    RenderRequest(html="cached", cache=True), request
+                )
+        finally:
+            main.app.state.render_cache = original_cache
+            main.app.state.capture_slots = original_slots
+            main.app.state.browser = original_browser
+        self.assertEqual(response.body, b"cached")
+        self.assertEqual(response.headers["x-vipercapture-cache"], "hit")
+        self.assertEqual(cache.get.await_count, 2)
+        engine.render_image.assert_not_awaited()
+
     async def test_signed_url_rejects_webhook_delivery(self):
         payload = RenderRequest.model_validate(
             {

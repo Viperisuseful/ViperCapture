@@ -859,7 +859,25 @@ class AsyncJobService:
                     continue
                 try:
                     event_job = (
-                        replace(job, status=job.webhook_event_status)
+                        replace(
+                            job,
+                            status=job.webhook_event_status,
+                            error_code=(
+                                None
+                                if job.webhook_event_status == "succeeded"
+                                else job.error_code
+                            ),
+                            error_message=(
+                                None
+                                if job.webhook_event_status == "succeeded"
+                                else job.error_message
+                            ),
+                            error_retryable=(
+                                None
+                                if job.webhook_event_status == "succeeded"
+                                else job.error_retryable
+                            ),
+                        )
                         if job.webhook_event_status is not None
                         else job
                     )

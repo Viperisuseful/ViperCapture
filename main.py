@@ -696,18 +696,27 @@ async def _render_response(payload: RenderRequest, request: Request) -> Response
         queue_ms = round((time.perf_counter() - queue_started) * 1000)
         browser: Browser = app.state.browser
         engine = _render_engine()
-        render_started = time.perf_counter()
         try:
-            artifact = await _await_while_connected(
-                request,
-                engine.render_image(
-                    browser,
-                    payload,
-                    RenderLimits(max_pixels=MAX_SCREENSHOT_PIXELS),
-                ),
-            )
             if payload.cache and cache is not None:
-                await cache.put(payload, artifact)
+                artifact = await _await_while_connected(
+                    request, cache.get(payload)
+                )
+                cache_hit = artifact is not None
+            if artifact is None:
+                render_started = time.perf_counter()
+                artifact = await _await_while_connected(
+                    request,
+                    engine.render_image(
+                        browser,
+                        payload,
+                        RenderLimits(max_pixels=MAX_SCREENSHOT_PIXELS),
+                    ),
+                )
+                render_ms = round(
+                    (time.perf_counter() - render_started) * 1000
+                )
+                if payload.cache and cache is not None:
+                    await cache.put(payload, artifact)
         except RenderError:
             if not browser.is_connected():
                 with suppress(Exception):
@@ -715,7 +724,6 @@ async def _render_response(payload: RenderRequest, request: Request) -> Response
             raise
         finally:
             app.state.capture_slots.release()
-        render_ms = round((time.perf_counter() - render_started) * 1000)
     metadata = artifact.metadata or {}
     diagnostic_headers = {
         "X-ViperCapture-Queue-Ms": str(max(0, queue_ms)),
@@ -1106,7 +1114,7 @@ async def update_schedule(schedule_id: UUID, payload: ScheduleUpdate) -> JSONRes
 
 @app.delete("/v1/schedules/{schedule_id}", status_code=204)
 async def delete_schedule(schedule_id: UUID) -> Response:
-    deleted = await _schedule_service().store.delete(str(schedule_id))
+    deleted = await _schedule_service().delete(str(schedule_id))
     if not deleted:
         raise RenderError("schedule_not_found", "The schedule was not found.", 404, False)
     return Response(status_code=204)

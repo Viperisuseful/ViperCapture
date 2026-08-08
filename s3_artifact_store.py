@@ -129,7 +129,7 @@ class S3ArtifactStore:
                 MetadataDirective="REPLACE",
                 Metadata={
                     "filename": _encode_filename(filename),
-                    "expires": str(int(expires_at.timestamp())),
+                    "expires": repr(expires_at.timestamp()),
                     "owner": OWNER_METADATA,
                 },
             )
@@ -171,10 +171,10 @@ class S3ArtifactStore:
             raise
         metadata = response.get("Metadata", {})
         try:
-            expires = int(metadata.get("expires", "0"))
+            expires = float(metadata.get("expires", "0"))
         except ValueError:
             expires = 0
-        if not expires or expires <= int(datetime.now(UTC).timestamp()):
+        if not expires or expires <= datetime.now(UTC).timestamp():
             close = getattr(response.get("Body"), "close", None)
             if close is not None:
                 await asyncio.to_thread(close)
@@ -238,13 +238,13 @@ class S3ArtifactStore:
                 raise
             metadata = head.get("Metadata", {})
             try:
-                expires = int(metadata.get("expires", "0"))
+                expires = float(metadata.get("expires", "0"))
             except (TypeError, ValueError):
                 continue
             if (
                 metadata.get("owner") == OWNER_METADATA
                 and (
-                    (expires > 0 and expires <= int(now.timestamp()))
+                    (expires > 0 and expires <= now.timestamp())
                     or (
                         expires == 0
                         and isinstance(modified, datetime)

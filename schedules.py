@@ -321,6 +321,7 @@ class ScheduleStore:
         cursor = connection.execute(
             """UPDATE schedules SET name=?,cron=?,timezone=?,enabled=?,payload=?,
             next_run_at=?,pending_run_at=CASE WHEN ?=0 THEN NULL ELSE pending_run_at END,
+            pending_attempt=CASE WHEN ?=0 THEN 0 ELSE pending_attempt END,
             updated_at=? WHERE id=? AND updated_at=?""",
             (
                 record.name,
@@ -329,6 +330,7 @@ class ScheduleStore:
                 int(record.enabled),
                 record.payload,
                 record.next_run_at.isoformat(),
+                int(record.enabled),
                 int(record.enabled),
                 record.updated_at.isoformat(),
                 record.id,
@@ -363,6 +365,32 @@ class ScheduleStore:
 
     async def claim_due(self, now: datetime) -> list[tuple[ScheduleRecord, datetime]]:
         return await self._run(self._claim_due, now)
+
+    async def claim_is_current(
+        self,
+        schedule_id: str,
+        due_at: datetime,
+        pending_attempt: int,
+    ) -> bool:
+        return await self._run(
+            self._claim_is_current,
+            schedule_id,
+            due_at,
+            pending_attempt,
+        )
+
+    def _claim_is_current(
+        self,
+        schedule_id: str,
+        due_at: datetime,
+        pending_attempt: int,
+    ) -> bool:
+        row = self._require().execute(
+            """SELECT 1 FROM schedules WHERE id=? AND enabled=1
+            AND pending_run_at=? AND pending_attempt=?""",
+            (schedule_id, due_at.isoformat(), pending_attempt),
+        ).fetchone()
+        return row is not None
 
     def _claim_due(
         self, now: datetime
@@ -516,6 +544,7 @@ class ScheduleService:
         self.cipher = cipher
         self.poll_seconds = max(0.1, poll_seconds)
         self.task: asyncio.Task | None = None
+        self.mutation_lock = asyncio.Lock()
 
     async def start(self) -> None:
         await self.store.start()
@@ -587,9 +616,10 @@ class ScheduleService:
             }
         )
         try:
-            return await self.store.update(
-                updated, expected_updated_at=record.updated_at
-            )
+            async with self.mutation_lock:
+                return await self.store.update(
+                    updated, expected_updated_at=record.updated_at
+                )
         except KeyError as exc:
             raise RenderError(
                 "schedule_conflict",
@@ -597,6 +627,10 @@ class ScheduleService:
                 409,
                 True,
             ) from exc
+
+    async def delete(self, schedule_id: str) -> bool:
+        async with self.mutation_lock:
+            return await self.store.delete(schedule_id)
 
     async def run_due(self, now: datetime | None = None) -> int:
         current = now or datetime.now(UTC)
@@ -617,26 +651,35 @@ class ScheduleService:
                 )
                 continue
             try:
-                request_id = (
-                    f"schedule-{record.id}-{int(due_at.timestamp())}"
-                    + (
-                        f"-retry-{record.pending_attempt}"
-                        if record.pending_attempt
-                        else ""
-                    )
-                )
-                job = await self.jobs.submit(
-                    render,
-                    request_id=request_id,
-                )
-                if job.status == "expired" and job.attempt_count == 0:
-                    await self.store.advance_occurrence_attempt(
+                async with self.mutation_lock:
+                    if not await self.store.claim_is_current(
                         record.id,
-                        due_at=due_at,
-                        expected_attempt=record.pending_attempt,
+                        due_at,
+                        record.pending_attempt,
+                    ):
+                        continue
+                    request_id = (
+                        f"schedule-{record.id}-{int(due_at.timestamp())}"
+                        + (
+                            f"-retry-{record.pending_attempt}"
+                            if record.pending_attempt
+                            else ""
+                        )
                     )
-                    continue
-                await self.store.record_result(record.id, job_id=job.id, error=None)
+                    job = await self.jobs.submit(
+                        render,
+                        request_id=request_id,
+                    )
+                    if job.status == "expired" and job.attempt_count == 0:
+                        await self.store.advance_occurrence_attempt(
+                            record.id,
+                            due_at=due_at,
+                            expected_attempt=record.pending_attempt,
+                        )
+                        continue
+                    await self.store.record_result(
+                        record.id, job_id=job.id, error=None
+                    )
             except Exception as exc:
                 retryable = not isinstance(exc, RenderError) or exc.retryable
                 if retryable:

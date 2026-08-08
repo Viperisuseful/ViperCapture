@@ -167,7 +167,7 @@ class S3ArtifactStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(stored.key.startswith("results/"))
         self.assertEqual(
             client.objects[stored.key]["Metadata"]["expires"],
-            str(int(stored.expires_at.timestamp())),
+            repr(stored.expires_at.timestamp()),
         )
         self.assertEqual(len(stored.key.split("/")), 3)
         artifact = await store.get(stored.key)

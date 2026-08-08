@@ -317,6 +317,57 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         store.defer_notification.assert_not_awaited()
 
+    async def test_delayed_success_webhook_clears_later_expiry_error(self):
+        store = SimpleNamespace(
+            pending_notifications=AsyncMock(),
+            acknowledge_notification=AsyncMock(),
+            defer_notification=AsyncMock(),
+        )
+        delivered = []
+
+        async def notifier(_url, job):
+            delivered.append(job)
+
+        service = AsyncJobService(
+            self.settings,
+            store,
+            self.artifacts,
+            _successful_renderer,
+            notifier=notifier,
+        )
+        now = datetime.now(timezone.utc)
+        job_id = str(uuid4())
+        webhook_payload = service.cipher.encrypt_webhook(
+            job_id, "https://hooks.example/success"
+        )
+        store.pending_notifications.return_value = [
+            JobRecord(
+                id=job_id,
+                request_id="delayed-success",
+                status="expired",
+                payload=None,
+                attempt_count=1,
+                available_at=now,
+                queue_expires_at=now,
+                created_at=now,
+                webhook_payload=webhook_payload,
+                webhook_event_status="succeeded",
+                error_code="async_result_expired",
+                error_message="expired",
+                error_retryable=False,
+                media_type="image/png",
+                filename="capture.png",
+                artifact_bytes=4,
+            )
+        ]
+
+        await service._drain_notifications()
+
+        self.assertEqual(delivered[0].status, "succeeded")
+        self.assertIsNone(delivered[0].error_code)
+        self.assertIsNone(delivered[0].error_message)
+        self.assertIsNone(delivered[0].error_retryable)
+
     async def test_request_id_is_idempotent_and_queue_limit_is_atomic(self):
         await self.store.start()
         await self.artifacts.start()
