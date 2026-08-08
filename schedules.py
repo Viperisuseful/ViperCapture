@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
+import sqlite3
+import stat
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import logging
-import os
 from pathlib import Path
-import sqlite3
-import stat
 from types import SimpleNamespace
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from async_jobs import AsyncJobService, PayloadCipher, _ensure_private_directory
 from render_contract import RenderRequest
-
+from render_errors import RenderError
 
 UTC = timezone.utc
 logger = logging.getLogger("vipercapture.schedules")
@@ -182,13 +182,14 @@ class ScheduleStore:
 
     @staticmethod
     def _record(row: sqlite3.Row) -> ScheduleRecord:
+        columns = row.keys()
         return ScheduleRecord(
             id=row["id"],
             name=row["name"],
             cron=row["cron"],
             timezone=row["timezone"],
             enabled=bool(row["enabled"]),
-            payload=bytes(row["payload"]),
+            payload=bytes(row["payload"]) if "payload" in columns else b"",
             next_run_at=_as_utc(row["next_run_at"]),
             last_run_at=_as_utc(row["last_run_at"]),
             last_job_id=row["last_job_id"],
@@ -234,25 +235,50 @@ class ScheduleStore:
             "SELECT * FROM schedules WHERE id = ?", (schedule_id,)
         ).fetchone()
 
-    async def list(self) -> list[ScheduleRecord]:
-        rows = await self._run(self._list)
+    async def list(
+        self, *, limit: int = 50, after: str | None = None
+    ) -> list[ScheduleRecord]:
+        rows = await self._run(self._list, limit, after)
         return [self._record(row) for row in rows]
 
-    def _list(self) -> list[sqlite3.Row]:
-        return self._require().execute(
-            "SELECT * FROM schedules ORDER BY created_at, id"
+    def _list(self, limit: int, after: str | None) -> list[sqlite3.Row]:
+        connection = self._require()
+        cursor_created_at = None
+        if after is not None:
+            cursor = connection.execute(
+                "SELECT created_at FROM schedules WHERE id = ?", (after,)
+            ).fetchone()
+            if cursor is None:
+                return []
+            cursor_created_at = cursor["created_at"]
+        columns = (
+            "id,name,cron,timezone,enabled,next_run_at,last_run_at,last_job_id,"
+            "last_error,created_at,updated_at"
+        )
+        if cursor_created_at is None:
+            return connection.execute(
+                f"SELECT {columns} FROM schedules ORDER BY created_at,id LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return connection.execute(
+            f"SELECT {columns} FROM schedules "
+            "WHERE created_at > ? OR (created_at = ? AND id > ?) "
+            "ORDER BY created_at,id LIMIT ?",
+            (cursor_created_at, cursor_created_at, after, limit),
         ).fetchall()
 
-    async def update(self, record: ScheduleRecord) -> ScheduleRecord:
-        if not await self._run(self._update, record):
+    async def update(
+        self, record: ScheduleRecord, *, expected_updated_at: datetime
+    ) -> ScheduleRecord:
+        if not await self._run(self._update, record, expected_updated_at):
             raise KeyError(record.id)
         return record
 
-    def _update(self, record: ScheduleRecord) -> bool:
+    def _update(self, record: ScheduleRecord, expected_updated_at: datetime) -> bool:
         connection = self._require()
         cursor = connection.execute(
             """UPDATE schedules SET name=?,cron=?,timezone=?,enabled=?,payload=?,
-            next_run_at=?,updated_at=? WHERE id=?""",
+            next_run_at=?,updated_at=? WHERE id=? AND updated_at=?""",
             (
                 record.name,
                 record.cron,
@@ -262,6 +288,7 @@ class ScheduleStore:
                 record.next_run_at.isoformat(),
                 record.updated_at.isoformat(),
                 record.id,
+                expected_updated_at.isoformat(),
             ),
         )
         connection.commit()
@@ -420,7 +447,17 @@ class ScheduleService:
                 "updated_at": now,
             }
         )
-        return await self.store.update(updated)
+        try:
+            return await self.store.update(
+                updated, expected_updated_at=record.updated_at
+            )
+        except KeyError as exc:
+            raise RenderError(
+                "schedule_conflict",
+                "The schedule changed while it was being updated.",
+                409,
+                True,
+            ) from exc
 
     async def run_due(self, now: datetime | None = None) -> int:
         current = now or datetime.now(UTC)

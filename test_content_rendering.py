@@ -1,5 +1,6 @@
 import unittest
 from io import BytesIO
+from unittest.mock import AsyncMock
 
 from pypdf import PdfWriter
 
@@ -11,7 +12,6 @@ from content_rendering import (
 from render_contract import RenderRequest
 from render_engine import RenderLimits
 from render_errors import RenderError
-
 
 LIMITS = RenderLimits(7680, 4320, 50_000_000)
 
@@ -31,11 +31,13 @@ class FakePage:
         *,
         html="<html><body><main>Hello document body with useful words.</main></body></html>",
         pdf=None,
+        width=800,
         height=900,
         forced_breaks=0,
     ):
         self.html = html
         self.pdf_bytes = pdf or pdf_with_pages(1)
+        self.width = width
         self.height = height
         self.forced_breaks = forced_breaks
         self.pdf_options = None
@@ -44,9 +46,11 @@ class FakePage:
     async def content(self):
         return self.html
 
-    async def evaluate(self, _script):
+    async def evaluate(self, script):
+        if "TextEncoder" in script:
+            return len(self.html.encode("utf-8"))
         return {
-            "width": 800,
+            "width": self.width,
             "height": self.height,
             "forcedBreaks": self.forced_breaks,
         }
@@ -100,6 +104,18 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
                 LIMITS,
             )
         self.assertEqual(raised.exception.code, "document_too_large")
+
+    async def test_html_preflight_avoids_materializing_oversized_dom(self):
+        page = FakePage(html="x" * 101)
+        page.content = AsyncMock(side_effect=AssertionError("content must not load"))
+        with self.assertRaises(RenderError) as raised:
+            await render_document_output(
+                page,
+                RenderRequest(url="https://example.com", output="html"),
+                RenderLimits(output_bytes=100),
+            )
+        self.assertEqual(raised.exception.code, "output_too_large")
+        page.content.assert_not_awaited()
 
     async def test_article_html_and_markdown_outputs(self):
         body = " ".join(["A substantial article sentence."] * 20)
@@ -184,6 +200,26 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
                 LIMITS,
             )
         self.assertEqual(height.exception.code, "pdf_page_too_tall")
+
+        with self.assertRaises(RenderError) as width:
+            await render_document_output(
+                FakePage(width=20_001),
+                RenderRequest.model_validate({
+                    "url": "https://example.com", "output": "pdf", "pdf": {"mode": "single_page"}
+                }),
+                LIMITS,
+            )
+        self.assertEqual(width.exception.code, "pdf_page_too_wide")
+
+        with self.assertRaises(RenderError) as area:
+            await render_document_output(
+                FakePage(width=10_000, height=10_000),
+                RenderRequest.model_validate({
+                    "url": "https://example.com", "output": "pdf", "pdf": {"mode": "single_page"}
+                }),
+                LIMITS,
+            )
+        self.assertEqual(area.exception.code, "pdf_area_limit_exceeded")
 
         print_page = FakePage(height=100_000)
         with self.assertRaises(RenderError) as preflight:

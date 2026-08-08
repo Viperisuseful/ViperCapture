@@ -3,12 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from base64 import b64decode
-from contextlib import suppress
-from dataclasses import dataclass, field
-from fnmatch import fnmatchcase
-import ipaddress
 import io
+import ipaddress
 import json
 import math
 import os
@@ -17,12 +13,17 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import zipfile
+from base64 import b64decode
+from contextlib import suppress
+from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Awaitable, Callable
 from urllib.parse import urlsplit, urlunsplit
-import zipfile
 
-from playwright.async_api import Browser, Page, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import Browser, Page
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from render_contract import (
     ActionType,
@@ -33,7 +34,6 @@ from render_contract import (
     Viewport,
 )
 from render_errors import RenderError
-
 
 ALLOWED_INTERNAL_SCHEMES = {"about", "blob", "data"}
 MEDIA_TYPES = {
@@ -773,7 +773,9 @@ class RenderEngine:
         page: Page,
         request: RenderRequest,
         failed_requests: list[dict[str, object]],
+        matched_failure_patterns: set[str] | None = None,
     ) -> None:
+        matched_failure_patterns = matched_failure_patterns or set()
         for expected in request.assertions.content_includes:
             present = await page.evaluate(
                 "text => Boolean(document.documentElement?.innerText.includes(text))",
@@ -806,7 +808,7 @@ class RenderEngine:
                 for failure in failed_requests
                 if fnmatchcase(str(failure.get("url", "")), pattern)
             ]
-            if matching:
+            if pattern in matched_failure_patterns or matching:
                 raise RenderError(
                     "request_assertion_failed",
                     "A matching page request failed.",
@@ -830,6 +832,7 @@ class RenderEngine:
         try:
             async with asyncio.timeout(limits.deadline_seconds):
                 outputs: list[tuple[str, RenderArtifact]] = []
+                output_bytes = 0
                 for viewport in request.viewports:
                     environment = request.environment.model_copy(
                         update={"device": viewport.device}
@@ -845,9 +848,16 @@ class RenderEngine:
                             "environment": environment,
                         }
                     )
-                    outputs.append(
-                        (viewport.name, await self._render_single(browser, single, limits))
-                    )
+                    artifact = await self._render_single(browser, single, limits)
+                    output_bytes += len(artifact.body)
+                    if output_bytes > limits.output_bytes:
+                        raise RenderError(
+                            "output_too_large",
+                            "The viewport artifacts exceed the aggregate output limit.",
+                            413,
+                            False,
+                        )
+                    outputs.append((viewport.name, artifact))
 
                 manifest_outputs = []
                 archive_buffer = io.BytesIO()
@@ -942,6 +952,7 @@ class RenderEngine:
         video_directory = None
         blocked_urls: list[str] = []
         failed_requests: list[dict[str, object]] = []
+        matched_failure_patterns: set[str] = set()
         console_events: list[dict[str, object]] = []
         network_events: list[dict[str, object]] = []
         try:
@@ -1108,6 +1119,9 @@ class RenderEngine:
                     page.on("response", record_network)
 
                 def record_failed(page_request) -> None:
+                    for pattern in request.assertions.request_failures:
+                        if fnmatchcase(page_request.url, pattern):
+                            matched_failure_patterns.add(pattern)
                     if len(failed_requests) >= 200:
                         return
                     failure = page_request.failure
@@ -1119,7 +1133,12 @@ class RenderEngine:
                     )
 
                 def record_error_response(response) -> None:
-                    if response.status < 400 or len(failed_requests) >= 200:
+                    if response.status < 400:
+                        return
+                    for pattern in request.assertions.request_failures:
+                        if fnmatchcase(response.url, pattern):
+                            matched_failure_patterns.add(pattern)
+                    if len(failed_requests) >= 200:
                         return
                     failed_requests.append(
                         {
@@ -1222,7 +1241,9 @@ class RenderEngine:
                         await self.cleanup_hooks.apply(page, request.cleanup)
                     if self.challenge_checker:
                         await self.challenge_checker(page, request.proceed_on_captcha, navigation_status)
-                await self._check_assertions(page, request, failed_requests)
+                await self._check_assertions(
+                    page, request, failed_requests, matched_failure_patterns
+                )
 
                 if request.output is OutputFormat.WEBM:
                     options = request.video
@@ -1255,11 +1276,12 @@ class RenderEngine:
                         trimmed_path,
                         duration_ms=options.duration_ms,
                     )
-                    body = trimmed_path.read_bytes()
-                    if not body:
+                    size = (await asyncio.to_thread(trimmed_path.stat)).st_size
+                    if not size:
                         raise RenderError("empty_output", "The renderer produced an empty video.", 502, True)
-                    if len(body) > limits.output_bytes:
+                    if size > limits.output_bytes:
                         raise RenderError("output_too_large", "The rendered video exceeds the output limit.", 413, False)
+                    body = await asyncio.to_thread(trimmed_path.read_bytes)
                     artifact = RenderArtifact(
                         body,
                         "video/webm",

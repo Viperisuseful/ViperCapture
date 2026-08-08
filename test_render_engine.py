@@ -2,14 +2,15 @@ import asyncio
 import io
 import json
 import socket
-from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, patch
 import zipfile
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from render_contract import LazyLoadMode, RenderRequest
 from render_engine import (
     PublicUrlValidator,
+    RenderArtifact,
     RenderEngine,
     RenderLimits,
     ensure_dimensions,
@@ -430,6 +431,44 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
             )
             manifest = json.loads(archive.read("manifest.json"))
         self.assertEqual(manifest["count"], 2)
+
+    async def test_multi_viewport_pack_rejects_aggregate_before_archive(self):
+        request = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "full_page": False,
+                "viewports": [
+                    {"name": "one", "width": 10, "height": 10},
+                    {"name": "two", "width": 10, "height": 10},
+                ],
+            }
+        )
+        engine = RenderEngine(hosted=False)
+        with patch.object(
+            engine,
+            "_render_single",
+            AsyncMock(return_value=RenderArtifact(b"123", "image/png", "x.png", {})),
+        ), self.assertRaises(RenderError) as raised:
+            await engine.render(
+                FakeBrowser(), request, RenderLimits(output_bytes=5)
+            )
+        self.assertEqual(raised.exception.code, "output_too_large")
+
+    async def test_assertion_match_survives_bounded_diagnostic_sample(self):
+        request = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "assertions": {"request_failures": ["*/critical.js"]},
+            }
+        )
+        with self.assertRaises(RenderError) as raised:
+            await RenderEngine(hosted=False)._check_assertions(
+                FakePage(),
+                request,
+                [{"url": "https://example.com/noise"}] * 200,
+                {"*/critical.js"},
+            )
+        self.assertEqual(raised.exception.code, "request_assertion_failed")
 
     async def test_metadata_output_is_bounded_json(self):
         class MetadataPage:

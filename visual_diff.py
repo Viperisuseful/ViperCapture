@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import io
 import json
 import zipfile
+from dataclasses import dataclass
 
 from PIL import Image, ImageChops, ImageDraw, ImageOps, UnidentifiedImageError
 
 from render_errors import RenderError
-
 
 MAX_DIFF_INPUT_BYTES = 20 * 1024 * 1024
 # Pillow expands compressed inputs into several simultaneous RGBA/mask
@@ -42,16 +41,16 @@ def _open_image(body: bytes, label: str) -> Image.Image:
     if not body or len(body) > MAX_DIFF_INPUT_BYTES:
         raise RenderError(
             "diff_input_invalid",
-            f"{label} must be a non-empty image no larger than 50 MiB.",
+            f"{label} must be a non-empty image no larger than 20 MiB.",
             413,
             False,
         )
     try:
         image = Image.open(io.BytesIO(body))
-        image.load()
-        image = ImageOps.exif_transpose(image)
         if image.width * image.height > MAX_DIFF_PIXELS:
             raise RenderError("diff_pixel_limit_exceeded", "Visual diff input exceeds the pixel limit.", 413, False)
+        image.load()
+        image = ImageOps.exif_transpose(image)
     except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
         raise RenderError("diff_input_invalid", f"{label} is not a safe supported image.", 422, False) from exc
     return image.convert("RGBA")

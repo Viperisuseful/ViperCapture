@@ -7,7 +7,6 @@ from uuid import uuid4
 from async_jobs import ArtifactStoreConfig
 from s3_artifact_store import S3ArtifactStore
 
-
 UTC = timezone.utc
 
 
@@ -15,6 +14,8 @@ class FakeS3:
     def __init__(self):
         self.objects = {}
         self.closed = False
+        self.list_calls = []
+        self.head_calls = []
 
     def head_bucket(self, **_kwargs):
         return {}
@@ -36,13 +37,15 @@ class FakeS3:
         }
 
     def head_object(self, *, Key, **_kwargs):
+        self.head_calls.append(Key)
         item = self.objects[Key]
         return {"Metadata": item["Metadata"]}
 
     def delete_object(self, *, Key, **_kwargs):
         self.objects.pop(Key, None)
 
-    def list_objects_v2(self, **_kwargs):
+    def list_objects_v2(self, **kwargs):
+        self.list_calls.append(kwargs)
         return {
             "Contents": [
                 {"Key": key, "LastModified": item["LastModified"]}
@@ -123,3 +126,18 @@ class S3ArtifactStoreTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn(unrelated, client.objects)
         self.assertIn(malformed, client.objects)
+
+    async def test_maintenance_is_bounded_and_skips_recent_objects(self):
+        client = FakeS3()
+        store = S3ArtifactStore(
+            ArtifactStoreConfig(Path("/tmp/unused"), timedelta(hours=1)),
+            bucket="captures",
+            client=client,
+        )
+        stored = await store.put(
+            str(uuid4()), b"data", media_type="image/png", filename="x.png"
+        )
+        await store.maintain(datetime.now(UTC))
+        self.assertEqual(len(client.list_calls), 1)
+        self.assertEqual(client.list_calls[0]["MaxKeys"], 25)
+        self.assertNotIn(stored.key, client.head_calls)

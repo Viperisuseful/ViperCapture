@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import re
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from datetime import datetime, timezone
-import os
 from pathlib import PurePosixPath
-import re
 from uuid import UUID, uuid4
 
 import boto3
@@ -16,10 +16,10 @@ from botocore.exceptions import ClientError
 
 from async_jobs import Artifact, ArtifactStoreConfig, StoredArtifact
 
-
 UTC = timezone.utc
 NOT_FOUND_CODES = {"NoSuchKey", "404", "NotFound"}
 OWNER_METADATA = "vipercapture-v1"
+MAINTENANCE_PAGE_SIZE = 25
 
 
 def _safe_extension(filename: str) -> str:
@@ -65,6 +65,7 @@ class S3ArtifactStore:
                 },
             ),
         )
+        self._maintenance_token: str | None = None
 
     async def start(self) -> None:
         await asyncio.to_thread(self.client.head_bucket, Bucket=self.bucket)
@@ -150,43 +151,50 @@ class S3ArtifactStore:
         )
 
     async def maintain(self, now: datetime) -> None:
-        continuation = None
-        while True:
-            arguments = {
-                "Bucket": self.bucket,
-                "Prefix": f"{self.prefix}/" if self.prefix else "",
-            }
-            if continuation:
-                arguments["ContinuationToken"] = continuation
-            response = await asyncio.to_thread(self.client.list_objects_v2, **arguments)
-            for item in response.get("Contents", []):
-                key = item.get("Key")
-                if not isinstance(key, str) or not self._owned_key_shape(key):
+        arguments = {
+            "Bucket": self.bucket,
+            "Prefix": f"{self.prefix}/" if self.prefix else "",
+            "MaxKeys": MAINTENANCE_PAGE_SIZE,
+        }
+        if self._maintenance_token:
+            arguments["ContinuationToken"] = self._maintenance_token
+        response = await asyncio.to_thread(self.client.list_objects_v2, **arguments)
+        cutoff = now - self.config.result_ttl
+        for item in response.get("Contents", []):
+            key = item.get("Key")
+            modified = item.get("LastModified")
+            if (
+                not isinstance(key, str)
+                or not self._owned_key_shape(key)
+                or (isinstance(modified, datetime) and modified > cutoff)
+            ):
+                continue
+            try:
+                head = await asyncio.to_thread(
+                    self.client.head_object,
+                    Bucket=self.bucket,
+                    Key=key,
+                )
+            except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") in NOT_FOUND_CODES:
                     continue
-                try:
-                    head = await asyncio.to_thread(
-                        self.client.head_object,
-                        Bucket=self.bucket,
-                        Key=key,
-                    )
-                except ClientError as exc:
-                    if exc.response.get("Error", {}).get("Code") in NOT_FOUND_CODES:
-                        continue
-                    raise
-                metadata = head.get("Metadata", {})
-                try:
-                    expires = int(metadata.get("expires", "0"))
-                except (TypeError, ValueError):
-                    continue
-                if (
-                    metadata.get("owner") == OWNER_METADATA
-                    and expires > 0
-                    and expires <= int(now.timestamp())
-                ):
-                    await self.delete(key)
-            if not response.get("IsTruncated"):
-                break
-            continuation = response.get("NextContinuationToken")
+                raise
+            metadata = head.get("Metadata", {})
+            try:
+                expires = int(metadata.get("expires", "0"))
+            except (TypeError, ValueError):
+                continue
+            if (
+                metadata.get("owner") == OWNER_METADATA
+                and expires > 0
+                and expires <= int(now.timestamp())
+            ):
+                await self.delete(key)
+        self._maintenance_token = (
+            response.get("NextContinuationToken")
+            if response.get("IsTruncated")
+            else None
+        )
 
     def _owned_key_shape(self, key: str) -> bool:
         relative = key

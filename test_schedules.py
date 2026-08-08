@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 from async_jobs import PayloadCipher
 from render_contract import RenderRequest
+from render_errors import RenderError
 from schedules import (
     ScheduleCreate,
     ScheduleService,
@@ -16,7 +17,6 @@ from schedules import (
     public_schedule_document,
     validate_cron,
 )
-
 
 UTC = timezone.utc
 
@@ -102,6 +102,52 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
         ) as to_thread:
             self.assertEqual(await self.store.list(), [])
         to_thread.assert_awaited_once()
+
+    async def test_list_is_paginated_without_loading_payloads(self):
+        for index in range(3):
+            await self.service.create(
+                ScheduleCreate(
+                    name=f"Schedule {index}",
+                    cron="0 * * * *",
+                    render=RenderRequest(html=f"secret-{index}"),
+                )
+            )
+        statements = []
+        self.store.connection.set_trace_callback(statements.append)
+        first = await self.store.list(limit=2)
+        second = await self.store.list(limit=2, after=first[-1].id)
+        self.store.connection.set_trace_callback(None)
+        self.assertEqual(len(first), 2)
+        self.assertEqual(len(second), 1)
+        list_queries = [
+            statement.lower()
+            for statement in statements
+            if "order by created_at" in statement.lower()
+        ]
+        self.assertTrue(list_queries)
+        self.assertTrue(
+            all(
+                "payload" not in statement and "select *" not in statement
+                for statement in list_queries
+            )
+        )
+
+    async def test_update_conflicts_with_concurrent_scheduler_advance(self):
+        record = await self.service.create(
+            ScheduleCreate(
+                name="Race",
+                cron="* * * * *",
+                render=RenderRequest(html="race"),
+            )
+        )
+        due = datetime.now(UTC) + timedelta(minutes=2)
+        await self.store.claim_due(due)
+        advanced = await self.store.get(record.id)
+        with self.assertRaises(RenderError) as raised:
+            await self.service.update(record, ScheduleUpdate(name="Stale"))
+        self.assertEqual(raised.exception.code, "schedule_conflict")
+        stored = await self.store.get(record.id)
+        self.assertEqual(stored.next_run_at, advanced.next_run_at)
 
     async def test_due_schedule_submits_once_and_advances_first(self):
         record = await self.service.create(

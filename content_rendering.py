@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from html import escape
 from io import BytesIO
-import math
 
 from lxml import html as lxml_html
 from markdown_it import MarkdownIt
@@ -17,8 +17,8 @@ from render_contract import ExtractMode, OutputFormat, PdfMode, RenderRequest
 from render_engine import RenderArtifact, RenderLimits
 from render_errors import RenderError
 
-
 MAX_PRINT_PAGES = 50
+MAX_SINGLE_PAGE_WIDTH = 20_000
 MAX_SINGLE_PAGE_HEIGHT = 20_000
 MAX_MARKDOWN_HTML_BYTES = 5 * 1024 * 1024
 PAPER_INCHES = {
@@ -86,7 +86,9 @@ def _validate_pdf(pdf: bytes, *, single_page: bool) -> int:
     return pages
 
 
-async def _render_pdf(page, request: RenderRequest) -> RenderArtifact:
+async def _render_pdf(
+    page, request: RenderRequest, limits: RenderLimits
+) -> RenderArtifact:
     options = request.pdf
     assert options is not None
     common: dict[str, object] = {
@@ -108,6 +110,14 @@ async def _render_pdf(page, request: RenderRequest) -> RenderArtifact:
         })""")
         width = max(1, math.ceil(float(dimensions["width"])))
         height = max(1, math.ceil(float(dimensions["height"])))
+        if width > MAX_SINGLE_PAGE_WIDTH:
+            raise RenderError(
+                "pdf_page_too_wide",
+                "Single-page PDF content exceeds 20000 CSS pixels.",
+                413,
+                False,
+                {"max_width": MAX_SINGLE_PAGE_WIDTH},
+            )
         if height > MAX_SINGLE_PAGE_HEIGHT:
             raise RenderError(
                 "pdf_page_too_tall",
@@ -115,6 +125,14 @@ async def _render_pdf(page, request: RenderRequest) -> RenderArtifact:
                 413,
                 False,
                 {"max_height": MAX_SINGLE_PAGE_HEIGHT},
+            )
+        if width * height > limits.max_pixels:
+            raise RenderError(
+                "pdf_area_limit_exceeded",
+                "Single-page PDF content exceeds the pixel area limit.",
+                413,
+                False,
+                {"max_pixels": limits.max_pixels},
             )
         # Playwright treats width and height as the entire sheet. Include the
         # margins so the measured document remains the printable area instead
@@ -187,26 +205,49 @@ async def render_document_output(
     request: RenderRequest,
     limits: RenderLimits,
 ) -> RenderArtifact:
-    del limits
     if request.output is OutputFormat.PDF:
-        return await _render_pdf(page, request)
+        return await _render_pdf(page, request, limits)
     if request.output not in {OutputFormat.HTML, OutputFormat.MARKDOWN}:
         raise RenderError(
             "unsupported_output", "The output format is not supported.", 422, False
         )
 
     try:
-        document_html = await page.content()
-        if (
-            request.output is OutputFormat.MARKDOWN
-            and len(document_html.encode("utf-8")) > MAX_MARKDOWN_HTML_BYTES
-        ):
+        maximum_html_bytes = (
+            limits.output_bytes
+            if request.output is OutputFormat.HTML
+            else MAX_MARKDOWN_HTML_BYTES
+        )
+        serialized_bytes = await page.evaluate(
+            """() => {
+                const doctype = document.doctype ? `<!DOCTYPE ${document.doctype.name}>` : "";
+                const html = document.documentElement?.outerHTML || "";
+                return new TextEncoder().encode(doctype + html).byteLength;
+            }"""
+        )
+        if int(serialized_bytes) > maximum_html_bytes:
+            code = (
+                "output_too_large"
+                if request.output is OutputFormat.HTML
+                else "document_too_large"
+            )
             raise RenderError(
-                "document_too_large",
-                "The hydrated document is too large for Markdown conversion.",
+                code,
+                "The hydrated document is too large to serialize.",
                 413,
                 False,
-                {"max_bytes": MAX_MARKDOWN_HTML_BYTES},
+                {"max_bytes": maximum_html_bytes},
+            )
+        document_html = await page.content()
+        if len(document_html.encode("utf-8")) > maximum_html_bytes:
+            raise RenderError(
+                "output_too_large"
+                if request.output is OutputFormat.HTML
+                else "document_too_large",
+                "The hydrated document is too large to serialize.",
+                413,
+                False,
+                {"max_bytes": maximum_html_bytes},
             )
         selected_html = (
             await asyncio.to_thread(_article_html, document_html)

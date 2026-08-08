@@ -1,8 +1,11 @@
 import unittest
 
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from bulk_jobs import BulkJobRequest
+from bulk_jobs import BulkBodyLimitMiddleware, BulkJobRequest
+from render_errors import RenderError, install_render_error_layer
 
 
 class BulkJobContractTests(unittest.TestCase):
@@ -35,3 +38,48 @@ class BulkJobContractTests(unittest.TestCase):
             BulkJobRequest.model_validate(
                 {"items": [{"render": {"url": "https://example.com"}}] * 101}
             )
+
+
+class BulkBodyLimitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rejects_streamed_body_before_downstream_parsing(self):
+        called = False
+
+        async def downstream(_scope, _receive, _send):
+            nonlocal called
+            called = True
+
+        chunks = iter(
+            [
+                {"type": "http.request", "body": b"123", "more_body": True},
+                {"type": "http.request", "body": b"456", "more_body": False},
+            ]
+        )
+
+        async def receive():
+            return next(chunks)
+
+        middleware = BulkBodyLimitMiddleware(downstream, max_bytes=5)
+        with self.assertRaises(RenderError) as raised:
+            await middleware(
+                {"type": "http", "method": "POST", "path": "/v1/jobs/bulk", "headers": []},
+                receive,
+                lambda _message: None,
+            )
+        self.assertEqual(raised.exception.code, "bulk_payload_too_large")
+        self.assertFalse(called)
+
+    def test_limit_uses_standard_error_envelope(self):
+        app = FastAPI()
+        app.add_middleware(BulkBodyLimitMiddleware, max_bytes=5)
+        install_render_error_layer(app)
+
+        @app.post("/v1/jobs/bulk")
+        async def accept_bulk():
+            return {"accepted": True}
+
+        response = TestClient(app, raise_server_exceptions=False).post(
+            "/v1/jobs/bulk", content=b"123456"
+        )
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(response.json()["error"]["code"], "bulk_payload_too_large")
+        self.assertEqual(response.headers["x-request-id"], response.json()["error"]["request_id"])

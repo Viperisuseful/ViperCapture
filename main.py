@@ -1,18 +1,18 @@
 import asyncio
-from contextlib import asynccontextmanager, suppress
-from datetime import datetime
 import hmac
 import os
-from pathlib import Path
 import re
 import subprocess
 import sys
 import time
-from typing import Awaitable, TypeVar
+from contextlib import asynccontextmanager, suppress
+from datetime import datetime
+from pathlib import Path
+from typing import Annotated, Awaitable, TypeVar
 from urllib.parse import urlencode
 from uuid import UUID
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
     FileResponse,
@@ -30,7 +30,7 @@ from async_jobs import (
     public_job_document,
     settings_from_environment,
 )
-from bulk_jobs import BulkJobRequest
+from bulk_jobs import BulkBodyLimitMiddleware, BulkJobRequest
 from page_cleanup import (
     CleanupOptions,
     apply_visual_cleanup,
@@ -38,9 +38,9 @@ from page_cleanup import (
     setup_autoconsent,
     should_block_resource,
 )
+from render_cache import RenderCache
 from render_contract import OutputFormat, RenderRequest
 from render_engine import CleanupHooks, RenderArtifact, RenderEngine, RenderLimits
-from render_cache import RenderCache
 from render_errors import RenderError, install_render_error_layer
 from schedules import (
     ScheduleCreate,
@@ -50,9 +50,8 @@ from schedules import (
     public_schedule_document,
 )
 from signed_urls import sign_render_request, verify_render_request
-from webhooks import WebhookDispatcher
 from visual_diff import MAX_DIFF_INPUT_BYTES, compare_images, create_diff_bundle
-
+from webhooks import WebhookDispatcher
 
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
@@ -338,6 +337,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+app.add_middleware(BulkBodyLimitMiddleware)
 install_render_error_layer(app)
 if DESKTOP_TOKEN:
     app.add_middleware(
@@ -977,10 +977,22 @@ async def create_schedule(payload: ScheduleCreate) -> JSONResponse:
 
 
 @app.get("/v1/schedules")
-async def list_schedules() -> JSONResponse:
-    records = await _schedule_service().store.list()
+async def list_schedules(
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    after: Annotated[UUID | None, Query()] = None,
+) -> JSONResponse:
+    records = await _schedule_service().store.list(
+        limit=limit + 1,
+        after=str(after) if after else None,
+    )
+    has_more = len(records) > limit
+    records = records[:limit]
     return JSONResponse(
-        {"count": len(records), "schedules": [public_schedule_document(item) for item in records]},
+        {
+            "count": len(records),
+            "schedules": [public_schedule_document(item) for item in records],
+            "next_cursor": records[-1].id if has_more else None,
+        },
         headers={"Cache-Control": "private, no-store"},
     )
 

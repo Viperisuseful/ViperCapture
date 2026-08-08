@@ -2,11 +2,12 @@ import io
 import json
 import unittest
 import zipfile
+from unittest.mock import Mock, patch
 
 from PIL import Image
 
 from render_errors import RenderError
-from visual_diff import MAX_DIFF_PIXELS, compare_images, create_diff_bundle
+from visual_diff import MAX_DIFF_PIXELS, _open_image, compare_images, create_diff_bundle
 
 
 def png(color, size=(4, 3)):
@@ -16,6 +17,15 @@ def png(color, size=(4, 3)):
 
 
 class VisualDiffTests(unittest.TestCase):
+    def test_pixel_limit_is_checked_before_decode(self):
+        image = Mock(width=MAX_DIFF_PIXELS + 1, height=1)
+        with patch(
+            "visual_diff.Image.open", return_value=image
+        ), self.assertRaises(RenderError) as raised:
+            _open_image(b"compressed", "baseline")
+        self.assertEqual(raised.exception.code, "diff_pixel_limit_exceeded")
+        image.load.assert_not_called()
+
     def test_identical_images_pass(self):
         body = png("white")
         result = compare_images(body, body)
