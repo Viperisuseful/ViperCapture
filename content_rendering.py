@@ -13,7 +13,12 @@ from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
 from render_contract import ExtractMode, OutputFormat, PdfMode, RenderRequest
-from render_engine import RenderArtifact, RenderLimits, _settled_thread
+from render_engine import (
+    PlaywrightError,
+    RenderArtifact,
+    RenderLimits,
+    _settled_thread,
+)
 from render_errors import RenderError
 
 MAX_PRINT_PAGES = 50
@@ -268,6 +273,8 @@ async def render_document_output(
         body = markdown.encode("utf-8")
         return RenderArtifact(body, "text/markdown; charset=utf-8", "vipercapture.md")
     except RenderError:
+        raise
+    except PlaywrightError:
         raise
     except Exception as exc:
         raise RenderError(

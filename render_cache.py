@@ -28,11 +28,13 @@ class RenderCache:
         ttl_seconds: int = 900,
         max_entries: int = 1_000,
         max_bytes: int = 512 * 1024 * 1024,
+        security_namespace: str = "",
     ) -> None:
         self.directory = directory
         self.ttl = timedelta(seconds=max(1, ttl_seconds))
         self.max_entries = max(1, max_entries)
         self.max_bytes = max(1, max_bytes)
+        self.security_namespace = security_namespace
         self.lock = asyncio.Lock()
         self._fingerprint_key: bytes | None = None
 
@@ -92,7 +94,9 @@ class RenderCache:
         canonical = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         return hmac.digest(
             self._fingerprint_key,
-            canonical.encode("utf-8"),
+            self.security_namespace.encode("utf-8")
+            + b"\0"
+            + canonical.encode("utf-8"),
             "sha256",
         ).hex()
 

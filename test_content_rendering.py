@@ -4,6 +4,7 @@ import unittest
 from io import BytesIO
 from unittest.mock import AsyncMock, patch
 
+from playwright.async_api import Error as PlaywrightError
 from pypdf import PdfWriter
 
 from content_rendering import (
@@ -67,6 +68,17 @@ class FakePage:
 
 
 class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
+    async def test_document_transport_failure_is_not_reclassified(self):
+        page = FakePage()
+        page.evaluate = AsyncMock(side_effect=PlaywrightError("page closed"))
+
+        with self.assertRaises(PlaywrightError):
+            await render_document_output(
+                page,
+                RenderRequest(url="https://example.com", output="html"),
+                LIMITS,
+            )
+
     async def test_cancelled_markdown_conversion_settles_worker(self):
         started = threading.Event()
         release = threading.Event()

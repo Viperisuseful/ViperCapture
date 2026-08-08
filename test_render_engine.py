@@ -175,6 +175,54 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.code, "render_failed")
         self.assertTrue(raised.exception.retryable)
 
+    async def test_custom_css_transport_failure_remains_retryable(self):
+        class BrokenPage(FakePage):
+            async def add_style_tag(self, **_options):
+                raise PlaywrightError("page closed")
+
+        with self.assertRaises(RenderError) as raised:
+            await RenderEngine(hosted=False).render(
+                FakeBrowser(FakeContext(BrokenPage())),
+                RenderRequest(
+                    url="https://example.com", custom_css="body {}"
+                ),
+                RenderLimits(
+                    max_width=1920,
+                    max_height=1080,
+                    max_pixels=2_073_600,
+                ),
+            )
+        self.assertEqual(raised.exception.code, "render_failed")
+        self.assertTrue(raised.exception.retryable)
+
+    async def test_malformed_capture_selector_is_not_retryable(self):
+        class BrokenLocator(FakeLocator):
+            async def is_visible(self):
+                raise PlaywrightError(
+                    "Unexpected token while parsing css selector"
+                )
+
+        class BrokenPage(FakePage):
+            def locator(self, _selector):
+                return BrokenLocator(self)
+
+        with self.assertRaises(RenderError) as raised:
+            await RenderEngine(hosted=False).render(
+                FakeBrowser(FakeContext(BrokenPage())),
+                RenderRequest(
+                    url="https://example.com",
+                    full_page=False,
+                    selector="div[",
+                ),
+                RenderLimits(
+                    max_width=1920,
+                    max_height=1080,
+                    max_pixels=2_073_600,
+                ),
+            )
+        self.assertEqual(raised.exception.code, "selector_invalid")
+        self.assertFalse(raised.exception.retryable)
+
     async def test_full_page_capture_uses_validated_rectangle(self):
         page = FakePage()
         with patch(

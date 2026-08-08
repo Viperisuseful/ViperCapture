@@ -382,6 +382,18 @@ def needs_request_routing(
     return hosted or bool(custom_headers) or cleanup_enabled
 
 
+def _invalid_selector_error(error: PlaywrightError) -> bool:
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "invalid selector",
+            "unknown engine",
+            "while parsing css selector",
+        )
+    )
+
+
 def ensure_dimensions(width: float, height: float, scale: float, limits: RenderLimits) -> None:
     output_width = math.ceil(width * scale)
     output_height = math.ceil(height * scale)
@@ -823,7 +835,15 @@ class RenderEngine:
                     True,
                     {"action_index": index, "action_type": action.type.value},
                 ) from exc
-            except PlaywrightError:
+            except PlaywrightError as exc:
+                if _invalid_selector_error(exc):
+                    raise RenderError(
+                        "action_selector_invalid",
+                        f"Action {index} uses an invalid selector.",
+                        422,
+                        False,
+                        {"action_index": index, "action_type": action.type.value},
+                    ) from exc
                 raise
             except Exception as exc:
                 raise RenderError(
@@ -1337,6 +1357,8 @@ class RenderEngine:
                 if request.custom_css:
                     try:
                         await page.add_style_tag(content=request.custom_css)
+                    except PlaywrightError:
+                        raise
                     except Exception as exc:
                         raise RenderError(
                             "custom_css_invalid",
@@ -1496,22 +1518,32 @@ class RenderEngine:
 
                 box = None
                 if request.selector:
-                    locator = page.locator(request.selector).first
-                    if not await locator.is_visible():
-                        raise RenderError(
-                            "selector_not_found",
-                            "The capture selector did not resolve to a visible element.",
-                            404,
-                            False,
-                        )
-                    box = await locator.bounding_box()
-                    if not box:
-                        raise RenderError(
-                            "selector_not_found",
-                            "The capture selector did not resolve to a visible element.",
-                            404,
-                            False,
-                        )
+                    try:
+                        locator = page.locator(request.selector).first
+                        if not await locator.is_visible():
+                            raise RenderError(
+                                "selector_not_found",
+                                "The capture selector did not resolve to a visible element.",
+                                404,
+                                False,
+                            )
+                        box = await locator.bounding_box()
+                        if not box:
+                            raise RenderError(
+                                "selector_not_found",
+                                "The capture selector did not resolve to a visible element.",
+                                404,
+                                False,
+                            )
+                    except PlaywrightError as exc:
+                        if _invalid_selector_error(exc):
+                            raise RenderError(
+                                "selector_invalid",
+                                "The capture selector is invalid.",
+                                422,
+                                False,
+                            ) from exc
+                        raise
                     ensure_dimensions(box["width"], box["height"], request.viewport.device_scale_factor, limits)
                     width, height = box["width"], box["height"]
                 elif request.clip:

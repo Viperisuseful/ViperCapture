@@ -304,6 +304,9 @@ async def lifespan(app: FastAPI):
         ttl_seconds=CACHE_TTL_SECONDS,
         max_entries=CACHE_MAX_ENTRIES,
         max_bytes=CACHE_MAX_BYTES,
+        security_namespace=(
+            f"hosted={int(HOSTED)};scripts={int(ALLOW_SCRIPTS)}"
+        ),
     )
     try:
         await app.state.render_cache.start()
