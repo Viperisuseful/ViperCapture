@@ -203,6 +203,24 @@ class RenderContractTest(unittest.TestCase):
         self.assertEqual(pack.credit_cost, 2)
         self.assertEqual(pack.recorded_output_type, "zip")
 
+    def test_cookie_domain_and_path_syntax_is_validated(self):
+        for cookie in (
+            {"name": "x", "value": "1", "domain": "https://example.com"},
+            {
+                "name": "x",
+                "value": "1",
+                "domain": "example.com",
+                "path": "relative",
+            },
+        ):
+            with self.subTest(cookie=cookie), self.assertRaises(ValidationError):
+                RenderRequest.model_validate(
+                    {
+                        "url": "https://example.com",
+                        "network": {"cookies": [cookie]},
+                    }
+                )
+
     def test_new_feature_conflicts_and_bounds_are_rejected(self):
         invalid = (
             {

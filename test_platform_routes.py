@@ -212,6 +212,62 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(document["results"][1]["accepted"])
         service.submit.assert_awaited_once()
 
+    async def test_bulk_webhook_validation_has_aggregate_deadline(self):
+        original_service = getattr(main.app.state, "async_jobs", None)
+        original_dispatcher = getattr(main.app.state, "webhooks", None)
+        service = SimpleNamespace(
+            submit=AsyncMock(),
+            existing=AsyncMock(return_value=None),
+        )
+
+        async def never_validates(_url):
+            await asyncio.Event().wait()
+
+        main.app.state.async_jobs = service
+        main.app.state.webhooks = SimpleNamespace(
+            validate_url=never_validates
+        )
+        payload = BulkJobRequest.model_validate(
+            {
+                "items": [
+                    {
+                        "id": str(index),
+                        "render": {
+                            "url": f"https://example.com/{index}",
+                            "delivery": {
+                                "webhook_url": f"https://hooks{index}.example/callback"
+                            },
+                        },
+                    }
+                    for index in range(2)
+                ]
+            }
+        )
+        try:
+            with patch(
+                "main.BULK_WEBHOOK_VALIDATION_TIMEOUT_SECONDS", 0.01
+            ):
+                response = await main.create_bulk_render_jobs(
+                    payload,
+                    SimpleNamespace(
+                        state=SimpleNamespace(request_id="deadline")
+                    ),
+                )
+        finally:
+            main.app.state.async_jobs = original_service
+            main.app.state.webhooks = original_dispatcher
+        document = json.loads(response.body)
+        self.assertEqual(response.status_code, 207)
+        self.assertEqual(document["failed"], 2)
+        self.assertTrue(
+            all(
+                item["error"]["code"]
+                == "bulk_webhook_validation_timeout"
+                for item in document["results"]
+            )
+        )
+        service.submit.assert_not_awaited()
+
     async def test_visual_diff_queue_is_bounded(self):
         original_slots = getattr(main.app.state, "diff_slots", None)
         main.app.state.diff_slots = asyncio.Semaphore(0)

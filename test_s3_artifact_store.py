@@ -1,6 +1,7 @@
 import asyncio
 import io
 import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -38,6 +39,10 @@ class FakeS3:
             "Metadata": item["Metadata"],
         }
 
+    def copy_object(self, *, Key, Metadata, ContentType, **_kwargs):
+        self.objects[Key]["Metadata"] = Metadata
+        self.objects[Key]["ContentType"] = ContentType
+
     def head_object(self, *, Key, **_kwargs):
         self.head_calls.append(Key)
         item = self.objects[Key]
@@ -61,6 +66,28 @@ class FakeS3:
 
 
 class S3ArtifactStoreTests(unittest.IsolatedAsyncioTestCase):
+    async def test_result_ttl_starts_after_upload(self):
+        class SlowS3(FakeS3):
+            def put_object(self, **kwargs):
+                time.sleep(0.05)
+                super().put_object(**kwargs)
+                self.uploaded_at = datetime.now(UTC)
+
+        client = SlowS3()
+        ttl = timedelta(seconds=1)
+        store = S3ArtifactStore(
+            ArtifactStoreConfig(Path("/tmp/unused"), ttl),
+            bucket="captures",
+            client=client,
+        )
+        stored = await store.put(
+            str(uuid4()), b"data", media_type="image/png", filename="x.png"
+        )
+        self.assertGreaterEqual(
+            stored.expires_at,
+            client.uploaded_at + ttl,
+        )
+
     async def test_cancelled_fetch_settles_before_returning(self):
         started = threading.Event()
         release = threading.Event()
@@ -105,6 +132,10 @@ class S3ArtifactStoreTests(unittest.IsolatedAsyncioTestCase):
             filename="capture.png",
         )
         self.assertTrue(stored.key.startswith("results/"))
+        self.assertEqual(
+            client.objects[stored.key]["Metadata"]["expires"],
+            str(int(stored.expires_at.timestamp())),
+        )
         self.assertEqual(len(stored.key.split("/")), 3)
         artifact = await store.get(stored.key)
         self.assertEqual(artifact.body, b"image-data")

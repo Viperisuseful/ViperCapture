@@ -997,11 +997,9 @@ class RenderEngine:
         console_events: list[dict[str, object]] = []
         network_events: list[dict[str, object]] = []
         cleanup_routing = (
-            request.cleanup.consent_mode.value != "none"
-            or request.cleanup.block_ads
+            request.cleanup.block_ads
             or request.cleanup.block_trackers
             or request.cleanup.block_chats
-            or request.cleanup.block_newsletters
         )
         request_routing = needs_request_routing(
             self.hosted,

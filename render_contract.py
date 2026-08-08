@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from enum import Enum
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -214,6 +215,30 @@ class CookieOptions(StrictModel):
     http_only: bool = False
     secure: bool = False
     same_site: str = Field(default="Lax", pattern=r"^(?:Strict|Lax|None)$")
+
+    @field_validator("domain")
+    @classmethod
+    def validate_domain(cls, value: str) -> str:
+        domain = value.removeprefix(".")
+        try:
+            ipaddress.ip_address(domain)
+        except ValueError:
+            labels = domain.split(".")
+            if any(
+                not label
+                or len(label) > 63
+                or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", label)
+                for label in labels
+            ):
+                raise ValueError("cookie domain must be a hostname or IP address")
+        return value
+
+    @field_validator("path")
+    @classmethod
+    def validate_path(cls, value: str) -> str:
+        if not value.startswith("/"):
+            raise ValueError("cookie path must begin with /")
+        return value
 
 
 class NetworkOptions(StrictModel):

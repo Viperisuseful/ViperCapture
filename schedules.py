@@ -152,6 +152,7 @@ class ScheduleStore:
             """
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=FULL;
+            PRAGMA secure_delete=ON;
             CREATE TABLE IF NOT EXISTS schedules (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -335,6 +336,8 @@ class ScheduleStore:
             ),
         )
         connection.commit()
+        if cursor.rowcount:
+            self._scrub_payload_history(connection)
         return cursor.rowcount == 1
 
     async def delete(self, schedule_id: str) -> bool:
@@ -346,7 +349,17 @@ class ScheduleStore:
             "DELETE FROM schedules WHERE id = ?", (schedule_id,)
         )
         connection.commit()
+        if cursor.rowcount:
+            self._scrub_payload_history(connection)
         return cursor.rowcount == 1
+
+    @staticmethod
+    def _scrub_payload_history(connection: sqlite3.Connection) -> None:
+        checkpoint = connection.execute(
+            "PRAGMA wal_checkpoint(TRUNCATE)"
+        ).fetchone()
+        if checkpoint is not None and checkpoint[0]:
+            raise RuntimeError("schedule payload scrub checkpoint was busy")
 
     async def claim_due(self, now: datetime) -> list[tuple[ScheduleRecord, datetime]]:
         return await self._run(self._claim_due, now)

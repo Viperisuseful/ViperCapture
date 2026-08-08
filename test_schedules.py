@@ -87,13 +87,30 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
 
         updated = await self.service.update(
             record,
-            ScheduleUpdate(name="Updated", enabled=False),
+            ScheduleUpdate(
+                name="Updated",
+                enabled=False,
+                render=RenderRequest(html="replacement"),
+            ),
         )
         self.assertEqual(updated.name, "Updated")
         self.assertFalse(updated.enabled)
+        database_files = (
+            self.store.path,
+            Path(f"{self.store.path}-wal"),
+            Path(f"{self.store.path}-shm"),
+        )
+        history = b"".join(
+            path.read_bytes() for path in database_files if path.exists()
+        )
+        self.assertNotIn(record.payload, history)
         self.assertEqual(len(await self.store.list()), 1)
         self.assertTrue(await self.store.delete(record.id))
         self.assertIsNone(await self.store.get(record.id))
+        history = b"".join(
+            path.read_bytes() for path in database_files if path.exists()
+        )
+        self.assertNotIn(updated.payload, history)
 
     async def test_sqlite_operations_run_off_the_event_loop(self):
         def run_inline(operation, *args):

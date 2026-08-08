@@ -271,11 +271,18 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
 
         await RenderEngine(hosted=False, cleanup_hooks=hooks).render(
             browser,
-            RenderRequest(url="https://example.com"),
+            RenderRequest(
+                url="https://example.com",
+                cleanup={
+                    "consent_mode": "reject",
+                    "block_newsletters": True,
+                },
+            ),
             RenderLimits(max_width=1920, max_height=1080, max_pixels=10_000_000),
         )
 
         self.assertEqual(browser.context_options["service_workers"], "allow")
+        self.assertIsNone(browser.context.route_handler)
 
     async def test_policy_block_does_not_mask_later_render_failure(self):
         context = FakeContext()

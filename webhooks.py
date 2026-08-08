@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 import hashlib
 import hmac
 import ipaddress
@@ -11,6 +10,8 @@ import json
 import socket
 import ssl
 import time
+from contextlib import suppress
+from dataclasses import dataclass
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
@@ -59,6 +60,7 @@ class WebhookDispatcher:
         self.attempts = max(1, min(attempts, 5))
         self.client_factory = client_factory
         self.sleep = sleep
+        self.validation_slots = asyncio.Semaphore(4)
 
     async def _validate_target(self, url: str) -> ValidatedWebhookTarget:
         parsed = urlsplit(url)
@@ -78,13 +80,23 @@ class WebhookDispatcher:
             )
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         try:
-            resolved = await asyncio.wait_for(
+            await self.validation_slots.acquire()
+            resolution = asyncio.create_task(
                 asyncio.to_thread(
                     socket.getaddrinfo,
                     parsed.hostname,
                     port,
                     type=socket.SOCK_STREAM,
-                ),
+                )
+            )
+            def release_resolution(completed: asyncio.Task) -> None:
+                self.validation_slots.release()
+                with suppress(BaseException):
+                    completed.result()
+
+            resolution.add_done_callback(release_resolution)
+            resolved = await asyncio.wait_for(
+                asyncio.shield(resolution),
                 timeout=5,
             )
             addresses = tuple(

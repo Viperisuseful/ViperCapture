@@ -132,6 +132,7 @@ MAX_DIFF_CONCURRENCY = max(
     1, int(os.getenv("VIPERCAPTURE_DIFF_CONCURRENCY", "1"))
 )
 CAPTURE_QUEUE_TIMEOUT_SECONDS = 30
+BULK_WEBHOOK_VALIDATION_TIMEOUT_SECONDS = 30
 AwaitedResult = TypeVar("AwaitedResult")
 ASYNC_JOBS_ENABLED = os.getenv(
     "VIPERCAPTURE_ASYNC_JOBS",
@@ -901,14 +902,43 @@ async def create_bulk_render_jobs(
     service = _async_job_service()
     results = []
     failures = 0
+    validation_tasks = [
+        asyncio.create_task(_validate_webhook(item.render))
+        for item in payload.items
+    ]
+    _done, pending = await asyncio.wait(
+        validation_tasks,
+        timeout=BULK_WEBHOOK_VALIDATION_TIMEOUT_SECONDS,
+    )
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+    validation_errors: list[RenderError | None] = []
+    for task in validation_tasks:
+        if task in pending:
+            validation_errors.append(
+                RenderError(
+                    "bulk_webhook_validation_timeout",
+                    "Bulk webhook validation exceeded its aggregate deadline.",
+                    504,
+                    True,
+                )
+            )
+            continue
+        try:
+            task.result()
+            validation_errors.append(None)
+        except RenderError as exc:
+            validation_errors.append(exc)
     for index, item in enumerate(payload.items):
         request_id = item.request_id or f"{request.state.request_id}-{index + 1}"
         try:
-            job = await _submit_job(
-                service,
-                item.render,
-                request_id=request_id,
-            )
+            job = await service.existing(item.render, request_id=request_id)
+            if job is None:
+                error = validation_errors[index]
+                if error is not None:
+                    raise error
+                job = await service.submit(item.render, request_id=request_id)
             results.append(
                 {
                     "index": index,

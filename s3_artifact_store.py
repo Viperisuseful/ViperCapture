@@ -88,7 +88,6 @@ class S3ArtifactStore:
             normalized_job_id = str(UUID(job_id))
         except ValueError as exc:
             raise ValueError("job_id must be a UUID") from exc
-        expires_at = datetime.now(UTC) + self.config.result_ttl
         name = f"{uuid4().hex}{_safe_extension(filename)}"
         key = "/".join(
             part for part in (self.prefix, normalized_job_id, name) if part
@@ -101,10 +100,33 @@ class S3ArtifactStore:
             ContentType=media_type,
             Metadata={
                 "filename": _encode_filename(filename),
-                "expires": str(int(expires_at.timestamp())),
+                "expires": "0",
                 "owner": OWNER_METADATA,
             },
         )
+        expires_at = datetime.now(UTC) + self.config.result_ttl
+        try:
+            await asyncio.to_thread(
+                self.client.copy_object,
+                Bucket=self.bucket,
+                Key=key,
+                CopySource={"Bucket": self.bucket, "Key": key},
+                ContentType=media_type,
+                MetadataDirective="REPLACE",
+                Metadata={
+                    "filename": _encode_filename(filename),
+                    "expires": str(int(expires_at.timestamp())),
+                    "owner": OWNER_METADATA,
+                },
+            )
+        except BaseException:
+            with suppress(Exception):
+                await asyncio.to_thread(
+                    self.client.delete_object,
+                    Bucket=self.bucket,
+                    Key=key,
+                )
+            raise
         return StoredArtifact(key=key, expires_at=expires_at)
 
     async def get(self, key: str) -> Artifact | None:
