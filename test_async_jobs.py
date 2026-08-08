@@ -32,6 +32,7 @@ from async_jobs import (
 )
 from render_contract import RenderRequest
 from render_errors import RenderError
+from webhooks import WebhookDeliveryError
 
 UTC = timezone.utc
 
@@ -312,6 +313,49 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         await service._drain_notifications()
 
         notifier.assert_awaited_once()
+        store.acknowledge_notification.assert_awaited_once_with(
+            job_id, webhook_payload
+        )
+        store.defer_notification.assert_not_awaited()
+
+    async def test_permanent_webhook_failure_is_acknowledged_immediately(self):
+        store = SimpleNamespace(
+            pending_notifications=AsyncMock(),
+            acknowledge_notification=AsyncMock(),
+            defer_notification=AsyncMock(),
+        )
+        notifier = AsyncMock(
+            side_effect=WebhookDeliveryError("HTTP 400", retryable=False)
+        )
+        service = AsyncJobService(
+            self.settings,
+            store,
+            self.artifacts,
+            _successful_renderer,
+            notifier=notifier,
+        )
+        now = datetime.now(UTC)
+        job_id = str(uuid4())
+        webhook_payload = service.cipher.encrypt_webhook(
+            job_id, "https://hooks.example/permanent"
+        )
+        store.pending_notifications.return_value = [
+            JobRecord(
+                id=job_id,
+                request_id="permanent-webhook",
+                status="failed",
+                payload=None,
+                attempt_count=1,
+                available_at=now,
+                queue_expires_at=now,
+                created_at=now,
+                webhook_payload=webhook_payload,
+                webhook_event_status="failed",
+            )
+        ]
+
+        await service._drain_notifications()
+
         store.acknowledge_notification.assert_awaited_once_with(
             job_id, webhook_payload
         )
@@ -3473,14 +3517,11 @@ class ProviderLoadingTests(unittest.TestCase):
             (
                 job_store,
                 (
-                    "start", "close", "create", "claim", "get_by_request_id",
+                    "start", "close", "create", "claim",
                     "get", "cancel",
                     "succeed", "fail", "requeue_running", "requeue", "maintain",
                     "expire_result",
                     "acknowledge_artifact_deletion",
-                    "pending_notifications",
-                    "defer_notification",
-                    "acknowledge_notification",
                 ),
             ),
             (

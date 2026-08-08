@@ -46,6 +46,35 @@ class BulkJobContractTests(unittest.TestCase):
 
 
 class BulkBodyLimitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_replay_releases_mutable_body_buffer(self):
+        async def downstream(_scope, receive, _send):
+            message = await receive()
+            self.assertEqual(message["body"], b"payload")
+            buffers = [
+                cell.cell_contents
+                for cell in receive.__closure__ or ()
+                if isinstance(cell.cell_contents, bytearray)
+            ]
+            self.assertEqual([len(buffer) for buffer in buffers], [0])
+
+        async def receive():
+            return {
+                "type": "http.request",
+                "body": b"payload",
+                "more_body": False,
+            }
+
+        await BulkBodyLimitMiddleware(downstream)(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/render",
+                "headers": [],
+            },
+            receive,
+            lambda _message: None,
+        )
+
     async def test_limits_json_and_multipart_routes_before_receive(self):
         called = False
 

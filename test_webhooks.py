@@ -117,11 +117,12 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
             "webhooks.socket.getaddrinfo",
             return_value=[(2, 1, 6, "", ("127.0.0.1", 80))],
         ):
-            with self.assertRaises(WebhookDeliveryError):
+            with self.assertRaises(WebhookDeliveryError) as raised:
                 await dispatcher.deliver(
                     "http://callback.example/hook",
                     {"id": "job-id", "status": "failed"},
                 )
+        self.assertFalse(raised.exception.retryable)
         self.assertEqual(len(client.requests), 1)
 
     async def test_delivery_uses_the_address_that_was_validated(self):

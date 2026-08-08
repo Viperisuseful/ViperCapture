@@ -9,6 +9,8 @@ from base64 import b64encode
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from playwright.async_api import Error as PlaywrightError
+
 from render_contract import LazyLoadMode, RenderRequest
 from render_engine import (
     CleanupHooks,
@@ -148,6 +150,31 @@ class FakeBrowser:
 
 
 class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
+    async def test_action_transport_failure_remains_retryable(self):
+        class BrokenLocator(FakeLocator):
+            async def click(self, **_options):
+                raise PlaywrightError("page closed")
+
+        class BrokenPage(FakePage):
+            def locator(self, _selector):
+                return BrokenLocator(self)
+
+        with self.assertRaises(RenderError) as raised:
+            await RenderEngine(hosted=False).render(
+                FakeBrowser(FakeContext(BrokenPage())),
+                RenderRequest(
+                    url="https://example.com",
+                    actions=[{"type": "click", "selector": "button"}],
+                ),
+                RenderLimits(
+                    max_width=1920,
+                    max_height=1080,
+                    max_pixels=2_073_600,
+                ),
+            )
+        self.assertEqual(raised.exception.code, "render_failed")
+        self.assertTrue(raised.exception.retryable)
+
     async def test_full_page_capture_uses_validated_rectangle(self):
         page = FakePage()
         with patch(

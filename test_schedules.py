@@ -186,6 +186,29 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.code, "invalid_schedule")
         self.assertEqual(raised.exception.status_code, 422)
 
+    async def test_committed_update_defers_busy_payload_scrub(self):
+        record = await self.service.create(
+            ScheduleCreate(
+                name="Scrub retry",
+                cron="0 * * * *",
+                render=RenderRequest(html="old"),
+            )
+        )
+        with patch.object(
+            self.store,
+            "_scrub_payload_history",
+            side_effect=(RuntimeError("busy"), None),
+        ) as scrub:
+            updated = await self.service.update(
+                record,
+                ScheduleUpdate(render=RenderRequest(html="new")),
+            )
+            self.assertEqual(updated.name, "Scrub retry")
+            self.assertTrue(self.store._scrub_pending)
+            self.assertIsNotNone(await self.store.get(record.id))
+            self.assertEqual(scrub.call_count, 2)
+            self.assertFalse(self.store._scrub_pending)
+
     async def test_due_schedule_submits_once_and_advances_first(self):
         record = await self.service.create(
             ScheduleCreate(

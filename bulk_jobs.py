@@ -88,7 +88,9 @@ class BulkBodyLimitMiddleware:
             if delivered:
                 return {"type": "http.request", "body": b"", "more_body": False}
             delivered = True
-            return {"type": "http.request", "body": bytes(body), "more_body": False}
+            payload = bytes(body)
+            body.clear()
+            return {"type": "http.request", "body": payload, "more_body": False}
 
         await self.app(scope, replay, send)
 

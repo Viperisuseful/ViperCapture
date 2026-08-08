@@ -20,7 +20,9 @@ from render_errors import RenderError
 
 
 class WebhookDeliveryError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, retryable: bool = True) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 @dataclass(frozen=True)
@@ -246,7 +248,10 @@ class WebhookDispatcher:
                         return
                     last_error = f"HTTP {status_code}"
                     if status_code < 500 and status_code != 429:
-                        break
+                        raise WebhookDeliveryError(
+                            f"webhook delivery failed: {last_error}",
+                            retryable=False,
+                        )
                 except (httpx.RequestError, OSError, TimeoutError, ValueError) as exc:
                     last_error = type(exc).__name__
                 if attempt + 1 < self.attempts:

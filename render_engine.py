@@ -22,6 +22,7 @@ from typing import Awaitable, Callable
 from urllib.parse import urlsplit, urlunsplit
 
 from playwright.async_api import Browser, Page
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from render_contract import (
@@ -822,6 +823,8 @@ class RenderEngine:
                     True,
                     {"action_index": index, "action_type": action.type.value},
                 ) from exc
+            except PlaywrightError:
+                raise
             except Exception as exc:
                 raise RenderError(
                     "action_failed",

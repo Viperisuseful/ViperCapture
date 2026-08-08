@@ -254,7 +254,6 @@ class JobStore(Protocol):
         max_attempts: int,
         claim_token: str,
     ) -> JobRecord | None: ...
-    async def get_by_request_id(self, request_id: str) -> JobRecord | None: ...
     async def get(self, job_id: str, now: datetime) -> JobRecord | None: ...
     async def cancel(self, job_id: str, now: datetime) -> JobRecord | None: ...
     async def succeed(
@@ -297,6 +296,10 @@ class JobStore(Protocol):
         now: datetime,
     ) -> JobRecord | None: ...
     async def acknowledge_artifact_deletion(self, key: str) -> None: ...
+
+
+@runtime_checkable
+class NotificationJobStore(Protocol):
     async def pending_notifications(
         self, now: datetime, limit: int = 100
     ) -> list[JobRecord]: ...
@@ -546,6 +549,12 @@ class AsyncJobService:
         self.renderer = renderer
         self.cipher = cipher or PayloadCipher.for_data_dir(settings.data_dir)
         self.notifier = notifier
+        if notifier is not None and not isinstance(
+            job_store, NotificationJobStore
+        ):
+            raise TypeError(
+                "webhook delivery requires notification-capable job storage"
+            )
         self._wakeups = [
             asyncio.Event() for _ in range(settings.worker_count)
         ]
@@ -688,7 +697,10 @@ class AsyncJobService:
     ) -> JobRecord | None:
         """Return an idempotent replay before repeating external validation."""
         await self._maintain()
-        current = await self.job_store.get_by_request_id(request_id)
+        lookup = getattr(self.job_store, "get_by_request_id", None)
+        if lookup is None:
+            return None
+        current = await lookup(request_id)
         if current is None:
             return None
         current = await self.job_store.get(current.id, datetime.now(UTC))
@@ -888,7 +900,11 @@ class AsyncJobService:
                         job.id,
                         type(exc).__name__,
                     )
-                    if job.webhook_attempt_count + 1 >= MAX_WEBHOOK_ATTEMPTS:
+                    if (
+                        getattr(exc, "retryable", True) is False
+                        or job.webhook_attempt_count + 1
+                        >= MAX_WEBHOOK_ATTEMPTS
+                    ):
                         logger.error(
                             "async job webhook dead-lettered job_id=%s", job.id
                         )

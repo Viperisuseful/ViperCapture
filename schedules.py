@@ -124,6 +124,7 @@ class ScheduleStore:
         self.path = path
         self.connection: sqlite3.Connection | None = None
         self.lock = asyncio.Lock()
+        self._scrub_pending = False
 
     async def start(self) -> None:
         if os.name == "nt":
@@ -186,6 +187,8 @@ class ScheduleStore:
                 "ALTER TABLE schedules ADD COLUMN pending_attempt INTEGER NOT NULL DEFAULT 0"
             )
         self.connection.commit()
+        self._scrub_pending = existed
+        self._try_scrub_payload_history()
         if os.name != "nt":
             for candidate in (
                 self.path,
@@ -209,7 +212,12 @@ class ScheduleStore:
 
     async def _run(self, operation, *args):
         async with self.lock:
-            task = asyncio.create_task(asyncio.to_thread(operation, *args))
+            def execute():
+                result = operation(*args)
+                self._try_scrub_payload_history()
+                return result
+
+            task = asyncio.create_task(asyncio.to_thread(execute))
             try:
                 return await asyncio.shield(task)
             except asyncio.CancelledError:
@@ -339,7 +347,7 @@ class ScheduleStore:
         )
         connection.commit()
         if cursor.rowcount:
-            self._scrub_payload_history(connection)
+            self._scrub_pending = True
         return cursor.rowcount == 1
 
     async def delete(self, schedule_id: str) -> bool:
@@ -352,8 +360,18 @@ class ScheduleStore:
         )
         connection.commit()
         if cursor.rowcount:
-            self._scrub_payload_history(connection)
+            self._scrub_pending = True
         return cursor.rowcount == 1
+
+    def _try_scrub_payload_history(self) -> None:
+        if not self._scrub_pending or self.connection is None:
+            return
+        try:
+            self._scrub_payload_history(self.connection)
+        except RuntimeError:
+            logger.warning("schedule payload scrub checkpoint busy; retrying later")
+        else:
+            self._scrub_pending = False
 
     @staticmethod
     def _scrub_payload_history(connection: sqlite3.Connection) -> None:
