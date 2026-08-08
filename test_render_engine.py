@@ -13,6 +13,7 @@ from render_engine import (
     RenderArtifact,
     RenderEngine,
     RenderLimits,
+    _run_process,
     ensure_dimensions,
     ensure_full_page_dimensions,
     is_public_http_url,
@@ -64,6 +65,10 @@ class FakePage:
         self.url = url
         self.goto_options = options
         return FakeNavigation()
+
+    async def set_content(self, content, **options):
+        self.content = content
+        self.goto_options = options
 
     def locator(self, _selector):
         return FakeLocator(self)
@@ -267,6 +272,53 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(resolve.await_count, 1)
             self.assertTrue(await validator.is_public("https://example.com/c"))
             self.assertEqual(resolve.await_count, 2)
+
+    async def test_public_address_checks_cap_distinct_origins(self):
+        validator = PublicUrlValidator()
+        with (
+            patch("render_engine.MAX_DNS_ORIGINS", 1),
+            patch(
+                "render_engine._resolve_public_origin",
+                AsyncMock(return_value=True),
+            ) as resolve,
+        ):
+            self.assertTrue(await validator.is_public("https://one.example"))
+            self.assertFalse(await validator.is_public("https://two.example"))
+        self.assertEqual(resolve.await_count, 1)
+
+    async def test_cancelled_process_is_terminated_and_awaited(self):
+        waiting = asyncio.Event()
+
+        class Process:
+            returncode = None
+
+            def __init__(self):
+                self.terminated = False
+                self.waited = False
+
+            async def communicate(self):
+                await waiting.wait()
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+
+            async def wait(self):
+                self.waited = True
+                return self.returncode
+
+        process = Process()
+        with patch(
+            "render_engine.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=process),
+        ):
+            task = asyncio.create_task(_run_process(["ffmpeg"], 30))
+            await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertTrue(process.terminated)
+        self.assertTrue(process.waited)
 
     async def test_lazy_load_modes_preserve_default_and_allow_fast_paths(self):
         class ScrollPage:
@@ -533,6 +585,32 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
         document = json.loads(artifact.body)
         self.assertEqual(document["title"], "Example")
         self.assertEqual(document["images"]["total"], 1)
+
+    async def test_markdown_input_conversion_is_off_thread_and_bounded(self):
+        request = RenderRequest.model_validate(
+            {"markdown": "# Hello", "full_page": False}
+        )
+        with patch(
+            "render_engine.asyncio.to_thread",
+            new_callable=AsyncMock,
+            wraps=asyncio.to_thread,
+        ) as to_thread:
+            await RenderEngine(hosted=False).render(
+                FakeBrowser(), request, RenderLimits(output_bytes=1024)
+            )
+        self.assertTrue(
+            any(
+                call.args and call.args[0].__name__ == "input_document"
+                for call in to_thread.await_args_list
+            )
+        )
+
+        with patch("content_rendering.input_document", return_value="x" * 6):
+            with self.assertRaises(RenderError) as raised:
+                await RenderEngine(hosted=False).render(
+                    FakeBrowser(), request, RenderLimits(output_bytes=5)
+                )
+        self.assertEqual(raised.exception.code, "document_too_large")
 
     async def test_selector_transparency_quality_and_waits(self):
         request = RenderRequest.model_validate(

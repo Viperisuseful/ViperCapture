@@ -196,7 +196,9 @@ async def _render_pdf(
                 },
             )
     pdf = await page.pdf(**common)
-    pages = _validate_pdf(pdf, single_page=single_page)
+    pages = await asyncio.to_thread(
+        _validate_pdf, pdf, single_page=single_page
+    )
     return RenderArtifact(pdf, "application/pdf", "vipercapture.pdf", {"pages": pages})
 
 

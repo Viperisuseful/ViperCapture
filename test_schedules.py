@@ -15,6 +15,7 @@ from schedules import (
     ScheduleUpdate,
     next_run,
     public_schedule_document,
+    schedule_cursor,
     validate_cron,
 )
 
@@ -115,7 +116,9 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
         statements = []
         self.store.connection.set_trace_callback(statements.append)
         first = await self.store.list(limit=2)
-        second = await self.store.list(limit=2, after=first[-1].id)
+        cursor = schedule_cursor(first[-1])
+        self.assertTrue(await self.store.delete(first[-1].id))
+        second = await self.store.list(limit=2, after=cursor)
         self.store.connection.set_trace_callback(None)
         self.assertEqual(len(first), 2)
         self.assertEqual(len(second), 1)

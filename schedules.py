@@ -7,12 +7,14 @@ import logging
 import os
 import sqlite3
 import stat
+from base64 import urlsafe_b64decode, urlsafe_b64encode
+from binascii import Error as BinasciiError
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from croniter import croniter
@@ -91,6 +93,29 @@ def _as_utc(value: str | None) -> datetime | None:
         return None
     parsed = datetime.fromisoformat(value)
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def schedule_cursor(record: ScheduleRecord) -> str:
+    value = f"{record.created_at.isoformat()}\0{record.id}".encode("utf-8")
+    return urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+
+def parse_schedule_cursor(value: str) -> tuple[str, str]:
+    try:
+        decoded = urlsafe_b64decode(value + "=" * (-len(value) % 4)).decode("utf-8")
+        created_at, separator, schedule_id = decoded.partition("\0")
+        datetime.fromisoformat(created_at)
+        UUID(schedule_id)
+        if not separator or not schedule_id:
+            raise ValueError
+        return created_at, schedule_id
+    except (BinasciiError, ValueError, UnicodeDecodeError) as exc:
+        raise RenderError(
+            "invalid_schedule_cursor",
+            "The schedule cursor is invalid.",
+            422,
+            False,
+        ) from exc
 
 
 class ScheduleStore:
@@ -244,13 +269,9 @@ class ScheduleStore:
     def _list(self, limit: int, after: str | None) -> list[sqlite3.Row]:
         connection = self._require()
         cursor_created_at = None
+        cursor_id = None
         if after is not None:
-            cursor = connection.execute(
-                "SELECT created_at FROM schedules WHERE id = ?", (after,)
-            ).fetchone()
-            if cursor is None:
-                return []
-            cursor_created_at = cursor["created_at"]
+            cursor_created_at, cursor_id = parse_schedule_cursor(after)
         columns = (
             "id,name,cron,timezone,enabled,next_run_at,last_run_at,last_job_id,"
             "last_error,created_at,updated_at"
@@ -264,7 +285,7 @@ class ScheduleStore:
             f"SELECT {columns} FROM schedules "
             "WHERE created_at > ? OR (created_at = ? AND id > ?) "
             "ORDER BY created_at,id LIMIT ?",
-            (cursor_created_at, cursor_created_at, after, limit),
+            (cursor_created_at, cursor_created_at, cursor_id, limit),
         ).fetchall()
 
     async def update(

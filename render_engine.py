@@ -11,7 +11,6 @@ import os
 import re
 import shutil
 import socket
-import subprocess
 import tempfile
 import zipfile
 from base64 import b64decode
@@ -59,6 +58,8 @@ DEVICE_PLATFORMS = {
 MAX_METADATA_ITEMS = 100
 MAX_METADATA_VALUE_CHARS = 2_048
 DNS_RESOLUTION_TIMEOUT_SECONDS = 5
+MAX_DNS_CONCURRENCY = 8
+MAX_DNS_ORIGINS = 100
 MAX_DIAGNOSTIC_EVENTS = 500
 
 
@@ -90,14 +91,31 @@ def _timestamp_ms(value: str) -> int:
     )
 
 
-def _webm_duration_ms(ffmpeg: Path, path: Path) -> int:
-    probe = subprocess.run(
-        [str(ffmpeg), "-hide_banner", "-i", str(path)],
-        capture_output=True,
-        check=False,
-        timeout=10,
+async def _run_process(command: list[str], timeout: float) -> tuple[int, bytes]:
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
     )
-    diagnostic = probe.stderr.decode("utf-8", "replace")
+    try:
+        _, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except BaseException:
+        if process.returncode is None:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=2)
+            except TimeoutError:
+                process.kill()
+                await process.wait()
+        raise
+    return process.returncode or 0, stderr
+
+
+async def _webm_duration_ms(ffmpeg: Path, path: Path) -> int:
+    _, diagnostic_bytes = await _run_process(
+        [str(ffmpeg), "-hide_banner", "-i", str(path)], 10
+    )
+    diagnostic = diagnostic_bytes.decode("utf-8", "replace")
     match = re.search(r"Duration:\s*(\d{2}:\d{2}:\d{2}(?:\.\d+)?)", diagnostic)
     if match is None:
         raise RenderError(
@@ -109,14 +127,14 @@ def _webm_duration_ms(ffmpeg: Path, path: Path) -> int:
     return _timestamp_ms(match.group(1))
 
 
-def _trim_webm(
+async def _trim_webm(
     source: Path,
     destination: Path,
     *,
     duration_ms: int,
 ) -> int:
     ffmpeg = _ffmpeg_executable()
-    source_duration_ms = _webm_duration_ms(ffmpeg, source)
+    source_duration_ms = await _webm_duration_ms(ffmpeg, source)
     start_ms = max(0, source_duration_ms - duration_ms)
     command = [
         str(ffmpeg),
@@ -139,20 +157,15 @@ def _trim_webm(
         "-y",
         str(destination),
     ]
-    completed = subprocess.run(
-        command,
-        capture_output=True,
-        check=False,
-        timeout=45,
-    )
-    if completed.returncode != 0 or not destination.is_file():
+    returncode, _ = await _run_process(command, 45)
+    if returncode != 0 or not destination.is_file():
         raise RenderError(
             "video_encode_failed",
             "The requested WebM recording window could not be encoded.",
             502,
             True,
         )
-    return _webm_duration_ms(ffmpeg, destination)
+    return await _webm_duration_ms(ffmpeg, destination)
 
 
 def diagnostic_url(value: str) -> str:
@@ -286,6 +299,12 @@ class PublicUrlValidator:
 
     def __init__(self) -> None:
         self._checks: dict[tuple[str, str, int], asyncio.Task[bool]] = {}
+        self._origins: set[tuple[str, str, int]] = set()
+        self._slots = asyncio.Semaphore(MAX_DNS_CONCURRENCY)
+
+    async def _resolve(self, hostname: str, port: int) -> bool:
+        async with self._slots:
+            return await _resolve_public_origin(hostname, port)
 
     async def is_public(self, target: str) -> bool:
         origin = normalized_origin(target)
@@ -293,8 +312,11 @@ class PublicUrlValidator:
             return False
         task = self._checks.get(origin)
         if task is None or task.done():
+            if origin not in self._origins and len(self._origins) >= MAX_DNS_ORIGINS:
+                return False
+            self._origins.add(origin)
             _, hostname, port = origin
-            task = asyncio.create_task(_resolve_public_origin(hostname, port))
+            task = asyncio.create_task(self._resolve(hostname, port))
             self._checks[origin] = task
 
             def forget(completed: asyncio.Task[bool]) -> None:
@@ -1192,8 +1214,17 @@ class RenderEngine:
                         )
                     else:
                         navigation = None
+                        document = await asyncio.to_thread(input_document, request)
+                        if len(document.encode("utf-8")) > limits.output_bytes:
+                            raise RenderError(
+                                "document_too_large",
+                                "The generated input document exceeds the output limit.",
+                                413,
+                                False,
+                                {"max_bytes": limits.output_bytes},
+                            )
                         await page.set_content(
-                            input_document(request),
+                            document,
                             wait_until=request.wait_for.event.value,
                             timeout=min(request.wait_for.timeout_ms, limits.wait_timeout_ms),
                         )
@@ -1293,8 +1324,7 @@ class RenderEngine:
                     context = None
                     path = await video.path()
                     trimmed_path = Path(video_directory.name) / "trimmed.webm"
-                    actual_duration_ms = await asyncio.to_thread(
-                        _trim_webm,
+                    actual_duration_ms = await _trim_webm(
                         Path(path),
                         trimmed_path,
                         duration_ms=options.duration_ms,

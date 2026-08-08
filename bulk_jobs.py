@@ -8,6 +8,14 @@ from render_contract import RenderRequest
 from render_errors import RenderError
 
 MAX_BULK_BODY_BYTES = 6 * 1024 * 1024
+MAX_DIFF_BODY_BYTES = 2 * 20 * 1024 * 1024 + 1024 * 1024
+JSON_BODY_PATHS = {
+    "/v1/render",
+    "/v1/signed-url",
+    "/v1/jobs",
+    "/v1/jobs/bulk",
+    "/v1/schedules",
+}
 
 
 class StrictModel(BaseModel):
@@ -30,18 +38,25 @@ class BulkJobRequest(StrictModel):
 
 
 class BulkBodyLimitMiddleware:
-    """Reject oversized bulk bodies before JSON or source fields are parsed."""
+    """Reject oversized API bodies before JSON or multipart parsing."""
 
     def __init__(self, app, *, max_bytes: int = MAX_BULK_BODY_BYTES) -> None:
         self.app = app
         self.max_bytes = max_bytes
 
     async def __call__(self, scope, receive, send) -> None:
-        if not (
-            scope["type"] == "http"
-            and scope.get("method") == "POST"
-            and scope.get("path") == "/v1/jobs/bulk"
+        path = scope.get("path", "")
+        method = scope.get("method")
+        if scope["type"] != "http" or method not in {"POST", "PATCH"}:
+            await self.app(scope, receive, send)
+            return
+        if path == "/v1/diff":
+            maximum = MAX_DIFF_BODY_BYTES
+        elif path in JSON_BODY_PATHS or (
+            method == "PATCH" and path.startswith("/v1/schedules/")
         ):
+            maximum = self.max_bytes
+        else:
             await self.app(scope, receive, send)
             return
         headers = dict(scope.get("headers", []))
@@ -49,8 +64,8 @@ class BulkBodyLimitMiddleware:
             content_length = int(headers.get(b"content-length", b"0"))
         except ValueError:
             content_length = 0
-        if content_length > self.max_bytes:
-            self._raise_limit()
+        if content_length > maximum:
+            self._raise_limit(maximum)
 
         body = bytearray()
         while True:
@@ -58,8 +73,8 @@ class BulkBodyLimitMiddleware:
             if message["type"] == "http.disconnect":
                 return
             body.extend(message.get("body", b""))
-            if len(body) > self.max_bytes:
-                self._raise_limit()
+            if len(body) > maximum:
+                self._raise_limit(maximum)
             if not message.get("more_body", False):
                 break
 
@@ -74,11 +89,11 @@ class BulkBodyLimitMiddleware:
 
         await self.app(scope, replay, send)
 
-    def _raise_limit(self) -> None:
+    def _raise_limit(self, maximum: int) -> None:
         raise RenderError(
-            "bulk_payload_too_large",
-            "The bulk request body exceeds the aggregate limit.",
+            "request_body_too_large",
+            "The request body exceeds the route limit.",
             413,
             False,
-            {"max_bytes": self.max_bytes},
+            {"max_bytes": maximum},
         )

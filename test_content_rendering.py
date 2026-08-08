@@ -1,11 +1,13 @@
+import asyncio
 import unittest
 from io import BytesIO
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from pypdf import PdfWriter
 
 from content_rendering import (
     MAX_PRINT_PAGES,
+    _validate_pdf,
     input_document,
     render_document_output,
 )
@@ -143,10 +145,18 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_print_and_single_page_pdf(self):
         print_page = FakePage()
-        printed = await render_document_output(
-            print_page,
-            RenderRequest.model_validate({"url": "https://example.com", "output": "pdf"}),
-            LIMITS,
+        with patch(
+            "content_rendering.asyncio.to_thread",
+            new_callable=AsyncMock,
+            wraps=asyncio.to_thread,
+        ) as to_thread:
+            printed = await render_document_output(
+                print_page,
+                RenderRequest.model_validate({"url": "https://example.com", "output": "pdf"}),
+                LIMITS,
+            )
+        self.assertTrue(
+            any(call.args and call.args[0] is _validate_pdf for call in to_thread.await_args_list)
         )
         self.assertEqual(printed.media_type, "application/pdf")
         self.assertEqual(print_page.pdf_options["format"], "A4")

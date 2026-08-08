@@ -1018,6 +1018,31 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.store.close()
 
+    async def test_cancellation_preserves_webhook_outbox(self):
+        await self.store.start()
+        try:
+            now = datetime.now(UTC)
+            job = JobRecord(
+                id=str(uuid4()),
+                request_id="cancelled-webhook",
+                status="queued",
+                payload=b"encrypted",
+                webhook_payload=b"encrypted-webhook",
+                attempt_count=0,
+                available_at=now,
+                queue_expires_at=now + timedelta(minutes=1),
+                created_at=now,
+            )
+            await self.store.create(job, active_limit=1)
+            cancelled = await self.store.cancel(job.id, now)
+            pending = await self.store.pending_notifications(now)
+            self.assertEqual(cancelled.status, "cancelled")
+            self.assertEqual(cancelled.webhook_event_status, "cancelled")
+            self.assertEqual(cancelled.webhook_payload, b"encrypted-webhook")
+            self.assertEqual([item.id for item in pending], [job.id])
+        finally:
+            await self.store.close()
+
     async def test_create_scrubs_only_when_expiring_queued_payload(self):
         await self.store.start()
         try:

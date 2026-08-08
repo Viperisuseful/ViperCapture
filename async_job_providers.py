@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import suppress
-from datetime import datetime, timedelta, timezone
 import errno
 import hmac
 import json
 import os
-from pathlib import Path
 import re
 import sqlite3
 import stat
 import threading
+from contextlib import suppress
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from uuid import uuid4
 
 from async_jobs import (
@@ -28,7 +28,6 @@ from async_jobs import (
     StoredArtifact,
     _ensure_private_directory,
 )
-
 
 UTC = timezone.utc
 
@@ -660,14 +659,19 @@ class SQLiteJobStore:
                         """
                         UPDATE async_jobs
                         SET status = 'cancelled', payload = NULL,
-                            webhook_payload = NULL, webhook_event_status = NULL,
+                            webhook_event_status = CASE
+                                WHEN webhook_payload IS NOT NULL THEN 'cancelled'
+                                ELSE NULL END,
+                            webhook_attempt_count = 0,
+                            webhook_available_at = CASE
+                                WHEN webhook_payload IS NOT NULL THEN ? ELSE NULL END,
                             completed_at = ?,
                             error_code = 'job_cancelled',
                             error_message = 'The queued job was cancelled.',
                             error_retryable = 0
                         WHERE id = ?
                         """,
-                        (current, job_id),
+                        (current, current, job_id),
                     )
             updated = connection.execute(
                 "SELECT * FROM async_jobs WHERE id = ?",
@@ -1108,7 +1112,7 @@ class SQLiteJobStore:
             """
             SELECT * FROM async_jobs
             WHERE webhook_payload IS NOT NULL
-              AND webhook_event_status IN ('succeeded', 'failed')
+              AND webhook_event_status IN ('succeeded', 'failed', 'cancelled')
               AND COALESCE(webhook_available_at, completed_at, 0) <= ?
             ORDER BY COALESCE(webhook_available_at, completed_at, 0), id
             LIMIT ?

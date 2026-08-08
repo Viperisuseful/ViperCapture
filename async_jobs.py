@@ -3,19 +3,19 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
-from contextlib import suppress
-from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
-from hashlib import sha256
 import hmac
 import importlib
 import inspect
 import json
 import logging
 import os
-from pathlib import Path
 import stat
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
+from hashlib import sha256
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 from uuid import uuid4
 
@@ -23,7 +23,6 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from render_contract import RenderRequest, canonical_render_document
 from render_errors import RenderError
-
 
 UTC = timezone.utc
 PAYLOAD_VERSION = b"vipercapture-open-async-v1\0"
@@ -717,7 +716,10 @@ class AsyncJobService:
     async def cancel(self, job_id: str) -> JobRecord | None:
         await self._maintain()
         try:
-            return await self.job_store.cancel(job_id, datetime.now(UTC))
+            job = await self.job_store.cancel(job_id, datetime.now(UTC))
+            if job is not None and job.webhook_event_status is not None:
+                self._notification_wakeup.set()
+            return job
         except JobConflictError as exc:
             raise RenderError(
                 "job_already_running",

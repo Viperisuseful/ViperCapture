@@ -48,6 +48,7 @@ from schedules import (
     ScheduleStore,
     ScheduleUpdate,
     public_schedule_document,
+    schedule_cursor,
 )
 from signed_urls import sign_render_request, verify_render_request
 from visual_diff import MAX_DIFF_INPUT_BYTES, compare_images, create_diff_bundle
@@ -991,11 +992,11 @@ async def create_schedule(payload: ScheduleCreate) -> JSONResponse:
 @app.get("/v1/schedules")
 async def list_schedules(
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
-    after: Annotated[UUID | None, Query()] = None,
+    after: Annotated[str | None, Query(max_length=256)] = None,
 ) -> JSONResponse:
     records = await _schedule_service().store.list(
         limit=limit + 1,
-        after=str(after) if after else None,
+        after=after,
     )
     has_more = len(records) > limit
     records = records[:limit]
@@ -1003,7 +1004,7 @@ async def list_schedules(
         {
             "count": len(records),
             "schedules": [public_schedule_document(item) for item in records],
-            "next_cursor": records[-1].id if has_more else None,
+            "next_cursor": schedule_cursor(records[-1]) if has_more else None,
         },
         headers={"Cache-Control": "private, no-store"},
     )
