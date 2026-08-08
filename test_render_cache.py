@@ -1,4 +1,6 @@
+import asyncio
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -8,6 +10,36 @@ from render_engine import RenderArtifact
 
 
 class RenderCacheTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelled_read_settles_before_releasing_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = RenderCache(Path(directory))
+            await cache.start()
+            request = RenderRequest(html="one", cache=True)
+            await cache.put(
+                request,
+                RenderArtifact(b"png", "image/png", "capture.png"),
+            )
+            started = threading.Event()
+            release = threading.Event()
+            original_read = cache._read
+
+            def slow_read(*args):
+                started.set()
+                release.wait()
+                return original_read(*args)
+
+            cache._read = slow_read
+            task = asyncio.create_task(cache.get(request))
+            await asyncio.to_thread(started.wait)
+            task.cancel()
+            await asyncio.sleep(0)
+            self.assertTrue(cache.lock.locked())
+            self.assertFalse(task.done())
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertFalse(cache.lock.locked())
+
     async def test_exact_round_trip_and_no_plaintext_request_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
             cache = RenderCache(Path(directory))

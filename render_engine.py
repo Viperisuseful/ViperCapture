@@ -60,6 +60,7 @@ MAX_METADATA_VALUE_CHARS = 2_048
 DNS_RESOLUTION_TIMEOUT_SECONDS = 5
 MAX_DNS_CONCURRENCY = 8
 MAX_DNS_ORIGINS = 100
+PUBLIC_DNS_SLOTS = asyncio.Semaphore(MAX_DNS_CONCURRENCY)
 MAX_DIAGNOSTIC_EVENTS = 500
 
 
@@ -293,14 +294,25 @@ def routed_headers(
 
 
 async def _resolve_public_origin(hostname: str, port: int) -> bool:
+    await PUBLIC_DNS_SLOTS.acquire()
+    resolution = asyncio.create_task(
+        asyncio.to_thread(
+            socket.getaddrinfo,
+            hostname,
+            port,
+            type=socket.SOCK_STREAM,
+        )
+    )
+
+    def release_resolution(completed: asyncio.Task) -> None:
+        PUBLIC_DNS_SLOTS.release()
+        with suppress(BaseException):
+            completed.result()
+
+    resolution.add_done_callback(release_resolution)
     try:
         addresses = await asyncio.wait_for(
-            asyncio.to_thread(
-                socket.getaddrinfo,
-                hostname,
-                port,
-                type=socket.SOCK_STREAM,
-            ),
+            asyncio.shield(resolution),
             timeout=DNS_RESOLUTION_TIMEOUT_SECONDS,
         )
         return bool(addresses) and all(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import re
 from enum import Enum
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import (
@@ -201,7 +202,20 @@ class ProxyOptions(StrictModel):
     @field_validator("server")
     @classmethod
     def validate_server(cls, value: str) -> str:
-        if not re.match(r"^(?:https?|socks[45])://", value, re.IGNORECASE):
+        try:
+            parsed = urlsplit(value)
+            parsed.port
+        except ValueError as exc:
+            raise ValueError("proxy server authority is invalid") from exc
+        if (
+            parsed.scheme.lower() not in {"http", "https", "socks4", "socks5"}
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
             raise ValueError("proxy server must use http, https, socks4, or socks5")
         return value
 

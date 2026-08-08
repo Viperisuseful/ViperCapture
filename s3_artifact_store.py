@@ -92,18 +92,32 @@ class S3ArtifactStore:
         key = "/".join(
             part for part in (self.prefix, normalized_job_id, name) if part
         )
-        await asyncio.to_thread(
-            self.client.put_object,
-            Bucket=self.bucket,
-            Key=key,
-            Body=body,
-            ContentType=media_type,
-            Metadata={
-                "filename": _encode_filename(filename),
-                "expires": "0",
-                "owner": OWNER_METADATA,
-            },
+        upload = asyncio.create_task(
+            asyncio.to_thread(
+                self.client.put_object,
+                Bucket=self.bucket,
+                Key=key,
+                Body=body,
+                ContentType=media_type,
+                Metadata={
+                    "filename": _encode_filename(filename),
+                    "expires": "0",
+                    "owner": OWNER_METADATA,
+                },
+            )
         )
+        try:
+            await asyncio.shield(upload)
+        except asyncio.CancelledError:
+            with suppress(Exception):
+                await asyncio.shield(upload)
+            with suppress(Exception):
+                await asyncio.to_thread(
+                    self.client.delete_object,
+                    Bucket=self.bucket,
+                    Key=key,
+                )
+            raise
         expires_at = datetime.now(UTC) + self.config.result_ttl
         try:
             await asyncio.to_thread(
@@ -229,8 +243,14 @@ class S3ArtifactStore:
                 continue
             if (
                 metadata.get("owner") == OWNER_METADATA
-                and expires > 0
-                and expires <= int(now.timestamp())
+                and (
+                    (expires > 0 and expires <= int(now.timestamp()))
+                    or (
+                        expires == 0
+                        and isinstance(modified, datetime)
+                        and modified <= cutoff
+                    )
+                )
             ):
                 await self.delete(key)
         self._maintenance_token = (

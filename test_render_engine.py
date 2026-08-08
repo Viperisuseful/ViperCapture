@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import socket
+import threading
 import unittest
 import zipfile
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from render_engine import (
     RenderArtifact,
     RenderEngine,
     RenderLimits,
+    _resolve_public_origin,
     _run_process,
     ensure_dimensions,
     ensure_full_page_dimensions,
@@ -131,6 +133,40 @@ class FakeBrowser:
 
 
 class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
+    async def test_dns_slot_is_held_until_timed_out_thread_finishes(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def resolve(*_args, **_kwargs):
+            started.set()
+            release.wait()
+            return [
+                (
+                    socket.AF_INET,
+                    socket.SOCK_STREAM,
+                    6,
+                    "",
+                    ("93.184.216.34", 443),
+                )
+            ]
+
+        slots = asyncio.Semaphore(1)
+        with (
+            patch("render_engine.PUBLIC_DNS_SLOTS", slots),
+            patch("render_engine.DNS_RESOLUTION_TIMEOUT_SECONDS", 0.01),
+            patch("render_engine.socket.getaddrinfo", side_effect=resolve),
+        ):
+            self.assertFalse(
+                await _resolve_public_origin("first.example", 443)
+            )
+            second = asyncio.create_task(
+                _resolve_public_origin("second.example", 443)
+            )
+            await asyncio.sleep(0.02)
+            self.assertFalse(second.done())
+            release.set()
+            self.assertTrue(await second)
+
     async def test_default_self_hosted_render_skips_request_routing(self):
         context = FakeContext()
         await RenderEngine(hosted=False).render(

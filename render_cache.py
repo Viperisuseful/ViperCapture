@@ -3,19 +3,19 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
-from hashlib import sha256
 import hmac
 import json
 import os
-from pathlib import Path
 import stat
 import tempfile
+from contextlib import suppress
+from datetime import datetime, timedelta, timezone
+from hashlib import sha256
+from pathlib import Path
 
+from async_jobs import _ensure_private_directory
 from render_contract import RenderRequest, canonical_render_document
 from render_engine import RenderArtifact
-from async_jobs import _ensure_private_directory
-
 
 UTC = timezone.utc
 
@@ -101,8 +101,17 @@ class RenderCache:
     async def get(self, request: RenderRequest) -> RenderArtifact | None:
         key = self.key(request)
         body_path, metadata_path = self._paths(key)
+        return await self._run_locked(self._read, body_path, metadata_path)
+
+    async def _run_locked(self, operation, *args):
         async with self.lock:
-            return await asyncio.to_thread(self._read, body_path, metadata_path)
+            task = asyncio.create_task(asyncio.to_thread(operation, *args))
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                with suppress(Exception):
+                    await asyncio.shield(task)
+                raise
 
     def _read(self, body_path: Path, metadata_path: Path) -> RenderArtifact | None:
         try:
@@ -154,9 +163,23 @@ class RenderCache:
                 if name in artifact.metadata
             },
         }
-        async with self.lock:
-            await asyncio.to_thread(self._write, body_path, metadata_path, artifact.body, metadata)
-            await asyncio.to_thread(self._trim)
+        await self._run_locked(
+            self._write_and_trim,
+            body_path,
+            metadata_path,
+            artifact.body,
+            metadata,
+        )
+
+    def _write_and_trim(
+        self,
+        body_path: Path,
+        metadata_path: Path,
+        body: bytes,
+        metadata: dict,
+    ) -> None:
+        self._write(body_path, metadata_path, body, metadata)
+        self._trim()
 
     def _write(self, body_path: Path, metadata_path: Path, body: bytes, metadata: dict) -> None:
         descriptors = []

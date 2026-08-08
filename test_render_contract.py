@@ -221,6 +221,21 @@ class RenderContractTest(unittest.TestCase):
                     }
                 )
 
+    def test_proxy_requires_a_valid_authority(self):
+        for server in (
+            "http://",
+            "http://proxy.example:bad",
+            "http://user:pass@proxy.example",
+            "http://proxy.example/path",
+        ):
+            with self.subTest(server=server), self.assertRaises(ValidationError):
+                RenderRequest.model_validate(
+                    {
+                        "url": "https://example.com",
+                        "network": {"proxy": {"server": server}},
+                    }
+                )
+
     def test_new_feature_conflicts_and_bounds_are_rejected(self):
         invalid = (
             {

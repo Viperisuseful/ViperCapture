@@ -268,6 +268,77 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         )
         service.submit.assert_not_awaited()
 
+    async def test_bulk_idempotent_replay_skips_webhook_validation(self):
+        original_service = getattr(main.app.state, "async_jobs", None)
+        original_dispatcher = getattr(main.app.state, "webhooks", None)
+        now = datetime.now(timezone.utc)
+        existing = JobRecord(
+            id="00000000-0000-0000-0000-000000000002",
+            request_id="replay-1",
+            status="queued",
+            payload=b"encrypted",
+            attempt_count=0,
+            available_at=now,
+            queue_expires_at=now + timedelta(minutes=1),
+            created_at=now,
+        )
+        service = SimpleNamespace(
+            existing=AsyncMock(return_value=existing),
+            submit=AsyncMock(),
+        )
+        validate = AsyncMock(side_effect=RuntimeError("must not run"))
+        main.app.state.async_jobs = service
+        main.app.state.webhooks = SimpleNamespace(validate_url=validate)
+        payload = BulkJobRequest.model_validate(
+            {
+                "items": [
+                    {
+                        "request_id": "replay-1",
+                        "render": {
+                            "url": "https://example.com",
+                            "delivery": {
+                                "webhook_url": "https://hooks.example/callback"
+                            },
+                        },
+                    }
+                ]
+            }
+        )
+        try:
+            response = await main.create_bulk_render_jobs(
+                payload,
+                SimpleNamespace(state=SimpleNamespace(request_id="bulk")),
+            )
+        finally:
+            main.app.state.async_jobs = original_service
+            main.app.state.webhooks = original_dispatcher
+        self.assertEqual(response.status_code, 202)
+        validate.assert_not_awaited()
+        service.submit.assert_not_awaited()
+
+    async def test_async_cache_hit_bypasses_chromium_slot(self):
+        original_cache = getattr(main.app.state, "render_cache", None)
+        original_slots = getattr(main.app.state, "capture_slots", None)
+        main.app.state.render_cache = SimpleNamespace(
+            get=AsyncMock(
+                return_value=RenderArtifact(
+                    b"cached", "image/png", "capture.png"
+                )
+            )
+        )
+        main.app.state.capture_slots = asyncio.Semaphore(0)
+        try:
+            artifact = await asyncio.wait_for(
+                main._render_async_image(
+                    RenderRequest(html="cached", cache=True)
+                ),
+                timeout=0.25,
+            )
+        finally:
+            main.app.state.render_cache = original_cache
+            main.app.state.capture_slots = original_slots
+        self.assertEqual(artifact.body, b"cached")
+
     async def test_visual_diff_queue_is_bounded(self):
         original_slots = getattr(main.app.state, "diff_slots", None)
         main.app.state.diff_slots = asyncio.Semaphore(0)

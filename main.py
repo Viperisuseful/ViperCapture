@@ -602,6 +602,16 @@ def _render_engine() -> RenderEngine:
 
 async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
     started = time.perf_counter()
+    cache = getattr(app.state, "render_cache", None)
+    if payload.cache and cache is not None:
+        cached = await cache.get(payload)
+        if cached is not None:
+            return RenderedArtifact(
+                body=cached.body,
+                media_type=cached.media_type,
+                filename=cached.filename,
+                render_ms=round((time.perf_counter() - started) * 1000),
+            )
     await app.state.capture_slots.acquire()
     browser: Browser = app.state.browser
     engine = _render_engine()
@@ -902,21 +912,39 @@ async def create_bulk_render_jobs(
     service = _async_job_service()
     results = []
     failures = 0
-    validation_tasks = [
-        asyncio.create_task(_validate_webhook(item.render))
-        for item in payload.items
+    existing_jobs = [None] * len(payload.items)
+    preflight_errors: list[RenderError | None] = [None] * len(payload.items)
+    request_ids = [
+        item.request_id or f"{request.state.request_id}-{index + 1}"
+        for index, item in enumerate(payload.items)
     ]
-    _done, pending = await asyncio.wait(
-        validation_tasks,
-        timeout=BULK_WEBHOOK_VALIDATION_TIMEOUT_SECONDS,
-    )
+    for index, item in enumerate(payload.items):
+        try:
+            existing_jobs[index] = await service.existing(
+                item.render,
+                request_id=request_ids[index],
+            )
+        except RenderError as exc:
+            preflight_errors[index] = exc
+    validation_tasks = {
+        index: asyncio.create_task(_validate_webhook(item.render))
+        for index, item in enumerate(payload.items)
+        if existing_jobs[index] is None and preflight_errors[index] is None
+    }
+    if validation_tasks:
+        _done, pending = await asyncio.wait(
+            set(validation_tasks.values()),
+            timeout=BULK_WEBHOOK_VALIDATION_TIMEOUT_SECONDS,
+        )
+    else:
+        pending = set()
     for task in pending:
         task.cancel()
     await asyncio.gather(*pending, return_exceptions=True)
-    validation_errors: list[RenderError | None] = []
-    for task in validation_tasks:
+    validation_errors: list[RenderError | None] = list(preflight_errors)
+    for index, task in validation_tasks.items():
         if task in pending:
-            validation_errors.append(
+            validation_errors[index] = (
                 RenderError(
                     "bulk_webhook_validation_timeout",
                     "Bulk webhook validation exceeded its aggregate deadline.",
@@ -927,18 +955,19 @@ async def create_bulk_render_jobs(
             continue
         try:
             task.result()
-            validation_errors.append(None)
         except RenderError as exc:
-            validation_errors.append(exc)
+            validation_errors[index] = exc
     for index, item in enumerate(payload.items):
-        request_id = item.request_id or f"{request.state.request_id}-{index + 1}"
         try:
-            job = await service.existing(item.render, request_id=request_id)
+            job = existing_jobs[index]
             if job is None:
                 error = validation_errors[index]
                 if error is not None:
                     raise error
-                job = await service.submit(item.render, request_id=request_id)
+                job = await service.submit(
+                    item.render,
+                    request_id=request_ids[index],
+                )
             results.append(
                 {
                     "index": index,
