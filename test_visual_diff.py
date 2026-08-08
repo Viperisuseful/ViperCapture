@@ -77,6 +77,21 @@ class VisualDiffTests(unittest.TestCase):
             0,
         )
 
+    def test_threshold_uses_premultiplied_translucent_color(self):
+        red = io.BytesIO()
+        black = io.BytesIO()
+        Image.new("RGBA", (1, 1), (255, 0, 0, 1)).save(red, "PNG")
+        Image.new("RGBA", (1, 1), (0, 0, 0, 1)).save(black, "PNG")
+
+        self.assertEqual(
+            compare_images(
+                red.getvalue(),
+                black.getvalue(),
+                pixel_threshold=1,
+            ).changed_pixels,
+            0,
+        )
+
     def test_exif_orientation_is_applied_before_comparison(self):
         oriented = io.BytesIO()
         normalized = io.BytesIO()

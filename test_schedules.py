@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -374,6 +375,28 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
 
         disabled = await self.store.get(record.id)
         self.assertEqual(disabled.pending_attempt, 0)
+
+    async def test_reenabling_skips_occurrences_missed_while_disabled(self):
+        record = await self.service.create(
+            ScheduleCreate(
+                name="Resume future",
+                cron="* * * * *",
+                enabled=False,
+                render=RenderRequest(html="future"),
+            )
+        )
+        stale = replace(
+            record,
+            next_run_at=datetime.now(UTC) - timedelta(minutes=5),
+            updated_at=datetime.now(UTC),
+        )
+        await self.store.update(stale, expected_updated_at=record.updated_at)
+
+        resumed = await self.service.update(
+            stale, ScheduleUpdate(enabled=True)
+        )
+
+        self.assertGreater(resumed.next_run_at, datetime.now(UTC))
 
 
 if __name__ == "__main__":

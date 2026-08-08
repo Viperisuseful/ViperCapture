@@ -612,7 +612,11 @@ class ScheduleService:
                 False,
             ) from exc
         now = datetime.now(UTC)
-        changed_clock = request.cron is not None or request.timezone is not None
+        changed_clock = (
+            request.cron is not None
+            or request.timezone is not None
+            or (request.enabled is True and not record.enabled)
+        )
         updated = ScheduleRecord(
             **{
                 **record.__dict__,

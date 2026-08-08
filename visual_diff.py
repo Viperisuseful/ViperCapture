@@ -78,22 +78,21 @@ def compare_images(
             {"baseline": list(baseline.size), "current": list(current.size)},
         )
 
-    def visible_rgba(image: Image.Image) -> Image.Image:
+    def premultiplied_rgba(image: Image.Image) -> Image.Image:
         red, green, blue, alpha = image.split()
-        visible = alpha.point(lambda value: 255 if value else 0)
         return Image.merge(
             "RGBA",
             (
-                ImageChops.multiply(red, visible),
-                ImageChops.multiply(green, visible),
-                ImageChops.multiply(blue, visible),
+                ImageChops.multiply(red, alpha),
+                ImageChops.multiply(green, alpha),
+                ImageChops.multiply(blue, alpha),
                 alpha,
             ),
         )
 
     difference = ImageChops.difference(
-        visible_rgba(baseline),
-        visible_rgba(current),
+        premultiplied_rgba(baseline),
+        premultiplied_rgba(current),
     )
     # A difference in any color or alpha channel changes the rendered pixel.
     channel_masks = [
