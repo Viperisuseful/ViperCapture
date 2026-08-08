@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from functools import lru_cache
-import json
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
-
 
 ConsentMode = Literal["none", "reject", "accept", "hide"]
 BASE_DIR = Path(__file__).resolve().parent
@@ -148,11 +147,21 @@ async def setup_autoconsent(page, mode: ConsentMode) -> AutoConsentSession | Non
         except Exception:
             pass
 
+    messages_received = 0
+    initialized = False
+
     async def handle_message(message) -> None:
+        nonlocal initialized, messages_received
         if not isinstance(message, dict):
+            return
+        messages_received += 1
+        if messages_received > 256:
             return
         message_type = message.get("type")
         if message_type == "init":
+            if initialized:
+                return
+            initialized = True
             await send_to_page({"type": "initResp", "config": config, "rules": rules})
         elif message_type == "eval":
             try:

@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 from playwright.async_api import Error as PlaywrightError
 
-from render_contract import LazyLoadMode, RenderRequest
+from render_contract import LazyLoadMode, OutputFormat, RenderRequest
 from render_engine import (
     CleanupHooks,
     PublicUrlValidator,
@@ -20,6 +20,7 @@ from render_engine import (
     RenderLimits,
     _resolve_public_origin,
     _run_process,
+    capture_clipped_image,
     ensure_dimensions,
     ensure_full_page_dimensions,
     is_public_http_url,
@@ -150,6 +151,25 @@ class FakeBrowser:
 
 
 class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
+    async def test_clipped_capture_hides_and_restores_caret(self):
+        page = FakePage()
+        page.context = FakeContext(page)
+        evaluations = []
+
+        async def evaluate(script, *_args):
+            evaluations.append(script)
+
+        page.evaluate = evaluate
+        await capture_clipped_image(
+            page,
+            output=OutputFormat.PNG,
+            clip={"x": 0, "y": 0, "width": 320, "height": 240, "scale": 1},
+            quality=None,
+            transparent=False,
+        )
+        self.assertIn("caret-color: transparent", evaluations[0])
+        self.assertIn("style[data-vipercapture-screenshot]", evaluations[-1])
+
     async def test_action_transport_failure_remains_retryable(self):
         class BrokenLocator(FakeLocator):
             async def click(self, **_options):
@@ -1088,6 +1108,59 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
                 ),
             )
         self.assertEqual(raised.exception.code, "captcha_detected")
+
+    async def test_cancelled_video_read_settles_before_cleanup(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        class Video:
+            async def path(self):
+                return "/tmp/source.webm"
+
+        class VideoPage(FakePage):
+            def __init__(self):
+                super().__init__()
+                self.video = Video()
+
+            async def close(self):
+                return None
+
+        async def trim(_source, target, *, duration_ms):
+            target.write_bytes(b"webm")
+            return duration_ms
+
+        def blocked_read():
+            started.set()
+            release.wait(timeout=2)
+            return b"webm"
+
+        with (
+            patch("render_engine._trim_webm", side_effect=trim),
+            patch("pathlib.Path.read_bytes", side_effect=blocked_read),
+        ):
+            operation = asyncio.create_task(
+                RenderEngine(hosted=False).render_image(
+                    FakeBrowser(FakeContext(VideoPage())),
+                    RenderRequest(
+                        url="https://example.com",
+                        output="webm",
+                        full_page=False,
+                        video={"duration_ms": 1_000},
+                    ),
+                    RenderLimits(
+                        max_width=1920,
+                        max_height=1080,
+                        max_pixels=2_073_600,
+                    ),
+                )
+            )
+            self.assertTrue(await asyncio.to_thread(started.wait, 1))
+            operation.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(operation.done())
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await operation
 
     async def test_assertions_run_after_full_page_lazy_loading(self):
         events = []

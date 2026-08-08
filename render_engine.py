@@ -631,7 +631,14 @@ async def capture_clipped_image(
     session = await page.context.new_cdp_session(page)
     try:
         with suppress(Exception):
-            await page.evaluate("() => document.getAnimations().forEach(a => a.pause())")
+            await page.evaluate("""() => {
+                document.getAnimations().forEach((animation) => animation.pause());
+                const style = document.createElement("style");
+                style.dataset.vipercaptureScreenshot = "true";
+                style.textContent = "*, *::before, *::after { caret-color: transparent !important; }";
+                document.documentElement.append(style);
+                void document.documentElement.offsetWidth;
+            }""")
         if transparent:
             await session.send(
                 "Emulation.setDefaultBackgroundColorOverride",
@@ -648,6 +655,12 @@ async def capture_clipped_image(
         result = await session.send("Page.captureScreenshot", options)
         return b64decode(result["data"])
     finally:
+        with suppress(Exception):
+            await page.evaluate(
+                """() => document.querySelectorAll(
+                    "style[data-vipercapture-screenshot]"
+                ).forEach((style) => style.remove())"""
+            )
         if transparent:
             with suppress(Exception):
                 await session.send("Emulation.setDefaultBackgroundColorOverride")
@@ -1468,7 +1481,7 @@ class RenderEngine:
                         raise RenderError("empty_output", "The renderer produced an empty video.", 502, True)
                     if size > limits.output_bytes:
                         raise RenderError("output_too_large", "The rendered video exceeds the output limit.", 413, False)
-                    body = await asyncio.to_thread(trimmed_path.read_bytes)
+                    body = await _settled_thread(trimmed_path.read_bytes)
                     artifact = RenderArtifact(
                         body,
                         "video/webm",

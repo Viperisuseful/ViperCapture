@@ -648,6 +648,13 @@ class AsyncJobService:
         *,
         request_id: str,
     ) -> JobRecord:
+        if payload.delivery.webhook_url is not None and self.notifier is None:
+            raise RenderError(
+                "webhooks_disabled",
+                "Webhook delivery is disabled for this ViperCapture instance.",
+                503,
+                False,
+            )
         await self._maintain()
         now = datetime.now(UTC)
         job_id = str(uuid4())

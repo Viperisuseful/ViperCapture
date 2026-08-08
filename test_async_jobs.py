@@ -93,6 +93,25 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         self.secret.stop()
         self.temporary.cleanup()
 
+    async def test_submit_rejects_webhook_without_notifier(self):
+        service = AsyncJobService(
+            self.settings,
+            self.store,
+            self.artifacts,
+            _successful_renderer,
+        )
+        payload = RenderRequest.model_validate(
+            {
+                "url": "https://example.com/report",
+                "delivery": {"webhook_url": "https://hooks.example/callback"},
+            }
+        )
+        with self.assertRaises(RenderError) as raised:
+            await service.submit(payload, request_id="disabled-webhook")
+        self.assertEqual(raised.exception.code, "webhooks_disabled")
+        self.assertFalse(raised.exception.retryable)
+        self.assertFalse(self.store.path.exists())
+
     async def test_job_is_encrypted_rendered_and_downloadable(self):
         service = AsyncJobService(
             self.settings,

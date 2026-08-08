@@ -71,6 +71,9 @@ class CleanupPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(init["config"]["logs"].values()))
         self.assertTrue(init["rules"]["autoconsent"])
 
+        await page.callback({"type": "init"})
+        self.assertEqual(len(page.messages), 1)
+
         await page.callback({"type": "autoconsentDone", "cmp": "test"})
         outcome = await finish_autoconsent(page, session)
         self.assertEqual(outcome["mode"], "reject")
