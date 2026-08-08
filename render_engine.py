@@ -60,6 +60,11 @@ MAX_METADATA_ITEMS = 100
 MAX_METADATA_VALUE_CHARS = 2_048
 DNS_RESOLUTION_TIMEOUT_SECONDS = 5
 MAX_DIAGNOSTIC_EVENTS = 500
+# Assertion matches are tracked across every request event, independent of the
+# bounded diagnostic sample, so a specifically asserted failure that arrives
+# after the sample is full still fails the render.
+MAX_FAILED_REQUEST_EVENTS = 200
+MAX_ASSERTION_MATCHES = 200
 
 
 def _ffmpeg_executable() -> Path:
@@ -803,9 +808,9 @@ class RenderEngine:
                     {"assertion": "content_excludes", "value": forbidden},
                 )
         for pattern in request.assertions.request_failures:
-            matching = [
+            matched = [
                 failure
-                for failure in failed_requests
+                for failure in assertion_matches or []
                 if fnmatchcase(str(failure.get("url", "")), pattern)
             ]
             if pattern in matched_failure_patterns or matching:
@@ -816,7 +821,7 @@ class RenderEngine:
                     True,
                     {
                         "pattern": pattern,
-                        "failures": matching[:10],
+                        "failures": matched[:10],
                     },
                 )
 
@@ -1118,6 +1123,19 @@ class RenderEngine:
                     page.on("console", record_console)
                     page.on("response", record_network)
 
+                def record_failure(url: str, detail: dict[str, object]) -> None:
+                    # Diagnostic sampling stays bounded, but assertion matches
+                    # are tracked across every event so a specifically asserted
+                    # failure arriving after the sample is full still fails.
+                    if len(failed_requests) < MAX_FAILED_REQUEST_EVENTS:
+                        failed_requests.append(detail)
+                    if assertion_patterns:
+                        for pattern in assertion_patterns:
+                            if fnmatchcase(url, pattern):
+                                if len(assertion_matches) < MAX_ASSERTION_MATCHES:
+                                    assertion_matches.append(detail)
+                                break
+
                 def record_failed(page_request) -> None:
                     for pattern in request.assertions.request_failures:
                         if fnmatchcase(page_request.url, pattern):
@@ -1125,11 +1143,12 @@ class RenderEngine:
                     if len(failed_requests) >= 200:
                         return
                     failure = page_request.failure
-                    failed_requests.append(
+                    record_failure(
+                        page_request.url[:2_048],
                         {
                             "url": page_request.url[:2_048],
                             "error": str(failure or "request_failed")[:512],
-                        }
+                        },
                     )
 
                 def record_error_response(response) -> None:
@@ -1140,11 +1159,12 @@ class RenderEngine:
                             matched_failure_patterns.add(pattern)
                     if len(failed_requests) >= 200:
                         return
-                    failed_requests.append(
+                    record_failure(
+                        response.url[:2_048],
                         {
                             "url": response.url[:2_048],
                             "status": response.status,
-                        }
+                        },
                     )
 
                 page.on("requestfailed", record_failed)

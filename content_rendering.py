@@ -20,6 +20,11 @@ from render_errors import RenderError
 MAX_PRINT_PAGES = 50
 MAX_SINGLE_PAGE_WIDTH = 20_000
 MAX_SINGLE_PAGE_HEIGHT = 20_000
+# Single-page PDF sheets are bounded in width and total area before being
+# passed to Chromium, so a compact page cannot force an arbitrarily wide PDF
+# surface through the renderer.
+MAX_SINGLE_PAGE_WIDTH = 20_000
+MAX_SINGLE_PAGE_AREA = 100_000_000
 MAX_MARKDOWN_HTML_BYTES = 5 * 1024 * 1024
 PAPER_INCHES = {
     "A4": (8.27, 11.69),
@@ -212,6 +217,11 @@ async def render_document_output(
             "unsupported_output", "The output format is not supported.", 422, False
         )
 
+    hydrated_limit = (
+        MAX_MARKDOWN_HTML_BYTES
+        if request.output is OutputFormat.MARKDOWN
+        else limits.output_bytes
+    )
     try:
         maximum_html_bytes = (
             limits.output_bytes

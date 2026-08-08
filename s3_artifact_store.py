@@ -52,6 +52,7 @@ class S3ArtifactStore:
         self.config = config
         self.bucket = bucket
         self.prefix = prefix.strip("/")
+        self._maintenance_continuation: str | None = None
         self.client = client or boto3.client(
             "s3",
             endpoint_url=os.getenv("VIPERCAPTURE_S3_ENDPOINT_URL") or None,

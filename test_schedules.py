@@ -168,6 +168,64 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(stored.next_run_at, due)
         self.assertEqual(await self.service.run_due(due), 0)
 
+    async def test_update_preserves_scheduler_advancement(self):
+        record = await self.service.create(
+            ScheduleCreate(
+                name="Hourly",
+                cron="0 * * * *",
+                render=RenderRequest(html="<h1>scheduled</h1>"),
+            )
+        )
+        # A stale snapshot taken before the scheduler claims the schedule.
+        stale = await self.store.get(record.id)
+        assert stale is not None
+        due = datetime.now(UTC) + timedelta(hours=2)
+        self.assertEqual(await self.service.run_due(due), 1)
+        claimed = await self.store.get(record.id)
+        assert claimed is not None
+        self.assertGreater(claimed.next_run_at, stale.next_run_at)
+        self.assertEqual(claimed.last_job_id, "job-1")
+
+        # Updating name/payload from the stale snapshot must not restore the
+        # pre-claim due timestamp or erase the recorded result.
+        updated = await self.service.update(
+            stale,
+            ScheduleUpdate(name="Renamed", render=RenderRequest(html="<p>new</p>")),
+        )
+        self.assertEqual(updated.name, "Renamed")
+        self.assertEqual(updated.next_run_at, claimed.next_run_at)
+        self.assertEqual(updated.last_job_id, "job-1")
+        self.assertEqual(await self.service.run_due(due), 0)
+
+        # Changing the clock still recomputes the next occurrence.
+        current = await self.store.get(record.id)
+        assert current is not None
+        moved = await self.service.update(
+            current,
+            ScheduleUpdate(cron="30 3 * * *"),
+        )
+        self.assertNotEqual(moved.next_run_at, claimed.next_run_at)
+
+    async def test_schedule_listing_pages_without_payloads(self):
+        for index in range(3):
+            await self.service.create(
+                ScheduleCreate(
+                    name=f"Job {index}",
+                    cron="0 * * * *",
+                    render=RenderRequest(html=f"<h1>{index}</h1>"),
+                )
+            )
+        first = await self.store.list_page(limit=2)
+        self.assertEqual(len(first), 2)
+        self.assertNotIn("payload", first[0])
+        self.assertNotIn("render", first[0])
+        second = await self.store.list_page(after=str(first[-1]["id"]), limit=2)
+        self.assertEqual(len(second), 1)
+        self.assertEqual(
+            {item["id"] for item in first + second},
+            {record.id for record in await self.store.list()},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
