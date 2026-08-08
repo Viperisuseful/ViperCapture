@@ -1,0 +1,24 @@
+{
+  "name": "ViperCapture render",
+  "nodes": [
+    {
+      "name": "Render screenshot",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [320, 240],
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.VIPERCAPTURE_URL + '/v1/render'}}",
+        "sendHeaders": true,
+        "headerParameters": {"parameters": [{"name": "Authorization", "value": "={{'Bearer ' + $env.VIPERCAPTURE_API_KEY}}"}]},
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {url: $json.url, output: 'png', deterministic: {enabled: true}} }}",
+        "options": {"response": {"response": {"responseFormat": "file"}}}
+      }
+    }
+  ],
+  "connections": {},
+  "active": false,
+  "settings": {}
+}

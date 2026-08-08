@@ -556,11 +556,13 @@ class ScheduleService:
         cipher: PayloadCipher,
         *,
         poll_seconds: float = 1.0,
+        on_job_created=None,
     ) -> None:
         self.store = store
         self.jobs = jobs
         self.cipher = cipher
         self.poll_seconds = max(0.1, poll_seconds)
+        self.on_job_created = on_job_created
         self.task: asyncio.Task | None = None
         self.mutation_lock = asyncio.Lock()
 
@@ -709,6 +711,8 @@ class ScheduleService:
                     await self.store.record_result(
                         record.id, job_id=job.id, error=None
                     )
+                    if self.on_job_created is not None:
+                        await self.on_job_created(record.id, job.id)
             except Exception as exc:
                 retryable = not isinstance(exc, RenderError) or exc.retryable
                 if retryable:

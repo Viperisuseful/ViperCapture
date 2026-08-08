@@ -64,6 +64,9 @@ class OutputFormat(str, Enum):
     MARKDOWN = "markdown"
     METADATA = "metadata"
     WEBM = "webm"
+    MP4 = "mp4"
+    GIF = "gif"
+    AVIF = "avif"
 
 
 class DevicePreset(str, Enum):
@@ -344,6 +347,32 @@ class DiagnosticsOptions(StrictModel):
     bundle: bool = False
     include_console: bool = True
     include_network: bool = True
+    include_har: bool = False
+    include_trace: bool = False
+    include_mhtml: bool = False
+    include_warc: bool = False
+
+
+class DeterministicOptions(StrictModel):
+    enabled: bool = False
+    timestamp_ms: int = Field(default=1_700_000_000_000, ge=0)
+    random_seed: int = Field(default=1, ge=0, le=2**32 - 1)
+    wait_for_fonts: bool = True
+
+
+class CertificationOptions(StrictModel):
+    enabled: bool = False
+
+
+class SliceOptions(StrictModel):
+    height: int = Field(ge=100, le=10_000)
+    overlap: int = Field(default=0, ge=0, le=1_000)
+
+    @model_validator(mode="after")
+    def validate_overlap(self) -> "SliceOptions":
+        if self.overlap >= self.height:
+            raise ValueError("slice overlap must be smaller than slice height")
+        return self
 
 
 class VideoOptions(StrictModel):
@@ -448,6 +477,11 @@ class RenderRequest(StrictModel):
     assertions: AssertionOptions = Field(default_factory=AssertionOptions)
     delivery: DeliveryOptions = Field(default_factory=DeliveryOptions)
     diagnostics: DiagnosticsOptions = Field(default_factory=DiagnosticsOptions)
+    deterministic: DeterministicOptions = Field(default_factory=DeterministicOptions)
+    certification: CertificationOptions = Field(default_factory=CertificationOptions)
+    slices: SliceOptions | None = None
+    profile_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{1,128}$")
+    save_profile: bool = False
     video: VideoOptions | None = None
     full_page: bool = True
     preserve_viewport_width: bool = Field(
@@ -491,6 +525,8 @@ class RenderRequest(StrictModel):
             raise ValueError("base_url is required for raw input custom headers")
         if self.preserve_viewport_width and not self.full_page:
             raise ValueError("preserve_viewport_width requires full_page=true")
+        if self.save_profile and self.profile_id is None:
+            raise ValueError("save_profile requires profile_id")
         for source in (self.html, self.markdown):
             if source is not None and len(source.encode("utf-8")) > MAX_SOURCE_BYTES:
                 raise ValueError("HTML and Markdown input may not exceed 5242880 bytes")
@@ -499,8 +535,9 @@ class RenderRequest(StrictModel):
             OutputFormat.PNG,
             OutputFormat.JPEG,
             OutputFormat.WEBP,
+            OutputFormat.AVIF,
         }
-        is_video = self.output is OutputFormat.WEBM
+        is_video = self.output in {OutputFormat.WEBM, OutputFormat.MP4, OutputFormat.GIF}
         if self.preserve_viewport_width and not is_image:
             raise ValueError(
                 "preserve_viewport_width requires an image output"
@@ -519,7 +556,7 @@ class RenderRequest(StrictModel):
             raise ValueError("clip and selector are mutually exclusive")
         if self.viewports is not None:
             if not is_image:
-                raise ValueError("viewports requires PNG, JPEG, or WebP output")
+                raise ValueError("viewports requires PNG, JPEG, WebP, or AVIF output")
             if self.full_page:
                 raise ValueError("viewports requires full_page=false")
             if self.selector is not None or self.clip is not None:
@@ -529,27 +566,45 @@ class RenderRequest(StrictModel):
                 raise ValueError("viewports names must be unique")
         if self.diagnostics.bundle and self.viewports is not None:
             raise ValueError("diagnostic bundles cannot be combined with multi-viewports")
+        advanced_diagnostics = (
+            self.diagnostics.include_har
+            or self.diagnostics.include_trace
+            or self.diagnostics.include_mhtml
+            or self.diagnostics.include_warc
+        )
+        if advanced_diagnostics and not self.diagnostics.bundle:
+            raise ValueError("HAR, trace, MHTML, and WARC require diagnostics.bundle=true")
+        if self.certification.enabled and self.viewports is not None:
+            raise ValueError("certification cannot be combined with multi-viewports")
         if is_video:
             if self.video is None:
                 self.video = VideoOptions()
             if self.selector is not None or self.clip is not None or self.viewports is not None:
-                raise ValueError("WebM video cannot use selector, clip, or multi-viewports")
+                raise ValueError("video cannot use selector, clip, or multi-viewports")
+            if self.diagnostics.include_trace or self.diagnostics.include_mhtml:
+                raise ValueError("video diagnostics support console, network, HAR, and WARC")
         elif self.video is not None:
-            raise ValueError("video settings require WebM output")
+            raise ValueError("video settings require WebM, MP4, or GIF output")
+        if self.slices is not None and (not is_image or not self.full_page or self.viewports is not None):
+            raise ValueError("slices require a single full-page image output")
         if self.cache and (not is_image or self.viewports is not None):
-            raise ValueError("cache is accepted only for a single PNG, JPEG, or WebP output")
+            raise ValueError("cache is accepted only for a single PNG, JPEG, WebP, or AVIF output")
         if self.cache and self.diagnostics.bundle:
             raise ValueError("cache cannot be combined with a diagnostic bundle")
+        if self.cache and self.profile_id is not None:
+            raise ValueError("cache cannot be combined with a persistent profile")
         if self.image.quality is not None and self.output not in {
             OutputFormat.JPEG,
             OutputFormat.WEBP,
+            OutputFormat.AVIF,
         }:
-            raise ValueError("quality is accepted only for JPEG or WebP")
+            raise ValueError("quality is accepted only for JPEG, WebP, or AVIF")
         if self.image.transparent_background and self.output not in {
             OutputFormat.PNG,
             OutputFormat.WEBP,
+            OutputFormat.AVIF,
         }:
-            raise ValueError("transparent_background is accepted only for PNG or WebP")
+            raise ValueError("transparent_background is accepted only for PNG, WebP, or AVIF")
         if self.image.optimize_for_speed and self.output not in {
             OutputFormat.PNG,
             OutputFormat.WEBP,
@@ -583,7 +638,12 @@ class RenderRequest(StrictModel):
 
     @property
     def recorded_output_type(self) -> str:
-        return "zip" if self.viewports is not None else self.output.value
+        return "zip" if (
+            self.viewports is not None
+            or self.slices is not None
+            or self.certification.enabled
+            or self.diagnostics.bundle
+        ) else self.output.value
 
 
 def canonical_render_document(

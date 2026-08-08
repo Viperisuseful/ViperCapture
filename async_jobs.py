@@ -345,6 +345,13 @@ def _positive_int(name: str, default: int) -> int:
     return value
 
 
+def _nonnegative_int(name: str, default: int) -> int:
+    value = int(os.getenv(name, str(default)))
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative")
+    return value
+
+
 def settings_from_environment(
     *,
     default_workers: int = 1,
@@ -359,7 +366,7 @@ def settings_from_environment(
     return JobSettings(
         data_dir=root,
         queue_limit=_positive_int("VIPERCAPTURE_JOB_QUEUE_LIMIT", 30),
-        worker_count=_positive_int(
+        worker_count=_nonnegative_int(
             "VIPERCAPTURE_JOB_WORKERS",
             default_workers,
         ),

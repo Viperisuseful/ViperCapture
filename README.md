@@ -7,7 +7,7 @@
 <p align="center"><strong>The open-source, self-hosted ScreenshotOne / Urlbox alternative.</strong></p>
 
 ViperCapture is an MIT-licensed browser rendering platform. It turns URLs, HTML,
-or Markdown into screenshots, PDFs, WebM video, hydrated HTML, Markdown, or
+or Markdown into screenshots, PDFs, AVIF images, WebM/MP4/GIF video, hydrated HTML, Markdown, or
 structured metadata—through a strict JSON API you can run on your own machines
 and storage.
 
@@ -17,7 +17,7 @@ and run the [reproducible benchmark](benchmarks/README.md) on your workload.
 
 ## What ships
 
-- PNG, JPEG, WebP, PDF, HTML, Markdown, metadata, and WebM output
+- PNG, JPEG, WebP, AVIF, PDF, HTML, Markdown, metadata, and WebM/MP4/GIF output
 - URL, raw HTML, and Markdown input; full-page, viewport, element, clip, and
   multi-viewport ZIP captures
 - Typed click, hover, fill, select, key, scroll, wait, hide, and opt-in
@@ -33,9 +33,14 @@ and run the [reproducible benchmark](benchmarks/README.md) on your workload.
 - Expiring HMAC-signed render URLs and a 15-minute exact-request image cache
 - Visual regression ZIPs with pixel counts, pass/fail thresholds, bounds, and
   highlighted changes
-- Privacy-aware diagnostic ZIPs with the artifact, manifest, console events,
-  and a request waterfall stripped of credentials, headers, bodies, and query
-  strings
+- Privacy-aware diagnostic ZIPs with console/network data and optional HAR,
+  Playwright trace, MHTML, and WARC; Ed25519-certified artifact bundles
+- Deterministic capture controls, sectioned slice ZIPs, project-owned visual
+  baselines, and reproducible comparison reports
+- Optional projects, hashed API keys, quotas, resource ownership, encrypted
+  persistent profiles, audit logs, Prometheus metrics, and OTLP tracing
+- Separate API/worker roles for horizontally scaled provider-backed queues,
+  plus ScreenshotOne and Urlbox compatibility adapters
 - Bounded concurrency, output/pixel/deadline limits, client-disconnect
   cancellation, consistent error envelopes, and hosted-mode SSRF defenses
 - Browser UI, Tauri desktop app, native Android app, Docker Compose, and a
@@ -63,7 +68,8 @@ docker compose up --build
 The Compose default binds only to loopback and stores durable queue state,
 encryption keys, schedules, cache entries, and local artifacts in a named
 volume. Read [self-hosting](docs/self-hosting.md) before exposing it to a
-network. The server has no built-in multi-tenant authorization layer.
+network. Set `VIPERCAPTURE_ADMIN_TOKEN` to enable the built-in project control
+plane before exposing API routes to multiple tenants.
 
 ## Render API
 
@@ -96,9 +102,14 @@ callback by setting `delivery.webhook_url`. Related orchestration endpoints:
 | `POST /v1/signed-url` | Mint an expiring HMAC render link |
 | `GET /v1/render/signed` | Render through a verified signed link |
 | `POST /v1/diff` | Compare two images and download a deterministic report ZIP |
+| `PUT/GET/POST /v1/baselines` | Store project baselines and compare review bundles |
+| `POST/DELETE /v1/profiles` | Manage encrypted Playwright storage-state profiles |
+| `GET /take` | ScreenshotOne-compatible common-options adapter |
+| `POST /compat/urlbox/v1/render/{sync,async}` | Urlbox-compatible adapters |
 
 See the [API and workflows guide](docs/api.md), [async provider guide](docs/async-jobs.md),
-and [migration guide](docs/migration-screenshotone-urlbox.md).
+[platform/operator guide](docs/platform.md), and
+[migration guide](docs/migration-screenshotone-urlbox.md).
 
 ## Storage and webhooks
 
@@ -121,9 +132,10 @@ delivery outbox survives process restarts.
 
 ## Security boundary
 
-Keep the service on loopback or place every route behind the same authenticated,
-rate-limited reverse proxy. Job and schedule UUIDs are locators, not access
-control. Hosted mode rejects targets and redirects that resolve privately at
+Keep the service on loopback, enable `VIPERCAPTURE_ADMIN_TOKEN`, or place every
+route behind the same authenticated, rate-limited reverse proxy. With the
+control plane disabled, job and schedule UUIDs remain locators rather than
+access control. Hosted mode rejects targets and redirects that resolve privately at
 validation time, unsafe subresources, cross-origin credential headers, proxy
 use, and cross-site cookies. Because browser DNS can change after validation,
 deployments must also enforce host/container egress rules to block rebinding.

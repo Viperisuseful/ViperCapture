@@ -14,7 +14,7 @@ so corrections can be submitted as pull requests.
 | Markdown input | Yes | Yes | Partial: Markdown is documented as an output |
 | PNG / JPEG / WebP | Yes | Yes | Yes |
 | PDF / hydrated HTML / Markdown / metadata | Yes | Yes | Yes |
-| Video | **WebM** | GIF/WebM animations | MP4/WebM |
+| Video | **WebM, MP4, GIF** | GIF/WebM animations | MP4/WebM |
 | Full page / viewport / selector / clip | Yes | Yes | Yes |
 | Multiple viewports in one request | Yes, ZIP | Bulk API | Batch/API workflows |
 | Typed browser actions | Yes | Scripts and page customization | Click/type/scroll and custom JS options |
@@ -31,12 +31,17 @@ so corrections can be submitted as pull requests.
 | Bulk endpoint | Yes, up to 100 | Yes | Client/batch workflow |
 | Cron schedules | Yes | External scheduler | Product/no-code workflows documented |
 | Pixel visual diff reports | Yes | Not documented as core render API | Schedule/compare workflow documented |
-| Diagnostic bundle | Yes: artifact, manifest, console, network | Partial: metadata/error options | Partial: request waterfall/metadata |
-| Deterministic local test fixtures | Yes | Managed service | Managed service |
+| Diagnostic bundle | Yes: artifact, manifest, console, network, HAR, trace, MHTML, WARC | Partial: metadata/error options | Partial: request waterfall/metadata |
+| Deterministic visual testing and baseline store | Yes | Managed service | Managed service |
+| Project API keys, quotas, ownership, audit log | Yes, operator opt-in | Managed | Managed |
+| Encrypted persistent browser profiles | Yes | Yes | Yes |
+| Prometheus metrics and OTLP traces | Yes | Vendor-managed | Vendor-managed |
+| Separate API and distributed worker roles | Yes, provider-backed | Vendor-managed | Vendor-managed |
+| ScreenshotOne/Urlbox request adapters | Yes | Native | Native |
 | Managed global proxies / stealth fleet | **No** | Yes | Yes |
 | Vendor SLA and human render support | **No** | Managed offering | Managed offering |
-| AVIF/HEIF/TIFF/JP2/GIF output | No | Yes | AVIF and MP4; see vendor docs |
-| Certified/evidentiary archive | No | Not compared | Yes |
+| AVIF output | Yes | Yes | Yes |
+| Certified/evidentiary archive | Yes, Ed25519 manifest | Not compared | Yes |
 
 Vendor sources:
 
@@ -51,8 +56,8 @@ Vendor sources:
 
 ## Deliberate non-parity
 
-ViperCapture does not claim a managed proxy network, anti-bot bypass, SLA,
-certified legal archive, or around-the-clock render support. Those are services,
+ViperCapture does not claim a managed proxy network, anti-bot bypass, legal
+admissibility opinion, SLA, or around-the-clock render support. Those are services,
 not repository features, and can be valid reasons to buy a managed provider.
 The open-source advantage is control: code, Chromium version, network, data,
 storage, capacity, and cost are inspectable and operator-owned.

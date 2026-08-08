@@ -4,6 +4,12 @@ ViperCapture uses one strict nested JSON contract rather than duplicating every
 vendor query-parameter name. Start by migrating server-side POST calls; signed
 embed URLs and async workflows can follow independently.
 
+For a staged cutover, the common ScreenshotOne query contract is available at
+`GET /take`; a project key may be sent as `access_key` or a bearer token. Urlbox
+common POST options are accepted at `/compat/urlbox/v1/render/sync` and
+`/compat/urlbox/v1/render/async`. Once traffic is stable, migrate to the native
+contract to access every ViperCapture option.
+
 ## Common option mapping
 
 | Vendor-style concept | ViperCapture field |
@@ -55,6 +61,6 @@ Example translation:
 8. Move traffic gradually and retain the managed provider as rollback until
    workload-specific acceptance criteria pass.
 
-There is intentionally no silent compatibility endpoint that accepts arbitrary
-vendor query strings. Strict validation exposes unsupported options during
-migration instead of quietly producing the wrong artifact.
+Compatibility endpoints intentionally reject unknown vendor options. Strict
+validation exposes unsupported options during migration instead of quietly
+producing the wrong artifact.

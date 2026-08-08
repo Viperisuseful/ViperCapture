@@ -19,7 +19,7 @@ import urllib.request
 
 
 DEFAULT_API_URL = "https://capture.viperisuseful.cc/v1/render"
-FORMATS = ("png", "jpeg", "webp", "pdf", "html", "markdown")
+FORMATS = ("png", "jpeg", "webp", "avif", "pdf", "html", "markdown", "webm", "mp4", "gif", "metadata")
 EXTENSIONS = {"jpeg": "jpg"}
 RETRYABLE_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 
@@ -69,6 +69,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--base-url", help="Public base URL for HTML or Markdown")
     parser.add_argument("--output", choices=FORMATS, default="png")
+    parser.add_argument("--api-key", default=os.environ.get("VIPERCAPTURE_API_KEY"))
+    parser.add_argument("--profile-id")
+    parser.add_argument("--deterministic", action="store_true")
+    parser.add_argument("--diagnostic-bundle", action="store_true")
     parser.add_argument("--output-path", type=Path, help="Exact artifact path")
     parser.add_argument(
         "--output-dir", type=Path, default=Path("."), help="Auto-named artifact folder"
@@ -133,11 +137,11 @@ def validate_args(args: argparse.Namespace) -> None:
     if not 0 <= args.delay_ms <= 15_000:
         raise ValueError("--delay-ms must be between 0 and 15000")
     if args.quality is not None:
-        if args.output not in {"jpeg", "webp"}:
-            raise ValueError("--quality is supported only for JPEG or WebP")
+        if args.output not in {"jpeg", "webp", "avif"}:
+            raise ValueError("--quality is supported only for JPEG, WebP, or AVIF")
         if not 1 <= args.quality <= 100:
             raise ValueError("--quality must be between 1 and 100")
-    if args.transparent_background and args.output not in {"png", "webp"}:
+    if args.transparent_background and args.output not in {"png", "webp", "avif"}:
         raise ValueError(
             "--transparent-background is supported only for PNG or WebP"
         )
@@ -177,6 +181,9 @@ def request_body(args: argparse.Namespace) -> dict:
             "timeout_ms": args.timeout_ms,
         },
         "proceed_on_captcha": args.proceed_on_captcha,
+        "profile_id": args.profile_id,
+        "deterministic": {"enabled": args.deterministic},
+        "diagnostics": {"bundle": args.diagnostic_bundle},
     }
     if args.url:
         body["url"] = args.url
@@ -256,7 +263,7 @@ def send_request(api_url: str, key: str | None, body: dict) -> tuple[bytes, str 
         "Accept": "application/octet-stream",
         "User-Agent": "vipercapture-agent-skill/1.0",
     }
-    if key and hosted_endpoint(api_url):
+    if key:
         headers["Authorization"] = f"Bearer {key}"
     request = urllib.request.Request(
         api_url,
@@ -337,7 +344,7 @@ def main() -> int:
                 )
             )
             return 0
-        key = os.environ.get("VIPERCAPTURE_API_KEY")
+        key = args.api_key
         if hosted_endpoint(args.api_url) and not key:
             raise ValueError("VIPERCAPTURE_API_KEY is required for the hosted API")
         target.parent.mkdir(parents=True, exist_ok=True)
