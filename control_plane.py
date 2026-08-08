@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import secrets
 import sqlite3
@@ -46,7 +47,9 @@ class Metrics:
 class ControlPlane:
     def __init__(self, path: Path, *, encryption_secret: str) -> None:
         self.path = path
-        self._cipher = AESGCM(hashlib.sha256(encryption_secret.encode()).digest())
+        secret = encryption_secret.encode()
+        self._cipher = AESGCM(hashlib.sha256(secret).digest())
+        self._key_hash_secret = hashlib.sha256(b"vipercapture-api-key\0" + secret).digest()
         self._windows: dict[str, deque[float]] = defaultdict(deque)
         self._active: dict[str, int] = defaultdict(int)
         self._limit_lock = asyncio.Lock()
@@ -122,7 +125,7 @@ class ControlPlane:
                 raise KeyError(project_id)
             db.execute(
                 "INSERT INTO api_keys(id,project_id,key_hash,prefix,name,scopes,created_at,revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
-                (key_id, project_id, hashlib.sha256(raw.encode()).digest(), prefix, name, json.dumps(scopes), int(time.time())),
+                (key_id, project_id, self._key_digest(raw), prefix, name, json.dumps(scopes), int(time.time())),
             )
         return {"id": key_id, "project_id": project_id, "name": name, "prefix": prefix, "scopes": scopes, "api_key": raw}
 
@@ -132,7 +135,7 @@ class ControlPlane:
         return cursor.rowcount == 1
 
     def authenticate(self, raw: str) -> dict[str, object] | None:
-        digest = hashlib.sha256(raw.encode()).digest()
+        digest = self._key_digest(raw)
         with self._connect() as db:
             row = db.execute(
                 "SELECT k.id key_id, k.project_id, k.scopes, p.rpm, p.concurrency FROM api_keys k JOIN projects p ON p.id=k.project_id WHERE k.key_hash=? AND k.revoked_at IS NULL",
@@ -143,6 +146,9 @@ class ControlPlane:
         result = dict(row)
         result["scopes"] = json.loads(str(result["scopes"]))
         return result
+
+    def _key_digest(self, raw: str) -> bytes:
+        return hmac.digest(self._key_hash_secret, raw.encode(), "sha256")
 
     async def acquire(self, identity: dict[str, object]) -> tuple[bool, str | None]:
         project_id = str(identity["project_id"])

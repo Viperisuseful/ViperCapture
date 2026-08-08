@@ -2,6 +2,7 @@ import io
 import json
 import os
 import base64
+import hashlib
 import tempfile
 import unittest
 import zipfile
@@ -32,6 +33,11 @@ class ControlPlaneTests(unittest.IsolatedAsyncioTestCase):
         key = self.control.create_key(str(project["id"]), "ci")
         identity = self.control.authenticate(key["api_key"])
         self.assertEqual(identity["project_id"], project["id"])
+        with self.control._connect() as database:
+            stored_digest = database.execute(
+                "SELECT key_hash FROM api_keys WHERE id=?", (key["id"],)
+            ).fetchone()[0]
+        self.assertNotEqual(stored_digest, hashlib.sha256(key["api_key"].encode()).digest())
         allowed, _ = await self.control.acquire(identity)
         self.assertTrue(allowed)
         second, reason = await self.control.acquire(identity)

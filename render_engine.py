@@ -240,7 +240,7 @@ async def _trim_webm(
         str(destination),
     ]
     returncode, _ = await _run_process(command, 45)
-    if returncode != 0 or not destination.is_file():
+    if returncode != 0:
         raise RenderError(
             "video_encode_failed",
             "The requested WebM recording window could not be encoded.",
