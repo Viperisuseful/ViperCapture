@@ -48,6 +48,33 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(response, expected)
         call_next.assert_awaited_once_with(request)
 
+    async def test_signed_routes_use_their_own_authentication(self):
+        expected = main.Response(status_code=200)
+        call_next = AsyncMock(return_value=expected)
+        with (
+            patch("main.DESKTOP_TOKEN", "desktop"),
+            patch("main.SIGNING_SECRET", "signing-secret"),
+            patch("main.SIGNING_ADMIN_TOKEN", "signing-admin"),
+        ):
+            for method, path, headers in (
+                ("GET", "/v1/render/signed", {}),
+                (
+                    "POST",
+                    "/v1/signed-url",
+                    {"authorization": "Bearer signing-admin"},
+                ),
+            ):
+                request = SimpleNamespace(
+                    method=method,
+                    url=SimpleNamespace(path=path),
+                    headers=headers,
+                )
+                response = await main.require_desktop_token(
+                    request, call_next
+                )
+                self.assertIs(response, expected)
+        self.assertEqual(call_next.await_count, 2)
+
     async def test_cached_render_bypasses_saturated_chromium_slots(self):
         original_cache = getattr(main.app.state, "render_cache", None)
         original_slots = getattr(main.app.state, "capture_slots", None)

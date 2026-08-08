@@ -373,10 +373,24 @@ if STATIC_DIR.exists():
 
 @app.middleware("http")
 async def require_desktop_token(request: Request, call_next):
+    path = request.url.path
+    signed_render = request.method == "GET" and path == "/v1/render/signed"
+    signing_token = SIGNING_ADMIN_TOKEN or SIGNING_SECRET
+    signing_admin = (
+        request.method == "POST"
+        and path == "/v1/signed-url"
+        and signing_token
+        and hmac.compare_digest(
+            request.headers.get("authorization", ""),
+            f"Bearer {signing_token}",
+        )
+    )
     if (
         DESKTOP_TOKEN
         and request.method != "OPTIONS"
-        and request.url.path != "/health"
+        and path != "/health"
+        and not signed_render
+        and not signing_admin
         and request.headers.get("authorization") != f"Bearer {DESKTOP_TOKEN}"
     ):
         return Response(status_code=401)

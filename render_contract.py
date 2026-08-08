@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
-from enum import Enum
 import re
+from enum import Enum
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
-
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    HttpUrl,
+    field_validator,
+    model_validator,
+)
 
 MAX_SOURCE_BYTES = 5 * 1024 * 1024
 MAX_HEADERS = 32
@@ -454,6 +460,10 @@ class RenderRequest(StrictModel):
             OutputFormat.WEBP,
         }
         is_video = self.output is OutputFormat.WEBM
+        if self.preserve_viewport_width and not is_image:
+            raise ValueError(
+                "preserve_viewport_width requires an image output"
+            )
         if self.custom_css is not None and len(self.custom_css.encode("utf-8")) > MAX_CUSTOM_CSS_BYTES:
             raise ValueError("custom_css may not exceed 65536 UTF-8 bytes")
         if len(set(self.fail_on_status)) != len(self.fail_on_status):

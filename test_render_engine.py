@@ -131,6 +131,15 @@ class FakeBrowser:
 
 
 class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
+    async def test_default_self_hosted_render_skips_request_routing(self):
+        context = FakeContext()
+        await RenderEngine(hosted=False).render(
+            FakeBrowser(context),
+            RenderRequest(url="https://example.com"),
+            RenderLimits(max_width=1920, max_height=1080, max_pixels=10_000_000),
+        )
+        self.assertIsNone(context.route_handler)
+
     def test_same_origin_headers_do_not_cross_redirects(self):
         original = "https://Example.com/path"
         headers = {"authorization": "old", "accept": "image/png"}

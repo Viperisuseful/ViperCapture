@@ -28,7 +28,9 @@ class FakeJobs:
 
     async def submit(self, payload, *, request_id):
         self.calls.append((payload, request_id))
-        return SimpleNamespace(id=f"job-{len(self.calls)}")
+        return SimpleNamespace(
+            id=f"job-{len(self.calls)}", status="queued", attempt_count=0
+        )
 
 
 class ScheduleTests(unittest.IsolatedAsyncioTestCase):
@@ -245,6 +247,30 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
             self.jobs.calls[-1][1],
             f"schedule-{record.id}-{int(due_at.timestamp())}",
         )
+
+    async def test_expired_unstarted_job_rotates_durable_request_id(self):
+        record = await self.service.create(
+            ScheduleCreate(
+                name="Expired recovery",
+                cron="* * * * *",
+                render=RenderRequest(html="retry expired"),
+            )
+        )
+        now = datetime.now(UTC) + timedelta(minutes=2)
+        successful_submit = self.jobs.submit
+        self.jobs.submit = AsyncMock(
+            return_value=SimpleNamespace(
+                id="expired-job", status="expired", attempt_count=0
+            )
+        )
+        await self.service.run_due(now)
+        original_id = self.jobs.submit.await_args.kwargs["request_id"]
+
+        self.jobs.submit = successful_submit
+        await self.service.run_due(now + timedelta(seconds=1))
+        self.assertEqual(self.jobs.calls[-1][1], f"{original_id}-retry-1")
+        stored = await self.store.get(record.id)
+        self.assertEqual(stored.last_job_id, "job-1")
 
 
 if __name__ == "__main__":

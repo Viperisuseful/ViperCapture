@@ -996,6 +996,20 @@ class RenderEngine:
         matched_failure_patterns: set[str] = set()
         console_events: list[dict[str, object]] = []
         network_events: list[dict[str, object]] = []
+        cleanup_routing = (
+            request.cleanup.consent_mode.value != "none"
+            or request.cleanup.block_ads
+            or request.cleanup.block_trackers
+            or request.cleanup.block_chats
+            or request.cleanup.block_newsletters
+        )
+        request_routing = needs_request_routing(
+            self.hosted,
+            request.headers,
+            cleanup_routing
+            or bool(request.network.block_url_patterns)
+            or bool(request.network.block_resource_types),
+        )
         try:
             async with asyncio.timeout(limits.deadline_seconds):
                 context_options: dict[str, object] = {}
@@ -1028,11 +1042,7 @@ class RenderEngine:
                                 or request.headers
                                 or request.network.block_url_patterns
                                 or request.network.block_resource_types
-                                or request.cleanup.consent_mode.value != "none"
-                                or request.cleanup.block_ads
-                                or request.cleanup.block_trackers
-                                or request.cleanup.block_chats
-                                or request.cleanup.block_newsletters
+                                or cleanup_routing
                             )
                             else "allow"
                         ),
@@ -1144,7 +1154,8 @@ class RenderEngine:
                         )
                     )
 
-                await context.route("**/*", route_request)
+                if request_routing:
+                    await context.route("**/*", route_request)
                 block_websocket_type = any(
                     resource.value == "websocket"
                     for resource in request.network.block_resource_types
@@ -1351,6 +1362,12 @@ class RenderEngine:
                             elapsed += delay
                     else:
                         await page.wait_for_timeout(options.duration_ms)
+                    await self._check_assertions(
+                        page,
+                        request,
+                        failed_requests,
+                        matched_failure_patterns,
+                    )
                     final_url = page.url
                     video = page.video
                     await page.close()

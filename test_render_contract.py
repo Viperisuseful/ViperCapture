@@ -51,6 +51,15 @@ class RenderContractTest(unittest.TestCase):
             {"url": "https://example.com", "preserve_viewport_width": True}
         )
         self.assertTrue(request.preserve_viewport_width)
+        with self.assertRaises(ValidationError):
+            RenderRequest.model_validate(
+                {
+                    "url": "https://example.com",
+                    "output": "pdf",
+                    "full_page": True,
+                    "preserve_viewport_width": True,
+                }
+            )
 
     def test_captcha_capture_can_be_explicitly_requested(self):
         request = RenderRequest.model_validate(

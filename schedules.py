@@ -67,6 +67,7 @@ class ScheduleRecord:
     last_run_at: datetime | None = None
     last_job_id: str | None = None
     last_error: str | None = None
+    pending_attempt: int = 0
 
 
 def validate_cron(expression: str, timezone_name: str) -> None:
@@ -160,6 +161,7 @@ class ScheduleStore:
                 payload BLOB NOT NULL,
                 next_run_at TEXT NOT NULL,
                 pending_run_at TEXT,
+                pending_attempt INTEGER NOT NULL DEFAULT 0,
                 last_run_at TEXT,
                 last_job_id TEXT,
                 last_error TEXT,
@@ -177,6 +179,10 @@ class ScheduleStore:
         if "pending_run_at" not in columns:
             self.connection.execute(
                 "ALTER TABLE schedules ADD COLUMN pending_run_at TEXT"
+            )
+        if "pending_attempt" not in columns:
+            self.connection.execute(
+                "ALTER TABLE schedules ADD COLUMN pending_attempt INTEGER NOT NULL DEFAULT 0"
             )
         self.connection.commit()
         if os.name != "nt":
@@ -230,6 +236,11 @@ class ScheduleStore:
             last_error=row["last_error"],
             created_at=_as_utc(row["created_at"]),
             updated_at=_as_utc(row["updated_at"]),
+            pending_attempt=(
+                int(row["pending_attempt"])
+                if "pending_attempt" in columns
+                else 0
+            ),
         )
 
     async def create(self, record: ScheduleRecord) -> ScheduleRecord:
@@ -362,7 +373,7 @@ class ScheduleStore:
                     continue
                 following = next_run(record.cron, record.timezone, now)
                 cursor = connection.execute(
-                    """UPDATE schedules SET next_run_at=?,pending_run_at=?,last_run_at=?,
+                    """UPDATE schedules SET next_run_at=?,pending_run_at=?,pending_attempt=0,last_run_at=?,
                     last_error=NULL,updated_at=? WHERE id=? AND next_run_at=?""",
                     (
                         following.isoformat(),
@@ -403,7 +414,7 @@ class ScheduleStore:
     ) -> None:
         connection = self._require()
         connection.execute(
-            """UPDATE schedules SET pending_run_at=NULL,last_job_id=?,last_error=?,
+            """UPDATE schedules SET pending_run_at=NULL,pending_attempt=0,last_job_id=?,last_error=?,
             updated_at=? WHERE id=?""",
             (job_id, error, datetime.now(UTC).isoformat(), schedule_id),
         )
@@ -438,6 +449,40 @@ class ScheduleStore:
                 datetime.now(UTC).isoformat(),
                 schedule_id,
                 due_at.isoformat(),
+            ),
+        )
+        connection.commit()
+        return cursor.rowcount == 1
+
+    async def advance_occurrence_attempt(
+        self,
+        schedule_id: str,
+        *,
+        due_at: datetime,
+        expected_attempt: int,
+    ) -> bool:
+        return await self._run(
+            self._advance_occurrence_attempt,
+            schedule_id,
+            due_at,
+            expected_attempt,
+        )
+
+    def _advance_occurrence_attempt(
+        self,
+        schedule_id: str,
+        due_at: datetime,
+        expected_attempt: int,
+    ) -> bool:
+        connection = self._require()
+        cursor = connection.execute(
+            """UPDATE schedules SET pending_attempt=pending_attempt+1,updated_at=?
+            WHERE id=? AND pending_run_at=? AND pending_attempt=?""",
+            (
+                datetime.now(UTC).isoformat(),
+                schedule_id,
+                due_at.isoformat(),
+                expected_attempt,
             ),
         )
         connection.commit()
@@ -559,10 +604,25 @@ class ScheduleService:
                 )
                 continue
             try:
+                request_id = (
+                    f"schedule-{record.id}-{int(due_at.timestamp())}"
+                    + (
+                        f"-retry-{record.pending_attempt}"
+                        if record.pending_attempt
+                        else ""
+                    )
+                )
                 job = await self.jobs.submit(
                     render,
-                    request_id=f"schedule-{record.id}-{int(due_at.timestamp())}",
+                    request_id=request_id,
                 )
+                if job.status == "expired" and job.attempt_count == 0:
+                    await self.store.advance_occurrence_attempt(
+                        record.id,
+                        due_at=due_at,
+                        expected_attempt=record.pending_attempt,
+                    )
+                    continue
                 await self.store.record_result(record.id, job_id=job.id, error=None)
             except Exception as exc:
                 retryable = not isinstance(exc, RenderError) or exc.retryable
