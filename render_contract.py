@@ -487,6 +487,8 @@ class RenderRequest(StrictModel):
             raise ValueError("exactly one of url, html, or markdown is required")
         if self.base_url is not None and self.url is not None:
             raise ValueError("base_url is accepted only with html or markdown input")
+        if self.headers and self.url is None and self.base_url is None:
+            raise ValueError("base_url is required for raw input custom headers")
         if self.preserve_viewport_width and not self.full_page:
             raise ValueError("preserve_viewport_width requires full_page=true")
         for source in (self.html, self.markdown):

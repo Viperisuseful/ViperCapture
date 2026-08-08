@@ -31,7 +31,6 @@ from async_jobs import (
     settings_from_environment,
 )
 from bulk_jobs import BulkBodyLimitMiddleware, BulkJobRequest
-from content_rendering import _settled_thread
 from page_cleanup import (
     CleanupOptions,
     apply_visual_cleanup,
@@ -41,7 +40,13 @@ from page_cleanup import (
 )
 from render_cache import RenderCache
 from render_contract import OutputFormat, RenderRequest
-from render_engine import CleanupHooks, RenderArtifact, RenderEngine, RenderLimits
+from render_engine import (
+    CleanupHooks,
+    RenderArtifact,
+    RenderEngine,
+    RenderLimits,
+    _settled_thread,
+)
 from render_errors import RenderError, install_render_error_layer
 from schedules import (
     ScheduleCreate,

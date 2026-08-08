@@ -337,6 +337,40 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(artifact.metadata["blocked_subresources"], 1)
         self.assertEqual(browser.context_options["service_workers"], "block")
 
+    async def test_cleanup_blocks_matching_websocket(self):
+        socket_route = SimpleNamespace(
+            url="wss://chat.example/socket",
+            close=AsyncMock(),
+            connect_to_server=AsyncMock(),
+        )
+        context = FakeContext()
+
+        class SocketPage(FakePage):
+            async def goto(self, url, **options):
+                await context.websocket_handler(socket_route)
+                return await super().goto(url, **options)
+
+        context.page = SocketPage()
+        hooks = CleanupHooks(
+            setup=AsyncMock(return_value=None),
+            finish=AsyncMock(return_value={}),
+            apply=AsyncMock(return_value={}),
+            blocked_category=lambda url, _options: (
+                "chat" if "chat.example" in url else None
+            ),
+        )
+        await RenderEngine(hosted=False, cleanup_hooks=hooks).render(
+            FakeBrowser(context),
+            RenderRequest(
+                url="https://example.com",
+                cleanup={"block_chats": True},
+            ),
+            RenderLimits(max_width=1920, max_height=1080, max_pixels=10_000_000),
+        )
+
+        socket_route.close.assert_awaited_once()
+        socket_route.connect_to_server.assert_not_awaited()
+
     async def test_inactive_cleanup_hooks_allow_service_workers(self):
         hooks = CleanupHooks(
             setup=AsyncMock(return_value=None),
@@ -858,6 +892,40 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(checker.await_count, 2)
         self.assertTrue(all(call.args[1] is True for call in checker.await_args_list))
+
+    async def test_video_rechecks_captcha_after_recording(self):
+        class VideoPage(FakePage):
+            video = object()
+            recorded = False
+
+            async def wait_for_timeout(self, delay):
+                await super().wait_for_timeout(delay)
+                self.recorded = True
+
+        async def checker(page, _proceed, _status):
+            if page.recorded:
+                raise RenderError(
+                    "captcha_detected", "Challenge appeared.", 422, False
+                )
+
+        with self.assertRaises(RenderError) as raised:
+            await RenderEngine(
+                hosted=False, challenge_checker=checker
+            ).render_image(
+                FakeBrowser(FakeContext(VideoPage())),
+                RenderRequest(
+                    url="https://example.com",
+                    output="webm",
+                    full_page=False,
+                    video={"duration_ms": 1_000},
+                ),
+                RenderLimits(
+                    max_width=1920,
+                    max_height=1080,
+                    max_pixels=2_073_600,
+                ),
+            )
+        self.assertEqual(raised.exception.code, "captcha_detected")
 
     async def test_assertions_run_after_full_page_lazy_loading(self):
         events = []

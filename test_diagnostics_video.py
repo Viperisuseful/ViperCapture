@@ -1,7 +1,10 @@
+import asyncio
 import io
 import json
+import threading
 import unittest
 import zipfile
+from unittest.mock import patch
 
 from pydantic import ValidationError
 
@@ -47,6 +50,36 @@ class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(manifest["artifact"]["bytes"], 5)
             self.assertEqual(manifest["artifact"]["metadata"]["final_url"], "https://example.com/path")
             self.assertNotIn(b"secret", archive.read("manifest.json"))
+
+    async def test_cancelled_diagnostic_bundle_settles_zip_thread(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocked_zip(_entries):
+            started.set()
+            release.wait(timeout=2)
+            return b"zip"
+
+        request = RenderRequest(
+            html="<p>test</p>", diagnostics={"bundle": True}
+        )
+        with patch("render_engine._write_diagnostic_zip", side_effect=blocked_zip):
+            operation = asyncio.create_task(
+                diagnostic_bundle(
+                    RenderArtifact(b"image", "image/png", "capture.png"),
+                    request,
+                    [],
+                    [],
+                    RenderLimits(),
+                )
+            )
+            self.assertTrue(await asyncio.to_thread(started.wait, 1))
+            operation.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(operation.done())
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await operation
 
     def test_video_contract_defaults_and_rejects_invalid_combinations(self):
         request = RenderRequest(url="https://example.com", output="webm")

@@ -112,6 +112,18 @@ async def _run_process(command: list[str], timeout: float) -> tuple[int, bytes]:
     return process.returncode or 0, stderr
 
 
+async def _settled_thread(operation, *args, **kwargs):
+    task = asyncio.create_task(
+        asyncio.to_thread(operation, *args, **kwargs)
+    )
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        with suppress(Exception):
+            await asyncio.shield(task)
+        raise
+
+
 async def _webm_duration_ms(ffmpeg: Path, path: Path) -> int:
     _, diagnostic_bytes = await _run_process(
         [str(ffmpeg), "-hide_banner", "-i", str(path)], 10
@@ -227,7 +239,7 @@ async def diagnostic_bundle(
         )
     if sum(len(entry) for _, entry in entries) > limits.output_bytes:
         raise RenderError("output_too_large", "The diagnostic bundle exceeds the output limit.", 413, False)
-    body = await asyncio.to_thread(_write_diagnostic_zip, entries)
+    body = await _settled_thread(_write_diagnostic_zip, entries)
     if len(body) > limits.output_bytes:
         raise RenderError("output_too_large", "The diagnostic bundle exceeds the output limit.", 413, False)
     return RenderArtifact(body, "application/zip", "vipercapture-diagnostics.zip", artifact.metadata)
@@ -1174,6 +1186,7 @@ class RenderEngine:
                     self.hosted
                     or block_websocket_type
                     or request.network.block_url_patterns
+                    or cleanup_routing
                 ):
                     async def block_web_socket(web_socket) -> None:
                         nonlocal blocked_subresources
@@ -1183,6 +1196,13 @@ class RenderEngine:
                             or any(
                                 fnmatchcase(web_socket.url, pattern)
                                 for pattern in request.network.block_url_patterns
+                            )
+                            or (
+                                self.cleanup_hooks is not None
+                                and self.cleanup_hooks.blocked_category(
+                                    web_socket.url, request.cleanup
+                                )
+                                is not None
                             )
                         )
                         if blocked:
@@ -1372,6 +1392,12 @@ class RenderEngine:
                             elapsed += delay
                     else:
                         await page.wait_for_timeout(options.duration_ms)
+                    if self.challenge_checker:
+                        await self.challenge_checker(
+                            page,
+                            request.proceed_on_captcha,
+                            navigation_status,
+                        )
                     await self._check_assertions(
                         page,
                         request,

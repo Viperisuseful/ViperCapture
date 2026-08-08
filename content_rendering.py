@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
 import math
-from contextlib import suppress
 from html import escape
 from io import BytesIO
 
@@ -15,7 +13,7 @@ from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
 from render_contract import ExtractMode, OutputFormat, PdfMode, RenderRequest
-from render_engine import RenderArtifact, RenderLimits
+from render_engine import RenderArtifact, RenderLimits, _settled_thread
 from render_errors import RenderError
 
 MAX_PRINT_PAGES = 50
@@ -28,16 +26,6 @@ PAPER_INCHES = {
 }
 
 
-async def _settled_thread(operation, *args, **kwargs):
-    task = asyncio.create_task(
-        asyncio.to_thread(operation, *args, **kwargs)
-    )
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        with suppress(Exception):
-            await asyncio.shield(task)
-        raise
 MARKDOWN = MarkdownIt("commonmark", {"html": True})
 
 

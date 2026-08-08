@@ -47,6 +47,7 @@ class RenderCache:
             if not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o077:
                 raise RuntimeError("render cache directory must be owner-only")
         self._fingerprint_key = await asyncio.to_thread(self._load_key)
+        await self._run_locked(self._trim)
 
     def _load_key(self) -> bytes:
         path = self.directory / ".fingerprint-key"
@@ -205,6 +206,11 @@ class RenderCache:
                 path.unlink(missing_ok=True)
 
     def _trim(self) -> None:
+        for temporary in self.directory.glob(".cache-*"):
+            temporary.unlink(missing_ok=True)
+        for body_path in self.directory.glob("*.bin"):
+            if not body_path.with_suffix(".json").exists():
+                body_path.unlink(missing_ok=True)
         metadata_files = sorted(
             self.directory.glob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True
         )

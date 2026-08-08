@@ -172,7 +172,7 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
     async def test_print_and_single_page_pdf(self):
         print_page = FakePage()
         with patch(
-            "content_rendering.asyncio.to_thread",
+            "render_engine.asyncio.to_thread",
             new_callable=AsyncMock,
             wraps=asyncio.to_thread,
         ) as to_thread:

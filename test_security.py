@@ -1,18 +1,23 @@
 import asyncio
-from base64 import b64encode
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import socket
 import threading
 import unittest
-from unittest.mock import AsyncMock, patch
+from base64 import b64encode
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from playwright.async_api import async_playwright
 from pydantic import ValidationError
 from starlette.requests import Request
 
-from main import _await_while_connected, _is_local_control_request, gpu_launch_args, hardware_gpu_active
+from main import (
+    _await_while_connected,
+    _is_local_control_request,
+    gpu_launch_args,
+    hardware_gpu_active,
+)
 from render_contract import LazyLoadMode, OutputFormat, RenderRequest
 from render_engine import (
     PublicUrlValidator,
@@ -650,6 +655,16 @@ class ValidationTests(unittest.TestCase):
     def test_managed_header_is_rejected(self):
         with self.assertRaises(ValidationError):
             RenderRequest(url="https://example.com", headers={"Host": "internal"})
+
+    def test_raw_input_headers_require_base_url(self):
+        with self.assertRaises(ValidationError):
+            RenderRequest(html="private", headers={"Authorization": "Bearer x"})
+        request = RenderRequest(
+            html="private",
+            base_url="https://example.com",
+            headers={"Authorization": "Bearer x"},
+        )
+        self.assertEqual(str(request.base_url), "https://example.com/")
 
     def test_valid_request(self):
         request = RenderRequest(

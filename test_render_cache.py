@@ -10,6 +10,19 @@ from render_engine import RenderArtifact
 
 
 class RenderCacheTests(unittest.IsolatedAsyncioTestCase):
+    async def test_start_removes_interrupted_publication_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            orphan = root / ("a" * 64 + ".bin")
+            temporary = root / ".cache-abandoned"
+            orphan.write_bytes(b"orphan")
+            temporary.write_bytes(b"temporary")
+
+            await RenderCache(root).start()
+
+            self.assertFalse(orphan.exists())
+            self.assertFalse(temporary.exists())
+
     async def test_cancelled_read_settles_before_releasing_lock(self):
         with tempfile.TemporaryDirectory() as directory:
             cache = RenderCache(Path(directory))
