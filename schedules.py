@@ -637,26 +637,33 @@ class ScheduleService:
         claimed = await self.store.claim_due(current)
         for record, due_at in claimed:
             try:
-                render = self._decrypt(record)
-            except Exception as exc:
-                await self.store.record_result(
-                    record.id,
-                    job_id=None,
-                    error=type(exc).__name__,
-                )
-                logger.warning(
-                    "scheduled render payload invalid schedule_id=%s error_type=%s",
-                    record.id,
-                    type(exc).__name__,
-                )
-                continue
-            try:
                 async with self.mutation_lock:
+                    current_record = await self.store.get(record.id)
+                    if (
+                        current_record is None
+                        or current_record.pending_attempt != record.pending_attempt
+                    ):
+                        continue
                     if not await self.store.claim_is_current(
                         record.id,
                         due_at,
                         record.pending_attempt,
                     ):
+                        continue
+                    try:
+                        render = self._decrypt(current_record)
+                    except Exception as exc:
+                        await self.store.record_result(
+                            record.id,
+                            job_id=None,
+                            error=type(exc).__name__,
+                        )
+                        logger.warning(
+                            "scheduled render payload invalid "
+                            "schedule_id=%s error_type=%s",
+                            record.id,
+                            type(exc).__name__,
+                        )
                         continue
                     request_id = (
                         f"schedule-{record.id}-{int(due_at.timestamp())}"

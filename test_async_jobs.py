@@ -1136,6 +1136,38 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.store.close()
 
+    async def test_acknowledging_webhook_scrubs_payload_history(self):
+        await self.store.start()
+        try:
+            now = datetime.now(UTC)
+            job = JobRecord(
+                id=str(uuid4()),
+                request_id="acknowledged-webhook",
+                status="queued",
+                payload=b"encrypted",
+                webhook_payload=b"encrypted-webhook",
+                attempt_count=0,
+                available_at=now,
+                queue_expires_at=now + timedelta(minutes=1),
+                created_at=now,
+            )
+            await self.store.create(job, active_limit=1)
+            await self.store.cancel(job.id, now)
+            with patch.object(
+                SQLiteJobStore,
+                "_scrub_payload_history",
+                wraps=SQLiteJobStore._scrub_payload_history,
+            ) as scrub:
+                await self.store.acknowledge_notification(
+                    job.id, b"encrypted-webhook"
+                )
+                scrub.assert_called_once()
+
+            acknowledged = await self.store.get_by_request_id(job.request_id)
+            self.assertIsNone(acknowledged.webhook_payload)
+        finally:
+            await self.store.close()
+
     async def test_create_scrubs_only_when_expiring_queued_payload(self):
         await self.store.start()
         try:

@@ -31,6 +31,7 @@ from async_jobs import (
     settings_from_environment,
 )
 from bulk_jobs import BulkBodyLimitMiddleware, BulkJobRequest
+from content_rendering import _settled_thread
 from page_cleanup import (
     CleanupOptions,
     apply_visual_cleanup,
@@ -772,14 +773,14 @@ async def visual_diff(
     try:
         baseline_body = await baseline.read(MAX_DIFF_INPUT_BYTES + 1)
         current_body = await current.read(MAX_DIFF_INPUT_BYTES + 1)
-        result = await asyncio.to_thread(
+        result = await _settled_thread(
             compare_images,
             baseline_body,
             current_body,
             pixel_threshold=pixel_threshold,
             max_difference_ratio=max_difference_ratio,
         )
-        bundle = await asyncio.to_thread(create_diff_bundle, result)
+        bundle = await _settled_thread(create_diff_bundle, result)
     except ValueError as exc:
         raise RenderError("diff_options_invalid", str(exc), 422, False) from exc
     finally:

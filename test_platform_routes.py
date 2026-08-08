@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -377,6 +378,36 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         finally:
             main.app.state.diff_slots = original_slots
         self.assertEqual(raised.exception.code, "diff_queue_busy")
+
+    async def test_visual_diff_keeps_slot_until_cancelled_thread_settles(self):
+        original_slots = getattr(main.app.state, "diff_slots", None)
+        main.app.state.diff_slots = asyncio.Semaphore(1)
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocked_compare(*_args, **_kwargs):
+            started.set()
+            release.wait(timeout=2)
+
+        upload = SimpleNamespace(read=AsyncMock(return_value=b"image"))
+        try:
+            with patch("main.compare_images", side_effect=blocked_compare):
+                operation = asyncio.create_task(main.visual_diff(upload, upload))
+                self.assertTrue(
+                    await asyncio.wait_for(
+                        asyncio.to_thread(started.wait, 1), timeout=1
+                    )
+                )
+                operation.cancel()
+                await asyncio.sleep(0)
+                self.assertTrue(main.app.state.diff_slots.locked())
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await operation
+                self.assertFalse(main.app.state.diff_slots.locked())
+        finally:
+            release.set()
+            main.app.state.diff_slots = original_slots
 
 
 if __name__ == "__main__":

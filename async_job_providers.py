@@ -1142,8 +1142,8 @@ class SQLiteJobStore:
     async def acknowledge_notification(
         self, job_id: str, webhook_payload: bytes
     ) -> None:
-        await self._run(
-            lambda connection: connection.execute(
+        def operation(connection: sqlite3.Connection) -> tuple[None, bool]:
+            updated = connection.execute(
                 """
                 UPDATE async_jobs
                 SET webhook_payload = NULL, webhook_event_status = NULL,
@@ -1152,7 +1152,9 @@ class SQLiteJobStore:
                 """,
                 (job_id, webhook_payload),
             )
-        )
+            return None, bool(updated.rowcount)
+
+        await self._run(operation, conditional_scrub=True)
 
     async def acknowledge_artifact_deletion(self, key: str) -> None:
         await self._run(

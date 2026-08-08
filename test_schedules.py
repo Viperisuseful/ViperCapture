@@ -306,6 +306,27 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.jobs.calls, [])
 
+    async def test_claim_reloads_payload_changed_by_update(self):
+        record = await self.service.create(
+            ScheduleCreate(
+                name="Update race",
+                cron="* * * * *",
+                render=RenderRequest(html="old payload"),
+            )
+        )
+        now = datetime.now(UTC) + timedelta(minutes=2)
+        claimed = await self.store.claim_due(now)
+        current = await self.store.get(record.id)
+        await self.service.update(
+            current,
+            ScheduleUpdate(render=RenderRequest(html="new payload")),
+        )
+        self.store.claim_due = AsyncMock(return_value=claimed)
+
+        await self.service.run_due(now)
+
+        self.assertEqual(self.jobs.calls[0][0].html, "new payload")
+
     async def test_disabling_schedule_clears_pending_retry_counter(self):
         record = await self.service.create(
             ScheduleCreate(
