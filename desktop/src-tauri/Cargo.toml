@@ -1,6 +1,6 @@
 [package]
 name = "vipercapture-desktop"
-version = "0.1.5"
+version = "0.1.6"
 description = "Tauri desktop shell foundation for ViperCapture"
 authors = ["viperisuseful"]
 license = "MIT"
