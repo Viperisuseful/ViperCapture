@@ -168,9 +168,56 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
             transparent=False,
         )
         self.assertIn("caret-color: transparent", evaluations[0])
-        self.assertIn("animation.finish()", evaluations[0])
-        self.assertIn("animation.cancel()", evaluations[0])
         self.assertIn("style[data-vipercapture-screenshot]", evaluations[-1])
+
+    async def test_cdp_animations_stabilize_before_full_page_measurement(self):
+        events = []
+
+        class AnimatedPage(FakePage):
+            async def evaluate(self, script, *_args):
+                if "document.getAnimations" in script:
+                    events.append("stabilize")
+                    return None
+                if "width:" in script and "height:" in script:
+                    events.append("measure")
+                    return {"width": 640, "height": 480}
+                return 480
+
+        async def capture(*_args, **_kwargs):
+            events.append("capture")
+            return b"image"
+
+        with patch("render_engine.capture_clipped_image", side_effect=capture):
+            await RenderEngine(hosted=False).render_image(
+                FakeBrowser(FakeContext(AnimatedPage())),
+                RenderRequest(url="https://example.com", full_page=True),
+                RenderLimits(
+                    max_width=1920,
+                    max_height=1080,
+                    max_pixels=2_073_600,
+                ),
+            )
+        self.assertEqual(
+            events,
+            ["stabilize", "measure", "stabilize", "measure", "capture"],
+        )
+
+    async def test_diagnostics_install_page_side_console_bound(self):
+        context = FakeContext()
+        await RenderEngine(hosted=False).render_image(
+            FakeBrowser(context),
+            RenderRequest(
+                url="https://example.com",
+                full_page=False,
+                diagnostics={"bundle": True},
+            ),
+            RenderLimits(max_width=1920, max_height=1080, max_pixels=2_073_600),
+        )
+        console_script = next(
+            script for script in context.init_scripts if "let remaining = 4000" in script
+        )
+        self.assertIn("args.slice(0, 32)", console_script)
+        self.assertIn("configurable: false", console_script)
 
     async def test_action_transport_failure_remains_retryable(self):
         class BrokenLocator(FakeLocator):

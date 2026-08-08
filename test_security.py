@@ -1,7 +1,10 @@
 import asyncio
+import io
+import json
 import socket
 import threading
 import unittest
+import zipfile
 from base64 import b64encode
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -323,6 +326,26 @@ class BrowserCaptureRegressionTests(unittest.IsolatedAsyncioTestCase):
             }""",
             {"encoded": encoded, "mediaType": media_type},
         )
+
+    async def test_diagnostic_console_is_bounded_before_transport(self):
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                artifact = await RenderEngine(hosted=False).render_image(
+                    browser,
+                    RenderRequest(
+                        html="<script>console.log('x'.repeat(1_000_000))</script>",
+                        full_page=False,
+                        diagnostics={"bundle": True},
+                    ),
+                    RenderLimits(),
+                )
+            finally:
+                await browser.close()
+        with zipfile.ZipFile(io.BytesIO(artifact.body)) as archive:
+            messages = json.loads(archive.read("console.json"))
+        self.assertEqual(len(messages), 1)
+        self.assertLessEqual(len(messages[0]["text"]), 4_096)
 
     async def test_fast_png_preserves_capture_semantics(self):
         async with async_playwright() as playwright:

@@ -63,7 +63,7 @@ MAX_DNS_CONCURRENCY = 8
 MAX_DNS_ORIGINS = 100
 PUBLIC_DNS_SLOTS = asyncio.Semaphore(MAX_DNS_CONCURRENCY)
 MAX_DIAGNOSTIC_EVENTS = 500
-CDP_CAPTURE_PREPARE_SCRIPT = """() => {
+STABILIZE_ANIMATIONS_SCRIPT = """() => {
     for (const animation of document.getAnimations()) {
         try {
             const timing = animation.effect?.getComputedTiming();
@@ -71,6 +71,8 @@ CDP_CAPTURE_PREPARE_SCRIPT = """() => {
             else animation.cancel();
         } catch { animation.cancel(); }
     }
+}"""
+CDP_CAPTURE_PREPARE_SCRIPT = """() => {
     const style = document.createElement("style");
     style.dataset.vipercaptureScreenshot = "true";
     style.textContent = "*, *::before, *::after { caret-color: transparent !important; }";
@@ -80,6 +82,38 @@ CDP_CAPTURE_PREPARE_SCRIPT = """() => {
 CDP_CAPTURE_CLEANUP_SCRIPT = """() => document.querySelectorAll(
     "style[data-vipercapture-screenshot]"
 ).forEach((style) => style.remove())"""
+BOUNDED_CONSOLE_SCRIPT = """(() => {
+    const methods = [
+        "log", "debug", "info", "warn", "error", "dir", "dirxml", "table",
+        "trace", "group", "groupCollapsed", "assert", "count", "countReset",
+        "timeLog"
+    ];
+    for (const method of methods) {
+        if (typeof console[method] !== "function") continue;
+        const original = console[method].bind(console);
+        Object.defineProperty(console, method, {
+            configurable: false,
+            writable: false,
+            value(...args) {
+                const prefix = method === "assert" ? [Boolean(args.shift())] : [];
+                let remaining = 4000;
+                const bounded = [];
+                for (const value of args.slice(0, 32)) {
+                    if (remaining <= 0) break;
+                    let text;
+                    if (typeof value === "string") text = value;
+                    else if (value === null) text = "null";
+                    else if (["number", "boolean", "bigint", "undefined"].includes(typeof value)) text = String(value);
+                    else text = "[value]";
+                    text = text.slice(0, remaining);
+                    remaining -= text.length;
+                    bounded.push(text);
+                }
+                return original(...prefix, ...bounded);
+            }
+        });
+    }
+})();"""
 
 
 def _ffmpeg_executable() -> Path:
@@ -1180,6 +1214,8 @@ class RenderEngine:
                             {{ configurable: true, get: () => {json.dumps(device_platform)} }}
                         )""",
                     )
+                if request.diagnostics.bundle:
+                    await context.add_init_script(script=BOUNDED_CONSOLE_SCRIPT)
 
                 async def route_request(route) -> None:
                     nonlocal blocked_private_subresources, blocked_subresources
@@ -1405,6 +1441,18 @@ class RenderEngine:
                     await self.cleanup_hooks.apply(page, request.cleanup)
                 if self.challenge_checker:
                     await self.challenge_checker(page, request.proceed_on_captcha, navigation_status)
+                uses_cdp_capture = (
+                    request.output is OutputFormat.WEBP
+                    or (
+                        request.output is OutputFormat.PNG
+                        and request.image.optimize_for_speed
+                    )
+                    or request.clip is not None
+                    or (request.full_page and request.selector is None)
+                )
+                if uses_cdp_capture and request.full_page:
+                    with suppress(Exception):
+                        await page.evaluate(STABILIZE_ANIMATIONS_SCRIPT)
                 if request.full_page:
                     if (
                         request.output in MEDIA_TYPES
@@ -1546,6 +1594,10 @@ class RenderEngine:
                 }
                 if request.image.quality is not None:
                     screenshot_options["quality"] = request.image.quality
+
+                if uses_cdp_capture:
+                    with suppress(Exception):
+                        await page.evaluate(STABILIZE_ANIMATIONS_SCRIPT)
 
                 box = None
                 if request.selector:
