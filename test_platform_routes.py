@@ -1,8 +1,8 @@
 import asyncio
-from datetime import datetime, timedelta, timezone
 import json
-from types import SimpleNamespace
 import unittest
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import main
@@ -35,6 +35,19 @@ class PlatformRouteTests(unittest.TestCase):
 
 
 class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_health_bypasses_desktop_token(self):
+        expected = main.Response(status_code=200)
+        call_next = AsyncMock(return_value=expected)
+        request = SimpleNamespace(
+            method="GET",
+            url=SimpleNamespace(path="/health"),
+            headers={},
+        )
+        with patch("main.DESKTOP_TOKEN", "secret"):
+            response = await main.require_desktop_token(request, call_next)
+        self.assertIs(response, expected)
+        call_next.assert_awaited_once_with(request)
+
     async def test_cached_render_bypasses_saturated_chromium_slots(self):
         original_cache = getattr(main.app.state, "render_cache", None)
         original_slots = getattr(main.app.state, "capture_slots", None)

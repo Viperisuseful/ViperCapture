@@ -376,6 +376,7 @@ async def require_desktop_token(request: Request, call_next):
     if (
         DESKTOP_TOKEN
         and request.method != "OPTIONS"
+        and request.url.path != "/health"
         and request.headers.get("authorization") != f"Bearer {DESKTOP_TOKEN}"
     ):
         return Response(status_code=401)

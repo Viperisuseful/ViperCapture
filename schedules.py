@@ -391,6 +391,45 @@ class ScheduleStore:
         )
         connection.commit()
 
+    async def retry_occurrence(
+        self,
+        schedule_id: str,
+        *,
+        due_at: datetime,
+        claimed_at: datetime,
+        error: str,
+    ) -> bool:
+        return await self._run(
+            self._retry_occurrence,
+            schedule_id,
+            due_at,
+            claimed_at,
+            error,
+        )
+
+    def _retry_occurrence(
+        self,
+        schedule_id: str,
+        due_at: datetime,
+        claimed_at: datetime,
+        error: str,
+    ) -> bool:
+        connection = self._require()
+        cursor = connection.execute(
+            """UPDATE schedules SET next_run_at=?,last_error=?,updated_at=?
+            WHERE id=? AND last_run_at=? AND updated_at=?""",
+            (
+                due_at.isoformat(),
+                error,
+                datetime.now(UTC).isoformat(),
+                schedule_id,
+                due_at.isoformat(),
+                claimed_at.isoformat(),
+            ),
+        )
+        connection.commit()
+        return cursor.rowcount == 1
+
 
 class ScheduleService:
     def __init__(
@@ -494,17 +533,39 @@ class ScheduleService:
         for record, due_at in claimed:
             try:
                 render = self._decrypt(record)
-                job = await self.jobs.submit(
-                    render,
-                    request_id=f"schedule-{record.id}-{int(due_at.timestamp())}",
-                )
-                await self.store.record_result(record.id, job_id=job.id, error=None)
             except Exception as exc:
                 await self.store.record_result(
                     record.id,
                     job_id=None,
                     error=type(exc).__name__,
                 )
+                logger.warning(
+                    "scheduled render payload invalid schedule_id=%s error_type=%s",
+                    record.id,
+                    type(exc).__name__,
+                )
+                continue
+            try:
+                job = await self.jobs.submit(
+                    render,
+                    request_id=f"schedule-{record.id}-{int(due_at.timestamp())}",
+                )
+                await self.store.record_result(record.id, job_id=job.id, error=None)
+            except Exception as exc:
+                retryable = not isinstance(exc, RenderError) or exc.retryable
+                if retryable:
+                    await self.store.retry_occurrence(
+                        record.id,
+                        due_at=due_at,
+                        claimed_at=current,
+                        error=type(exc).__name__,
+                    )
+                else:
+                    await self.store.record_result(
+                        record.id,
+                        job_id=None,
+                        error=type(exc).__name__,
+                    )
                 logger.warning(
                     "scheduled render submission failed schedule_id=%s error_type=%s",
                     record.id,

@@ -990,6 +990,7 @@ class RenderEngine:
         context = None
         video_directory = None
         blocked_subresources = 0
+        blocked_private_subresources = False
         failed_requests: list[dict[str, object]] = []
         matched_failure_patterns: set[str] = set()
         console_events: list[dict[str, object]] = []
@@ -1026,7 +1027,11 @@ class RenderEngine:
                                 or request.headers
                                 or request.network.block_url_patterns
                                 or request.network.block_resource_types
-                                or self.cleanup_hooks
+                                or request.cleanup.consent_mode.value != "none"
+                                or request.cleanup.block_ads
+                                or request.cleanup.block_trackers
+                                or request.cleanup.block_chats
+                                or request.cleanup.block_newsletters
                             )
                             else "allow"
                         ),
@@ -1090,7 +1095,7 @@ class RenderEngine:
                     )
 
                 async def route_request(route) -> None:
-                    nonlocal blocked_subresources
+                    nonlocal blocked_private_subresources, blocked_subresources
                     request_url = route.request.url
                     try:
                         scheme = urlsplit(request_url).scheme.lower()
@@ -1126,6 +1131,7 @@ class RenderEngine:
                             return
                     if self.hosted and not await public_urls.is_public(request_url):
                         blocked_subresources += 1
+                        blocked_private_subresources = True
                         await route.abort("blockedbyclient")
                         return
                     await route.continue_(
@@ -1600,7 +1606,7 @@ class RenderEngine:
         except RenderError:
             raise
         except Exception as exc:
-            if blocked_subresources:
+            if blocked_private_subresources:
                 raise RenderError(
                     "subresource_not_public",
                     "The page requested a private or non-public resource.",

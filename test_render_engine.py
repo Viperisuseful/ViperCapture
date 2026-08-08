@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 from render_contract import LazyLoadMode, RenderRequest
 from render_engine import (
+    CleanupHooks,
     PublicUrlValidator,
     RenderArtifact,
     RenderEngine,
@@ -249,6 +250,56 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(socket_route.connected)
         self.assertEqual(artifact.metadata["blocked_subresources"], 1)
         self.assertEqual(browser.context_options["service_workers"], "block")
+
+    async def test_inactive_cleanup_hooks_allow_service_workers(self):
+        hooks = CleanupHooks(
+            setup=AsyncMock(return_value=None),
+            finish=AsyncMock(return_value={}),
+            apply=AsyncMock(return_value={}),
+            blocked_category=lambda _url, _options: None,
+        )
+        browser = FakeBrowser()
+
+        await RenderEngine(hosted=False, cleanup_hooks=hooks).render(
+            browser,
+            RenderRequest(url="https://example.com"),
+            RenderLimits(max_width=1920, max_height=1080, max_pixels=10_000_000),
+        )
+
+        self.assertEqual(browser.context_options["service_workers"], "allow")
+
+    async def test_policy_block_does_not_mask_later_render_failure(self):
+        context = FakeContext()
+
+        class FailingPage(FakePage):
+            async def goto(self, url, **options):
+                route = Route(RoutedRequest(f"{url}/blocked.js", "script"))
+                await context.route_handler(route)
+                return await super().goto(url, **options)
+
+            async def screenshot(self, **_options):
+                raise RuntimeError("browser disconnected")
+
+        context.page = FailingPage()
+        request = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "network": {"block_resource_types": ["script"]},
+            }
+        )
+
+        with self.assertRaises(RenderError) as raised:
+            await RenderEngine(hosted=False).render(
+                FakeBrowser(context),
+                request,
+                RenderLimits(
+                    max_width=1920,
+                    max_height=1080,
+                    max_pixels=10_000_000,
+                ),
+            )
+        self.assertEqual(raised.exception.code, "render_failed")
+        self.assertTrue(raised.exception.retryable)
 
     async def test_public_address_resolution_has_a_hard_timeout(self):
         def slow_to_thread(*_args, **_kwargs):

@@ -186,6 +186,35 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(stored.next_run_at, due)
         self.assertEqual(await self.service.run_due(due), 0)
 
+    async def test_retryable_submission_failure_preserves_due_occurrence(self):
+        record = await self.service.create(
+            ScheduleCreate(
+                name="Retry",
+                cron="* * * * *",
+                render=RenderRequest(html="retry me"),
+            )
+        )
+        due = datetime.now(UTC) + timedelta(minutes=2)
+        successful_submit = self.jobs.submit
+        self.jobs.submit = AsyncMock(
+            side_effect=RenderError(
+                "async_queue_full", "Queue full", 503, True
+            )
+        )
+
+        self.assertEqual(await self.service.run_due(due), 1)
+        failed = await self.store.get(record.id)
+        self.assertLessEqual(failed.next_run_at, due)
+        request_id = self.jobs.submit.await_args.kwargs["request_id"]
+
+        self.jobs.submit = successful_submit
+        self.assertEqual(
+            await self.service.run_due(due + timedelta(seconds=1)), 1
+        )
+        self.assertEqual(self.jobs.calls[-1][1], request_id)
+        retried = await self.store.get(record.id)
+        self.assertEqual(retried.last_job_id, "job-1")
+
 
 if __name__ == "__main__":
     unittest.main()
