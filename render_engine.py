@@ -262,7 +262,7 @@ async def _transcode_video(source: Path, destination: Path, output: OutputFormat
         [str(ffmpeg), "-hide_banner", "-loglevel", "error", "-i", str(source), *encoding, "-y", str(destination)],
         45,
     )
-    if returncode != 0 or not destination.is_file():
+    if returncode != 0:
         raise RenderError("video_encode_failed", f"The requested {output.value.upper()} could not be encoded.", 502, True)
 
 
