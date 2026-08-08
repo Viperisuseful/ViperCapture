@@ -2,18 +2,13 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 from render_contract import RenderRequest
 from render_errors import RenderError
 
 MAX_BULK_BODY_BYTES = 6 * 1024 * 1024
 
-# A bulk request may carry 100 independently valid renders; without an
-# aggregate cap, 100 near-5 MiB sources approach 500 MiB of accepted source
-# text in one JSON body. Bounding the combined embedded source keeps a single
-# valid bulk request from exhausting process memory.
-MAX_BULK_SOURCE_BYTES = 20 * 1024 * 1024
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")

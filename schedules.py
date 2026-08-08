@@ -67,14 +67,6 @@ class ScheduleRecord:
     last_error: str | None = None
 
 
-# Columns needed by public schedule documents; the encrypted payload is never
-# selected for listings.
-SCHEDULE_SUMMARY_COLUMNS = (
-    "id,name,cron,timezone,enabled,next_run_at,last_run_at,last_job_id,"
-    "last_error,created_at,updated_at"
-)
-
-
 def validate_cron(expression: str, timezone_name: str) -> None:
     try:
         zone = ZoneInfo(timezone_name)

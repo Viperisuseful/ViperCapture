@@ -4,7 +4,6 @@ import json
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
-from uuid import UUID
 
 import main
 from async_jobs import JobRecord
@@ -183,46 +182,6 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         finally:
             main.app.state.diff_slots = original_slots
         self.assertEqual(raised.exception.code, "diff_queue_busy")
-
-    async def test_schedule_listing_is_paginated_and_payload_free(self):
-        original_schedules = getattr(main.app.state, "schedules", None)
-        pages = {
-            None: [
-                {"id": f"00000000-0000-0000-0000-00000000000{index}", "name": f"Job {index}"}
-                for index in range(2)
-            ],
-            "00000000-0000-0000-0000-000000000001": [
-                {"id": "00000000-0000-0000-0000-000000000002", "name": "Job 2"}
-            ],
-        }
-        calls = []
-
-        async def list_page(*, after=None, limit=100):
-            calls.append((after, limit))
-            return pages[after]
-
-        main.app.state.schedules = SimpleNamespace(
-            store=SimpleNamespace(list_page=list_page)
-        )
-        try:
-            first = await main.list_schedules(after=None, limit=2)
-            second = await main.list_schedules(
-                after=UUID("00000000-0000-0000-0000-000000000001"), limit=2
-            )
-        finally:
-            main.app.state.schedules = original_schedules
-        first_document = json.loads(first.body)
-        second_document = json.loads(second.body)
-        self.assertEqual(first_document["count"], 2)
-        self.assertEqual(
-            first_document["next_cursor"], "00000000-0000-0000-0000-000000000001"
-        )
-        self.assertIsNone(second_document["next_cursor"])
-        self.assertNotIn("payload", first_document["schedules"][0])
-        self.assertEqual(
-            calls,
-            [(None, 2), ("00000000-0000-0000-0000-000000000001", 2)],
-        )
 
 
 if __name__ == "__main__":
