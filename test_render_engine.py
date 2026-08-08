@@ -5,6 +5,7 @@ import socket
 import threading
 import unittest
 import zipfile
+from base64 import b64encode
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -98,6 +99,7 @@ class FakePage:
 class FakeContext:
     def __init__(self, page=None):
         self.page = page or FakePage()
+        self.page.context = self
         self.closed = False
         self.route_handler = None
         self.websocket_handler = None
@@ -110,10 +112,23 @@ class FakeContext:
         self.websocket_handler = handler
 
     async def new_page(self):
+        self.page.context = self
         return self.page
 
     async def add_init_script(self, *, script):
         self.init_scripts.append(script)
+
+    async def new_cdp_session(self, _page):
+        class Session:
+            async def send(self, method, _options=None):
+                if method == "Page.captureScreenshot":
+                    return {"data": b64encode(b"page-image").decode()}
+                return {}
+
+            async def detach(self):
+                return None
+
+        return Session()
 
     async def close(self):
         self.closed = True
@@ -133,6 +148,32 @@ class FakeBrowser:
 
 
 class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
+    async def test_full_page_capture_uses_validated_rectangle(self):
+        page = FakePage()
+        with patch(
+            "render_engine.capture_clipped_image",
+            AsyncMock(return_value=b"full-page"),
+        ) as capture:
+            await RenderEngine(hosted=False).render(
+                FakeBrowser(FakeContext(page)),
+                RenderRequest(url="https://example.com", full_page=True),
+                RenderLimits(
+                    max_width=1920,
+                    max_height=1080,
+                    max_pixels=10_000_000,
+                ),
+            )
+        self.assertEqual(
+            capture.await_args.kwargs["clip"],
+            {
+                "x": 0,
+                "y": 0,
+                "width": 1280.0,
+                "height": 720.0,
+                "scale": 1,
+            },
+        )
+
     async def test_dns_slot_is_held_until_timed_out_thread_finishes(self):
         started = threading.Event()
         release = threading.Event()

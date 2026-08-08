@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+from contextlib import suppress
 from html import escape
 from io import BytesIO
 
@@ -25,6 +26,18 @@ PAPER_INCHES = {
     "A4": (8.27, 11.69),
     "Letter": (8.5, 11.0),
 }
+
+
+async def _settled_thread(operation, *args, **kwargs):
+    task = asyncio.create_task(
+        asyncio.to_thread(operation, *args, **kwargs)
+    )
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        with suppress(Exception):
+            await asyncio.shield(task)
+        raise
 MARKDOWN = MarkdownIt("commonmark", {"html": True})
 
 
@@ -196,7 +209,7 @@ async def _render_pdf(
                 },
             )
     pdf = await page.pdf(**common)
-    pages = await asyncio.to_thread(
+    pages = await _settled_thread(
         _validate_pdf, pdf, single_page=single_page
     )
     return RenderArtifact(pdf, "application/pdf", "vipercapture.pdf", {"pages": pages})
@@ -252,14 +265,14 @@ async def render_document_output(
                 {"max_bytes": maximum_html_bytes},
             )
         selected_html = (
-            await asyncio.to_thread(_article_html, document_html)
+            await _settled_thread(_article_html, document_html)
             if request.extract_mode is ExtractMode.ARTICLE
             else document_html
         )
         if request.output is OutputFormat.HTML:
             body = selected_html.encode("utf-8")
             return RenderArtifact(body, "text/html; charset=utf-8", "vipercapture.html")
-        markdown = await asyncio.to_thread(
+        markdown = await _settled_thread(
             markdownify,
             selected_html,
             heading_style="ATX",

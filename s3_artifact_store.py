@@ -7,7 +7,7 @@ import os
 import re
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import PurePosixPath
 from uuid import UUID, uuid4
 
@@ -118,7 +118,7 @@ class S3ArtifactStore:
                     Key=key,
                 )
             raise
-        expires_at = datetime.now(UTC) + self.config.result_ttl
+        ttl_seconds = self.config.result_ttl.total_seconds()
         try:
             await asyncio.to_thread(
                 self.client.copy_object,
@@ -129,9 +129,14 @@ class S3ArtifactStore:
                 MetadataDirective="REPLACE",
                 Metadata={
                     "filename": _encode_filename(filename),
-                    "expires": repr(expires_at.timestamp()),
+                    "ttl": repr(ttl_seconds),
                     "owner": OWNER_METADATA,
                 },
+            )
+            persisted = await asyncio.to_thread(
+                self.client.head_object,
+                Bucket=self.bucket,
+                Key=key,
             )
         except BaseException:
             with suppress(Exception):
@@ -141,6 +146,12 @@ class S3ArtifactStore:
                     Key=key,
                 )
             raise
+        modified = persisted.get("LastModified")
+        if not isinstance(modified, datetime):
+            modified = datetime.now(UTC)
+        elif modified.tzinfo is None:
+            modified = modified.replace(tzinfo=UTC)
+        expires_at = modified + self.config.result_ttl
         return StoredArtifact(key=key, expires_at=expires_at)
 
     async def get(self, key: str) -> Artifact | None:
@@ -171,9 +182,16 @@ class S3ArtifactStore:
             raise
         metadata = response.get("Metadata", {})
         try:
+            ttl = float(metadata.get("ttl", "0"))
             expires = float(metadata.get("expires", "0"))
         except ValueError:
+            ttl = 0
             expires = 0
+        modified = response.get("LastModified")
+        if ttl > 0 and isinstance(modified, datetime):
+            if modified.tzinfo is None:
+                modified = modified.replace(tzinfo=UTC)
+            expires = (modified + timedelta(seconds=ttl)).timestamp()
         if not expires or expires <= datetime.now(UTC).timestamp():
             close = getattr(response.get("Body"), "close", None)
             if close is not None:
@@ -238,9 +256,14 @@ class S3ArtifactStore:
                 raise
             metadata = head.get("Metadata", {})
             try:
+                ttl = float(metadata.get("ttl", "0"))
                 expires = float(metadata.get("expires", "0"))
             except (TypeError, ValueError):
                 continue
+            if ttl > 0 and isinstance(modified, datetime):
+                expires = (
+                    modified + timedelta(seconds=ttl)
+                ).timestamp()
             if (
                 metadata.get("owner") == OWNER_METADATA
                 and (

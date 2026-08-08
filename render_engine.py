@@ -1605,6 +1605,20 @@ class RenderEngine:
                         quality=request.image.quality,
                         transparent=request.image.transparent_background,
                     )
+                elif request.full_page:
+                    image = await capture_clipped_image(
+                        page,
+                        output=request.output,
+                        clip={
+                            "x": 0,
+                            "y": 0,
+                            "width": float(width),
+                            "height": float(height),
+                            "scale": request.viewport.device_scale_factor,
+                        },
+                        quality=request.image.quality,
+                        transparent=request.image.transparent_background,
+                    )
                 else:
                     image = await page.screenshot(
                         full_page=request.full_page,

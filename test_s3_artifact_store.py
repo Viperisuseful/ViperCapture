@@ -37,16 +37,21 @@ class FakeS3:
             "Body": io.BytesIO(item["Body"]),
             "ContentType": item["ContentType"],
             "Metadata": item["Metadata"],
+            "LastModified": item["LastModified"],
         }
 
     def copy_object(self, *, Key, Metadata, ContentType, **_kwargs):
         self.objects[Key]["Metadata"] = Metadata
         self.objects[Key]["ContentType"] = ContentType
+        self.objects[Key]["LastModified"] = datetime.now(UTC)
 
     def head_object(self, *, Key, **_kwargs):
         self.head_calls.append(Key)
         item = self.objects[Key]
-        return {"Metadata": item["Metadata"]}
+        return {
+            "Metadata": item["Metadata"],
+            "LastModified": item["LastModified"],
+        }
 
     def delete_object(self, *, Key, **_kwargs):
         self.objects.pop(Key, None)
@@ -120,6 +125,10 @@ class S3ArtifactStoreTests(unittest.IsolatedAsyncioTestCase):
             stored.expires_at,
             client.uploaded_at + ttl,
         )
+        self.assertEqual(
+            stored.expires_at,
+            client.objects[stored.key]["LastModified"] + ttl,
+        )
 
     async def test_cancelled_fetch_settles_before_returning(self):
         started = threading.Event()
@@ -166,8 +175,8 @@ class S3ArtifactStoreTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(stored.key.startswith("results/"))
         self.assertEqual(
-            client.objects[stored.key]["Metadata"]["expires"],
-            repr(stored.expires_at.timestamp()),
+            client.objects[stored.key]["Metadata"]["ttl"],
+            repr(store.config.result_ttl.total_seconds()),
         )
         self.assertEqual(len(stored.key.split("/")), 3)
         artifact = await store.get(stored.key)
@@ -231,6 +240,7 @@ class S3ArtifactStoreTests(unittest.IsolatedAsyncioTestCase):
         stored = await store.put(
             str(uuid4()), b"data", media_type="image/png", filename="x.png"
         )
+        client.head_calls.clear()
         await store.maintain(datetime.now(UTC))
         self.assertEqual(len(client.list_calls), 1)
         self.assertEqual(client.list_calls[0]["MaxKeys"], 25)

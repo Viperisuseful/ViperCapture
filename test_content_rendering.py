@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import unittest
 from io import BytesIO
 from unittest.mock import AsyncMock, patch
@@ -66,6 +67,31 @@ class FakePage:
 
 
 class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelled_markdown_conversion_settles_worker(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def convert(*_args, **_kwargs):
+            started.set()
+            release.wait()
+            return "markdown"
+
+        request = RenderRequest(
+            url="https://example.com",
+            output="markdown",
+        )
+        with patch("content_rendering.markdownify", side_effect=convert):
+            task = asyncio.create_task(
+                render_document_output(FakePage(), request, LIMITS)
+            )
+            await asyncio.to_thread(started.wait)
+            task.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
     def test_html_input_is_wrapped_with_utf8_and_escaped_base(self):
         request = RenderRequest.model_validate({
             "html": "<h1>Hello</h1>",
