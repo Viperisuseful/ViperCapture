@@ -814,7 +814,8 @@ class RenderEngine:
         failed_requests: list[dict[str, object]],
         matched_failure_patterns: set[str] | None = None,
     ) -> None:
-        matched_failure_patterns = matched_failure_patterns or set()
+        if matched_failure_patterns is None:
+            matched_failure_patterns = set()
         for expected in request.assertions.content_includes:
             present = await page.evaluate(
                 "text => Boolean(document.documentElement?.innerText.includes(text))",

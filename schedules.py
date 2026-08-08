@@ -159,6 +159,7 @@ class ScheduleStore:
                 enabled INTEGER NOT NULL,
                 payload BLOB NOT NULL,
                 next_run_at TEXT NOT NULL,
+                pending_run_at TEXT,
                 last_run_at TEXT,
                 last_job_id TEXT,
                 last_error TEXT,
@@ -169,6 +170,14 @@ class ScheduleStore:
                 ON schedules(enabled, next_run_at);
             """
         )
+        columns = {
+            row["name"]
+            for row in self.connection.execute("PRAGMA table_info(schedules)")
+        }
+        if "pending_run_at" not in columns:
+            self.connection.execute(
+                "ALTER TABLE schedules ADD COLUMN pending_run_at TEXT"
+            )
         self.connection.commit()
         if os.name != "nt":
             for candidate in (
@@ -299,7 +308,8 @@ class ScheduleStore:
         connection = self._require()
         cursor = connection.execute(
             """UPDATE schedules SET name=?,cron=?,timezone=?,enabled=?,payload=?,
-            next_run_at=?,updated_at=? WHERE id=? AND updated_at=?""",
+            next_run_at=?,pending_run_at=CASE WHEN ?=0 THEN NULL ELSE pending_run_at END,
+            updated_at=? WHERE id=? AND updated_at=?""",
             (
                 record.name,
                 record.cron,
@@ -307,6 +317,7 @@ class ScheduleStore:
                 int(record.enabled),
                 record.payload,
                 record.next_run_at.isoformat(),
+                int(record.enabled),
                 record.updated_at.isoformat(),
                 record.id,
                 expected_updated_at.isoformat(),
@@ -337,19 +348,25 @@ class ScheduleStore:
         connection.execute("BEGIN IMMEDIATE")
         try:
             rows = connection.execute(
-                "SELECT * FROM schedules WHERE enabled = 1 AND next_run_at <= ? "
-                "ORDER BY next_run_at LIMIT 100",
+                "SELECT * FROM schedules WHERE pending_run_at IS NOT NULL OR "
+                "(enabled = 1 AND next_run_at <= ?) "
+                "ORDER BY COALESCE(pending_run_at,next_run_at) LIMIT 100",
                 (now.isoformat(),),
             ).fetchall()
             for row in rows:
                 record = self._record(row)
-                due_at = record.next_run_at
+                pending_run_at = _as_utc(row["pending_run_at"])
+                due_at = pending_run_at or record.next_run_at
+                if pending_run_at is not None:
+                    claimed.append((record, due_at))
+                    continue
                 following = next_run(record.cron, record.timezone, now)
                 cursor = connection.execute(
-                    """UPDATE schedules SET next_run_at=?,last_run_at=?,
+                    """UPDATE schedules SET next_run_at=?,pending_run_at=?,last_run_at=?,
                     last_error=NULL,updated_at=? WHERE id=? AND next_run_at=?""",
                     (
                         following.isoformat(),
+                        due_at.isoformat(),
                         due_at.isoformat(),
                         now.isoformat(),
                         record.id,
@@ -386,7 +403,8 @@ class ScheduleStore:
     ) -> None:
         connection = self._require()
         connection.execute(
-            "UPDATE schedules SET last_job_id=?,last_error=?,updated_at=? WHERE id=?",
+            """UPDATE schedules SET pending_run_at=NULL,last_job_id=?,last_error=?,
+            updated_at=? WHERE id=?""",
             (job_id, error, datetime.now(UTC).isoformat(), schedule_id),
         )
         connection.commit()
@@ -396,14 +414,12 @@ class ScheduleStore:
         schedule_id: str,
         *,
         due_at: datetime,
-        claimed_at: datetime,
         error: str,
     ) -> bool:
         return await self._run(
             self._retry_occurrence,
             schedule_id,
             due_at,
-            claimed_at,
             error,
         )
 
@@ -411,20 +427,17 @@ class ScheduleStore:
         self,
         schedule_id: str,
         due_at: datetime,
-        claimed_at: datetime,
         error: str,
     ) -> bool:
         connection = self._require()
         cursor = connection.execute(
-            """UPDATE schedules SET next_run_at=?,last_error=?,updated_at=?
-            WHERE id=? AND last_run_at=? AND updated_at=?""",
+            """UPDATE schedules SET last_error=?,updated_at=?
+            WHERE id=? AND pending_run_at=?""",
             (
-                due_at.isoformat(),
                 error,
                 datetime.now(UTC).isoformat(),
                 schedule_id,
                 due_at.isoformat(),
-                claimed_at.isoformat(),
             ),
         )
         connection.commit()
@@ -557,7 +570,6 @@ class ScheduleService:
                     await self.store.retry_occurrence(
                         record.id,
                         due_at=due_at,
-                        claimed_at=current,
                         error=type(exc).__name__,
                     )
                 else:

@@ -46,6 +46,10 @@ class VisualDiffTests(unittest.TestCase):
         with zipfile.ZipFile(io.BytesIO(create_diff_bundle(result))) as archive:
             self.assertEqual(set(archive.namelist()), {"report.json", "diff.png"})
             self.assertEqual(json.loads(archive.read("report.json"))["changed_pixels"], 1)
+            self.assertTrue(
+                all(info.date_time == (1980, 1, 1, 0, 0, 0) for info in archive.infolist())
+            )
+        self.assertEqual(create_diff_bundle(result), create_diff_bundle(result))
 
     def test_threshold_and_dimension_validation(self):
         self.assertTrue(compare_images(png((0, 0, 0)), png((2, 2, 2)), pixel_threshold=2).passed)

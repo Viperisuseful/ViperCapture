@@ -533,6 +533,30 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(clipped.await_args.kwargs["clip"]["x"], 5)
         self.assertEqual(artifact.metadata["width"], 320)
 
+    async def test_empty_live_request_match_set_is_preserved(self):
+        matched: set[str] = set()
+        pattern = "https://example.com/failure*"
+
+        class MatchingPage:
+            async def evaluate(self, *_args):
+                matched.add(pattern)
+                return True
+
+        request = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "assertions": {
+                    "content_includes": ["ready"],
+                    "request_failures": [pattern],
+                },
+            }
+        )
+        with self.assertRaises(RenderError) as raised:
+            await RenderEngine(hosted=False)._check_assertions(
+                MatchingPage(), request, [], matched
+            )
+        self.assertEqual(raised.exception.code, "request_assertion_failed")
+
     async def test_configured_navigation_status_fails(self):
         request = RenderRequest.model_validate(
             {"url": "https://example.com", "fail_on_status": [200]}

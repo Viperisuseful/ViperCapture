@@ -675,7 +675,7 @@ export default function App() {
                     </dl>
                   </CardContent>
                   <CardFooter className="justify-end gap-2">
-                    <Button variant="outline" size="sm" asChild><a href={latest.url} target="_blank" rel="noreferrer"><ExternalLink data-icon="inline-start" />Open</a></Button>
+                    {!latest.type.startsWith("text/html") && <Button variant="outline" size="sm" asChild><a href={latest.url} target="_blank" rel="noreferrer"><ExternalLink data-icon="inline-start" />Open</a></Button>}
                     <Button size="sm" asChild><a href={latest.url} download={latest.name}><Download data-icon="inline-start" />Download</a></Button>
                   </CardFooter>
                 </Card>

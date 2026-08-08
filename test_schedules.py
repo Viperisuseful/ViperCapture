@@ -204,7 +204,7 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(await self.service.run_due(due), 1)
         failed = await self.store.get(record.id)
-        self.assertLessEqual(failed.next_run_at, due)
+        self.assertEqual(failed.last_error, "RenderError")
         request_id = self.jobs.submit.await_args.kwargs["request_id"]
 
         self.jobs.submit = successful_submit
@@ -214,6 +214,37 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.jobs.calls[-1][1], request_id)
         retried = await self.store.get(record.id)
         self.assertEqual(retried.last_job_id, "job-1")
+
+    async def test_claimed_occurrence_survives_store_restart(self):
+        record = await self.service.create(
+            ScheduleCreate(
+                name="Crash recovery",
+                cron="* * * * *",
+                render=RenderRequest(html="recover me"),
+            )
+        )
+        now = datetime.now(UTC) + timedelta(minutes=2)
+        claimed = await self.store.claim_due(now)
+        due_at = claimed[0][1]
+        await self.store.close()
+
+        self.store = ScheduleStore(
+            Path(self.temporary.name) / "schedules.sqlite3"
+        )
+        await self.store.start()
+        recovered = ScheduleService(
+            self.store,
+            self.jobs,
+            PayloadCipher(b"s" * 32),
+            poll_seconds=60,
+        )
+        self.assertEqual(
+            await recovered.run_due(now + timedelta(seconds=1)), 1
+        )
+        self.assertEqual(
+            self.jobs.calls[-1][1],
+            f"schedule-{record.id}-{int(due_at.timestamp())}",
+        )
 
 
 if __name__ == "__main__":

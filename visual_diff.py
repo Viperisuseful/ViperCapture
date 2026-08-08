@@ -128,8 +128,15 @@ def compare_images(
 
 
 def create_diff_bundle(result: VisualDiff) -> bytes:
+    def entry(name: str) -> zipfile.ZipInfo:
+        information = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+        information.compress_type = zipfile.ZIP_DEFLATED
+        information.external_attr = 0o600 << 16
+        return information
+
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("report.json", json.dumps(result.report(), sort_keys=True, indent=2) + "\n")
-        archive.writestr("diff.png", result.diff_png)
+        report = json.dumps(result.report(), sort_keys=True, indent=2) + "\n"
+        archive.writestr(entry("report.json"), report)
+        archive.writestr(entry("diff.png"), result.diff_png)
     return output.getvalue()

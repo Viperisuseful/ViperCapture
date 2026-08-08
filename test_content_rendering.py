@@ -231,6 +231,30 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(area.exception.code, "pdf_area_limit_exceeded")
 
+        with self.assertRaises(RenderError) as margin_area:
+            await render_document_output(
+                FakePage(width=19_000, height=2_500),
+                RenderRequest.model_validate(
+                    {
+                        "url": "https://example.com",
+                        "output": "pdf",
+                        "pdf": {
+                            "mode": "single_page",
+                            "margins": {
+                                "top": 4,
+                                "right": 4,
+                                "bottom": 4,
+                                "left": 4,
+                            },
+                        },
+                    }
+                ),
+                LIMITS,
+            )
+        self.assertEqual(
+            margin_area.exception.code, "pdf_area_limit_exceeded"
+        )
+
         print_page = FakePage(height=100_000)
         with self.assertRaises(RenderError) as preflight:
             await render_document_output(

@@ -110,30 +110,6 @@ async def _render_pdf(
         })""")
         width = max(1, math.ceil(float(dimensions["width"])))
         height = max(1, math.ceil(float(dimensions["height"])))
-        if width > MAX_SINGLE_PAGE_WIDTH:
-            raise RenderError(
-                "pdf_page_too_wide",
-                "Single-page PDF content exceeds 20000 CSS pixels.",
-                413,
-                False,
-                {"max_width": MAX_SINGLE_PAGE_WIDTH},
-            )
-        if height > MAX_SINGLE_PAGE_HEIGHT:
-            raise RenderError(
-                "pdf_page_too_tall",
-                "Single-page PDF content exceeds 20000 CSS pixels.",
-                413,
-                False,
-                {"max_height": MAX_SINGLE_PAGE_HEIGHT},
-            )
-        if width * height > limits.max_pixels:
-            raise RenderError(
-                "pdf_area_limit_exceeded",
-                "Single-page PDF content exceeds the pixel area limit.",
-                413,
-                False,
-                {"max_pixels": limits.max_pixels},
-            )
         # Playwright treats width and height as the entire sheet. Include the
         # margins so the measured document remains the printable area instead
         # of silently overflowing past page one.
@@ -143,6 +119,30 @@ async def _render_pdf(
         sheet_height = height + math.ceil(
             (options.margins.top + options.margins.bottom) * 96
         )
+        if sheet_width > MAX_SINGLE_PAGE_WIDTH:
+            raise RenderError(
+                "pdf_page_too_wide",
+                "Single-page PDF content exceeds 20000 CSS pixels.",
+                413,
+                False,
+                {"max_width": MAX_SINGLE_PAGE_WIDTH},
+            )
+        if sheet_height > MAX_SINGLE_PAGE_HEIGHT:
+            raise RenderError(
+                "pdf_page_too_tall",
+                "Single-page PDF content exceeds 20000 CSS pixels.",
+                413,
+                False,
+                {"max_height": MAX_SINGLE_PAGE_HEIGHT},
+            )
+        if sheet_width * sheet_height > limits.max_pixels:
+            raise RenderError(
+                "pdf_area_limit_exceeded",
+                "Single-page PDF content exceeds the pixel area limit.",
+                413,
+                False,
+                {"max_pixels": limits.max_pixels},
+            )
         common.update(
             {
                 "width": f"{sheet_width}px",
