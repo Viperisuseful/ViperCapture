@@ -4,45 +4,46 @@
 
 <h1 align="center">ViperCapture</h1>
 
-<p align="center">
-  Capture public webpages as PNG, JPEG, or WebP images with Chromium.
-</p>
+<p align="center"><strong>The open-source, self-hosted ScreenshotOne / Urlbox alternative.</strong></p>
 
-<p align="center">
-  <a href="https://capture.viperisuseful.cc">Live Demo</a>
-  ·
-  <a href="docs/self-hosting.md">Self-hosting guide</a>
-</p>
+ViperCapture is an MIT-licensed browser rendering platform. It turns URLs, HTML,
+or Markdown into screenshots, PDFs, WebM video, hydrated HTML, Markdown, or
+structured metadata—through a strict JSON API you can run on your own machines
+and storage.
 
-ViperCapture is a webpage capture engine with a browser interface and a JSON
-API. It handles full-page, viewport, and element captures without requiring you
-to manage browser automation code.
+This project aims for practical workflow parity, not misleading one-for-one
+option naming. See the dated, source-linked [compatibility matrix](docs/compatibility.md)
+and run the [reproducible benchmark](benchmarks/README.md) on your workload.
 
-## Features
+## What ships
 
-- PNG, JPEG, and WebP output
-- Full-page, viewport, and CSS selector capture
-- Optional viewport-width preservation for wide full-page captures
-- Phone, desktop, and 4K presets with custom viewport support
-- Image quality, transparent background, and device scale controls
-- Wait conditions for page events, selectors, text, and fixed delays
-- Same-origin request headers for authenticated or customized pages
-- Bounded scrolling for lazy-loaded content
-- Optional adaptive or disabled lazy-load scrolling for faster full-page captures
-- Optional speed-first WebP encoding
-- Optional hardware GPU rendering with startup verification
-- A local-only GPU rendering switch that safely restarts Chromium after active captures finish
-- The same Radix Nova shadcn/ui component system and theme used by ViperCapture Cloud
-- Page-level challenge detection with an explicit capture-as-displayed choice
-- Observable renders with elapsed time, active waits, cancellation, dimensions,
-  file size, render duration, and request IDs
-- Durable polling-based jobs with encrypted inputs, restart recovery, expiring
-  results, and pluggable database and object-storage providers
-- Inline validation for selectors, waits, and same-origin custom headers
+- PNG, JPEG, WebP, PDF, HTML, Markdown, metadata, and WebM output
+- URL, raw HTML, and Markdown input; full-page, viewport, element, clip, and
+  multi-viewport ZIP captures
+- Typed click, hover, fill, select, key, scroll, wait, hide, and opt-in
+  JavaScript actions
+- Wait conditions, assertions, custom CSS, devices, locale/timezone,
+  geolocation, cookies, user agent, proxy, resource blocking, and cleanup
+- Ad, tracker, chat, newsletter, and consent-banner cleanup backed by the
+  vendored, license-preserved AutoConsent rule set
+- Durable encrypted async jobs, idempotency, retries, polling, cancellation,
+  bulk submission, cron schedules, and signed webhook callbacks
+- Private local result storage or built-in S3-compatible storage for AWS S3,
+  Cloudflare R2, MinIO, Backblaze B2, and compatible providers
+- Expiring HMAC-signed render URLs and a 15-minute exact-request image cache
+- Visual regression ZIPs with pixel counts, pass/fail thresholds, bounds, and
+  highlighted changes
+- Privacy-aware diagnostic ZIPs with the artifact, manifest, console events,
+  and a request waterfall stripped of credentials, headers, bodies, and query
+  strings
+- Bounded concurrency, output/pixel/deadline limits, client-disconnect
+  cancellation, consistent error envelopes, and hosted-mode SSRF defenses
+- Browser UI, Tauri desktop app, native Android app, Docker Compose, and a
+  portable agent skill
 
-## Getting started
+## Start in one command
 
-Install [Python 3.11 or newer](https://www.python.org/downloads/), then run:
+With Python 3.11 or newer:
 
 ```bash
 git clone https://github.com/Viperisuseful/ViperCapture.git
@@ -50,199 +51,112 @@ cd ViperCapture
 python launch.py
 ```
 
-The launcher creates a virtual environment, installs the required packages and
-Chromium, starts ViperCapture, and opens `http://127.0.0.1:8000`.
+The launcher creates a virtual environment, installs Chromium, starts the API,
+and opens `http://127.0.0.1:8000`.
 
-Running `python launch.py` is the supported setup and startup method on every
-platform.
-
-## Native apps
-
-The Tauri 2 app is isolated in [`desktop/`](desktop), so desktop packaging and
-releases do not change the web frontend in [`frontend/`](frontend). It bundles
-the FastAPI renderer, Python runtime, and Playwright Chromium as a local,
-authenticated sidecar; users do not need to install Python or a browser.
-
-See the [desktop build guide](docs/desktop.md) for local development,
-validation, package formats, and signing status.
-
-The Android build uses a native, offscreen Android WebView renderer instead of
-the desktop Python sidecar. It supports Android 10 and newer and saves captures
-through Android's Downloads collection. See the [Android build guide](docs/android.md)
-for setup, local builds, supported controls, and release signing.
-
-## API
-
-Send a JSON request to `POST /v1/render`:
+Or use Docker:
 
 ```bash
-curl 'http://127.0.0.1:8000/v1/render' \
-  --header 'Content-Type: application/json' \
-  --data '{
-    "url": "https://www.wikipedia.org",
+docker compose up --build
+```
+
+The Compose default binds only to loopback and stores durable queue state,
+encryption keys, schedules, cache entries, and local artifacts in a named
+volume. Read [self-hosting](docs/self-hosting.md) before exposing it to a
+network. The server has no built-in multi-tenant authorization layer.
+
+## Render API
+
+```bash
+curl --fail-with-body http://127.0.0.1:8000/v1/render \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "url": "https://example.com",
     "output": "png",
-    "viewport": {
-      "width": 1280,
-      "height": 720,
-      "device_scale_factor": 1
-    },
     "full_page": false,
-    "lazy_load": "adaptive",
-    "selector": "main",
-    "image": {
-      "transparent_background": true,
-      "optimize_for_speed": true
-    },
-    "wait_for": {
-      "event": "networkidle",
-      "selector": "main",
-      "timeout_ms": 15000
-    },
-    "headers": {
-      "X-Render-Mode": "docs"
-    }
-  }' \
-  --output wikipedia.png
+    "viewport": {"width": 1280, "height": 720},
+    "actions": [{"type": "hide", "selector": ".newsletter"}],
+    "cleanup": {"block_ads": true, "consent_mode": "reject"},
+    "assertions": {"content_includes": ["Example Domain"]}
+  }' --output example.png
 ```
 
-A successful request returns the image bytes with the matching media type.
-Every response includes `X-Request-Id`. Successful renders also report queue
-time, render time, and output dimensions in `X-ViperCapture-*` diagnostic
-headers. Errors use a consistent JSON object with a stable code, message,
-request ID, retryable flag, and details.
+The synchronous response is the artifact itself. It includes a request ID,
+queue/render timing, dimensions, navigation status, and cache outcome in
+`X-ViperCapture-*` headers.
 
-### Async jobs
+For durable work, send the same render object to `POST /v1/jobs`. Poll
+`GET /v1/jobs/{id}`, download `GET /v1/jobs/{id}/result`, or receive a signed
+callback by setting `delivery.webhook_url`. Related orchestration endpoints:
 
-For work that should survive a client disconnect or application restart, submit
-the same request to `POST /v1/jobs`, poll its status, and download the result:
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /v1/jobs/bulk` | Best-effort submission of up to 100 independently idempotent jobs |
+| `POST/GET/PATCH/DELETE /v1/schedules` | Encrypted five-field cron schedules with IANA time zones |
+| `POST /v1/signed-url` | Mint an expiring HMAC render link |
+| `GET /v1/render/signed` | Render through a verified signed link |
+| `POST /v1/diff` | Compare two images and download a deterministic report ZIP |
+
+See the [API and workflows guide](docs/api.md), [async provider guide](docs/async-jobs.md),
+and [migration guide](docs/migration-screenshotone-urlbox.md).
+
+## Storage and webhooks
+
+Set `VIPERCAPTURE_S3_BUCKET` to switch job results from local files to the
+built-in S3 adapter. Standard AWS credential resolution is used. R2 and MinIO
+add an endpoint URL and path-style addressing where appropriate. The
+`docker-compose.s3.yml` overlay provides a complete local MinIO proof:
 
 ```bash
-capture_run="$(date -u +%Y-%m-%dT%H)"
-job_id="$(
-  curl --fail-with-body --silent \
-    --header 'Content-Type: application/json' \
-    --header "X-Request-Id: homepage-$capture_run" \
-    --data '{"url":"https://example.com","full_page":false}' \
-    http://127.0.0.1:8000/v1/jobs |
-  python -c 'import json,sys; print(json.load(sys.stdin)["id"])'
-)"
-
-while true; do
-  job_status="$(
-    curl --fail-with-body --silent \
-      "http://127.0.0.1:8000/v1/jobs/$job_id" |
-    python -c 'import json,sys; print(json.load(sys.stdin)["status"])'
-  )"
-  case "$job_status" in
-    succeeded) break ;;
-    failed|cancelled|expired)
-      echo "async capture ended with status: $job_status" >&2
-      exit 1
-      ;;
-  esac
-  sleep 1
-done
-
-curl --fail-with-body "http://127.0.0.1:8000/v1/jobs/$job_id/result" \
-  --output capture.png
+export MINIO_ROOT_PASSWORD='replace-with-at-least-a-long-random-secret'
+docker compose -f docker-compose.yml -f docker-compose.s3.yml up --build
 ```
 
-The bundled provider uses SQLite for job state and private local files for
-results. Queued request data is AES-GCM encrypted before it reaches the job
-store. Database and storage adapters are independently replaceable through
-Python factory hooks, so deployments can use PostgreSQL, Redis, S3-compatible
-storage, or another provider without changing the API or renderer. See the
-[async jobs and providers guide](docs/async-jobs.md).
+Set `VIPERCAPTURE_WEBHOOK_SECRET` to enable callbacks. Each body is canonical
+JSON signed with HMAC-SHA256 in `X-ViperCapture-Webhook-Signature`, with timestamp and
+event-ID headers for verification and deduplication. Private callback targets
+are rejected unless the operator explicitly opts in. Public DNS results are
+pinned through the callback connection to prevent rebinding, and the encrypted
+delivery outbox survives process restarts.
 
-### Request options
+## Security boundary
 
-| Field | Default | Purpose |
-| --- | --- | --- |
-| `url` | required | Public webpage to capture |
-| `output` | `png` | `png`, `jpeg`, or `webp` |
-| `viewport` | `1280 × 720 × 1` | Width, height, and device scale factor |
-| `full_page` | `true` | Capture the full document or current viewport |
-| `preserve_viewport_width` | `false` | Clip wide full-page output to the requested viewport width |
-| `lazy_load` | `thorough` | `thorough`, `adaptive`, or `none` full-page scrolling |
-| `selector` | empty | Capture one visible element when `full_page` is `false` |
-| `image` | defaults | JPEG/WebP quality, PNG/WebP transparency, and speed-first WebP encoding |
-| `wait_for` | load | Page event, selector, text, delay, and timeout |
-| `headers` | `{}` | Headers sent only to same-origin target requests |
-| `proceed_on_captcha` | `false` | Capture a detected page-level challenge as displayed instead of returning HTTP 409 |
+Keep the service on loopback or place every route behind the same authenticated,
+rate-limited reverse proxy. Job and schedule UUIDs are locators, not access
+control. Hosted mode rejects targets and redirects that resolve privately at
+validation time, unsafe subresources, cross-origin credential headers, proxy
+use, and cross-site cookies. Because browser DNS can change after validation,
+deployments must also enforce host/container egress rules to block rebinding.
+Self-host mode intentionally permits operators to reach internal pages and use
+proxies; isolate Chromium accordingly.
 
-Detected page-level challenges return `captcha_detected` by default. Setting
-`proceed_on_captcha` to `true` captures the visible challenge; it does not solve
-or bypass the CAPTCHA.
+JavaScript actions are disabled unless `VIPERCAPTURE_ALLOW_SCRIPTS=1`. Render
+inputs can contain credentials and private page data. Async and scheduled inputs
+are AES-GCM encrypted and erased at terminal job states, but diagnostic console
+output and browser video can still capture sensitive page content—treat their
+artifacts accordingly.
 
-For the lowest latency, combine `wait_for.event: "domcontentloaded"` with
-`lazy_load: "none"`. This captures earlier and may omit resources or content
-that appears later. `lazy_load: "adaptive"` is a middle ground, while the
-default `thorough` mode preserves the existing scrolling behavior.
+## Native apps and agent skill
 
-## Agent skill
+The Tauri 2 desktop app lives in [`desktop/`](desktop) and the Android WebView
+renderer is documented in [docs/android.md](docs/android.md). The portable
+[`skills/vipercapture`](skills/vipercapture) skill works with Codex, Claude Code,
+and Cursor and includes a dependency-free client.
 
-The portable [Agent Skill](https://agentskills.io) in
-[`skills/vipercapture`](skills/vipercapture) lets Codex, Claude Code, and
-Cursor capture webpages or render HTML and Markdown through ViperCapture. It
-includes a dependency-free Python client for ViperCapture instances.
-
-Clone this repository, then copy the skill into the user-level directory for
-your agent:
-
-| Agent | Install location | Invocation |
-| --- | --- | --- |
-| [Codex](https://developers.openai.com/codex/skills) | `~/.agents/skills/vipercapture` | `$vipercapture` |
-| [Claude Code](https://code.claude.com/docs/en/skills) | `~/.claude/skills/vipercapture` | `/vipercapture` |
-| [Cursor](https://cursor.com/docs/skills) | `~/.agents/skills/vipercapture` or `~/.cursor/skills/vipercapture` | `/vipercapture` |
+## Development and proof
 
 ```bash
-git clone https://github.com/Viperisuseful/ViperCapture.git
-cd ViperCapture
+python -m pip install -r requirements.txt
+python -m playwright install chromium
+python -m unittest -v
+npm ci --prefix frontend && npm run lint --prefix frontend && npm run build --prefix frontend
 ```
 
-On macOS or Linux, install for Codex and Cursor with:
-
-```bash
-mkdir -p ~/.agents/skills
-cp -R skills/vipercapture ~/.agents/skills/
-```
-
-Install for Claude Code with:
-
-```bash
-mkdir -p ~/.claude/skills
-cp -R skills/vipercapture ~/.claude/skills/
-```
-
-On Windows PowerShell, replace the destination with
-`$HOME\.agents\skills\vipercapture`, `$HOME\.claude\skills\vipercapture`, or
-`$HOME\.cursor\skills\vipercapture`:
-
-```powershell
-New-Item -ItemType Directory -Force "$HOME\.agents\skills" | Out-Null
-Copy-Item -Recurse -Force ".\skills\vipercapture" "$HOME\.agents\skills"
-```
-
-## Self-hosting
-
-Run one application process because each process owns a Chromium process tree.
-Start with `VIPERCAPTURE_MAX_CONCURRENCY=1`, apply memory and CPU limits, and
-measure the host before raising browser concurrency.
-
-See the [self-hosting guide](docs/self-hosting.md) for the full production
-boundary and supported capability set, and the
-[async jobs guide](docs/async-jobs.md) for durable queue configuration and
-custom providers.
-
-## Project layout
-
-The main components are `main.py` for the FastAPI application,
-`render_contract.py` for request validation, and `render_engine.py` for
-Playwright rendering. `async_jobs.py` defines the portable queue contracts and
-`async_job_providers.py` supplies SQLite and filesystem defaults. The
-hosted/self-hosted interface remains in `frontend/`;
-the independently packaged Tauri application is in `desktop/`.
+CI runs the renderer suite and both web/desktop builds. The benchmark emits raw
+samples and never invents competitor results; use your own provider credentials
+to compare from the same host and scenario file.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). AutoConsent assets under `vendor/autoconsent` retain their
+upstream license and attribution.

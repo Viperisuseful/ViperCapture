@@ -1,11 +1,11 @@
 # Async jobs and provider adapters
 
-ViperCapture can detach image rendering from the client connection. The
+ViperCapture can detach rendering from the client connection. The
 synchronous `POST /v1/render` endpoint remains available; async clients use:
 
 - `POST /v1/jobs` to submit the normal `RenderRequest` JSON.
 - `GET /v1/jobs/{id}` to read queue, render, or terminal status.
-- `GET /v1/jobs/{id}/result` to download a successful image.
+- `GET /v1/jobs/{id}/result` to download a successful artifact.
 - `DELETE /v1/jobs/{id}` to cancel work that is still queued.
 
 Submission returns HTTP 202 with `Location` and `Retry-After` headers. Supplying
@@ -32,8 +32,15 @@ running can omit committed queue state and downloadable results. Provider
 adapters need an equivalent coordinated snapshot procedure for live backups.
 The job database receives only ciphertext for request bodies, so URLs and
 custom target headers are not stored as plaintext. Terminal transitions erase
-that ciphertext. A keyed request fingerprint enforces idempotency without
-storing the raw request.
+that request ciphertext. When webhook delivery is requested, its URL is stored
+as separate AES-GCM ciphertext and the terminal transition atomically marks an
+outbox event. A separate notification worker drains that outbox, so a slow
+callback cannot occupy render workers or delay API requests and startup
+maintenance. Only that encrypted URL remains until successful delivery is
+acknowledged; pending delivery is excluded from metadata expiry. A keyed
+request fingerprint enforces idempotency without storing the raw request.
+Failed callback rows receive exponential retry delays, so an unavailable
+destination cannot monopolize the bounded delivery batch or starve newer jobs.
 The bundled providers create the database, WAL sidecars, key, and result files
 with owner-only permissions. Key and result creation fsync both file contents
 and directory entries before reporting durable success. SQLite enables secure
@@ -49,9 +56,10 @@ ViperCapture leaves claimed work `running` during shutdown. At startup it
 requeues interrupted jobs unless they have already reached the configured
 attempt limit; a success committed just before shutdown remains successful.
 Retryable render failures are attempted up to three times by default. A queued
-job has 15 minutes to be claimed. Local results expire after one hour and
-terminal metadata after 24 hours. Expired and orphaned local artifacts are
-removed during routine queue maintenance.
+job has 15 minutes to be claimed. Local results—including PNG, JPEG, WebP, PDF,
+HTML, Markdown, JSON metadata, ZIP bundles, and WebM video—expire after one
+hour and terminal metadata after 24 hours. Expired and orphaned local artifacts
+are removed during routine queue maintenance.
 
 Successful job timings report queue time through the first claim and render
 time from that first claim through final settlement. The render duration
@@ -73,6 +81,11 @@ therefore includes failed attempts, retry backoff, and result persistence.
 | `VIPERCAPTURE_ASYNC_RESULT_CONCURRENCY` | `2` | Maximum simultaneous async result streams |
 | `VIPERCAPTURE_JOB_STORE_FACTORY` | bundled SQLite | `module:function` database adapter factory |
 | `VIPERCAPTURE_ARTIFACT_STORE_FACTORY` | bundled filesystem | `module:function` artifact adapter factory |
+| `VIPERCAPTURE_S3_BUCKET` | unset | Select the built-in S3-compatible artifact provider |
+| `VIPERCAPTURE_S3_ENDPOINT_URL` | AWS default | R2, MinIO, B2, or compatible service endpoint |
+| `VIPERCAPTURE_S3_REGION` | `us-east-1` | S3 signing region |
+| `VIPERCAPTURE_S3_ADDRESSING_STYLE` | `auto` | `auto`, `virtual`, or `path` bucket addressing |
+| `VIPERCAPTURE_S3_PREFIX` | `vipercapture` | Result object key prefix |
 
 Workers share `VIPERCAPTURE_MAX_CONCURRENCY` with synchronous renders. Raising
 the worker count does not bypass the Chromium semaphore.
@@ -157,6 +170,11 @@ decrypts it only after `claim`. Adapters must treat `JobRecord.payload` as
 opaque bytes. Set the same `VIPERCAPTURE_JOB_SECRET` whenever state can move
 between machines or processes.
 
+Durable job-store adapters also implement `pending_notifications` and
+`acknowledge_notification`. Terminal success/failure and creation of the
+encrypted webhook outbox record must be one atomic state transition. Delivery
+is at least once, so consumers should deduplicate the stable webhook ID.
+
 ## Storage adapters
 
 `async_jobs.ArtifactStore` is the binary provider contract. Its factory
@@ -178,7 +196,7 @@ Configure it independently:
 VIPERCAPTURE_ARTIFACT_STORE_FACTORY=my_vipercapture_s3:create_artifact_store
 ```
 
-`put` receives the job ID, validated image bytes, media type, and download
+`put` receives the job ID, validated artifact bytes, media type, and download
 filename. It returns a `StoredArtifact` containing an opaque key and its
 absolute expiry. The provider must start the configured result TTL after the
 artifact is durably persisted, not before a potentially slow upload. `get`

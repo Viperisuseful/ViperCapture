@@ -1,0 +1,133 @@
+import asyncio
+import io
+import json
+import os
+import tempfile
+import threading
+import unittest
+import zipfile
+from pathlib import Path
+from unittest.mock import patch
+
+from pydantic import ValidationError
+
+from render_contract import RenderRequest
+from render_engine import (
+    RenderArtifact,
+    RenderLimits,
+    _ffmpeg_executable,
+    diagnostic_bundle,
+    diagnostic_url,
+)
+
+
+class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
+    def test_ffmpeg_discovery_checks_native_playwright_caches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidates = (
+                root / "Library" / "Caches" / "ms-playwright" / "ffmpeg-1" / "ffmpeg-mac",
+                root / "local" / "ms-playwright" / "ffmpeg-1" / "ffmpeg-win64.exe",
+            )
+            for candidate in candidates:
+                candidate.parent.mkdir(parents=True)
+                candidate.write_bytes(b"ffmpeg")
+                candidate.chmod(0o700)
+
+            with (
+                patch("render_engine.shutil.which", return_value=None),
+                patch("render_engine.Path.home", return_value=root),
+                patch.dict(os.environ, {"LOCALAPPDATA": str(root / "local")}, clear=True),
+            ):
+                self.assertEqual(_ffmpeg_executable(), candidates[0])
+
+            candidates[0].unlink()
+            with (
+                patch("render_engine.shutil.which", return_value=None),
+                patch("render_engine.Path.home", return_value=root),
+                patch.dict(os.environ, {"LOCALAPPDATA": str(root / "local")}, clear=True),
+            ):
+                self.assertEqual(_ffmpeg_executable(), candidates[1])
+
+    def test_diagnostic_urls_drop_secrets(self):
+        sanitized = diagnostic_url("https://user:pass@example.com/path?token=secret#fragment")
+        self.assertEqual(sanitized, "https://example.com/path")
+
+    async def test_diagnostic_bundle_is_self_describing(self):
+        request = RenderRequest(
+            html="<p>test</p>",
+            diagnostics={"bundle": True},
+        )
+        artifact = RenderArtifact(
+            b"image",
+            "image/png",
+            "capture.png",
+            {"width": 1, "final_url": "https://example.com/path?token=secret"},
+        )
+        result = await diagnostic_bundle(
+            artifact,
+            request,
+            [{"type": "log", "text": "ready"}],
+            [{"method": "GET", "url": "https://example.com", "status": 200}],
+            RenderLimits(),
+        )
+        self.assertEqual(result.media_type, "application/zip")
+        with zipfile.ZipFile(io.BytesIO(result.body)) as archive:
+            self.assertEqual(
+                set(archive.namelist()),
+                {"capture.png", "manifest.json", "console.json", "network.json"},
+            )
+            manifest = json.loads(archive.read("manifest.json"))
+            self.assertEqual(manifest["artifact"]["bytes"], 5)
+            self.assertEqual(manifest["artifact"]["metadata"]["final_url"], "https://example.com/path")
+            self.assertNotIn(b"secret", archive.read("manifest.json"))
+
+    async def test_cancelled_diagnostic_bundle_settles_zip_thread(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocked_zip(_entries):
+            started.set()
+            release.wait(timeout=2)
+            return b"zip"
+
+        request = RenderRequest(
+            html="<p>test</p>", diagnostics={"bundle": True}
+        )
+        with patch("render_engine._write_diagnostic_zip", side_effect=blocked_zip):
+            operation = asyncio.create_task(
+                diagnostic_bundle(
+                    RenderArtifact(b"image", "image/png", "capture.png"),
+                    request,
+                    [],
+                    [],
+                    RenderLimits(),
+                )
+            )
+            self.assertTrue(await asyncio.to_thread(started.wait, 1))
+            operation.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(operation.done())
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await operation
+
+    def test_video_contract_defaults_and_rejects_invalid_combinations(self):
+        request = RenderRequest(url="https://example.com", output="webm")
+        self.assertEqual(request.video.duration_ms, 5_000)
+        self.assertEqual(request.credit_cost, 1)
+        with self.assertRaises(ValidationError):
+            RenderRequest(url="https://example.com", output="png", video={})
+        with self.assertRaises(ValidationError):
+            RenderRequest(
+                url="https://example.com",
+                output="webm",
+                viewports=[
+                    {"name": "one", "width": 10, "height": 10},
+                    {"name": "two", "width": 10, "height": 10},
+                ],
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import suppress
-from datetime import datetime, timedelta, timezone
 import errno
 import hmac
 import json
 import os
-from pathlib import Path
 import re
 import sqlite3
 import stat
 import threading
+from contextlib import suppress
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from uuid import uuid4
 
 from async_jobs import (
@@ -28,7 +28,6 @@ from async_jobs import (
     StoredArtifact,
     _ensure_private_directory,
 )
-
 
 UTC = timezone.utc
 
@@ -221,6 +220,10 @@ class SQLiteJobStore:
                 request_id TEXT NOT NULL UNIQUE,
                 status TEXT NOT NULL,
                 payload BLOB,
+                webhook_payload BLOB,
+                webhook_event_status TEXT,
+                webhook_attempt_count INTEGER NOT NULL DEFAULT 0,
+                webhook_available_at REAL,
                 attempt_count INTEGER NOT NULL DEFAULT 0,
                 available_at REAL NOT NULL,
                 queue_expires_at REAL NOT NULL,
@@ -264,6 +267,29 @@ class SQLiteJobStore:
             connection.execute(
                 "ALTER TABLE async_jobs ADD COLUMN request_fingerprint BLOB"
             )
+        if "webhook_payload" not in columns:
+            connection.execute(
+                "ALTER TABLE async_jobs ADD COLUMN webhook_payload BLOB"
+            )
+        if "webhook_event_status" not in columns:
+            connection.execute(
+                "ALTER TABLE async_jobs ADD COLUMN webhook_event_status TEXT"
+            )
+        if "webhook_attempt_count" not in columns:
+            connection.execute(
+                "ALTER TABLE async_jobs ADD COLUMN webhook_attempt_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if "webhook_available_at" not in columns:
+            connection.execute(
+                "ALTER TABLE async_jobs ADD COLUMN webhook_available_at REAL"
+            )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS async_jobs_webhook_idx
+            ON async_jobs(webhook_available_at, completed_at)
+            WHERE webhook_payload IS NOT NULL
+            """
+        )
 
     @staticmethod
     def _from_row(row: sqlite3.Row | None) -> JobRecord | None:
@@ -283,6 +309,14 @@ class SQLiteJobStore:
                 if row["request_fingerprint"] is not None
                 else None
             ),
+            webhook_payload=(
+                bytes(row["webhook_payload"])
+                if row["webhook_payload"] is not None
+                else None
+            ),
+            webhook_event_status=row["webhook_event_status"],
+            webhook_attempt_count=int(row["webhook_attempt_count"] or 0),
+            webhook_available_at=_datetime(row["webhook_available_at"]),
             started_at=_datetime(row["started_at"]),
             completed_at=_datetime(row["completed_at"]),
             artifact_key=row["artifact_key"],
@@ -322,13 +356,20 @@ class SQLiteJobStore:
             expired_queue = connection.execute(
                 """
                 UPDATE async_jobs
-                SET status = 'expired', payload = NULL, completed_at = ?,
+                SET status = 'expired', payload = NULL,
+                    webhook_event_status = CASE
+                        WHEN webhook_payload IS NOT NULL THEN 'failed'
+                        ELSE NULL END,
+                    webhook_attempt_count = 0,
+                    webhook_available_at = CASE
+                        WHEN webhook_payload IS NOT NULL THEN ? ELSE NULL END,
+                    completed_at = ?,
                     error_code = 'job_queue_expired',
                     error_message = 'The job expired before a worker could start it.',
                     error_retryable = 1
                 WHERE status = 'queued' AND queue_expires_at <= ?
                 """,
-                (current, current),
+                (current, current, current),
             )
             connection.execute(
                 """
@@ -369,15 +410,16 @@ class SQLiteJobStore:
             connection.execute(
                 """
                 INSERT INTO async_jobs (
-                    id, request_id, status, payload, attempt_count,
+                    id, request_id, status, payload, webhook_payload, attempt_count,
                     available_at, queue_expires_at, created_at,
                     request_fingerprint
-                ) VALUES (?, ?, 'queued', ?, 0, ?, ?, ?, ?)
+                ) VALUES (?, ?, 'queued', ?, ?, 0, ?, ?, ?, ?)
                 """,
                 (
                     job.id,
                     job.request_id,
                     job.payload,
+                    job.webhook_payload,
                     _epoch(job.available_at),
                     _epoch(job.queue_expires_at),
                     _epoch(job.created_at),
@@ -429,13 +471,20 @@ class SQLiteJobStore:
             exhausted_queue = connection.execute(
                 """
                 UPDATE async_jobs
-                SET status = 'failed', payload = NULL, completed_at = ?,
+                SET status = 'failed', payload = NULL,
+                    webhook_event_status = CASE
+                        WHEN webhook_payload IS NOT NULL THEN 'failed'
+                        ELSE NULL END,
+                    webhook_attempt_count = 0,
+                    webhook_available_at = CASE
+                        WHEN webhook_payload IS NOT NULL THEN ? ELSE NULL END,
+                    completed_at = ?,
                     error_code = 'job_attempts_exhausted',
                     error_message = 'The queued job exhausted its retry attempts.',
                     error_retryable = 0
                 WHERE status = 'queued' AND attempt_count >= ?
                 """,
-                (current, max_attempts),
+                (current, current, max_attempts),
             )
             row = connection.execute(
                 """
@@ -479,6 +528,22 @@ class SQLiteJobStore:
             conditional_scrub=True,
         )
 
+    async def get_by_request_id(self, request_id: str) -> JobRecord | None:
+        return await self._run(self._get_by_request_id, request_id)
+
+    @classmethod
+    def _get_by_request_id(
+        cls,
+        connection: sqlite3.Connection,
+        request_id: str,
+    ) -> JobRecord | None:
+        return cls._from_row(
+            connection.execute(
+                "SELECT * FROM async_jobs WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+        )
+
     @classmethod
     def _get(
         cls,
@@ -492,13 +557,20 @@ class SQLiteJobStore:
             expired_queue = connection.execute(
                 """
                 UPDATE async_jobs
-                SET status = 'expired', payload = NULL, completed_at = ?,
+                SET status = 'expired', payload = NULL,
+                    webhook_event_status = CASE
+                        WHEN webhook_payload IS NOT NULL THEN 'failed'
+                        ELSE NULL END,
+                    webhook_attempt_count = 0,
+                    webhook_available_at = CASE
+                        WHEN webhook_payload IS NOT NULL THEN ? ELSE NULL END,
+                    completed_at = ?,
                     error_code = 'job_queue_expired',
                     error_message = 'The job expired before a worker could start it.',
                     error_retryable = 1
                 WHERE id = ? AND status = 'queued' AND queue_expires_at <= ?
                 """,
-                (current, job_id, current),
+                (current, current, job_id, current),
             )
             connection.execute(
                 """
@@ -568,26 +640,38 @@ class SQLiteJobStore:
                         """
                         UPDATE async_jobs
                         SET status = 'expired', payload = NULL,
+                            webhook_event_status = CASE
+                                WHEN webhook_payload IS NOT NULL THEN 'failed'
+                                ELSE NULL END,
+                            webhook_attempt_count = 0,
+                            webhook_available_at = CASE
+                                WHEN webhook_payload IS NOT NULL THEN ? ELSE NULL END,
                             completed_at = ?,
                             error_code = 'job_queue_expired',
                             error_message = 'The job expired before a worker could start it.',
                             error_retryable = 1
                         WHERE id = ?
                         """,
-                        (current, job_id),
+                        (current, current, job_id),
                     )
                 else:
                     connection.execute(
                         """
                         UPDATE async_jobs
                         SET status = 'cancelled', payload = NULL,
+                            webhook_event_status = CASE
+                                WHEN webhook_payload IS NOT NULL THEN 'cancelled'
+                                ELSE NULL END,
+                            webhook_attempt_count = 0,
+                            webhook_available_at = CASE
+                                WHEN webhook_payload IS NOT NULL THEN ? ELSE NULL END,
                             completed_at = ?,
                             error_code = 'job_cancelled',
                             error_message = 'The queued job was cancelled.',
                             error_retryable = 0
                         WHERE id = ?
                         """,
-                        (current, job_id),
+                        (current, current, job_id),
                     )
             updated = connection.execute(
                 "SELECT * FROM async_jobs WHERE id = ?",
@@ -661,7 +745,14 @@ class SQLiteJobStore:
             updated = connection.execute(
                 """
                 UPDATE async_jobs
-                SET status = 'succeeded', payload = NULL, artifact_key = ?,
+                SET status = 'succeeded', payload = NULL,
+                    webhook_event_status = CASE
+                        WHEN webhook_payload IS NOT NULL THEN 'succeeded'
+                        ELSE NULL END,
+                    webhook_attempt_count = 0,
+                    webhook_available_at = CASE
+                        WHEN webhook_payload IS NOT NULL THEN ? ELSE NULL END,
+                    artifact_key = ?,
                     media_type = ?, filename = ?, artifact_bytes = ?,
                     result_expires_at = ?, queue_ms = ?, render_ms = ?,
                     completed_at = ?, error_code = NULL, error_message = NULL,
@@ -669,6 +760,7 @@ class SQLiteJobStore:
                 WHERE id = ? AND status = 'running' AND attempt_count = ?
                 """,
                 (
+                    current,
                     artifact_key,
                     media_type,
                     filename,
@@ -739,11 +831,19 @@ class SQLiteJobStore:
             updated = connection.execute(
                 """
                 UPDATE async_jobs
-                SET status = 'failed', payload = NULL, completed_at = ?,
+                SET status = 'failed', payload = NULL,
+                    webhook_event_status = CASE
+                        WHEN webhook_payload IS NOT NULL THEN 'failed'
+                        ELSE NULL END,
+                    webhook_attempt_count = 0,
+                    webhook_available_at = CASE
+                        WHEN webhook_payload IS NOT NULL THEN ? ELSE NULL END,
+                    completed_at = ?,
                     error_code = ?, error_message = ?, error_retryable = ?
                 WHERE id = ? AND status = 'running' AND attempt_count = ?
                 """,
                 (
+                    completed_at,
                     completed_at,
                     code_value,
                     message_value,
@@ -794,25 +894,39 @@ class SQLiteJobStore:
             expired = connection.execute(
                 """
                 UPDATE async_jobs
-                SET status = 'expired', payload = NULL, completed_at = ?,
+                SET status = 'expired', payload = NULL,
+                    webhook_event_status = CASE
+                        WHEN webhook_payload IS NOT NULL THEN 'failed'
+                        ELSE NULL END,
+                    webhook_attempt_count = 0,
+                    webhook_available_at = CASE
+                        WHEN webhook_payload IS NOT NULL THEN ? ELSE NULL END,
+                    completed_at = ?,
                     error_code = 'job_queue_expired',
                     error_message = 'The job expired before a worker could restart it.',
                     error_retryable = 1
                 WHERE status = 'running' AND queue_expires_at <= ?
                 """,
-                (current, current),
+                (current, current, current),
             ).rowcount
             exhausted = connection.execute(
                 """
                 UPDATE async_jobs
-                SET status = 'failed', payload = NULL, completed_at = ?,
+                SET status = 'failed', payload = NULL,
+                    webhook_event_status = CASE
+                        WHEN webhook_payload IS NOT NULL THEN 'failed'
+                        ELSE NULL END,
+                    webhook_attempt_count = 0,
+                    webhook_available_at = CASE
+                        WHEN webhook_payload IS NOT NULL THEN ? ELSE NULL END,
+                    completed_at = ?,
                     error_code = 'job_attempts_exhausted',
                     error_message = 'The interrupted job exhausted its retry attempts.',
                     error_retryable = 0
                 WHERE status = 'running' AND queue_expires_at > ?
                   AND attempt_count >= ?
                 """,
-                (current, current, max_attempts),
+                (current, current, current, max_attempts),
             ).rowcount
             requeued = connection.execute(
                 """
@@ -855,14 +969,27 @@ class SQLiteJobStore:
                 expired = connection.execute(
                     """
                     UPDATE async_jobs
-                    SET status = 'expired', payload = NULL, completed_at = ?,
+                    SET status = 'expired', payload = NULL,
+                        webhook_event_status = CASE
+                            WHEN webhook_payload IS NOT NULL THEN 'failed'
+                            ELSE NULL END,
+                        webhook_attempt_count = 0,
+                        webhook_available_at = CASE
+                            WHEN webhook_payload IS NOT NULL THEN ? ELSE NULL END,
+                        completed_at = ?,
                         error_code = 'job_queue_expired',
                         error_message = 'The interrupted job expired.',
                         error_retryable = 1
                     WHERE id = ? AND status = 'running'
                       AND attempt_count = ? AND queue_expires_at <= ?
                     """,
-                    (completed_at, job_id, expected_attempt, current),
+                    (
+                        completed_at,
+                        completed_at,
+                        job_id,
+                        expected_attempt,
+                        current,
+                    ),
                 ).rowcount
             return None, bool(expired)
 
@@ -919,13 +1046,20 @@ class SQLiteJobStore:
             expired_queue = connection.execute(
                 """
                 UPDATE async_jobs
-                SET status = 'expired', payload = NULL, completed_at = ?,
+                SET status = 'expired', payload = NULL,
+                    webhook_event_status = CASE
+                        WHEN webhook_payload IS NOT NULL THEN 'failed'
+                        ELSE NULL END,
+                    webhook_attempt_count = 0,
+                    webhook_available_at = CASE
+                        WHEN webhook_payload IS NOT NULL THEN ? ELSE NULL END,
+                    completed_at = ?,
                     error_code = 'job_queue_expired',
                     error_message = 'The job expired before a worker could start it.',
                     error_retryable = 1
                 WHERE status = 'queued' AND queue_expires_at <= ?
                 """,
-                (current, current),
+                (current, current, current),
             )
             connection.execute(
                 """
@@ -944,6 +1078,7 @@ class SQLiteJobStore:
                 WHERE status IN ('failed', 'cancelled', 'expired')
                   AND completed_at < ?
                   AND artifact_key IS NULL
+                  AND webhook_payload IS NULL
                 """,
                 (cutoff,),
             )
@@ -956,6 +1091,70 @@ class SQLiteJobStore:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
             raise
+
+    async def pending_notifications(
+        self, now: datetime, limit: int = 100
+    ) -> list[JobRecord]:
+        return await self._run(
+            self._pending_notifications,
+            now,
+            max(1, min(limit, 100)),
+        )
+
+    @classmethod
+    def _pending_notifications(
+        cls,
+        connection: sqlite3.Connection,
+        now: datetime,
+        limit: int,
+    ) -> list[JobRecord]:
+        rows = connection.execute(
+            """
+            SELECT * FROM async_jobs
+            WHERE webhook_payload IS NOT NULL
+              AND webhook_event_status IN ('succeeded', 'failed', 'cancelled')
+              AND COALESCE(webhook_available_at, completed_at, 0) <= ?
+            ORDER BY COALESCE(webhook_available_at, completed_at, 0), id
+            LIMIT ?
+            """,
+            (_epoch(now), limit),
+        ).fetchall()
+        return [cls._from_row(row) for row in rows]
+
+    async def defer_notification(
+        self,
+        job_id: str,
+        webhook_payload: bytes,
+        available_at: datetime,
+    ) -> None:
+        await self._run(
+            lambda connection: connection.execute(
+                """
+                UPDATE async_jobs
+                SET webhook_attempt_count = webhook_attempt_count + 1,
+                    webhook_available_at = ?
+                WHERE id = ? AND webhook_payload = ?
+                """,
+                (_epoch(available_at), job_id, webhook_payload),
+            )
+        )
+
+    async def acknowledge_notification(
+        self, job_id: str, webhook_payload: bytes
+    ) -> None:
+        def operation(connection: sqlite3.Connection) -> tuple[None, bool]:
+            updated = connection.execute(
+                """
+                UPDATE async_jobs
+                SET webhook_payload = NULL, webhook_event_status = NULL,
+                    webhook_attempt_count = 0, webhook_available_at = NULL
+                WHERE id = ? AND webhook_payload = ?
+                """,
+                (job_id, webhook_payload),
+            )
+            return None, bool(updated.rowcount)
+
+        await self._run(operation, conditional_scrub=True)
 
     async def acknowledge_artifact_deletion(self, key: str) -> None:
         await self._run(
@@ -1016,7 +1215,20 @@ class SQLiteJobStore:
             raise
 
 
-_SAFE_KEY = re.compile(r"^[0-9a-f-]{36}\.(png|jpg|webp)$")
+_SAFE_KEY = re.compile(
+    r"^[0-9a-f-]{36}\.(png|jpg|webp|pdf|html|md|json|zip|webm)$"
+)
+_ARTIFACT_EXTENSIONS = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/webp": "webp",
+    "application/pdf": "pdf",
+    "text/html; charset=utf-8": "html",
+    "text/markdown; charset=utf-8": "md",
+    "application/json": "json",
+    "application/zip": "zip",
+    "video/webm": "webm",
+}
 
 
 class LocalArtifactStore:
@@ -1056,11 +1268,7 @@ class LocalArtifactStore:
         media_type: str,
         filename: str,
     ) -> StoredArtifact:
-        extension = {
-            "image/png": "png",
-            "image/jpeg": "jpg",
-            "image/webp": "webp",
-        }.get(media_type)
+        extension = _ARTIFACT_EXTENSIONS.get(media_type)
         if extension is None:
             raise ValueError("unsupported async artifact media type")
         key = f"{uuid4()}.{extension}"

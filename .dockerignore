@@ -1,0 +1,13 @@
+.git
+.github
+**/.env
+**/.env.*
+!**/.env.example
+.venv
+__pycache__
+*.pyc
+captures
+.vipercapture
+frontend/node_modules
+desktop/node_modules
+desktop/src-tauri/target

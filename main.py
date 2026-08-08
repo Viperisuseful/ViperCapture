@@ -1,16 +1,18 @@
 import asyncio
-from contextlib import asynccontextmanager, suppress
-from datetime import datetime
+import hmac
 import os
-from pathlib import Path
 import re
 import subprocess
 import sys
 import time
-from typing import Awaitable, TypeVar
+from contextlib import asynccontextmanager, suppress
+from datetime import datetime
+from pathlib import Path
+from typing import Annotated, Awaitable, TypeVar
+from urllib.parse import urlencode
 from uuid import UUID
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
     FileResponse,
@@ -28,10 +30,35 @@ from async_jobs import (
     public_job_document,
     settings_from_environment,
 )
-from render_contract import RenderRequest
-from render_engine import RenderEngine, RenderLimits
+from bulk_jobs import BulkBodyLimitMiddleware, BulkJobRequest
+from page_cleanup import (
+    CleanupOptions,
+    apply_visual_cleanup,
+    finish_autoconsent,
+    setup_autoconsent,
+    should_block_resource,
+)
+from render_cache import RenderCache
+from render_contract import OutputFormat, RenderRequest
+from render_engine import (
+    CleanupHooks,
+    RenderArtifact,
+    RenderEngine,
+    RenderLimits,
+    _settled_thread,
+)
 from render_errors import RenderError, install_render_error_layer
-
+from schedules import (
+    ScheduleCreate,
+    ScheduleService,
+    ScheduleStore,
+    ScheduleUpdate,
+    public_schedule_document,
+    schedule_cursor,
+)
+from signed_urls import sign_render_request, verify_render_request
+from visual_diff import MAX_DIFF_INPUT_BYTES, compare_images, create_diff_bundle
+from webhooks import WebhookDispatcher
 
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
@@ -58,6 +85,7 @@ DESKTOP_ALLOW_HEADERS = [
     "Content-Type",
     "X-Request-Id",
 ]
+DESKTOP_ALLOW_METHODS = ["GET", "POST", "PATCH", "DELETE"]
 
 
 def _load_local_env() -> None:
@@ -78,6 +106,16 @@ def _load_local_env() -> None:
 _load_local_env()
 
 HOSTED = os.getenv("VIPERCAPTURE_HOSTED") == "1"
+ALLOW_SCRIPTS = os.getenv("VIPERCAPTURE_ALLOW_SCRIPTS") == "1"
+SIGNING_SECRET = os.getenv("VIPERCAPTURE_SIGNING_SECRET", "")
+SIGNING_ADMIN_TOKEN = os.getenv("VIPERCAPTURE_SIGNING_ADMIN_TOKEN", "")
+PUBLIC_URL = os.getenv("VIPERCAPTURE_PUBLIC_URL", "").rstrip("/")
+WEBHOOK_SECRET = os.getenv("VIPERCAPTURE_WEBHOOK_SECRET", "")
+ALLOW_PRIVATE_WEBHOOKS = os.getenv("VIPERCAPTURE_ALLOW_PRIVATE_WEBHOOKS") == "1"
+if SIGNING_SECRET and len(SIGNING_SECRET.encode("utf-8")) < 32:
+    raise ValueError("VIPERCAPTURE_SIGNING_SECRET must contain at least 32 bytes")
+if WEBHOOK_SECRET and len(WEBHOOK_SECRET.encode("utf-8")) < 32:
+    raise ValueError("VIPERCAPTURE_WEBHOOK_SECRET must contain at least 32 bytes")
 GPU_MODE = os.getenv(
     "VIPERCAPTURE_GPU_MODE",
     "auto" if os.getenv("VIPERCAPTURE_ENABLE_GPU") == "1" else "off",
@@ -96,7 +134,11 @@ MAX_ASYNC_RESULT_DOWNLOADS = max(
 MAX_SCREENSHOT_PIXELS = max(
     1, int(os.getenv("VIPERCAPTURE_MAX_PIXELS", "50000000"))
 )
+MAX_DIFF_CONCURRENCY = max(
+    1, int(os.getenv("VIPERCAPTURE_DIFF_CONCURRENCY", "1"))
+)
 CAPTURE_QUEUE_TIMEOUT_SECONDS = 30
+BULK_WEBHOOK_VALIDATION_TIMEOUT_SECONDS = 30
 AwaitedResult = TypeVar("AwaitedResult")
 ASYNC_JOBS_ENABLED = os.getenv(
     "VIPERCAPTURE_ASYNC_JOBS",
@@ -106,6 +148,34 @@ ASYNC_JOB_SETTINGS = (
     settings_from_environment(default_workers=MAX_CONCURRENT_CAPTURES)
     if ASYNC_JOBS_ENABLED
     else None
+)
+SCHEDULES_ENABLED = os.getenv(
+    "VIPERCAPTURE_SCHEDULES",
+    "0" if os.name == "nt" else "1",
+) != "0"
+CACHE_DIRECTORY = Path(
+    os.getenv(
+        "VIPERCAPTURE_CACHE_DIR",
+        str(
+            (
+                ASYNC_JOB_SETTINGS.data_dir
+                if ASYNC_JOB_SETTINGS
+                else Path(
+                    os.getenv(
+                        "VIPERCAPTURE_DATA_DIR",
+                        str(BASE_DIR / ".vipercapture"),
+                    )
+                ).expanduser()
+            )
+            / "cache"
+        ),
+    )
+).expanduser()
+CACHE_TTL_SECONDS = max(1, int(os.getenv("VIPERCAPTURE_CACHE_TTL_SECONDS", "900")))
+CACHE_MAX_ENTRIES = max(1, int(os.getenv("VIPERCAPTURE_CACHE_MAX_ENTRIES", "1000")))
+CACHE_MAX_BYTES = max(
+    1,
+    int(os.getenv("VIPERCAPTURE_CACHE_MAX_BYTES", str(512 * 1024 * 1024))),
 )
 
 
@@ -224,9 +294,37 @@ async def lifespan(app: FastAPI):
     app.state.gpu_mode = GPU_MODE
     app.state.gpu_hardware_active = await _detect_hardware_gpu(browser, GPU_MODE)
     app.state.capture_slots = asyncio.Semaphore(MAX_CONCURRENT_CAPTURES)
+    app.state.diff_slots = asyncio.Semaphore(MAX_DIFF_CONCURRENCY)
     app.state.async_result_slots = asyncio.Semaphore(MAX_ASYNC_RESULT_DOWNLOADS)
     app.state.browser_restart_lock = asyncio.Lock()
     app.state.async_jobs = None
+    app.state.schedules = None
+    app.state.render_cache = RenderCache(
+        CACHE_DIRECTORY,
+        ttl_seconds=CACHE_TTL_SECONDS,
+        max_entries=CACHE_MAX_ENTRIES,
+        max_bytes=CACHE_MAX_BYTES,
+        security_namespace=(
+            f"hosted={int(HOSTED)};scripts={int(ALLOW_SCRIPTS)};"
+            f"max_pixels={MAX_SCREENSHOT_PIXELS}"
+        ),
+    )
+    try:
+        await app.state.render_cache.start()
+    except BaseException:
+        with suppress(Exception):
+            await browser.close()
+        await playwright.stop()
+        raise
+    app.state.webhooks = (
+        WebhookDispatcher(
+            secret=WEBHOOK_SECRET,
+            public_url=PUBLIC_URL,
+            allow_private=ALLOW_PRIVATE_WEBHOOKS,
+        )
+        if WEBHOOK_SECRET
+        else None
+    )
     try:
         if ASYNC_JOBS_ENABLED:
             if ASYNC_JOB_SETTINGS is None:
@@ -237,12 +335,23 @@ async def lifespan(app: FastAPI):
                 job_store,
                 artifact_store,
                 _render_async_image,
+                notifier=_notify_job if app.state.webhooks is not None else None,
             )
             await service.start()
             app.state.async_jobs = service
+            if SCHEDULES_ENABLED:
+                scheduler = ScheduleService(
+                    ScheduleStore(ASYNC_JOB_SETTINGS.data_dir / "schedules.sqlite3"),
+                    service,
+                    service.cipher,
+                )
+                await scheduler.start()
+                app.state.schedules = scheduler
         yield
     finally:
         try:
+            if app.state.schedules is not None:
+                await app.state.schedules.close()
             if app.state.async_jobs is not None:
                 await app.state.async_jobs.close()
         finally:
@@ -252,13 +361,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+app.add_middleware(BulkBodyLimitMiddleware)
 install_render_error_layer(app)
 if DESKTOP_TOKEN:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=DESKTOP_ORIGINS,
         allow_credentials=False,
-        allow_methods=["GET", "POST", "DELETE"],
+        allow_methods=DESKTOP_ALLOW_METHODS,
         allow_headers=DESKTOP_ALLOW_HEADERS,
         expose_headers=[
             "Content-Disposition",
@@ -274,9 +384,24 @@ if STATIC_DIR.exists():
 
 @app.middleware("http")
 async def require_desktop_token(request: Request, call_next):
+    path = request.url.path
+    signed_render = request.method == "GET" and path == "/v1/render/signed"
+    signing_token = SIGNING_ADMIN_TOKEN or SIGNING_SECRET
+    signing_admin = (
+        request.method == "POST"
+        and path == "/v1/signed-url"
+        and signing_token
+        and hmac.compare_digest(
+            request.headers.get("authorization", ""),
+            f"Bearer {signing_token}",
+        )
+    )
     if (
         DESKTOP_TOKEN
         and request.method != "OPTIONS"
+        and path != "/health"
+        and not signed_render
+        and not signing_admin
         and request.headers.get("authorization") != f"Bearer {DESKTOP_TOKEN}"
     ):
         return Response(status_code=401)
@@ -447,21 +572,61 @@ async def _check_captcha(
         )
 
 
-async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
-    started = time.perf_counter()
-    await app.state.capture_slots.acquire()
-    browser: Browser = app.state.browser
-    engine = RenderEngine(
+def _page_cleanup_options(options) -> CleanupOptions:
+    return CleanupOptions(
+        consent_mode=options.consent_mode.value,
+        block_ads=options.block_ads,
+        block_trackers=options.block_trackers,
+        block_chats=options.block_chats,
+        block_newsletters=options.block_newsletters,
+    )
+
+
+async def _apply_page_cleanup(page, options) -> dict[str, int]:
+    await apply_visual_cleanup(page, _page_cleanup_options(options))
+    return {}
+
+
+def _blocked_resource_category(url: str, options) -> str | None:
+    return should_block_resource(url, _page_cleanup_options(options))
+
+
+def _render_engine() -> RenderEngine:
+    playwright = getattr(app.state, "playwright", None)
+    return RenderEngine(
         hosted=HOSTED,
+        cleanup_hooks=CleanupHooks(
+            setup=setup_autoconsent,
+            finish=finish_autoconsent,
+            apply=_apply_page_cleanup,
+            blocked_category=_blocked_resource_category,
+        ),
         challenge_checker=_check_captcha,
         browser_replacer=lambda failed: _replace_browser(app, failed),
+        device_descriptors=(
+            dict(playwright.devices) if playwright is not None else None
+        ),
+        allow_scripts=ALLOW_SCRIPTS,
     )
+
+
+async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
+    started = time.perf_counter()
+    cache = getattr(app.state, "render_cache", None)
+    if payload.cache and cache is not None:
+        cached = await cache.get(payload)
+        if cached is not None:
+            return RenderedArtifact(
+                body=cached.body,
+                media_type=cached.media_type,
+                filename=cached.filename,
+                render_ms=round((time.perf_counter() - started) * 1000),
+            )
+    await app.state.capture_slots.acquire()
+    browser: Browser = app.state.browser
+    engine = _render_engine()
     try:
-        artifact = await engine.render_image(
-            browser,
-            payload,
-            RenderLimits(max_pixels=MAX_SCREENSHOT_PIXELS),
-        )
+        artifact, _cache_hit = await _render_with_cache(engine, browser, payload)
     except RenderError:
         if not browser.is_connected():
             with suppress(Exception):
@@ -477,48 +642,103 @@ async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
     )
 
 
-@app.post("/v1/render", response_class=Response)
-async def render_v1(payload: RenderRequest, request: Request) -> Response:
-    queue_started = time.perf_counter()
-    try:
-        await _await_while_connected(
-            request,
-            asyncio.wait_for(
-                app.state.capture_slots.acquire(),
-                timeout=CAPTURE_QUEUE_TIMEOUT_SECONDS,
-            ),
-        )
-    except TimeoutError as exc:
-        raise RenderError("capture_queue_busy", "The render queue is busy.", 503, True) from exc
-    queue_ms = round((time.perf_counter() - queue_started) * 1000)
-    browser: Browser = app.state.browser
-    engine = RenderEngine(
-        hosted=HOSTED,
-        challenge_checker=_check_captcha,
-        browser_replacer=lambda failed: _replace_browser(app, failed),
+async def _render_with_cache(
+    engine: RenderEngine,
+    browser: Browser,
+    payload: RenderRequest,
+) -> tuple[RenderArtifact, bool]:
+    cache = getattr(app.state, "render_cache", None)
+    if payload.cache and cache is not None:
+        cached = await cache.get(payload)
+        if cached is not None:
+            return cached, True
+    artifact = await engine.render_image(
+        browser,
+        payload,
+        RenderLimits(max_pixels=MAX_SCREENSHOT_PIXELS),
     )
-    render_started = time.perf_counter()
-    try:
-        artifact = await _await_while_connected(
-            request,
-            engine.render_image(
-                browser,
-                payload,
-                RenderLimits(max_pixels=MAX_SCREENSHOT_PIXELS),
-            ),
+    if payload.cache and cache is not None:
+        await cache.put(payload, artifact)
+    return artifact, False
+
+
+async def _notify_job(webhook_url: str, job) -> None:
+    dispatcher = getattr(app.state, "webhooks", None)
+    if dispatcher is None:
+        return
+    await dispatcher.deliver(
+        webhook_url,
+        public_job_document(job),
+    )
+
+
+async def _render_response(payload: RenderRequest, request: Request) -> Response:
+    if payload.delivery.webhook_url is not None:
+        raise RenderError(
+            "delivery_requires_async_job",
+            "Webhook delivery is accepted only by POST /v1/jobs.",
+            422,
+            False,
         )
-    except RenderError:
-        if not browser.is_connected():
-            with suppress(Exception):
-                await _replace_browser(app, browser)
-        raise
-    finally:
-        app.state.capture_slots.release()
-    render_ms = round((time.perf_counter() - render_started) * 1000)
+    cache = getattr(app.state, "render_cache", None)
+    artifact = None
+    cache_hit = False
+    queue_ms = 0
+    render_ms = 0
+    if payload.cache and cache is not None:
+        artifact = await _await_while_connected(request, cache.get(payload))
+        cache_hit = artifact is not None
+
+    if artifact is None:
+        queue_started = time.perf_counter()
+        try:
+            await _await_while_connected(
+                request,
+                asyncio.wait_for(
+                    app.state.capture_slots.acquire(),
+                    timeout=CAPTURE_QUEUE_TIMEOUT_SECONDS,
+                ),
+            )
+        except TimeoutError as exc:
+            raise RenderError(
+                "capture_queue_busy", "The render queue is busy.", 503, True
+            ) from exc
+        queue_ms = round((time.perf_counter() - queue_started) * 1000)
+        browser: Browser = app.state.browser
+        engine = _render_engine()
+        try:
+            if payload.cache and cache is not None:
+                artifact = await _await_while_connected(
+                    request, cache.get(payload)
+                )
+                cache_hit = artifact is not None
+            if artifact is None:
+                render_started = time.perf_counter()
+                artifact = await _await_while_connected(
+                    request,
+                    engine.render_image(
+                        browser,
+                        payload,
+                        RenderLimits(max_pixels=MAX_SCREENSHOT_PIXELS),
+                    ),
+                )
+                render_ms = round(
+                    (time.perf_counter() - render_started) * 1000
+                )
+                if payload.cache and cache is not None:
+                    await cache.put(payload, artifact)
+        except RenderError:
+            if not browser.is_connected():
+                with suppress(Exception):
+                    await _replace_browser(app, browser)
+            raise
+        finally:
+            app.state.capture_slots.release()
     metadata = artifact.metadata or {}
     diagnostic_headers = {
         "X-ViperCapture-Queue-Ms": str(max(0, queue_ms)),
         "X-ViperCapture-Render-Ms": str(max(0, render_ms)),
+        "X-ViperCapture-Cache": "hit" if cache_hit else ("miss" if payload.cache else "disabled"),
     }
     for key, header in (
         ("width", "X-ViperCapture-Width"),
@@ -535,6 +755,136 @@ async def render_v1(payload: RenderRequest, request: Request) -> Response:
             "Content-Disposition": f'attachment; filename="{artifact.filename}"',
             **diagnostic_headers,
         },
+    )
+
+
+@app.post("/v1/render", response_class=Response)
+async def render_v1(payload: RenderRequest, request: Request) -> Response:
+    return await _render_response(payload, request)
+
+
+@app.post("/v1/diff", response_class=Response)
+async def visual_diff(
+    baseline: UploadFile = File(...),
+    current: UploadFile = File(...),
+    pixel_threshold: int = Form(0),
+    max_difference_ratio: float = Form(0),
+) -> Response:
+    try:
+        await asyncio.wait_for(
+            app.state.diff_slots.acquire(),
+            timeout=CAPTURE_QUEUE_TIMEOUT_SECONDS,
+        )
+    except TimeoutError as exc:
+        raise RenderError(
+            "diff_queue_busy", "The visual diff queue is busy.", 503, True
+        ) from exc
+    try:
+        baseline_body = await baseline.read(MAX_DIFF_INPUT_BYTES + 1)
+        current_body = await current.read(MAX_DIFF_INPUT_BYTES + 1)
+        result = await _settled_thread(
+            compare_images,
+            baseline_body,
+            current_body,
+            pixel_threshold=pixel_threshold,
+            max_difference_ratio=max_difference_ratio,
+        )
+        bundle = await _settled_thread(create_diff_bundle, result)
+    except ValueError as exc:
+        raise RenderError("diff_options_invalid", str(exc), 422, False) from exc
+    finally:
+        app.state.diff_slots.release()
+    return Response(
+        bundle,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": 'attachment; filename="visual-diff.zip"',
+            "X-ViperCapture-Diff-Passed": str(result.passed).lower(),
+            "X-ViperCapture-Difference-Ratio": f"{result.ratio:.8f}",
+            "Cache-Control": "private, no-store",
+        },
+    )
+
+
+@app.get("/v1/render/signed", response_class=Response)
+async def render_signed(
+    request: Request,
+    payload: str,
+    expires: int,
+    signature: str,
+) -> Response:
+    if not SIGNING_SECRET:
+        raise RenderError(
+            "signed_urls_disabled",
+            "Signed render URLs are disabled for this ViperCapture instance.",
+            503,
+            False,
+        )
+    render_request = verify_render_request(
+        payload,
+        expires,
+        signature,
+        secret=SIGNING_SECRET,
+    )
+    response = await _render_response(render_request, request)
+    if render_request.output is not OutputFormat.HTML:
+        disposition = response.headers.get("Content-Disposition", "")
+        response.headers["Content-Disposition"] = disposition.replace(
+            "attachment", "inline", 1
+        )
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
+
+
+@app.post("/v1/signed-url")
+async def create_signed_url(
+    payload: RenderRequest,
+    request: Request,
+    ttl_seconds: int = 3600,
+) -> JSONResponse:
+    if not SIGNING_SECRET:
+        raise RenderError(
+            "signed_urls_disabled",
+            "Signed render URLs are disabled for this ViperCapture instance.",
+            503,
+            False,
+        )
+    expected_token = SIGNING_ADMIN_TOKEN or SIGNING_SECRET
+    supplied = request.headers.get("authorization", "")
+    prefix = "Bearer "
+    if not supplied.startswith(prefix) or not hmac.compare_digest(
+        supplied[len(prefix):], expected_token
+    ):
+        raise RenderError(
+            "signing_unauthorized",
+            "A valid signing administrator token is required.",
+            401,
+            False,
+        )
+    if payload.delivery.webhook_url is not None:
+        raise RenderError(
+            "delivery_requires_async_job",
+            "Webhook delivery is accepted only by POST /v1/jobs.",
+            422,
+            False,
+        )
+    try:
+        encoded, expires, signature = sign_render_request(
+            payload,
+            secret=SIGNING_SECRET,
+            ttl_seconds=ttl_seconds,
+        )
+    except ValueError as exc:
+        raise RenderError("signed_url_invalid", str(exc), 422, False) from exc
+    path = "/v1/render/signed?" + urlencode(
+        {"payload": encoded, "expires": expires, "signature": signature}
+    )
+    return JSONResponse(
+        {
+            "url": f"{PUBLIC_URL}{path}" if PUBLIC_URL else path,
+            "expires": expires,
+        },
+        headers={"Cache-Control": "private, no-store"},
     )
 
 
@@ -555,7 +905,8 @@ async def create_render_job(
     payload: RenderRequest,
     request: Request,
 ) -> JSONResponse:
-    job = await _async_job_service().submit(
+    job = await _submit_job(
+        _async_job_service(),
         payload,
         request_id=request.state.request_id,
     )
@@ -569,6 +920,214 @@ async def create_render_job(
             "Cache-Control": "private, no-store",
         },
     )
+
+
+@app.post("/v1/jobs/bulk", status_code=202)
+async def create_bulk_render_jobs(
+    payload: BulkJobRequest,
+    request: Request,
+) -> JSONResponse:
+    service = _async_job_service()
+    results = []
+    failures = 0
+    existing_jobs = [None] * len(payload.items)
+    preflight_errors: list[RenderError | None] = [None] * len(payload.items)
+    request_ids = [
+        item.request_id or f"{request.state.request_id}-{index + 1}"
+        for index, item in enumerate(payload.items)
+    ]
+    for index, item in enumerate(payload.items):
+        try:
+            existing_jobs[index] = await service.existing(
+                item.render,
+                request_id=request_ids[index],
+            )
+        except RenderError as exc:
+            preflight_errors[index] = exc
+    validation_tasks = {
+        index: asyncio.create_task(_validate_webhook(item.render))
+        for index, item in enumerate(payload.items)
+        if existing_jobs[index] is None and preflight_errors[index] is None
+    }
+    if validation_tasks:
+        _done, pending = await asyncio.wait(
+            set(validation_tasks.values()),
+            timeout=BULK_WEBHOOK_VALIDATION_TIMEOUT_SECONDS,
+        )
+    else:
+        pending = set()
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+    validation_errors: list[RenderError | None] = list(preflight_errors)
+    for index, task in validation_tasks.items():
+        if task in pending:
+            validation_errors[index] = (
+                RenderError(
+                    "bulk_webhook_validation_timeout",
+                    "Bulk webhook validation exceeded its aggregate deadline.",
+                    504,
+                    True,
+                )
+            )
+            continue
+        try:
+            task.result()
+        except RenderError as exc:
+            validation_errors[index] = exc
+    for index, item in enumerate(payload.items):
+        try:
+            job = existing_jobs[index]
+            if job is None:
+                error = validation_errors[index]
+                if error is not None:
+                    raise error
+                job = await service.submit(
+                    item.render,
+                    request_id=request_ids[index],
+                )
+            results.append(
+                {
+                    "index": index,
+                    "id": item.id,
+                    "accepted": True,
+                    "job": public_job_document(job),
+                    "error": None,
+                }
+            )
+        except RenderError as exc:
+            failures += 1
+            results.append(
+                {
+                    "index": index,
+                    "id": item.id,
+                    "accepted": False,
+                    "job": None,
+                    "error": {
+                        "code": exc.code,
+                        "message": exc.message,
+                        "retryable": exc.retryable,
+                        "details": exc.details,
+                    },
+                }
+            )
+    return JSONResponse(
+        {
+            "count": len(results),
+            "accepted": len(results) - failures,
+            "failed": failures,
+            "results": results,
+        },
+        status_code=207 if failures else 202,
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
+def _schedule_service() -> ScheduleService:
+    service = getattr(app.state, "schedules", None)
+    if service is None:
+        raise RenderError(
+            "schedules_disabled",
+            "Schedules are disabled for this ViperCapture instance.",
+            503,
+            False,
+        )
+    return service
+
+
+async def _validate_webhook(payload: RenderRequest) -> None:
+    if payload.delivery.webhook_url is None:
+        return
+    dispatcher = getattr(app.state, "webhooks", None)
+    if dispatcher is None:
+        raise RenderError(
+            "webhooks_disabled",
+            "Webhook delivery is disabled for this ViperCapture instance.",
+            503,
+            False,
+        )
+    await dispatcher.validate_url(str(payload.delivery.webhook_url))
+
+
+async def _submit_job(
+    service: AsyncJobService,
+    payload: RenderRequest,
+    *,
+    request_id: str,
+):
+    existing = await service.existing(payload, request_id=request_id)
+    if existing is not None:
+        return existing
+    try:
+        await _validate_webhook(payload)
+    except RenderError:
+        # A concurrent request may have committed while validation was in
+        # flight. Preserve idempotent replay semantics in that race too.
+        existing = await service.existing(payload, request_id=request_id)
+        if existing is not None:
+            return existing
+        raise
+    return await service.submit(payload, request_id=request_id)
+
+
+@app.post("/v1/schedules", status_code=201)
+async def create_schedule(payload: ScheduleCreate) -> JSONResponse:
+    await _validate_webhook(payload.render)
+    record = await _schedule_service().create(payload)
+    return JSONResponse(
+        public_schedule_document(record),
+        status_code=201,
+        headers={"Location": f"/v1/schedules/{record.id}", "Cache-Control": "private, no-store"},
+    )
+
+
+@app.get("/v1/schedules")
+async def list_schedules(
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    after: Annotated[str | None, Query(max_length=256)] = None,
+) -> JSONResponse:
+    records = await _schedule_service().store.list(
+        limit=limit + 1,
+        after=after,
+    )
+    has_more = len(records) > limit
+    records = records[:limit]
+    return JSONResponse(
+        {
+            "count": len(records),
+            "schedules": [public_schedule_document(item) for item in records],
+            "next_cursor": schedule_cursor(records[-1]) if has_more else None,
+        },
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
+@app.get("/v1/schedules/{schedule_id}")
+async def read_schedule(schedule_id: UUID) -> JSONResponse:
+    record = await _schedule_service().store.get(str(schedule_id))
+    if record is None:
+        raise RenderError("schedule_not_found", "The schedule was not found.", 404, False)
+    return JSONResponse(public_schedule_document(record), headers={"Cache-Control": "private, no-store"})
+
+
+@app.patch("/v1/schedules/{schedule_id}")
+async def update_schedule(schedule_id: UUID, payload: ScheduleUpdate) -> JSONResponse:
+    service = _schedule_service()
+    record = await service.store.get(str(schedule_id))
+    if record is None:
+        raise RenderError("schedule_not_found", "The schedule was not found.", 404, False)
+    if payload.render is not None:
+        await _validate_webhook(payload.render)
+    updated = await service.update(record, payload)
+    return JSONResponse(public_schedule_document(updated), headers={"Cache-Control": "private, no-store"})
+
+
+@app.delete("/v1/schedules/{schedule_id}", status_code=204)
+async def delete_schedule(schedule_id: UUID) -> Response:
+    deleted = await _schedule_service().delete(str(schedule_id))
+    if not deleted:
+        raise RenderError("schedule_not_found", "The schedule was not found.", 404, False)
+    return Response(status_code=204)
 
 
 @app.get("/v1/jobs/{job_id}")

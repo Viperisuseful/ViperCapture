@@ -1,6 +1,10 @@
 # Self-hosting ViperCapture
 
-The public ViperCapture repository contains the MIT-licensed URL-to-image engine and browser interface only. Hosted accounts, billing, credits, referrals, document/PDF rendering, managed cleanup, deployment configuration, and secrets are deliberately excluded.
+The public ViperCapture repository contains the MIT-licensed rendering engine,
+browser interface, orchestration APIs, local/S3-compatible storage, schedules,
+signed delivery, diagnostics, and video. The managed ViperCapture Cloud account,
+billing, credits, referrals, deployment configuration, and production secrets
+remain separate.
 
 ## Local install
 
@@ -53,7 +57,10 @@ and restart the service normally.
 
 ## Capability boundary
 
-The public engine supports a public URL source, PNG/JPEG/WebP output, viewport/full-page/selector capture, image quality, transparency, wait conditions, and same-origin target headers. It blocks detected page-level challenges by default. Callers may set `proceed_on_captcha: true` to capture the visible challenge as displayed; ViperCapture never solves or bypasses CAPTCHAs.
+The public engine implements the feature set documented in [API and workflows](api.md).
+It blocks detected page-level challenges by default. Callers may set
+`proceed_on_captcha: true` to capture the visible challenge as displayed;
+ViperCapture never solves or bypasses CAPTCHAs.
 
 Polling-based jobs are enabled by default and use the same rendering contract,
 SSRF controls, concurrency semaphore, and pixel limits as `/v1/render`. The
@@ -61,6 +68,11 @@ local defaults keep encrypted state and expiring results under
 `~/.vipercapture`. Set `VIPERCAPTURE_ASYNC_JOBS=0` to disable the subsystem, or
 follow the [async jobs guide](async-jobs.md) to change retention, capacity, and
 providers.
+
+Schedules are enabled by default on Unix hosts. The bundled SQLite schedule
+store cannot enforce private ACLs on Windows, so `VIPERCAPTURE_SCHEDULES`
+defaults to `0` there and the bundled store refuses direct startup. Use an
+external scheduler on Windows or keep the feature disabled.
 
 ## Selectors and waits
 

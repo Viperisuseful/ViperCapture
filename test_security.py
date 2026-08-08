@@ -1,18 +1,26 @@
 import asyncio
-from base64 import b64encode
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
+import json
 import socket
 import threading
 import unittest
-from unittest.mock import AsyncMock, patch
+import zipfile
+from base64 import b64encode
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from playwright.async_api import async_playwright
 from pydantic import ValidationError
 from starlette.requests import Request
 
-from main import _await_while_connected, _is_local_control_request, gpu_launch_args, hardware_gpu_active
+from main import (
+    _await_while_connected,
+    _is_local_control_request,
+    gpu_launch_args,
+    hardware_gpu_active,
+)
 from render_contract import LazyLoadMode, OutputFormat, RenderRequest
 from render_engine import (
     PublicUrlValidator,
@@ -319,6 +327,26 @@ class BrowserCaptureRegressionTests(unittest.IsolatedAsyncioTestCase):
             {"encoded": encoded, "mediaType": media_type},
         )
 
+    async def test_diagnostic_console_is_bounded_before_transport(self):
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                artifact = await RenderEngine(hosted=False).render_image(
+                    browser,
+                    RenderRequest(
+                        html="<script>console.log('x'.repeat(1_000_000))</script>",
+                        full_page=False,
+                        diagnostics={"bundle": True},
+                    ),
+                    RenderLimits(),
+                )
+            finally:
+                await browser.close()
+        with zipfile.ZipFile(io.BytesIO(artifact.body)) as archive:
+            messages = json.loads(archive.read("console.json"))
+        self.assertEqual(len(messages), 1)
+        self.assertLessEqual(len(messages[0]["text"]), 4_096)
+
     async def test_fast_png_preserves_capture_semantics(self):
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=True)
@@ -489,6 +517,28 @@ class BrowserCaptureRegressionTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await browser.close()
 
+    async def test_webm_contains_only_the_post_preparation_window(self):
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                artifact = await RenderEngine(hosted=False).render(
+                    browser,
+                    RenderRequest.model_validate(
+                        {
+                            "html": "<h1>Timed recording</h1>",
+                            "output": "webm",
+                            "wait_for": {"delay_ms": 500},
+                            "video": {"duration_ms": 1000},
+                        }
+                    ),
+                    RenderLimits(deadline_seconds=30),
+                )
+            finally:
+                await browser.close()
+        self.assertEqual(artifact.body[:4], bytes.fromhex("1a45dfa3"))
+        self.assertGreaterEqual(artifact.metadata["duration_ms"], 850)
+        self.assertLessEqual(artifact.metadata["duration_ms"], 1_100)
+
 
 class CaptureCancellationTests(unittest.IsolatedAsyncioTestCase):
     async def test_completed_work_returns_without_waiting_on_disconnect_poll(self):
@@ -628,6 +678,16 @@ class ValidationTests(unittest.TestCase):
     def test_managed_header_is_rejected(self):
         with self.assertRaises(ValidationError):
             RenderRequest(url="https://example.com", headers={"Host": "internal"})
+
+    def test_raw_input_headers_require_base_url(self):
+        with self.assertRaises(ValidationError):
+            RenderRequest(html="private", headers={"Authorization": "Bearer x"})
+        request = RenderRequest(
+            html="private",
+            base_url="https://example.com",
+            headers={"Authorization": "Bearer x"},
+        )
+        self.assertEqual(str(request.base_url), "https://example.com/")
 
     def test_valid_request(self):
         request = RenderRequest(
