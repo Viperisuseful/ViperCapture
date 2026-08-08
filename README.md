@@ -109,7 +109,9 @@ callback by setting `delivery.webhook_url`. Related orchestration endpoints:
 
 See the [API and workflows guide](docs/api.md), [async provider guide](docs/async-jobs.md),
 [platform/operator guide](docs/platform.md), and
-[migration guide](docs/migration-screenshotone-urlbox.md).
+[migration guide](docs/migration-screenshotone-urlbox.md). If a site you
+administer challenges the renderer, follow the least-privilege
+[Cloudflare/WAF authorization guide](docs/site-access.md).
 
 ## Storage and webhooks
 

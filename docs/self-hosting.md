@@ -102,6 +102,11 @@ Custom headers are sent only to requests matching the target URL's exact
 scheme, hostname, and port. They are stripped from cross-origin subresources
 and redirects.
 
+If a Cloudflare, CDN, WAF, or origin rule blocks captures of a site you
+administer, use the scoped pattern in [site access](site-access.md): fixed
+renderer address, exact host and path, and an origin-only secret header. It
+does not disable or evade challenges on third-party sites.
+
 ## Diagnostic response headers
 
 Successful `POST /v1/render` responses include:

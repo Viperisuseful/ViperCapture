@@ -39,6 +39,7 @@ so corrections can be submitted as pull requests.
 | Separate API and distributed worker roles | Yes, provider-backed | Vendor-managed | Vendor-managed |
 | ScreenshotOne/Urlbox request adapters | Yes | Native | Native |
 | Managed global proxies / stealth fleet | **No** | Yes | Yes |
+| Owner-authorized Cloudflare/WAF access | **Yes: scoped header, profile, proxy, diagnostics, rule guide** | Managed | Managed |
 | Vendor SLA and human render support | **No** | Managed offering | Managed offering |
 | AVIF output | Yes | Yes | Yes |
 | Certified/evidentiary archive | Yes, Ed25519 manifest | Not compared | Yes |
@@ -61,6 +62,11 @@ admissibility opinion, SLA, or around-the-clock render support. Those are servic
 not repository features, and can be valid reasons to buy a managed provider.
 The open-source advantage is control: code, Chromium version, network, data,
 storage, capacity, and cost are inspectable and operator-owned.
+
+For a target the operator owns, the [site access guide](site-access.md) documents
+a narrow Cloudflare/WAF exception using the renderer address, exact host and
+path, and an origin-scoped secret header. This is authorization, not challenge
+evasion.
 
 ## Adjacent alternatives
 

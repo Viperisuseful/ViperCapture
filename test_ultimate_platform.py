@@ -81,6 +81,11 @@ class ArtifactFeatureTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValidationError):
             RenderRequest(url="https://example.com", output="pdf", slices={"height": 500})
 
+    def test_browser_ui_exposes_every_render_output(self):
+        source = (Path(__file__).parent / "frontend" / "src" / "App.tsx").read_text()
+        for output in OutputFormat:
+            self.assertIn(f'value="{output.value}"', source)
+
     async def test_slices_and_certification_are_verifiable_archives(self):
         image = Image.new("RGB", (20, 250), "white")
         body = io.BytesIO()
