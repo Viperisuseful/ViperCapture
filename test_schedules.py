@@ -149,6 +149,21 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
         stored = await self.store.get(record.id)
         self.assertEqual(stored.next_run_at, advanced.next_run_at)
 
+    async def test_invalid_partial_schedule_update_is_typed(self):
+        record = await self.service.create(
+            ScheduleCreate(
+                name="Validation",
+                cron="0 * * * *",
+                render=RenderRequest(html="valid"),
+            )
+        )
+        with self.assertRaises(RenderError) as raised:
+            await self.service.update(
+                record, ScheduleUpdate(cron="not a cron")
+            )
+        self.assertEqual(raised.exception.code, "invalid_schedule")
+        self.assertEqual(raised.exception.status_code, 422)
+
     async def test_due_schedule_submits_once_and_advances_first(self):
         record = await self.service.create(
             ScheduleCreate(

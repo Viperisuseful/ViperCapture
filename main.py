@@ -148,7 +148,19 @@ SCHEDULES_ENABLED = os.getenv(
 CACHE_DIRECTORY = Path(
     os.getenv(
         "VIPERCAPTURE_CACHE_DIR",
-        str((ASYNC_JOB_SETTINGS.data_dir if ASYNC_JOB_SETTINGS else BASE_DIR / ".vipercapture") / "cache"),
+        str(
+            (
+                ASYNC_JOB_SETTINGS.data_dir
+                if ASYNC_JOB_SETTINGS
+                else Path(
+                    os.getenv(
+                        "VIPERCAPTURE_DATA_DIR",
+                        str(BASE_DIR / ".vipercapture"),
+                    )
+                ).expanduser()
+            )
+            / "cache"
+        ),
     )
 ).expanduser()
 CACHE_TTL_SECONDS = max(1, int(os.getenv("VIPERCAPTURE_CACHE_TTL_SECONDS", "900")))

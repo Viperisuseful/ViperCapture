@@ -950,7 +950,7 @@ class RenderEngine:
 
         context = None
         video_directory = None
-        blocked_urls: list[str] = []
+        blocked_subresources = 0
         failed_requests: list[dict[str, object]] = []
         matched_failure_patterns: set[str] = set()
         console_events: list[dict[str, object]] = []
@@ -1041,6 +1041,7 @@ class RenderEngine:
                     )
 
                 async def route_request(route) -> None:
+                    nonlocal blocked_subresources
                     request_url = route.request.url
                     try:
                         scheme = urlsplit(request_url).scheme.lower()
@@ -1058,24 +1059,24 @@ class RenderEngine:
                         and route.request.frame.parent_frame is None
                     )
                     if blocked_by_type and not main_document:
-                        blocked_urls.append(request_url)
+                        blocked_subresources += 1
                         await route.abort("blockedbyclient")
                         return
                     if not main_document and any(
                         fnmatchcase(request_url, pattern)
                         for pattern in request.network.block_url_patterns
                     ):
-                        blocked_urls.append(request_url)
+                        blocked_subresources += 1
                         await route.abort("blockedbyclient")
                         return
                     if self.cleanup_hooks:
                         category = self.cleanup_hooks.blocked_category(request_url, request.cleanup)
                         if category and not main_document:
-                            blocked_urls.append(request_url)
+                            blocked_subresources += 1
                             await route.abort("blockedbyclient")
                             return
                     if self.hosted and not await public_urls.is_public(request_url):
-                        blocked_urls.append(request_url)
+                        blocked_subresources += 1
                         await route.abort("blockedbyclient")
                         return
                     await route.continue_(
@@ -1088,10 +1089,32 @@ class RenderEngine:
                     )
 
                 await context.route("**/*", route_request)
-                if self.hosted:
+                block_websocket_type = any(
+                    resource.value == "websocket"
+                    for resource in request.network.block_resource_types
+                )
+                if (
+                    self.hosted
+                    or block_websocket_type
+                    or request.network.block_url_patterns
+                ):
                     async def block_web_socket(web_socket) -> None:
-                        blocked_urls.append(web_socket.url)
-                        await web_socket.close(code=1008, reason="Blocked in hosted mode")
+                        nonlocal blocked_subresources
+                        blocked = (
+                            self.hosted
+                            or block_websocket_type
+                            or any(
+                                fnmatchcase(web_socket.url, pattern)
+                                for pattern in request.network.block_url_patterns
+                            )
+                        )
+                        if blocked:
+                            blocked_subresources += 1
+                            await web_socket.close(
+                                code=1008, reason="Blocked by render network policy"
+                            )
+                        else:
+                            await web_socket.connect_to_server()
                     await context.route_web_socket("**/*", block_web_socket)
 
                 page = await context.new_page()
@@ -1292,7 +1315,7 @@ class RenderEngine:
                             "duration_ms": actual_duration_ms,
                             "navigation_status": navigation_status,
                             "final_url": final_url,
-                            "blocked_subresources": len(blocked_urls),
+                            "blocked_subresources": blocked_subresources,
                             "output_count": 1,
                         },
                     )
@@ -1308,7 +1331,7 @@ class RenderEngine:
                                 "source_type": request.source_type,
                                 "final_url": page.url,
                                 "navigation_status": navigation_status,
-                                "blocked_subresources": len(blocked_urls),
+                                "blocked_subresources": blocked_subresources,
                             }
                         )
                         artifact = RenderArtifact(
@@ -1337,7 +1360,7 @@ class RenderEngine:
                             **artifact.metadata,
                             "navigation_status": navigation_status,
                             "final_url": page.url,
-                            "blocked_subresources": len(blocked_urls),
+                            "blocked_subresources": blocked_subresources,
                             "output_count": 1,
                         },
                     )
@@ -1510,7 +1533,7 @@ class RenderEngine:
                         "height": math.ceil(height * request.viewport.device_scale_factor),
                         "navigation_status": navigation_status,
                         "final_url": page.url,
-                        "blocked_subresources": len(blocked_urls),
+                        "blocked_subresources": blocked_subresources,
                         "output_count": 1,
                     },
                 )
@@ -1520,7 +1543,7 @@ class RenderEngine:
         except RenderError:
             raise
         except Exception as exc:
-            if blocked_urls:
+            if blocked_subresources:
                 raise RenderError(
                     "subresource_not_public",
                     "The page requested a private or non-public resource.",

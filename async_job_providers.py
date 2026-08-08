@@ -358,14 +358,19 @@ class SQLiteJobStore:
                 """
                 UPDATE async_jobs
                 SET status = 'expired', payload = NULL,
-                    webhook_payload = NULL, webhook_event_status = NULL,
+                    webhook_event_status = CASE
+                        WHEN webhook_payload IS NOT NULL THEN 'failed'
+                        ELSE NULL END,
+                    webhook_attempt_count = 0,
+                    webhook_available_at = CASE
+                        WHEN webhook_payload IS NOT NULL THEN ? ELSE NULL END,
                     completed_at = ?,
                     error_code = 'job_queue_expired',
                     error_message = 'The job expired before a worker could start it.',
                     error_retryable = 1
                 WHERE status = 'queued' AND queue_expires_at <= ?
                 """,
-                (current, current),
+                (current, current, current),
             )
             connection.execute(
                 """
@@ -554,14 +559,19 @@ class SQLiteJobStore:
                 """
                 UPDATE async_jobs
                 SET status = 'expired', payload = NULL,
-                    webhook_payload = NULL, webhook_event_status = NULL,
+                    webhook_event_status = CASE
+                        WHEN webhook_payload IS NOT NULL THEN 'failed'
+                        ELSE NULL END,
+                    webhook_attempt_count = 0,
+                    webhook_available_at = CASE
+                        WHEN webhook_payload IS NOT NULL THEN ? ELSE NULL END,
                     completed_at = ?,
                     error_code = 'job_queue_expired',
                     error_message = 'The job expired before a worker could start it.',
                     error_retryable = 1
                 WHERE id = ? AND status = 'queued' AND queue_expires_at <= ?
                 """,
-                (current, job_id, current),
+                (current, current, job_id, current),
             )
             connection.execute(
                 """
@@ -631,14 +641,19 @@ class SQLiteJobStore:
                         """
                         UPDATE async_jobs
                         SET status = 'expired', payload = NULL,
-                            webhook_payload = NULL, webhook_event_status = NULL,
+                            webhook_event_status = CASE
+                                WHEN webhook_payload IS NOT NULL THEN 'failed'
+                                ELSE NULL END,
+                            webhook_attempt_count = 0,
+                            webhook_available_at = CASE
+                                WHEN webhook_payload IS NOT NULL THEN ? ELSE NULL END,
                             completed_at = ?,
                             error_code = 'job_queue_expired',
                             error_message = 'The job expired before a worker could start it.',
                             error_retryable = 1
                         WHERE id = ?
                         """,
-                        (current, job_id),
+                        (current, current, job_id),
                     )
                 else:
                     connection.execute(
@@ -876,14 +891,19 @@ class SQLiteJobStore:
                 """
                 UPDATE async_jobs
                 SET status = 'expired', payload = NULL,
-                    webhook_payload = NULL, webhook_event_status = NULL,
+                    webhook_event_status = CASE
+                        WHEN webhook_payload IS NOT NULL THEN 'failed'
+                        ELSE NULL END,
+                    webhook_attempt_count = 0,
+                    webhook_available_at = CASE
+                        WHEN webhook_payload IS NOT NULL THEN ? ELSE NULL END,
                     completed_at = ?,
                     error_code = 'job_queue_expired',
                     error_message = 'The job expired before a worker could restart it.',
                     error_retryable = 1
                 WHERE status = 'running' AND queue_expires_at <= ?
                 """,
-                (current, current),
+                (current, current, current),
             ).rowcount
             exhausted = connection.execute(
                 """
@@ -946,7 +966,12 @@ class SQLiteJobStore:
                     """
                     UPDATE async_jobs
                     SET status = 'expired', payload = NULL,
-                        webhook_payload = NULL, webhook_event_status = NULL,
+                        webhook_event_status = CASE
+                            WHEN webhook_payload IS NOT NULL THEN 'failed'
+                            ELSE NULL END,
+                        webhook_attempt_count = 0,
+                        webhook_available_at = CASE
+                            WHEN webhook_payload IS NOT NULL THEN ? ELSE NULL END,
                         completed_at = ?,
                         error_code = 'job_queue_expired',
                         error_message = 'The interrupted job expired.',
@@ -954,7 +979,13 @@ class SQLiteJobStore:
                     WHERE id = ? AND status = 'running'
                       AND attempt_count = ? AND queue_expires_at <= ?
                     """,
-                    (completed_at, job_id, expected_attempt, current),
+                    (
+                        completed_at,
+                        completed_at,
+                        job_id,
+                        expected_attempt,
+                        current,
+                    ),
                 ).rowcount
             return None, bool(expired)
 
@@ -1012,14 +1043,19 @@ class SQLiteJobStore:
                 """
                 UPDATE async_jobs
                 SET status = 'expired', payload = NULL,
-                    webhook_payload = NULL, webhook_event_status = NULL,
+                    webhook_event_status = CASE
+                        WHEN webhook_payload IS NOT NULL THEN 'failed'
+                        ELSE NULL END,
+                    webhook_attempt_count = 0,
+                    webhook_available_at = CASE
+                        WHEN webhook_payload IS NOT NULL THEN ? ELSE NULL END,
                     completed_at = ?,
                     error_code = 'job_queue_expired',
                     error_message = 'The job expired before a worker could start it.',
                     error_retryable = 1
                 WHERE status = 'queued' AND queue_expires_at <= ?
                 """,
-                (current, current),
+                (current, current, current),
             )
             connection.execute(
                 """

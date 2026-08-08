@@ -206,6 +206,43 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(page.script_route.aborted)
         self.assertEqual(artifact.metadata["blocked_subresources"], 1)
 
+    async def test_self_hosted_websocket_block_controls_are_honored(self):
+        class Socket:
+            url = "wss://example.com/live"
+
+            def __init__(self):
+                self.closed = False
+                self.connected = False
+
+            async def close(self, **_kwargs):
+                self.closed = True
+
+            async def connect_to_server(self):
+                self.connected = True
+
+        context = FakeContext()
+        socket_route = Socket()
+
+        class SocketPage(FakePage):
+            async def goto(self, url, **options):
+                await context.websocket_handler(socket_route)
+                return await super().goto(url, **options)
+
+        context.page = SocketPage()
+        artifact = await RenderEngine(hosted=False).render(
+            FakeBrowser(context),
+            RenderRequest.model_validate(
+                {
+                    "url": "https://example.com",
+                    "network": {"block_url_patterns": ["*/live"]},
+                }
+            ),
+            RenderLimits(max_width=1920, max_height=1080, max_pixels=10_000_000),
+        )
+        self.assertTrue(socket_route.closed)
+        self.assertFalse(socket_route.connected)
+        self.assertEqual(artifact.metadata["blocked_subresources"], 1)
+
     async def test_public_address_resolution_has_a_hard_timeout(self):
         def slow_to_thread(*_args, **_kwargs):
             return asyncio.sleep(60)

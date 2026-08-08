@@ -1,19 +1,21 @@
 import asyncio
-from contextlib import closing
-from datetime import datetime, timedelta, timezone
 import errno
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
+import unittest
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-import unittest
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
+import main
 from async_job_providers import LocalArtifactStore, SQLiteJobStore
 from async_jobs import (
     Artifact,
@@ -28,10 +30,8 @@ from async_jobs import (
     StoredArtifact,
     load_providers,
 )
-import main
 from render_contract import RenderRequest
 from render_errors import RenderError
-
 
 UTC = timezone.utc
 
@@ -988,6 +988,33 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(expired.status, "expired")
             self.assertEqual(expired.error_code, "job_queue_expired")
             self.assertIsNone(expired.payload)
+        finally:
+            await self.store.close()
+
+    async def test_queue_expiry_preserves_webhook_outbox(self):
+        await self.store.start()
+        try:
+            now = datetime.now(UTC)
+            job = JobRecord(
+                id=str(uuid4()),
+                request_id="expired-webhook",
+                status="queued",
+                payload=b"encrypted",
+                webhook_payload=b"encrypted-webhook",
+                attempt_count=0,
+                available_at=now,
+                queue_expires_at=now + timedelta(seconds=1),
+                created_at=now,
+            )
+            await self.store.create(job, active_limit=1)
+            expired_at = now + timedelta(seconds=2)
+            await self.store.maintain(expired_at)
+            expired = await self.store.get_by_request_id(job.request_id)
+            pending = await self.store.pending_notifications(expired_at)
+            self.assertEqual(expired.status, "expired")
+            self.assertEqual(expired.webhook_event_status, "failed")
+            self.assertEqual(expired.webhook_payload, b"encrypted-webhook")
+            self.assertEqual([item.id for item in pending], [job.id])
         finally:
             await self.store.close()
 
@@ -3145,6 +3172,25 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             await self.store.close()
 
 class ProviderLoadingTests(unittest.TestCase):
+    def test_cache_defaults_to_data_directory_without_async_jobs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = dict(os.environ)
+            environment.update(
+                {
+                    "VIPERCAPTURE_ASYNC_JOBS": "0",
+                    "VIPERCAPTURE_DATA_DIR": directory,
+                }
+            )
+            environment.pop("VIPERCAPTURE_CACHE_DIR", None)
+            result = subprocess.run(
+                [sys.executable, "-c", "import main; print(main.CACHE_DIRECTORY)"],
+                cwd=Path(__file__).parent,
+                env=environment,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(result.stdout.strip(), str(Path(directory) / "cache"))
     def test_generated_local_key_is_private_and_restart_stable(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ,

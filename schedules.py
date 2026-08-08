@@ -424,7 +424,15 @@ class ScheduleService:
         name = request.name if request.name is not None else record.name
         expression = request.cron if request.cron is not None else record.cron
         timezone_name = request.timezone if request.timezone is not None else record.timezone
-        validate_cron(expression, timezone_name)
+        try:
+            validate_cron(expression, timezone_name)
+        except ValueError as exc:
+            raise RenderError(
+                "invalid_schedule",
+                str(exc),
+                422,
+                False,
+            ) from exc
         now = datetime.now(UTC)
         changed_clock = request.cron is not None or request.timezone is not None
         updated = ScheduleRecord(
