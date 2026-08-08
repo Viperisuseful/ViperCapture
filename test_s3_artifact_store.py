@@ -1,4 +1,6 @@
+import asyncio
 import io
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -59,6 +61,34 @@ class FakeS3:
 
 
 class S3ArtifactStoreTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelled_fetch_settles_before_returning(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        class BlockingS3(FakeS3):
+            def get_object(self, **kwargs):
+                started.set()
+                release.wait()
+                return super().get_object(**kwargs)
+
+        client = BlockingS3()
+        store = S3ArtifactStore(
+            ArtifactStoreConfig(Path("/tmp/unused"), timedelta(hours=1)),
+            bucket="captures",
+            client=client,
+        )
+        stored = await store.put(
+            str(uuid4()), b"data", media_type="image/png", filename="x.png"
+        )
+        task = asyncio.create_task(store.get(stored.key))
+        await asyncio.to_thread(started.wait)
+        task.cancel()
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+        release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
     async def test_round_trip_and_delete(self):
         client = FakeS3()
         store = S3ArtifactStore(

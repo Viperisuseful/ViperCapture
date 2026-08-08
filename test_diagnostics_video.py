@@ -6,15 +6,20 @@ import zipfile
 from pydantic import ValidationError
 
 from render_contract import RenderRequest
-from render_engine import RenderArtifact, RenderLimits, diagnostic_bundle, diagnostic_url
+from render_engine import (
+    RenderArtifact,
+    RenderLimits,
+    diagnostic_bundle,
+    diagnostic_url,
+)
 
 
-class DiagnosticsAndVideoTests(unittest.TestCase):
+class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
     def test_diagnostic_urls_drop_secrets(self):
         sanitized = diagnostic_url("https://user:pass@example.com/path?token=secret#fragment")
         self.assertEqual(sanitized, "https://example.com/path")
 
-    def test_diagnostic_bundle_is_self_describing(self):
+    async def test_diagnostic_bundle_is_self_describing(self):
         request = RenderRequest(
             html="<p>test</p>",
             diagnostics={"bundle": True},
@@ -25,7 +30,7 @@ class DiagnosticsAndVideoTests(unittest.TestCase):
             "capture.png",
             {"width": 1, "final_url": "https://example.com/path?token=secret"},
         )
-        result = diagnostic_bundle(
+        result = await diagnostic_bundle(
             artifact,
             request,
             [{"type": "log", "text": "ready"}],

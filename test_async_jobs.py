@@ -275,6 +275,48 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await service.close()
 
+    async def test_webhook_is_dead_lettered_after_tenth_failure(self):
+        store = SimpleNamespace(
+            pending_notifications=AsyncMock(),
+            acknowledge_notification=AsyncMock(),
+            defer_notification=AsyncMock(),
+        )
+        notifier = AsyncMock(side_effect=RuntimeError("unavailable"))
+        service = AsyncJobService(
+            self.settings,
+            store,
+            self.artifacts,
+            _successful_renderer,
+            notifier=notifier,
+        )
+        now = datetime.now(timezone.utc)
+        job_id = str(uuid4())
+        webhook_payload = service.cipher.encrypt_webhook(
+            job_id, "https://hooks.example/failing"
+        )
+        job = JobRecord(
+            id=job_id,
+            request_id="dead-letter-webhook",
+            status="succeeded",
+            payload=None,
+            attempt_count=1,
+            available_at=now,
+            queue_expires_at=now + timedelta(minutes=1),
+            created_at=now,
+            webhook_payload=webhook_payload,
+            webhook_event_status="succeeded",
+            webhook_attempt_count=9,
+        )
+        store.pending_notifications.return_value = [job]
+
+        await service._drain_notifications()
+
+        notifier.assert_awaited_once()
+        store.acknowledge_notification.assert_awaited_once_with(
+            job_id, webhook_payload
+        )
+        store.defer_notification.assert_not_awaited()
+
     async def test_request_id_is_idempotent_and_queue_limit_is_atomic(self):
         await self.store.start()
         await self.artifacts.start()

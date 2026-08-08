@@ -6,6 +6,7 @@ from pydantic import ValidationError
 
 from bulk_jobs import (
     MAX_DIFF_BODY_BYTES,
+    MAX_JSON_BODY_BYTES,
     BulkBodyLimitMiddleware,
     BulkJobRequest,
 )
@@ -57,9 +58,12 @@ class BulkBodyLimitTests(unittest.IsolatedAsyncioTestCase):
 
         middleware = BulkBodyLimitMiddleware(downstream, max_bytes=5)
         for path, size in (
-            ("/v1/render", 6),
+            ("/v1/render", MAX_JSON_BODY_BYTES + 1),
             ("/v1/diff", MAX_DIFF_BODY_BYTES + 1),
-            ("/v1/schedules/00000000-0000-0000-0000-000000000001", 6),
+            (
+                "/v1/schedules/00000000-0000-0000-0000-000000000001",
+                MAX_JSON_BODY_BYTES + 1,
+            ),
         ):
             with self.assertRaises(RenderError):
                 await middleware(

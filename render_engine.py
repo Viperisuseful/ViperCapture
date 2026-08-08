@@ -179,7 +179,15 @@ def diagnostic_url(value: str) -> str:
         return "invalid-url"
 
 
-def diagnostic_bundle(
+def _write_diagnostic_zip(entries: list[tuple[str, bytes]]) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as archive:
+        for name, body in entries:
+            archive.writestr(name, body)
+    return output.getvalue()
+
+
+async def diagnostic_bundle(
     artifact: "RenderArtifact",
     request: RenderRequest,
     console_events: list[dict[str, object]],
@@ -201,15 +209,24 @@ def diagnostic_bundle(
         },
         "privacy": "Network query strings, credentials, request headers, cookies, and bodies are omitted.",
     }
-    output = io.BytesIO()
-    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr(artifact.filename, artifact.body)
-        archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
-        if request.diagnostics.include_console:
-            archive.writestr("console.json", json.dumps(console_events, ensure_ascii=False, indent=2) + "\n")
-        if request.diagnostics.include_network:
-            archive.writestr("network.json", json.dumps(network_events, ensure_ascii=False, indent=2) + "\n")
-    body = output.getvalue()
+    entries = [
+        (artifact.filename, artifact.body),
+        (
+            "manifest.json",
+            (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode(),
+        ),
+    ]
+    if request.diagnostics.include_console:
+        entries.append(
+            ("console.json", (json.dumps(console_events, ensure_ascii=False, indent=2) + "\n").encode())
+        )
+    if request.diagnostics.include_network:
+        entries.append(
+            ("network.json", (json.dumps(network_events, ensure_ascii=False, indent=2) + "\n").encode())
+        )
+    if sum(len(entry) for _, entry in entries) > limits.output_bytes:
+        raise RenderError("output_too_large", "The diagnostic bundle exceeds the output limit.", 413, False)
+    body = await asyncio.to_thread(_write_diagnostic_zip, entries)
     if len(body) > limits.output_bytes:
         raise RenderError("output_too_large", "The diagnostic bundle exceeds the output limit.", 413, False)
     return RenderArtifact(body, "application/zip", "vipercapture-diagnostics.zip", artifact.metadata)
@@ -1002,7 +1019,17 @@ class RenderEngine:
                             "height": request.viewport.height,
                         },
                         "device_scale_factor": request.viewport.device_scale_factor,
-                        "service_workers": "block" if self.hosted else "allow",
+                        "service_workers": (
+                            "block"
+                            if (
+                                self.hosted
+                                or request.headers
+                                or request.network.block_url_patterns
+                                or request.network.block_resource_types
+                                or self.cleanup_hooks
+                            )
+                            else "allow"
+                        ),
                     }
                 )
                 if request.environment.color_scheme is not None:
@@ -1349,7 +1376,7 @@ class RenderEngine:
                             "output_count": 1,
                         },
                     )
-                    return diagnostic_bundle(artifact, request, console_events, network_events, limits)
+                    return await diagnostic_bundle(artifact, request, console_events, network_events, limits)
 
                 if request.output not in MEDIA_TYPES:
                     if request.output is OutputFormat.METADATA:
@@ -1394,7 +1421,7 @@ class RenderEngine:
                             "output_count": 1,
                         },
                     )
-                    return diagnostic_bundle(artifact, request, console_events, network_events, limits)
+                    return await diagnostic_bundle(artifact, request, console_events, network_events, limits)
 
                 screenshot_options: dict[str, object] = {
                     "type": request.output.value,
@@ -1567,7 +1594,7 @@ class RenderEngine:
                         "output_count": 1,
                     },
                 )
-                return diagnostic_bundle(artifact, request, console_events, network_events, limits)
+                return await diagnostic_bundle(artifact, request, console_events, network_events, limits)
         except TimeoutError as exc:
             raise RenderError("render_timeout", "The render exceeded its total deadline.", 504, True) from exc
         except RenderError:

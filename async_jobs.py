@@ -26,6 +26,7 @@ from render_errors import RenderError
 
 UTC = timezone.utc
 PAYLOAD_VERSION = b"vipercapture-open-async-v1\0"
+MAX_WEBHOOK_ATTEMPTS = 10
 logger = logging.getLogger("vipercapture.async_jobs")
 
 
@@ -869,6 +870,14 @@ class AsyncJobService:
                         job.id,
                         type(exc).__name__,
                     )
+                    if job.webhook_attempt_count + 1 >= MAX_WEBHOOK_ATTEMPTS:
+                        logger.error(
+                            "async job webhook dead-lettered job_id=%s", job.id
+                        )
+                        await self.job_store.acknowledge_notification(
+                            job.id, job.webhook_payload
+                        )
+                        continue
                     delay = min(
                         3600,
                         0.1 * (2 ** min(job.webhook_attempt_count, 15)),

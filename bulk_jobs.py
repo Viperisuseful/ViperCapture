@@ -8,6 +8,7 @@ from render_contract import RenderRequest
 from render_errors import RenderError
 
 MAX_BULK_BODY_BYTES = 6 * 1024 * 1024
+MAX_JSON_BODY_BYTES = 32 * 1024 * 1024
 MAX_DIFF_BODY_BYTES = 2 * 20 * 1024 * 1024 + 1024 * 1024
 JSON_BODY_PATHS = {
     "/v1/render",
@@ -52,10 +53,12 @@ class BulkBodyLimitMiddleware:
             return
         if path == "/v1/diff":
             maximum = MAX_DIFF_BODY_BYTES
+        elif path == "/v1/jobs/bulk":
+            maximum = self.max_bytes
         elif path in JSON_BODY_PATHS or (
             method == "PATCH" and path.startswith("/v1/schedules/")
         ):
-            maximum = self.max_bytes
+            maximum = MAX_JSON_BODY_BYTES
         else:
             await self.app(scope, receive, send)
             return

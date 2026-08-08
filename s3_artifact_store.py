@@ -6,6 +6,7 @@ import asyncio
 import os
 import re
 from base64 import urlsafe_b64decode, urlsafe_b64encode
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from uuid import UUID, uuid4
@@ -107,12 +108,27 @@ class S3ArtifactStore:
         return StoredArtifact(key=key, expires_at=expires_at)
 
     async def get(self, key: str) -> Artifact | None:
-        try:
-            response = await asyncio.to_thread(
+        fetch = asyncio.create_task(
+            asyncio.to_thread(
                 self.client.get_object,
                 Bucket=self.bucket,
                 Key=key,
             )
+        )
+        try:
+            response = await asyncio.shield(fetch)
+        except asyncio.CancelledError:
+            response = None
+            with suppress(Exception):
+                response = await asyncio.shield(fetch)
+            close = (
+                getattr(response.get("Body"), "close", None)
+                if response is not None
+                else None
+            )
+            if close is not None:
+                await asyncio.to_thread(close)
+            raise
         except ClientError as exc:
             if exc.response.get("Error", {}).get("Code") in NOT_FOUND_CODES:
                 return None
@@ -129,8 +145,13 @@ class S3ArtifactStore:
             await self.delete(key)
             return None
         stream = response["Body"]
+        read = asyncio.create_task(asyncio.to_thread(stream.read))
         try:
-            body = await asyncio.to_thread(stream.read)
+            body = await asyncio.shield(read)
+        except asyncio.CancelledError:
+            with suppress(Exception):
+                await asyncio.shield(read)
+            raise
         finally:
             close = getattr(stream, "close", None)
             if close is not None:

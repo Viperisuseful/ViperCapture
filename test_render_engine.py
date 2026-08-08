@@ -234,8 +234,9 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
                 return await super().goto(url, **options)
 
         context.page = SocketPage()
+        browser = FakeBrowser(context)
         artifact = await RenderEngine(hosted=False).render(
-            FakeBrowser(context),
+            browser,
             RenderRequest.model_validate(
                 {
                     "url": "https://example.com",
@@ -247,6 +248,7 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(socket_route.closed)
         self.assertFalse(socket_route.connected)
         self.assertEqual(artifact.metadata["blocked_subresources"], 1)
+        self.assertEqual(browser.context_options["service_workers"], "block")
 
     async def test_public_address_resolution_has_a_hard_timeout(self):
         def slow_to_thread(*_args, **_kwargs):
