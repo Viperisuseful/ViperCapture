@@ -223,11 +223,26 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.jobs.calls), 1)
         payload, request_id = self.jobs.calls[0]
         self.assertEqual(payload.html, "<h1>scheduled</h1>")
-        self.assertTrue(request_id.startswith(f"schedule-{record.id}-"))
+        self.assertTrue(request_id.startswith(f"_schedule-{record.id}-"))
         stored = await self.store.get(record.id)
         self.assertEqual(stored.last_job_id, "job-1")
         self.assertGreater(stored.next_run_at, due)
         self.assertEqual(await self.service.run_due(due), 0)
+
+    async def test_internal_request_ids_use_reserved_namespace(self):
+        record = await self.service.create(
+            ScheduleCreate(
+                name="Reserved ID",
+                cron="* * * * *",
+                render=RenderRequest(html="scheduled"),
+            )
+        )
+
+        await self.service.run_due(datetime.now(UTC) + timedelta(minutes=2))
+
+        request_id = self.jobs.calls[0][1]
+        self.assertTrue(request_id.startswith("_schedule-"))
+        self.assertRegex(request_id, r"^_[A-Za-z0-9._:-]+$")
 
     async def test_retryable_submission_failure_preserves_due_occurrence(self):
         record = await self.service.create(
@@ -286,7 +301,7 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             self.jobs.calls[-1][1],
-            f"schedule-{record.id}-{int(due_at.timestamp())}",
+            f"_schedule-{record.id}-{int(due_at.timestamp())}",
         )
 
     async def test_expired_unstarted_job_rotates_durable_request_id(self):

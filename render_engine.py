@@ -394,6 +394,11 @@ def _invalid_selector_error(error: PlaywrightError) -> bool:
     )
 
 
+def _invalid_key_error(error: PlaywrightError) -> bool:
+    message = str(error).lower()
+    return "unknown key" in message or "unknown modifier" in message
+
+
 def ensure_dimensions(width: float, height: float, scale: float, limits: RenderLimits) -> None:
     output_width = math.ceil(width * scale)
     output_height = math.ceil(height * scale)
@@ -849,6 +854,14 @@ class RenderEngine:
                     raise RenderError(
                         "action_selector_invalid",
                         f"Action {index} uses an invalid selector.",
+                        422,
+                        False,
+                        {"action_index": index, "action_type": action.type.value},
+                    ) from exc
+                if _invalid_key_error(exc):
+                    raise RenderError(
+                        "action_key_invalid",
+                        f"Action {index} uses an invalid key expression.",
                         422,
                         False,
                         {"action_index": index, "action_type": action.type.value},

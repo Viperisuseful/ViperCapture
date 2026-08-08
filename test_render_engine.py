@@ -175,6 +175,37 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.code, "render_failed")
         self.assertTrue(raised.exception.retryable)
 
+    async def test_invalid_press_key_is_not_retryable(self):
+        class BrokenLocator(FakeLocator):
+            async def press(self, *_args, **_options):
+                raise PlaywrightError("Unknown key: Control+")
+
+        class BrokenPage(FakePage):
+            def locator(self, _selector):
+                return BrokenLocator(self)
+
+        with self.assertRaises(RenderError) as raised:
+            await RenderEngine(hosted=False).render(
+                FakeBrowser(FakeContext(BrokenPage())),
+                RenderRequest(
+                    url="https://example.com",
+                    actions=[
+                        {
+                            "type": "press",
+                            "selector": "input",
+                            "key": "Control+",
+                        }
+                    ],
+                ),
+                RenderLimits(
+                    max_width=1920,
+                    max_height=1080,
+                    max_pixels=2_073_600,
+                ),
+            )
+        self.assertEqual(raised.exception.code, "action_key_invalid")
+        self.assertFalse(raised.exception.retryable)
+
     async def test_custom_css_transport_failure_remains_retryable(self):
         class BrokenPage(FakePage):
             async def add_style_tag(self, **_options):

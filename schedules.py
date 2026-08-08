@@ -688,7 +688,7 @@ class ScheduleService:
                         )
                         continue
                     request_id = (
-                        f"schedule-{record.id}-{int(due_at.timestamp())}"
+                        f"_schedule-{record.id}-{int(due_at.timestamp())}"
                         + (
                             f"-retry-{record.pending_attempt}"
                             if record.pending_attempt
