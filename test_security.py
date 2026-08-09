@@ -722,10 +722,12 @@ class FrontendTests(unittest.TestCase):
         self.assertIn("ViperCapture | Open-source webpage rendering", index)
         self.assertIn("/static/app/assets/", index)
         self.assertIn("GPU rendering", source)
-        self.assertIn("Fast PNG encoding", source)
-        self.assertNotIn("Fast WebP encoding", source)
-        self.assertIn('!isAndroid && output === "png"', desktop_source)
-        self.assertNotIn("Fast WebP encoding", desktop_source)
+        self.assertIn("Fast {output.toUpperCase()} encoding", source)
+        self.assertIn('output === "png" || output === "webp"', source)
+        self.assertIn("<FieldLegend>Page cleanup</FieldLegend>", source)
+        self.assertIn("Fast {output.toUpperCase()} encoding", desktop_source)
+        self.assertIn('output === "png" || output === "webp"', desktop_source)
+        self.assertIn("<FieldLegend>Page cleanup</FieldLegend>", desktop_source)
         self.assertIn('"style": "radix-nova"', components)
 
 
