@@ -225,6 +225,35 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
             ["stabilize", "measure", "stabilize", "measure", "capture"],
         )
 
+    async def test_firefox_animations_stabilize_before_full_page_measurement(self):
+        events = []
+
+        class AnimatedPage(FakePage):
+            async def evaluate(self, script, *_args):
+                if "document.getAnimations" in script:
+                    events.append("stabilize")
+                    return None
+                if "width:" in script and "height:" in script:
+                    events.append("measure")
+                    return {"width": 640, "height": 480}
+                return 480
+
+            async def screenshot(self, **_options):
+                events.append("capture")
+                return b"image"
+
+        await RenderEngine(hosted=False).render_image(
+            FakeBrowser(FakeContext(AnimatedPage())),
+            RenderRequest(
+                url="https://example.com", engine="firefox", full_page=True
+            ),
+            RenderLimits(max_width=1920, max_height=1080, max_pixels=2_073_600),
+        )
+        self.assertEqual(
+            events,
+            ["stabilize", "measure", "stabilize", "measure", "capture"],
+        )
+
     async def test_diagnostics_install_page_side_console_bound(self):
         context = FakeContext()
         await RenderEngine(hosted=False).render_image(

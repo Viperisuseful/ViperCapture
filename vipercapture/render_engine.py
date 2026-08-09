@@ -1889,8 +1889,7 @@ class RenderEngine:
                     )
                 )
                 stabilizes_full_page = (
-                    request.engine.value == BrowserEngine.CHROMIUM.value
-                    and request.full_page
+                    request.full_page
                     and request.selector is None
                 )
                 if stabilizes_full_page:

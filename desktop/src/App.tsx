@@ -482,7 +482,7 @@ export default function App() {
         locale: locale.trim() || null,
         timezone: timezone.trim() || null,
       },
-      full_page: imageOutput ? effectiveFullPage : fullPage,
+      full_page: imageOutput ? effectiveFullPage : true,
       preserve_viewport_width: effectiveFullPage && preserveViewportWidth,
       lazy_load: lazyLoad,
       selector: imageOutput && !clipEnabled ? selector || null : null,
@@ -762,11 +762,11 @@ export default function App() {
                       </ToggleGroupItem>
                     ))}
                   </ToggleGroup>
-                  <Field orientation="horizontal">
+                  {["png", "jpeg", "webp", "avif"].includes(output) && <Field orientation="horizontal">
                     <FieldLabel htmlFor="full-page"><span><span className="block">Full page</span><FieldDescription>Scroll and capture the document.</FieldDescription></span></FieldLabel>
                     <Switch id="full-page" checked={fullPage} onCheckedChange={(checked: boolean) => setFullPage(checked)} disabled={Boolean(selector) || clipEnabled} />
-                  </Field>
-                  {!isAndroid && fullPage && !selector && !clipEnabled && <Field orientation="horizontal"><FieldLabel htmlFor="preserve-width"><span><span className="block">Preserve viewport width</span><FieldDescription>Clip horizontal overflow while retaining full height.</FieldDescription></span></FieldLabel><Switch id="preserve-width" checked={preserveViewportWidth} onCheckedChange={setPreserveViewportWidth} /></Field>}
+                  </Field>}
+                  {!isAndroid && ["png", "jpeg", "webp", "avif"].includes(output) && fullPage && !selector && !clipEnabled && <Field orientation="horizontal"><FieldLabel htmlFor="preserve-width"><span><span className="block">Preserve viewport width</span><FieldDescription>Clip horizontal overflow while retaining full height.</FieldDescription></span></FieldLabel><Switch id="preserve-width" checked={preserveViewportWidth} onCheckedChange={setPreserveViewportWidth} /></Field>}
                 </FieldSet>
 
                 {!isAndroid && (

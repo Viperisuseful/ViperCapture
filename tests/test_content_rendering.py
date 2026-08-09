@@ -384,6 +384,28 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(fragmented.metadata["pages"], MAX_PRINT_PAGES)
 
+    async def test_pdf_range_beyond_document_is_non_retryable(self):
+        page = FakePage()
+        page.pdf = AsyncMock(
+            side_effect=PlaywrightError(
+                "Page.pdf: Protocol error (Page.printToPDF): Page range exceeds page count"
+            )
+        )
+        with self.assertRaises(RenderError) as raised:
+            await render_document_output(
+                page,
+                RenderRequest.model_validate(
+                    {
+                        "url": "https://example.com",
+                        "output": "pdf",
+                        "pdf": {"page_ranges": "10"},
+                    }
+                ),
+                LIMITS,
+            )
+        self.assertEqual(raised.exception.code, "pdf_page_range_invalid")
+        self.assertFalse(raised.exception.retryable)
+
     def test_pdf_costs_two_credits(self):
         request = RenderRequest.model_validate({"html": "Hello", "output": "pdf"})
         self.assertEqual(request.credit_cost, 2)

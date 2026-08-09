@@ -207,7 +207,17 @@ async def _render_pdf(
                     "estimated_pages": estimated_pages,
                 },
             )
-    pdf = await page.pdf(**common)
+    try:
+        pdf = await page.pdf(**common)
+    except PlaywrightError as exc:
+        if options.page_ranges is not None and "page range exceeds page count" in str(exc).lower():
+            raise RenderError(
+                "pdf_page_range_invalid",
+                "The requested PDF pages are outside the rendered document.",
+                422,
+                False,
+            ) from exc
+        raise
     pages = await _settled_thread(
         _validate_pdf, pdf, single_page=single_page
     )
