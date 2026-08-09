@@ -41,12 +41,13 @@ private URLs, generated captures, virtual environments, or browser binaries.
 
 The main files are:
 
-- `main.py` — FastAPI application and local interface
-- `render_contract.py` — request validation
-- `render_engine.py` — Playwright rendering and network controls
-- `render_errors.py` — stable API errors
-- `async_jobs.py` — provider-neutral queue contracts and worker lifecycle
-- `async_job_providers.py` — bundled SQLite and filesystem adapters
+- `vipercapture/main.py` — FastAPI application and local interface
+- `vipercapture/render_contract.py` — request validation
+- `vipercapture/render_engine.py` — Playwright rendering and network controls
+- `tests/` — renderer and API tests
+- `vipercapture/render_errors.py` — stable API errors
+- `vipercapture/async_jobs.py` — provider-neutral queue contracts and worker lifecycle
+- `vipercapture/async_job_providers.py` — bundled SQLite and filesystem adapters
 - `templates/` and `static/` — local browser interface
 
 ## Tests
