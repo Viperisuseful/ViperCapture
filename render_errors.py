@@ -12,9 +12,15 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-
 logger = logging.getLogger("vipercapture.errors")
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+RESERVED_REQUEST_ID_PATTERN = re.compile(r"^_project-[0-9a-f]{24}:")
+
+
+def reserved_request_id(value: str) -> bool:
+    return RESERVED_REQUEST_ID_PATTERN.match(value) is not None
+
+
 STATUS_CODES = {
     400: "invalid_request", 401: "unauthorized", 403: "forbidden",
     404: "not_found", 405: "method_not_allowed", 409: "conflict",
@@ -82,7 +88,20 @@ def install_render_error_layer(app: FastAPI) -> None:
     @app.middleware("http")
     async def attach_request_id(request: Request, call_next):
         supplied = request.headers.get("x-request-id", "")
-        request.state.request_id = supplied if REQUEST_ID_PATTERN.fullmatch(supplied) else str(uuid4())
+        request.state.request_id = (
+            supplied
+            if REQUEST_ID_PATTERN.fullmatch(supplied)
+            and not reserved_request_id(supplied)
+            else str(uuid4())
+        )
+        if reserved_request_id(supplied):
+            return error_response(
+                request,
+                code="request_id_reserved",
+                message="X-Request-Id uses a reserved internal namespace.",
+                status_code=422,
+                retryable=False,
+            )
         try:
             response = await call_next(request)
         except RenderError as exc:

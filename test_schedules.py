@@ -96,6 +96,7 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(updated.name, "Updated")
         self.assertFalse(updated.enabled)
+
         database_files = (
             self.store.path,
             Path(f"{self.store.path}-wal"),
@@ -112,6 +113,33 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
             path.read_bytes() for path in database_files if path.exists()
         )
         self.assertNotIn(updated.payload, history)
+
+    async def test_conflicting_payload_update_restores_winning_quota(self):
+        resized = []
+
+        async def resize(schedule_id, project_id, size_bytes):
+            resized.append((schedule_id, project_id, size_bytes))
+
+        self.service.on_schedule_resize = resize
+        record = await self.service.create(
+            ScheduleCreate(
+                name="Race",
+                cron="0 * * * *",
+                render=RenderRequest(html="original"),
+            ),
+            project_id="project",
+        )
+        winner = await self.service.update(
+            record,
+            ScheduleUpdate(render=RenderRequest(html="winner")),
+        )
+        with self.assertRaises(RenderError) as raised:
+            await self.service.update(
+                record,
+                ScheduleUpdate(render=RenderRequest(html="stale")),
+            )
+        self.assertEqual(raised.exception.code, "schedule_conflict")
+        self.assertEqual(resized[-1], (record.id, "project", len(winner.payload)))
 
     async def test_sqlite_operations_run_off_the_event_loop(self):
         def run_inline(operation, *args):

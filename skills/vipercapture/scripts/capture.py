@@ -295,8 +295,7 @@ def source_label(args: argparse.Namespace) -> str:
 
 def output_path(args: argparse.Namespace) -> Path:
     if args.output_path:
-        target = args.output_path.expanduser()
-        return target.with_suffix(".zip") if args.diagnostic_bundle else target
+        return args.output_path.expanduser()
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     extension = "zip" if args.diagnostic_bundle else EXTENSIONS.get(args.output, args.output)
     name = f"{source_label(args)}-{timestamp}.{extension}"

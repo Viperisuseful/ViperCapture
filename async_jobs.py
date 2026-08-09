@@ -576,6 +576,8 @@ class AsyncJobService:
         notifier: JobNotifier | None = None,
         recover_running: bool = True,
         recover_stale: bool = False,
+        ownership_reserver: Callable[[str, str], Awaitable[None]] | None = None,
+        ownership_releaser: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self.settings = settings
         self.job_store = job_store
@@ -585,6 +587,8 @@ class AsyncJobService:
         self.notifier = notifier
         self.recover_running = recover_running
         self.recover_stale = recover_stale
+        self.ownership_reserver = ownership_reserver
+        self.ownership_releaser = ownership_releaser
         if notifier is not None and not isinstance(
             job_store, NotificationJobStore
         ):
@@ -717,9 +721,15 @@ class AsyncJobService:
                 else None
             ),
         )
+        reserved = False
+        if self.ownership_reserver is not None:
+            await self.ownership_reserver(job_id, request_id)
+            reserved = True
         try:
             stored = await self.job_store.create(job, self.settings.queue_limit)
         except QueueFullError as exc:
+            if reserved and self.ownership_releaser is not None:
+                await self.ownership_releaser(job_id)
             raise RenderError(
                 "async_queue_full",
                 "The async render queue is full.",
@@ -729,12 +739,24 @@ class AsyncJobService:
                 {"Retry-After": "5"},
             ) from exc
         except IdempotencyConflictError as exc:
+            if reserved and self.ownership_releaser is not None:
+                await self.ownership_releaser(job_id)
             raise RenderError(
                 "idempotency_key_conflict",
                 "X-Request-Id was already used for a different render.",
                 409,
                 False,
             ) from exc
+        except BaseException:
+            if reserved and self.ownership_releaser is not None:
+                await self.ownership_releaser(job_id)
+            raise
+        if (
+            reserved
+            and stored.id != job_id
+            and self.ownership_releaser is not None
+        ):
+            await self.ownership_releaser(job_id)
         self._wake_workers()
         return stored
 

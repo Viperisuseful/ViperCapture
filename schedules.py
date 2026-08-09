@@ -603,6 +603,7 @@ class ScheduleService:
         poll_seconds: float = 1.0,
         on_job_created=None,
         project_for_schedule=None,
+        on_schedule_resize=None,
     ) -> None:
         self.store = store
         self.jobs = jobs
@@ -610,6 +611,7 @@ class ScheduleService:
         self.poll_seconds = max(0.1, poll_seconds)
         self.on_job_created = on_job_created
         self.project_for_schedule = project_for_schedule
+        self.on_schedule_resize = on_schedule_resize
         self.task: asyncio.Task | None = None
         self.mutation_lock = asyncio.Lock()
 
@@ -698,9 +700,24 @@ class ScheduleService:
         )
         try:
             async with self.mutation_lock:
-                return await self.store.update(
-                    updated, expected_updated_at=record.updated_at
-                )
+                if request.render is not None and self.on_schedule_resize is not None:
+                    await self.on_schedule_resize(
+                        record.id, record.project_id, len(updated.payload)
+                    )
+                try:
+                    return await self.store.update(
+                        updated, expected_updated_at=record.updated_at
+                    )
+                except BaseException:
+                    if request.render is not None and self.on_schedule_resize is not None:
+                        current = await self.store.get(record.id)
+                        if current is not None:
+                            await self.on_schedule_resize(
+                                current.id,
+                                current.project_id,
+                                len(current.payload),
+                            )
+                    raise
         except KeyError as exc:
             raise RenderError(
                 "schedule_conflict",

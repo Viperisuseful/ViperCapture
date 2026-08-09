@@ -6,15 +6,15 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-import main
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+
+import main
 from async_jobs import JobRecord
 from bulk_jobs import BulkJobRequest
 from render_contract import RenderRequest
 from render_engine import RenderArtifact
 from render_errors import RenderError
-from schedules import ScheduleRecord
 
 
 class PlatformRouteTests(unittest.TestCase):
@@ -48,9 +48,44 @@ class PlatformRouteTests(unittest.TestCase):
                     "origins": [],
                 }
             )
+        with self.assertRaises(ValidationError):
+            main.ProfileCreate(
+                storage_state={
+                    "cookies": [],
+                    "origins": [
+                        {"origin": "not-an-origin", "localStorage": []}
+                    ],
+                }
+            )
+        profile = main.ProfileCreate(
+            storage_state={
+                "cookies": [],
+                "origins": [
+                    {
+                        "origin": "https://example.com/",
+                        "localStorage": [],
+                    }
+                ],
+            }
+        )
+        self.assertEqual(
+            profile.storage_state.origins[0].origin, "https://example.com"
+        )
 
 
 class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_invalid_baseline_is_rejected_before_persistence(self):
+        control = SimpleNamespace(put_baseline=Mock(), audit=Mock())
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(control=control)),
+            state=SimpleNamespace(project_id="project", key_id="key"),
+        )
+        image = SimpleNamespace(read=AsyncMock(return_value=b"not-an-image"))
+        with self.assertRaises(RenderError) as raised:
+            await main.put_baseline("home", image, request)
+        self.assertEqual(raised.exception.code, "diff_input_invalid")
+        control.put_baseline.assert_not_called()
+
     async def test_readiness_is_unavailable_without_a_browser(self):
         original_browser = getattr(main.app.state, "browser", None)
         main.app.state.browser = None
@@ -268,55 +303,6 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 204)
         control.disown.assert_called_once_with(
             "schedule", schedule_id, "project"
-        )
-
-    async def test_admin_schedule_update_resizes_stored_owner_quota(self):
-        schedule_id = "00000000-0000-0000-0000-000000000002"
-        now = datetime.now(timezone.utc)
-        record = ScheduleRecord(
-            id=schedule_id,
-            name="Admin update",
-            cron="0 * * * *",
-            timezone="UTC",
-            enabled=True,
-            payload=b"old",
-            next_run_at=now,
-            created_at=now,
-            updated_at=now,
-            project_id="project",
-        )
-        updated = main.replace(record, payload=b"new", updated_at=now + timedelta(seconds=1))
-        control = SimpleNamespace(
-            owner=Mock(return_value="project"), resize_schedule=Mock()
-        )
-        service = SimpleNamespace(
-            store=SimpleNamespace(get=AsyncMock(return_value=record)),
-            payload_size=Mock(return_value=10),
-            update=AsyncMock(return_value=updated),
-        )
-        original_control = getattr(main.app.state, "control", None)
-        original_schedules = getattr(main.app.state, "schedules", None)
-        main.app.state.control = control
-        main.app.state.schedules = service
-        request = SimpleNamespace(
-            app=main.app,
-            state=SimpleNamespace(
-                is_admin=True, trusted_local=False, project_id=None
-            ),
-        )
-        try:
-            with patch("main.CONTROL_ENABLED", True):
-                response = await main.update_schedule(
-                    schedule_id,
-                    main.ScheduleUpdate(render=RenderRequest(html="new")),
-                    request,
-                )
-        finally:
-            main.app.state.control = original_control
-            main.app.state.schedules = original_schedules
-        self.assertEqual(response.status_code, 200)
-        control.resize_schedule.assert_called_once_with(
-            schedule_id, "project", 10
         )
 
     async def test_cached_render_bypasses_saturated_chromium_slots(self):

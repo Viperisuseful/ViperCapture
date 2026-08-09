@@ -10,9 +10,9 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Awaitable, Literal, TypeVar
 from types import SimpleNamespace
-from urllib.parse import urlencode
+from typing import Annotated, Awaitable, Literal, TypeVar
+from urllib.parse import urlencode, urlsplit
 from uuid import UUID, uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
@@ -25,7 +25,7 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 from playwright.async_api import Browser, Playwright, async_playwright
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from async_jobs import (
     AsyncJobService,
@@ -73,7 +73,12 @@ from schedules import (
 )
 from signed_urls import sign_render_request, verify_render_request
 from telemetry import configure_telemetry
-from visual_diff import MAX_DIFF_INPUT_BYTES, compare_images, create_diff_bundle
+from visual_diff import (
+    MAX_DIFF_INPUT_BYTES,
+    compare_images,
+    create_diff_bundle,
+    validate_image,
+)
 from webhooks import WebhookDispatcher
 
 if sys.platform.startswith("win"):
@@ -187,6 +192,13 @@ def _job_ownership_ttl() -> int | None:
             + ASYNC_JOB_SETTINGS.metadata_ttl
         ).total_seconds()
     )
+
+
+def _internal_project_id(request_id: str) -> str | None:
+    candidate = request_id.partition(":")[0]
+    if re.fullmatch(r"_project-[0-9a-f]{24}", candidate):
+        return candidate.removeprefix("_project-")
+    return None
 
 
 SCHEDULES_ENABLED = os.getenv(
@@ -415,6 +427,29 @@ async def lifespan(app: FastAPI):
                 raise RuntimeError(
                     "split workers require a job store with lease-based recover_stale()"
                 )
+
+            async def reserve_job_ownership(job_id: str, request_id: str) -> None:
+                control = getattr(app.state, "control", None)
+                project_id = _internal_project_id(request_id)
+                if control is None or project_id is None:
+                    return
+                await _settled_thread(
+                    control.own,
+                    "job",
+                    job_id,
+                    project_id,
+                    _job_ownership_ttl(),
+                )
+                if not await asyncio.to_thread(
+                    control.is_owner, "job", job_id, project_id
+                ):
+                    raise RuntimeError("job ownership reservation conflicted")
+
+            async def release_job_ownership(job_id: str) -> None:
+                control = getattr(app.state, "control", None)
+                if control is not None:
+                    await _settled_thread(control.disown, "job", job_id)
+
             service = AsyncJobService(
                 ASYNC_JOB_SETTINGS,
                 job_store,
@@ -423,6 +458,12 @@ async def lifespan(app: FastAPI):
                 notifier=_notify_job if app.state.webhooks is not None else None,
                 recover_running=PROCESS_ROLE == "all",
                 recover_stale=PROCESS_ROLE == "worker",
+                ownership_reserver=(
+                    reserve_job_ownership if CONTROL_ENABLED else None
+                ),
+                ownership_releaser=(
+                    release_job_ownership if CONTROL_ENABLED else None
+                ),
             )
             await service.start()
             app.state.async_jobs = service
@@ -449,12 +490,32 @@ async def lifespan(app: FastAPI):
                         control.owner, "schedule", schedule_id
                     )
 
+                async def resize_scheduled_payload(
+                    schedule_id: str,
+                    project_id: str | None,
+                    size_bytes: int,
+                ) -> None:
+                    control = getattr(app.state, "control", None)
+                    if control is None:
+                        return
+                    owner = project_id or await asyncio.to_thread(
+                        control.owner, "schedule", schedule_id
+                    )
+                    if owner is not None:
+                        await _settled_thread(
+                            control.resize_schedule,
+                            schedule_id,
+                            owner,
+                            size_bytes,
+                        )
+
                 scheduler = ScheduleService(
                     load_schedule_store(ASYNC_JOB_SETTINGS),
                     service,
                     service.cipher,
                     on_job_created=own_scheduled_job,
                     project_for_schedule=scheduled_project,
+                    on_schedule_resize=resize_scheduled_payload,
                 )
                 await scheduler.start()
                 app.state.schedules = scheduler
@@ -730,6 +791,22 @@ class BrowserOriginState(BaseModel):
     local_storage: list[BrowserLocalStorageEntry] = Field(
         default_factory=list, alias="localStorage"
     )
+
+    @field_validator("origin")
+    @classmethod
+    def validate_origin(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("origin must be an HTTP(S) origin without a path")
+        return f"{parsed.scheme}://{parsed.netloc}"
 
 
 class BrowserStorageState(BaseModel):
@@ -1071,11 +1148,11 @@ def _render_engine() -> RenderEngine:
 async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
     started = time.perf_counter()
     job = current_job()
-    project_id = None
-    if CONTROL_ENABLED and job is not None:
-        candidate = job.request_id.partition(":")[0]
-        if re.fullmatch(r"_project-[0-9a-f]{24}", candidate):
-            project_id = candidate.removeprefix("_project-")
+    project_id = (
+        _internal_project_id(job.request_id)
+        if CONTROL_ENABLED and job is not None
+        else None
+    )
     control = getattr(app.state, "control", None)
     project_acquired = False
     if project_id is not None and control is not None:
@@ -1341,6 +1418,7 @@ async def put_baseline(name: str, image: UploadFile, request: Request) -> JSONRe
     body = await image.read(MAX_DIFF_INPUT_BYTES + 1)
     if not body or len(body) > MAX_DIFF_INPUT_BYTES:
         raise RenderError("baseline_too_large", "The baseline image exceeds the input limit.", 413, False)
+    await _settled_thread(validate_image, body, "baseline")
     try:
         document = await asyncio.to_thread(
             control.put_baseline, project_id, name, body
@@ -1845,63 +1923,15 @@ async def update_schedule(schedule_id: UUID, payload: ScheduleUpdate, request: R
     if payload.render is not None:
         await _validate_profile_access(payload.render, request)
         await _validate_webhook(payload.render)
-    control = getattr(request.app.state, "control", None)
-    project_id = request.state.project_id
-    quota_project_id = project_id
-    if (
-        payload.render is not None
-        and CONTROL_ENABLED
-        and control is not None
-        and quota_project_id is None
-    ):
-        quota_project_id = await asyncio.to_thread(
-            control.owner, "schedule", str(schedule_id)
-        )
-    resized = (
-        payload.render is not None
-        and CONTROL_ENABLED
-        and control is not None
-        and quota_project_id is not None
-    )
-    if resized:
-        try:
-            size_bytes = await _settled_thread(
-                service.payload_size, str(schedule_id), payload.render
-            )
-            await _settled_thread(
-                control.resize_schedule,
-                str(schedule_id),
-                quota_project_id,
-                size_bytes,
-            )
-        except asyncio.CancelledError:
-            await _settled_thread(
-                control.resize_schedule,
-                str(schedule_id),
-                quota_project_id,
-                len(record.payload),
-            )
-            raise
-        except ScheduleQuotaError as exc:
-            raise RenderError(
-                "schedule_quota_exceeded",
-                "The project schedule storage quota was reached.",
-                413,
-                False,
-            ) from exc
     try:
         updated = await service.update(record, payload)
-    except BaseException:
-        if resized:
-            current = await service.store.get(str(schedule_id))
-            if current is None or current.updated_at == record.updated_at:
-                await _settled_thread(
-                    control.resize_schedule,
-                    str(schedule_id),
-                    quota_project_id,
-                    len(record.payload),
-                )
-        raise
+    except ScheduleQuotaError as exc:
+        raise RenderError(
+            "schedule_quota_exceeded",
+            "The project schedule storage quota was reached.",
+            413,
+            False,
+        ) from exc
     return JSONResponse(public_schedule_document(updated), headers={"Cache-Control": "private, no-store"})
 
 

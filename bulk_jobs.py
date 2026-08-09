@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from render_contract import RenderRequest
-from render_errors import RenderError
+from render_errors import RenderError, reserved_request_id
 
 MAX_BULK_BODY_BYTES = 6 * 1024 * 1024
 MAX_JSON_BODY_BYTES = 32 * 1024 * 1024
@@ -26,6 +26,13 @@ class BulkJobItem(StrictModel):
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
     )
     render: RenderRequest
+
+    @field_validator("request_id")
+    @classmethod
+    def reject_reserved_request_id(cls, value: str | None) -> str | None:
+        if value is not None and reserved_request_id(value):
+            raise ValueError("request_id uses a reserved internal namespace")
+        return value
 
 
 class BulkJobRequest(StrictModel):

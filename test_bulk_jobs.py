@@ -45,6 +45,19 @@ class BulkJobContractTests(unittest.TestCase):
                 {"items": [{"render": {"url": "https://example.com"}}] * 101}
             )
 
+    def test_bulk_request_rejects_reserved_project_request_id(self):
+        with self.assertRaises(ValidationError):
+            BulkJobRequest.model_validate(
+                {
+                    "items": [
+                        {
+                            "request_id": f"_project-{'a' * 24}:caller",
+                            "render": {"url": "https://example.com"},
+                        }
+                    ]
+                }
+            )
+
 
 class BulkBodyLimitTests(unittest.IsolatedAsyncioTestCase):
     async def test_replay_releases_mutable_body_buffer(self):

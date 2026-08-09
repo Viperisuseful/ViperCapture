@@ -56,6 +56,11 @@ def _open_image(body: bytes, label: str) -> Image.Image:
     return image.convert("RGBA")
 
 
+def validate_image(body: bytes, label: str = "image") -> None:
+    image = _open_image(body, label)
+    image.close()
+
+
 def compare_images(
     baseline_body: bytes,
     current_body: bytes,

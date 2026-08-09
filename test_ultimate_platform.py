@@ -278,6 +278,13 @@ class ControlPlaneTests(unittest.IsolatedAsyncioTestCase):
             ).fetchall()
         self.assertEqual([column[2] for column in columns], ["created_at"])
 
+    async def test_resource_expiry_has_a_time_leading_index(self):
+        with self.control._connect() as database:
+            columns = database.execute(
+                "PRAGMA index_info(resources_expiry)"
+            ).fetchall()
+        self.assertEqual([column[2] for column in columns], ["expires_at"])
+
 
 class CompatibilityTests(unittest.TestCase):
     def test_screenshotone_common_options(self):

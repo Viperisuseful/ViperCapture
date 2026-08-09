@@ -50,6 +50,17 @@ class RenderErrorLayerTest(unittest.TestCase):
         )
         self.assertNotEqual(replaced.headers["x-request-id"], "bad id")
 
+    def test_reserved_project_request_id_is_rejected(self):
+        reserved = f"_project-{'a' * 24}:caller"
+        response = self.client.post(
+            "/validate",
+            json={"value": 1},
+            headers={"X-Request-Id": reserved},
+        )
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["error"]["code"], "request_id_reserved")
+        self.assertNotEqual(response.headers["x-request-id"], reserved)
+
     def test_render_status_families_share_the_envelope(self):
         for status in (400, 401, 403, 409, 413, 422, 429, 502, 504, 500):
             with self.subTest(status=status):

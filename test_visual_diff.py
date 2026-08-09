@@ -7,7 +7,13 @@ from unittest.mock import Mock, patch
 from PIL import Image
 
 from render_errors import RenderError
-from visual_diff import MAX_DIFF_PIXELS, _open_image, compare_images, create_diff_bundle
+from visual_diff import (
+    MAX_DIFF_PIXELS,
+    _open_image,
+    compare_images,
+    create_diff_bundle,
+    validate_image,
+)
 
 
 def png(color, size=(4, 3)):
@@ -17,6 +23,11 @@ def png(color, size=(4, 3)):
 
 
 class VisualDiffTests(unittest.TestCase):
+    def test_invalid_baseline_is_rejected_before_storage(self):
+        with self.assertRaises(RenderError) as raised:
+            validate_image(b"not-an-image", "baseline")
+        self.assertEqual(raised.exception.code, "diff_input_invalid")
+
     def test_pixel_limit_is_checked_before_decode(self):
         image = Mock(width=MAX_DIFF_PIXELS + 1, height=1)
         with patch(

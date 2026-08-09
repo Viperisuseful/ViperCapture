@@ -115,6 +115,54 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(raised.exception.retryable)
         self.assertFalse(self.store.path.exists())
 
+    async def test_submit_reserves_ownership_before_queue_visibility(self):
+        reserved = False
+
+        async def reserve(_job_id, _request_id):
+            nonlocal reserved
+            reserved = True
+
+        async def create(job, _limit):
+            self.assertTrue(reserved)
+            return job
+
+        store = SimpleNamespace(
+            maintain=AsyncMock(return_value=[]),
+            create=AsyncMock(side_effect=create),
+        )
+        service = AsyncJobService(
+            self.settings,
+            store,
+            SimpleNamespace(maintain=AsyncMock()),
+            _successful_renderer,
+            ownership_reserver=reserve,
+        )
+        job = await service.submit(_payload(), request_id="owned-before-queue")
+        self.assertEqual(job.request_id, "owned-before-queue")
+
+    async def test_submit_releases_reserved_ownership_when_create_fails(self):
+        reserved_ids = []
+        release = AsyncMock()
+
+        async def reserve(job_id, _request_id):
+            reserved_ids.append(job_id)
+
+        store = SimpleNamespace(
+            maintain=AsyncMock(return_value=[]),
+            create=AsyncMock(side_effect=RuntimeError("database unavailable")),
+        )
+        service = AsyncJobService(
+            self.settings,
+            store,
+            SimpleNamespace(maintain=AsyncMock()),
+            _successful_renderer,
+            ownership_reserver=reserve,
+            ownership_releaser=release,
+        )
+        with self.assertRaisesRegex(RuntimeError, "database unavailable"):
+            await service.submit(_payload(), request_id="failed-create")
+        release.assert_awaited_once_with(reserved_ids[0])
+
     async def test_api_only_service_does_not_recover_distributed_jobs(self):
         job_store = SimpleNamespace(
             start=AsyncMock(),
