@@ -155,9 +155,9 @@ class ConsentMode(str, Enum):
 
 
 class Viewport(StrictModel):
-    width: int = Field(default=1280, ge=1, le=7680)
-    height: int = Field(default=720, ge=1, le=4320)
-    device_scale_factor: float = Field(default=1, ge=0.1, le=4)
+    width: int = Field(default=1280, ge=1, le=65_535)
+    height: int = Field(default=720, ge=1, le=65_535)
+    device_scale_factor: float = Field(default=1, ge=0.1, le=8)
 
 
 class NamedViewport(Viewport):
@@ -383,8 +383,8 @@ class VideoOptions(StrictModel):
 class ClipOptions(StrictModel):
     x: float = Field(default=0, ge=0, le=100_000)
     y: float = Field(default=0, ge=0, le=100_000)
-    width: float = Field(gt=0, le=20_000)
-    height: float = Field(gt=0, le=20_000)
+    width: float = Field(gt=0, le=100_000)
+    height: float = Field(gt=0, le=100_000)
 
 
 class ImageOptions(StrictModel):

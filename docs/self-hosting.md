@@ -23,6 +23,57 @@ Playwright Chromium, starts the application, and opens the local interface.
 - Put all `/v1/jobs` routes behind the same reverse-proxy authentication as
   `/v1/render`; opaque job IDs are not an authorization mechanism.
 
+## Local render limits
+
+Local installs default to a deliberately large 500,000,000-pixel budget,
+16,384 CSS pixels for either viewport dimension, and 100,000 CSS pixels of
+full-page height. The encoded-output ceiling is 1 GiB. These are safety
+ceilings, not a promise that every machine,
+page, browser build, or image format can allocate that much memory. A decoded
+RGBA surface alone needs roughly four bytes per output pixel, and Chromium plus
+the encoder need additional working memory. Keep concurrency at one for very
+large captures.
+
+Remote self-hosters should size the limits to the container or VM instead of
+exposing the local defaults unchanged. For example, this restores conservative
+hosted ceilings:
+
+```bash
+VIPERCAPTURE_MAX_PIXELS=50000000
+VIPERCAPTURE_MAX_WIDTH=7680
+VIPERCAPTURE_MAX_HEIGHT=4320
+VIPERCAPTURE_MAX_FULL_PAGE_HEIGHT=20000
+VIPERCAPTURE_MAX_OUTPUT_BYTES=52428800
+VIPERCAPTURE_MAX_CONCURRENCY=1
+```
+
+Put these values in the `.env` file beside `docker-compose.yml`, or export them
+before running `python launch.py`. The effective limits are returned by
+`GET /app-config` and enforced for direct renders, async jobs, schedules, bulk
+jobs, and viewport packs. Output pixels are approximately
+`width × height × device_scale_factor²`; full-page height is measured after the
+page finishes loading.
+
+Do not remove the pixel ceiling on an Internet-facing service. Also set an
+application memory limit, a request timeout, and low Chromium concurrency so
+one extreme page cannot exhaust the host.
+
+## Page cleanup and advanced controls
+
+The local browser and desktop interfaces expose the Cloud cleanup controls:
+reject, accept, hide, or leave cookie consent unchanged; block known ad,
+tracker, chat, and newsletter resources or overlays; and apply custom CSS.
+Cleanup is opt-in at the API layer and enabled by default only in the
+interactive interfaces.
+
+Advanced controls include deterministic device signals, color scheme, reduced
+motion, locale and timezone, selector capture, rectangular crop, lazy-content
+loading, readiness waits, exact failure statuses, same-origin headers, image
+encoding, PDF layout, extraction mode, diagnostics, and video settings. The
+API additionally exposes actions, cookies, proxies, resource patterns,
+geolocation, assertions, deterministic time/randomness, slices, profiles,
+signed delivery, and certification as documented in [API and workflows](api.md).
+
 ## Optional GPU rendering
 
 GPU acceleration is off by default. Self-hosters with a compatible GPU and

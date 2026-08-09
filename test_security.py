@@ -722,10 +722,12 @@ class FrontendTests(unittest.TestCase):
         self.assertIn("ViperCapture | Open-source webpage rendering", index)
         self.assertIn("/static/app/assets/", index)
         self.assertIn("GPU rendering", source)
-        self.assertIn("Fast PNG encoding", source)
-        self.assertNotIn("Fast WebP encoding", source)
-        self.assertIn('!isAndroid && output === "png"', desktop_source)
-        self.assertNotIn("Fast WebP encoding", desktop_source)
+        self.assertIn("Fast {output.toUpperCase()} encoding", source)
+        self.assertIn('output === "png" || output === "webp"', source)
+        self.assertIn("<FieldLegend>Page cleanup</FieldLegend>", source)
+        self.assertIn("Fast {output.toUpperCase()} encoding", desktop_source)
+        self.assertIn('output === "png" || output === "webp"', desktop_source)
+        self.assertIn("<FieldLegend>Page cleanup</FieldLegend>", desktop_source)
         self.assertIn('"style": "radix-nova"', components)
 
 
@@ -812,10 +814,30 @@ class DimensionTests(unittest.TestCase):
             max_width=1920,
             max_height=1080,
             max_pixels=50_000_000,
+            max_full_page_height=20_000,
         )
         ensure_full_page_dimensions(1280, 4_000, 1, limits)
         with self.assertRaisesRegex(RenderError, "page_too_tall"):
             ensure_full_page_dimensions(1280, 20_001, 1, limits)
+
+    def test_self_host_defaults_allow_large_local_captures(self):
+        limits = RenderLimits()
+        self.assertEqual(limits.max_width, 16_384)
+        self.assertEqual(limits.max_height, 16_384)
+        self.assertEqual(limits.max_pixels, 500_000_000)
+        self.assertEqual(limits.max_full_page_height, 100_000)
+        self.assertEqual(limits.output_bytes, 1024 * 1024 * 1024)
+        request = RenderRequest(
+            url="https://example.com",
+            viewport={"width": 16_384, "height": 16_384},
+            full_page=False,
+        )
+        ensure_dimensions(
+            request.viewport.width,
+            request.viewport.height,
+            request.viewport.device_scale_factor,
+            limits,
+        )
 
     def test_wide_page_error_suggests_preserving_viewport_width(self):
         with self.assertRaises(RenderError) as raised:

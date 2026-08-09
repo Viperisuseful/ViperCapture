@@ -156,7 +156,19 @@ MAX_ASYNC_RESULT_DOWNLOADS = max(
     1, int(os.getenv("VIPERCAPTURE_ASYNC_RESULT_CONCURRENCY", "2"))
 )
 MAX_SCREENSHOT_PIXELS = max(
-    1, int(os.getenv("VIPERCAPTURE_MAX_PIXELS", "50000000"))
+    1, int(os.getenv("VIPERCAPTURE_MAX_PIXELS", "500000000"))
+)
+MAX_VIEWPORT_WIDTH = max(
+    1, int(os.getenv("VIPERCAPTURE_MAX_WIDTH", "16384"))
+)
+MAX_VIEWPORT_HEIGHT = max(
+    1, int(os.getenv("VIPERCAPTURE_MAX_HEIGHT", "16384"))
+)
+MAX_FULL_PAGE_HEIGHT = max(
+    1, int(os.getenv("VIPERCAPTURE_MAX_FULL_PAGE_HEIGHT", "100000"))
+)
+MAX_OUTPUT_BYTES = max(
+    1, int(os.getenv("VIPERCAPTURE_MAX_OUTPUT_BYTES", str(1024 * 1024 * 1024)))
 )
 MAX_DIFF_CONCURRENCY = max(
     1, int(os.getenv("VIPERCAPTURE_DIFF_CONCURRENCY", "1"))
@@ -1269,7 +1281,13 @@ async def _render_with_cache(
     artifact = await engine.render_image(
         browser,
         payload,
-        RenderLimits(max_pixels=MAX_SCREENSHOT_PIXELS),
+        RenderLimits(
+            max_width=MAX_VIEWPORT_WIDTH,
+            max_height=MAX_VIEWPORT_HEIGHT,
+            max_pixels=MAX_SCREENSHOT_PIXELS,
+            max_full_page_height=MAX_FULL_PAGE_HEIGHT,
+            output_bytes=MAX_OUTPUT_BYTES,
+        ),
     )
     if payload.cache and cache is not None:
         await cache.put(payload, artifact, namespace)
@@ -1337,7 +1355,13 @@ async def _render_response(payload: RenderRequest, request: Request) -> Response
                     engine.render_image(
                         browser,
                         payload,
-                        RenderLimits(max_pixels=MAX_SCREENSHOT_PIXELS),
+                        RenderLimits(
+                            max_width=MAX_VIEWPORT_WIDTH,
+                            max_height=MAX_VIEWPORT_HEIGHT,
+                            max_pixels=MAX_SCREENSHOT_PIXELS,
+                            max_full_page_height=MAX_FULL_PAGE_HEIGHT,
+                            output_bytes=MAX_OUTPUT_BYTES,
+                        ),
                     ),
                 )
                 render_ms = round(
@@ -2212,6 +2236,10 @@ async def app_config():
         "server_saves": not HOSTED,
         "control_plane": CONTROL_ENABLED,
         "max_screenshot_pixels": MAX_SCREENSHOT_PIXELS,
+        "max_viewport_width": MAX_VIEWPORT_WIDTH,
+        "max_viewport_height": MAX_VIEWPORT_HEIGHT,
+        "max_full_page_height": MAX_FULL_PAGE_HEIGHT,
+        "max_output_bytes": MAX_OUTPUT_BYTES,
         "async_jobs": {
             "enabled": ASYNC_JOBS_ENABLED,
             "workers": (
