@@ -284,19 +284,25 @@ class ControlPlane:
             raw.encode(), key=self._key_hash_secret, digest_size=32
         ).digest()
 
-    async def acquire(self, identity: dict[str, object]) -> tuple[bool, str | None]:
+    async def acquire(
+        self, identity: dict[str, object], *, concurrency: bool = True
+    ) -> tuple[bool, str | None]:
         project_id = str(identity["project_id"])
         async with self._limit_lock:
             result, lease_id = await self._settled_acquisition(
-                self._acquire, identity, project_id
+                self._acquire, identity, project_id, concurrency
             )
             if result[0] is False:
                 return result
-            self._leases[project_id].append(lease_id)
+            if lease_id is not None:
+                self._leases[project_id].append(lease_id)
             return result
 
     def _acquire(
-        self, identity: dict[str, object], project_id: str
+        self,
+        identity: dict[str, object],
+        project_id: str,
+        concurrency: bool,
     ) -> tuple[tuple[bool, str | None], str | None]:
         now = time.time()
         lease_id = secrets.token_hex(16)
@@ -309,20 +315,23 @@ class ControlPlane:
             ).fetchone()[0]
             if int(rpm) >= int(identity["rpm"]):
                 return (False, "rate_limit_exceeded"), None
-            active = db.execute(
-                "SELECT count(*) FROM active_leases WHERE project_id=?", (project_id,)
-            ).fetchone()[0]
-            if int(active) >= int(identity["concurrency"]):
-                return (False, "concurrency_limit_exceeded"), None
+            if concurrency:
+                active = db.execute(
+                    "SELECT count(*) FROM active_leases WHERE project_id=?",
+                    (project_id,),
+                ).fetchone()[0]
+                if int(active) >= int(identity["concurrency"]):
+                    return (False, "concurrency_limit_exceeded"), None
             db.execute(
                 "INSERT INTO rate_events VALUES (?, ?, ?)",
                 (secrets.token_hex(16), project_id, now),
             )
-            db.execute(
-                "INSERT INTO active_leases VALUES (?, ?, ?)",
-                (lease_id, project_id, now + LIMIT_LEASE_SECONDS),
-            )
-        return (True, None), lease_id
+            if concurrency:
+                db.execute(
+                    "INSERT INTO active_leases VALUES (?, ?, ?)",
+                    (lease_id, project_id, now + LIMIT_LEASE_SECONDS),
+                )
+        return (True, None), lease_id if concurrency else None
 
     async def release(self, project_id: str) -> None:
         async with self._limit_lock:
@@ -498,6 +507,12 @@ class ControlPlane:
             )
             self._check_profile_quota(db, project_id, profile_id, payload)
             db.execute("INSERT OR REPLACE INTO profiles VALUES (?, ?, ?, ?, ?)", (profile_id, project_id, payload, now, expires))
+            db.execute(
+                "INSERT OR IGNORE INTO resources"
+                "(kind,id,project_id,created_at,expires_at,size_bytes) "
+                "VALUES ('profile', ?, ?, ?, ?, 0)",
+                (profile_id, project_id, now, expires),
+            )
 
     @staticmethod
     def _check_profile_quota(db, project_id: str, profile_id: str, payload: bytes) -> None:
@@ -524,6 +539,10 @@ class ControlPlane:
             row = db.execute("SELECT payload, expires_at FROM profiles WHERE id=? AND project_id=?", (profile_id, project_id)).fetchone()
             if row and row["expires_at"] is not None and row["expires_at"] <= int(time.time()):
                 db.execute("DELETE FROM profiles WHERE id=? AND project_id=?", (profile_id, project_id))
+                db.execute(
+                    "DELETE FROM resources WHERE kind='profile' AND id=? AND project_id=?",
+                    (profile_id, project_id),
+                )
                 row = None
         if row is None:
             return None

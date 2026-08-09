@@ -1503,7 +1503,33 @@ class RenderEngine:
                             FixedDate.now = () => fixed;
                             Object.defineProperty(globalThis, 'Date', {{value: FixedDate}});
                             let state = {request.deterministic.random_seed} >>> 0;
-                            Math.random = () => ((state = (1664525 * state + 1013904223) >>> 0) / 4294967296);
+                            const nextRandom = () => ((state = (1664525 * state + 1013904223) >>> 0) / 4294967296);
+                            Math.random = nextRandom;
+                            const deterministicBytes = (array) => {{
+                                if (!ArrayBuffer.isView(array) || array instanceof DataView ||
+                                    array instanceof Float32Array || array instanceof Float64Array) {{
+                                    throw new DOMException('Expected an integer TypedArray', 'TypeMismatchError');
+                                }}
+                                if (array.byteLength > 65536) {{
+                                    throw new DOMException('The requested length exceeds 65,536 bytes', 'QuotaExceededError');
+                                }}
+                                const bytes = new Uint8Array(array.buffer, array.byteOffset, array.byteLength);
+                                for (let index = 0; index < bytes.length; index += 1) {{
+                                    bytes[index] = Math.floor(nextRandom() * 256);
+                                }}
+                                return array;
+                            }};
+                            Object.defineProperty(Crypto.prototype, 'getRandomValues', {{value: deterministicBytes}});
+                            Object.defineProperty(Crypto.prototype, 'randomUUID', {{value: () => {{
+                                const bytes = deterministicBytes(new Uint8Array(16));
+                                bytes[6] = (bytes[6] & 0x0f) | 0x40;
+                                bytes[8] = (bytes[8] & 0x3f) | 0x80;
+                                const hex = [...bytes].map(value => value.toString(16).padStart(2, '0'));
+                                return `${{hex.slice(0, 4).join('')}}-${{hex.slice(4, 6).join('')}}-${{hex.slice(6, 8).join('')}}-${{hex.slice(8, 10).join('')}}-${{hex.slice(10).join('')}}`;
+                            }}}});
+                            let performanceTick = 0;
+                            Object.defineProperty(performance, 'timeOrigin', {{get: () => fixed}});
+                            Object.defineProperty(performance, 'now', {{value: () => (performanceTick += 0.1)}});
                         }})()"""
                     )
                 if request.network.cookies:

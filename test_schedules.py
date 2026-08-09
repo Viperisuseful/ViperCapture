@@ -155,6 +155,27 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    async def test_list_filters_projects_inside_sqlite(self):
+        for project_id in ("project-a", "project-b"):
+            for index in range(2):
+                await self.service.create(
+                    ScheduleCreate(
+                        name=f"{project_id}-{index}",
+                        cron="0 * * * *",
+                        render=RenderRequest(html=project_id),
+                    ),
+                    project_id=project_id,
+                )
+        statements = []
+        self.store.connection.set_trace_callback(statements.append)
+        records = await self.store.list(project_id="project-b")
+        self.store.connection.set_trace_callback(None)
+        self.assertEqual(len(records), 2)
+        self.assertTrue(all(record.name.startswith("project-b") for record in records))
+        queries = [statement for statement in statements if "FROM schedules" in statement]
+        self.assertEqual(len(queries), 1)
+        self.assertIn("project_id=", queries[0])
+
     async def test_update_conflicts_with_concurrent_scheduler_advance(self):
         record = await self.service.create(
             ScheduleCreate(

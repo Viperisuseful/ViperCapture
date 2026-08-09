@@ -62,7 +62,7 @@ from render_engine import (
     _settled_thread,
     certification_public_key,
 )
-from render_errors import RenderError, install_render_error_layer
+from render_errors import RenderError, error_response, install_render_error_layer
 from schedules import (
     ScheduleCreate,
     ScheduleService,
@@ -474,7 +474,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 TELEMETRY_ENABLED = configure_telemetry(app)
 app.add_middleware(BulkBodyLimitMiddleware)
-install_render_error_layer(app)
 if DESKTOP_TOKEN:
     app.add_middleware(
         CORSMiddleware,
@@ -540,26 +539,60 @@ async def require_desktop_token(request: Request, call_next):
             raw = request.query_params.get("access_key", "")
         identity = await asyncio.to_thread(control.authenticate, raw) if raw else None
         if identity is None:
-            return JSONResponse({"error": {"code": "unauthorized", "message": "A valid project API key is required.", "retryable": False}}, status_code=401)
-        allowed, reason = await control.acquire(identity)
+            return error_response(
+                request,
+                code="unauthorized",
+                message="A valid project API key is required.",
+                status_code=401,
+                retryable=False,
+            )
+        uses_render_capacity = (
+            path == "/take"
+            or path.startswith("/compat/")
+            or (path == "/v1/render" and request.method == "POST")
+        )
+        allowed, reason = await control.acquire(
+            identity, concurrency=uses_render_capacity
+        )
         if not allowed:
-            return JSONResponse({"error": {"code": reason, "message": "The project request limit was reached.", "retryable": True}}, status_code=429, headers={"Retry-After": "1"})
+            return error_response(
+                request,
+                code=str(reason),
+                message="The project request limit was reached.",
+                status_code=429,
+                retryable=True,
+                headers={"Retry-After": "1"},
+            )
         request.state.project_id = str(identity["project_id"])
         request.state.key_id = str(identity["key_id"])
         request.state.scopes = list(identity["scopes"])
-        required_scope = "render"
+        required_scopes = {"render"}
         if path.startswith("/v1/jobs") or path.endswith("/async"):
-            required_scope = "jobs"
+            required_scopes = {"jobs"}
         elif path.startswith("/v1/schedules"):
-            required_scope = "schedules"
+            required_scopes = {"schedules"}
         elif path.startswith("/v1/profiles"):
-            required_scope = "profiles"
+            required_scopes = {"profiles"}
         elif path.startswith("/v1/baselines") or path == "/v1/diff":
-            required_scope = "baselines"
-        if required_scope not in request.state.scopes:
-            await control.release(request.state.project_id)
-            return JSONResponse({"error": {"code": "insufficient_scope", "message": f"The API key requires the {required_scope} scope.", "retryable": False}}, status_code=403)
-        acquired_project = request.state.project_id
+            required_scopes = {"baselines"}
+        elif path == "/v1/certification/public-key":
+            required_scopes = {"render", "jobs"}
+        if required_scopes.isdisjoint(request.state.scopes):
+            if uses_render_capacity:
+                await control.release(request.state.project_id)
+            return error_response(
+                request,
+                code="insufficient_scope",
+                message=(
+                    "The API key requires one of these scopes: "
+                    + ", ".join(sorted(required_scopes))
+                    + "."
+                ),
+                status_code=403,
+                retryable=False,
+            )
+        if uses_render_capacity:
+            acquired_project = request.state.project_id
     if (
         DESKTOP_TOKEN
         and request.method != "OPTIONS"
@@ -572,7 +605,13 @@ async def require_desktop_token(request: Request, call_next):
     ):
         if acquired_project is not None:
             await control.release(acquired_project)
-        return Response(status_code=401)
+        return error_response(
+            request,
+            code="unauthorized",
+            message="A valid desktop or project credential is required.",
+            status_code=401,
+            retryable=False,
+        )
     if (
         PROCESS_ROLE == "worker"
         and protected_api
@@ -580,7 +619,13 @@ async def require_desktop_token(request: Request, call_next):
     ):
         if acquired_project is not None:
             await control.release(acquired_project)
-        return JSONResponse({"error": {"code": "worker_only", "message": "This process accepts background work only.", "retryable": False}}, status_code=503)
+        return error_response(
+            request,
+            code="worker_only",
+            message="This process accepts background work only.",
+            status_code=503,
+            retryable=False,
+        )
     try:
         response = await call_next(request)
     finally:
@@ -609,6 +654,9 @@ async def record_http_metrics(request: Request, call_next):
         METRICS.inc(
             "http_request_duration_seconds_sum", time.perf_counter() - started
         )
+
+
+install_render_error_layer(app)
 
 
 @app.get("/health")
@@ -734,7 +782,7 @@ async def create_profile(payload: ProfileCreate, request: Request) -> JSONRespon
         raise RenderError("project_required", "Use a project API key to create a profile.", 422, False)
     profile_id = secrets.token_urlsafe(24).replace("-", "_")
     try:
-        await asyncio.to_thread(
+        await _settled_thread(
             control.put_profile,
             project_id,
             profile_id,
@@ -748,9 +796,9 @@ async def create_profile(payload: ProfileCreate, request: Request) -> JSONRespon
             413,
             False,
         ) from exc
-    await asyncio.to_thread(
-        control.own, "profile", profile_id, project_id, payload.ttl_seconds
-    )
+    except asyncio.CancelledError:
+        await _settled_thread(control.delete_profile, project_id, profile_id)
+        raise
     await asyncio.to_thread(control.audit, project_id, request.state.key_id, "profile.created", profile_id)
     return JSONResponse({"id": profile_id, "expires_in": payload.ttl_seconds}, status_code=201, headers={"Cache-Control": "private, no-store"})
 
@@ -1702,7 +1750,9 @@ async def create_schedule(payload: ScheduleCreate, request: Request) -> JSONResp
                 False,
             ) from exc
     try:
-        record = await service.create(payload, schedule_id=schedule_id)
+        record = await service.create(
+            payload, schedule_id=schedule_id, project_id=project_id
+        )
     except BaseException:
         if reserved and await service.store.get(schedule_id) is None:
             await _settled_thread(
@@ -1725,25 +1775,11 @@ async def list_schedules(
 ) -> JSONResponse:
     service = _schedule_service()
     if CONTROL_ENABLED and not request.state.is_admin:
-        records = []
-        cursor = after
-        while len(records) <= limit:
-            batch = await service.store.list(limit=100, after=cursor)
-            if not batch:
-                break
-            for item in batch:
-                if await asyncio.to_thread(
-                    app.state.control.is_owner,
-                    "schedule",
-                    item.id,
-                    request.state.project_id,
-                ):
-                    records.append(item)
-                    if len(records) > limit:
-                        break
-            cursor = schedule_cursor(batch[-1])
-            if len(batch) < 100:
-                break
+        records = await service.store.list(
+            limit=limit + 1,
+            after=after,
+            project_id=request.state.project_id,
+        )
     else:
         records = await service.store.list(limit=limit + 1, after=after)
     has_more = len(records) > limit
@@ -1830,15 +1866,20 @@ async def update_schedule(schedule_id: UUID, payload: ScheduleUpdate, request: R
 @app.delete("/v1/schedules/{schedule_id}", status_code=204)
 async def delete_schedule(schedule_id: UUID, request: Request) -> Response:
     await _require_resource(request, "schedule", str(schedule_id))
+    owner = None
+    if CONTROL_ENABLED:
+        owner = await asyncio.to_thread(
+            app.state.control.owner, "schedule", str(schedule_id)
+        )
     deleted = await _schedule_service().delete(str(schedule_id))
     if not deleted:
         raise RenderError("schedule_not_found", "The schedule was not found.", 404, False)
-    if CONTROL_ENABLED and request.state.project_id is not None:
+    if CONTROL_ENABLED and owner is not None:
         await asyncio.to_thread(
             app.state.control.disown,
             "schedule",
             str(schedule_id),
-            request.state.project_id,
+            owner,
         )
     return Response(status_code=204)
 

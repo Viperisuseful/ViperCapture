@@ -61,6 +61,11 @@ class ControlPlaneTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.control.is_owner("job", "j1", str(project["id"])))
         state = {"cookies": [{"name": "session", "value": "secret"}], "origins": []}
         self.control.put_profile(str(project["id"]), "profile", state, None)
+        self.assertTrue(
+            self.control.is_owner(
+                "profile", "profile", str(project["id"])
+            )
+        )
         raw_database = (Path(self.directory.name) / "control.sqlite3").read_bytes()
         self.assertNotIn(b"secret", raw_database)
         self.assertEqual(self.control.get_profile_any("profile"), state)
@@ -68,6 +73,22 @@ class ControlPlaneTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.control.audits()[0]["action"], "test")
         self.assertTrue(self.control.revoke_key(key["id"]))
         self.assertIsNone(self.control.authenticate(key["api_key"]))
+
+    async def test_read_only_requests_do_not_consume_render_concurrency(self):
+        project = self.control.create_project("tests", 10, 1)
+        project_id = str(project["id"])
+        key = self.control.create_key(project_id, "ci")
+        identity = self.control.authenticate(key["api_key"])
+        self.assertTrue(await self.control.acquire_worker(project_id))
+        allowed, reason = await self.control.acquire(
+            identity, concurrency=False
+        )
+        self.assertTrue(allowed)
+        self.assertIsNone(reason)
+        allowed, reason = await self.control.acquire(identity)
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "concurrency_limit_exceeded")
+        await self.control.release(project_id)
 
     async def test_resource_expiry_deletion_and_audit_retention(self):
         project = self.control.create_project("tests", 10, 1)
@@ -347,6 +368,15 @@ class ArtifactFeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('--url "${{ inputs.url }}"', action)
         self.assertIn("internal = 8000", terraform)
         self.assertIn("VIPERCAPTURE_CONTROL_SECRET", terraform)
+        self.assertNotIn(";", terraform)
+        self.assertIn('container_path = "/data"', terraform)
+        workflow = json.loads(
+            (root / "integrations" / "n8n-workflow.json").read_text()
+        )
+        node_types = {node["type"] for node in workflow["nodes"]}
+        self.assertIn("n8n-nodes-base.manualTrigger", node_types)
+        self.assertIn("n8n-nodes-base.set", node_types)
+        self.assertTrue(workflow["connections"])
         self.assertIn("Pillow>=11.3.0", (root / "requirements.txt").read_text())
         self.assertIn("ffmpeg", (root / "Dockerfile").read_text())
 

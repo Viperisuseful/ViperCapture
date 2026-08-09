@@ -39,8 +39,9 @@ updates resize that reservation and deletion releases it.
 
 ## Deterministic, diagnostic, and certified artifacts
 
-`deterministic.enabled` fixes JavaScript time and randomness, waits for fonts,
-and combines with the existing animation stabilization. `slices` emits a ZIP
+`deterministic.enabled` fixes `Date`, `Math.random`, Web Crypto random values
+and UUIDs, and the browser performance clock; it also waits for fonts and
+combines with the existing animation stabilization. `slices` emits a ZIP
 of bounded-height full-page sections. A diagnostic bundle can add redacted HAR,
 Playwright trace, and WARC files. `certification.enabled` produces an
 Ed25519-signed manifest when `VIPERCAPTURE_CERTIFICATION_SECRET` is set to at
@@ -58,6 +59,8 @@ The built-in SQLite control plane is intentionally restricted to `role=all`;
 split deployments must enforce shared authentication and quotas at their
 gateway. Schedules in split mode require a shared
 `VIPERCAPTURE_SCHEDULE_STORE_FACTORY`; disable them explicitly otherwise.
+Its paginated `list` operation must accept a `project_id` filter and apply it
+inside indexed storage rather than scanning other tenants' rows.
 The combined `all` role recovers its own interrupted claims on restart. Split
 workers require an external job store with lease-based `recover_stale()` so a
 replica can recover only expired claims and cannot steal live work.

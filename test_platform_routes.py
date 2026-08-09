@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import main
+from fastapi.testclient import TestClient
 from async_jobs import JobRecord
 from bulk_jobs import BulkJobRequest
 from render_contract import RenderRequest
@@ -144,6 +145,82 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             'vipercapture_http_requests_total{method="POST",route="unmatched",status="401"} 1',
             metrics.prometheus(),
+        )
+
+    def test_early_auth_failure_has_correlated_request_id(self):
+        with (
+            patch("main.DESKTOP_TOKEN", "desktop"),
+            patch("main.CONTROL_ENABLED", False),
+        ):
+            response = TestClient(main.app).get(
+                "/v1/jobs", headers={"X-Request-Id": "early-auth"}
+            )
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.headers["X-Request-Id"], "early-auth")
+        self.assertEqual(response.json()["error"]["request_id"], "early-auth")
+
+    async def test_status_requests_skip_concurrency_and_jobs_can_read_cert_key(self):
+        expected = main.Response(status_code=200)
+        call_next = AsyncMock(return_value=expected)
+        control = SimpleNamespace(
+            authenticate=Mock(
+                return_value={
+                    "project_id": "project",
+                    "key_id": "key",
+                    "scopes": ["jobs"],
+                }
+            ),
+            acquire=AsyncMock(return_value=(True, None)),
+            release=AsyncMock(),
+        )
+        with (
+            patch("main.CONTROL_ENABLED", True),
+            patch("main.CONTROL_ADMIN_TOKEN", "admin"),
+        ):
+            for path in (
+                "/v1/jobs/00000000-0000-0000-0000-000000000000",
+                "/v1/certification/public-key",
+            ):
+                request = SimpleNamespace(
+                    method="GET",
+                    url=SimpleNamespace(path=path),
+                    headers={"authorization": "Bearer project-key"},
+                    query_params={},
+                    app=SimpleNamespace(state=SimpleNamespace(control=control)),
+                )
+                self.assertIs(
+                    await main.require_desktop_token(request, call_next), expected
+                )
+        self.assertTrue(
+            all(
+                call.kwargs["concurrency"] is False
+                for call in control.acquire.await_args_list
+            )
+        )
+        control.release.assert_not_awaited()
+
+    async def test_admin_schedule_delete_releases_stored_owner_quota(self):
+        schedule_id = "00000000-0000-0000-0000-000000000001"
+        control = SimpleNamespace(owner=Mock(return_value="project"), disown=Mock())
+        service = SimpleNamespace(delete=AsyncMock(return_value=True))
+        original_control = getattr(main.app.state, "control", None)
+        original_schedules = getattr(main.app.state, "schedules", None)
+        main.app.state.control = control
+        main.app.state.schedules = service
+        request = SimpleNamespace(
+            state=SimpleNamespace(
+                is_admin=True, trusted_local=False, project_id=None
+            )
+        )
+        try:
+            with patch("main.CONTROL_ENABLED", True):
+                response = await main.delete_schedule(schedule_id, request)
+        finally:
+            main.app.state.control = original_control
+            main.app.state.schedules = original_schedules
+        self.assertEqual(response.status_code, 204)
+        control.disown.assert_called_once_with(
+            "schedule", schedule_id, "project"
         )
 
     async def test_cached_render_bypasses_saturated_chromium_slots(self):

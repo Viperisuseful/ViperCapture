@@ -327,6 +327,33 @@ class BrowserCaptureRegressionTests(unittest.IsolatedAsyncioTestCase):
             {"encoded": encoded, "mediaType": media_type},
         )
 
+    async def test_deterministic_mode_controls_crypto_and_performance(self):
+        source = """<script>
+        document.body.textContent = [
+          crypto.randomUUID(),
+          Array.from(crypto.getRandomValues(new Uint8Array(8))).join(','),
+          performance.timeOrigin,
+          performance.now()
+        ].join('|');
+        </script>"""
+        request = RenderRequest(
+            html=source,
+            full_page=False,
+            deterministic={"enabled": True, "random_seed": 42},
+        )
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                first = await RenderEngine(hosted=False).render_image(
+                    browser, request, RenderLimits()
+                )
+                second = await RenderEngine(hosted=False).render_image(
+                    browser, request, RenderLimits()
+                )
+            finally:
+                await browser.close()
+        self.assertEqual(first.body, second.body)
+
     async def test_diagnostic_console_is_bounded_before_transport(self):
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=True)
