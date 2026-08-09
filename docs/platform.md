@@ -39,7 +39,7 @@ limits; abandoned concurrency leases expire after 15 minutes.
 `deterministic.enabled` fixes JavaScript time and randomness, waits for fonts,
 and combines with the existing animation stabilization. `slices` emits a ZIP
 of bounded-height full-page sections. A diagnostic bundle can add redacted HAR,
-Playwright trace, MHTML, and WARC files. `certification.enabled` produces an
+Playwright trace, and WARC files. `certification.enabled` produces an
 Ed25519-signed manifest when `VIPERCAPTURE_CERTIFICATION_SECRET` is set to at
 least 32 bytes. Certification proves bundle integrity; it does not by itself
 make a legal-admissibility claim.

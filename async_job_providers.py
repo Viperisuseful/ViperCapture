@@ -995,6 +995,29 @@ class SQLiteJobStore:
 
         await self._run(operation, conditional_scrub=True)
 
+    async def defer(
+        self,
+        job_id: str,
+        expected_attempt: int,
+        available_at: datetime,
+    ) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            updated = connection.execute(
+                """
+                UPDATE async_jobs
+                SET status = 'queued', available_at = ?,
+                    attempt_count = attempt_count - 1, claim_token = NULL
+                WHERE id = ? AND status = 'running' AND attempt_count = ?
+                """,
+                (_epoch(available_at), job_id, expected_attempt),
+            )
+            if updated.rowcount != 1:
+                connection.rollback()
+                raise JobConflictError
+            connection.commit()
+
+        await self._run(operation)
+
     async def maintain(self, now: datetime) -> list[str]:
         return await self._run(
             self._maintain,

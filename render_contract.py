@@ -349,7 +349,6 @@ class DiagnosticsOptions(StrictModel):
     include_network: bool = True
     include_har: bool = False
     include_trace: bool = False
-    include_mhtml: bool = False
     include_warc: bool = False
 
 
@@ -569,11 +568,10 @@ class RenderRequest(StrictModel):
         advanced_diagnostics = (
             self.diagnostics.include_har
             or self.diagnostics.include_trace
-            or self.diagnostics.include_mhtml
             or self.diagnostics.include_warc
         )
         if advanced_diagnostics and not self.diagnostics.bundle:
-            raise ValueError("HAR, trace, MHTML, and WARC require diagnostics.bundle=true")
+            raise ValueError("HAR, trace, and WARC require diagnostics.bundle=true")
         if self.certification.enabled and self.viewports is not None:
             raise ValueError("certification cannot be combined with multi-viewports")
         if is_video:
@@ -581,7 +579,7 @@ class RenderRequest(StrictModel):
                 self.video = VideoOptions()
             if self.selector is not None or self.clip is not None or self.viewports is not None:
                 raise ValueError("video cannot use selector, clip, or multi-viewports")
-            if self.diagnostics.include_trace or self.diagnostics.include_mhtml:
+            if self.diagnostics.include_trace:
                 raise ValueError("video diagnostics support console, network, HAR, and WARC")
         elif self.video is not None:
             raise ValueError("video settings require WebM, MP4, or GIF output")

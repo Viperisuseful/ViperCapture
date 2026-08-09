@@ -122,6 +122,14 @@ class JobConflictError(Exception):
     pass
 
 
+class JobDeferred(Exception):
+    """Return a claimed job to its queue without spending an attempt."""
+
+    def __init__(self, delay_seconds: float = 1.0) -> None:
+        self.delay_seconds = delay_seconds
+        super().__init__("job execution deferred")
+
+
 class IdempotencyConflictError(Exception):
     pass
 
@@ -1298,6 +1306,21 @@ class AsyncJobService:
             # a committed success from interrupted work and enforce attempts.
             # An uploaded-but-uncommitted artifact retains its storage TTL.
             raise
+        except JobDeferred as exc:
+            available_at = datetime.now(UTC) + timedelta(
+                seconds=max(0.1, exc.delay_seconds)
+            )
+            await self._retry_state_transition(
+                "defer",
+                lambda: getattr(self.job_store, "defer")(
+                    job.id,
+                    job.attempt_count,
+                    available_at,
+                ),
+                lambda: self._transition_conflict_resolved(job),
+            )
+            self._wake_at(available_at)
+            return
         except Exception as exc:
             if stored_key:
                 await self._safe_delete(stored_key)

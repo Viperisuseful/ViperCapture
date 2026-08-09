@@ -570,12 +570,14 @@ class ScheduleService:
         *,
         poll_seconds: float = 1.0,
         on_job_created=None,
+        project_for_schedule=None,
     ) -> None:
         self.store = store
         self.jobs = jobs
         self.cipher = cipher
         self.poll_seconds = max(0.1, poll_seconds)
         self.on_job_created = on_job_created
+        self.project_for_schedule = project_for_schedule
         self.task: asyncio.Task | None = None
         self.mutation_lock = asyncio.Lock()
 
@@ -710,6 +712,10 @@ class ScheduleService:
                             else ""
                         )
                     )
+                    if self.project_for_schedule is not None:
+                        project_id = await self.project_for_schedule(record.id)
+                        if project_id is not None:
+                            request_id = f"{project_id}:{request_id}"
                     job = await self.jobs.submit(
                         render,
                         request_id=request_id,

@@ -5,6 +5,7 @@ terraform {
 variable "image" { type = string; default = "ghcr.io/viperisuseful/vipercapture:latest" }
 variable "port" { type = number; default = 8765 }
 variable "admin_token" { type = string; sensitive = true }
+variable "control_secret" { type = string; sensitive = true }
 
 resource "docker_image" "vipercapture" { name = var.image }
 resource "docker_container" "vipercapture" {
@@ -12,5 +13,8 @@ resource "docker_container" "vipercapture" {
   image = docker_image.vipercapture.image_id
   restart = "unless-stopped"
   ports { internal = 8000; external = var.port; ip = "127.0.0.1" }
-  env = ["VIPERCAPTURE_ADMIN_TOKEN=${var.admin_token}"]
+  env = [
+    "VIPERCAPTURE_ADMIN_TOKEN=${var.admin_token}",
+    "VIPERCAPTURE_CONTROL_SECRET=${var.control_secret}",
+  ]
 }

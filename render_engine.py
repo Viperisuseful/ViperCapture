@@ -254,7 +254,10 @@ async def _trim_webm(
 async def _transcode_video(source: Path, destination: Path, output: OutputFormat) -> None:
     ffmpeg = _ffmpeg_executable()
     if output is OutputFormat.MP4:
-        encoding = ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+        encoding = [
+            "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-c:v", "libx264",
+            "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        ]
     elif output is OutputFormat.GIF:
         encoding = ["-vf", "fps=12,scale='min(1280,iw)':-2:flags=lanczos", "-loop", "0"]
     else:
@@ -426,7 +429,7 @@ def _warc_document(events: list[dict[str, object]]) -> bytes:
     return b"".join(records)
 
 
-def _redact_trace_archive(body: bytes) -> bytes:
+def _redact_trace_archive(body: bytes, max_bytes: int) -> bytes:
     sensitive = {
         "authorization", "cookie", "cookies", "headers", "postdata",
         "requestbody", "responsebody", "storagestate", "value",
@@ -454,11 +457,23 @@ def _redact_trace_archive(body: bytes) -> bytes:
     with zipfile.ZipFile(source) as archive, zipfile.ZipFile(
         destination, "w", zipfile.ZIP_DEFLATED
     ) as output:
-        for name in archive.namelist():
+        retained = [
+            item
+            for item in archive.infolist()
+            if not item.filename.lower().endswith(".network")
+            and "/resources/" not in f"/{item.filename.lower()}"
+        ]
+        if sum(item.file_size for item in retained) > max_bytes:
+            raise RenderError(
+                "output_too_large",
+                "The redacted trace exceeds the output limit.",
+                413,
+                False,
+            )
+        for item in retained:
+            name = item.filename
             lowered = name.lower()
-            if lowered.endswith(".network") or "/resources/" in f"/{lowered}":
-                continue
-            data = archive.read(name)
+            data = archive.read(item)
             if lowered.endswith(".trace"):
                 lines = []
                 for line in data.splitlines():
@@ -539,20 +554,25 @@ async def diagnostic_bundle(
         entries.append(("network.har", _har_document(network_events)))
     if request.diagnostics.include_warc:
         entries.append(("network.warc", _warc_document(network_events)))
-    if request.diagnostics.include_mhtml and page is not None:
-        session = await context.new_cdp_session(page)
-        try:
-            snapshot = await session.send("Page.captureSnapshot", {"format": "mhtml"})
-            entries.append(("page.mhtml", str(snapshot.get("data", "")).encode()))
-        finally:
-            await session.detach()
     if request.diagnostics.include_trace and context is not None:
         with tempfile.TemporaryDirectory(prefix="vipercapture-trace-") as directory:
             trace_path = Path(directory) / "trace.zip"
             await context.tracing.stop(path=trace_path)
+            if trace_path.stat().st_size > limits.output_bytes:
+                raise RenderError(
+                    "output_too_large",
+                    "The raw trace exceeds the output limit.",
+                    413,
+                    False,
+                )
             raw_trace = await _settled_thread(trace_path.read_bytes)
             entries.append(
-                ("trace.zip", await _settled_thread(_redact_trace_archive, raw_trace))
+                (
+                    "trace.zip",
+                    await _settled_thread(
+                        _redact_trace_archive, raw_trace, limits.output_bytes
+                    ),
+                )
             )
     if sum(len(entry) for _, entry in entries) > limits.output_bytes:
         raise RenderError("output_too_large", "The diagnostic bundle exceeds the output limit.", 413, False)

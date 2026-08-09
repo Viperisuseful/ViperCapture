@@ -229,6 +229,23 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(stored.next_run_at, due)
         self.assertEqual(await self.service.run_due(due), 0)
 
+    async def test_project_schedule_prefix_reaches_the_worker(self):
+        project_id = "a" * 24
+        self.service.project_for_schedule = AsyncMock(return_value=project_id)
+        record = await self.service.create(
+            ScheduleCreate(
+                name="Owned",
+                cron="* * * * *",
+                render=RenderRequest(html="owned"),
+            )
+        )
+        await self.service.run_due(datetime.now(UTC) + timedelta(minutes=2))
+        self.assertTrue(
+            self.jobs.calls[0][1].startswith(
+                f"{project_id}:_schedule-{record.id}-"
+            )
+        )
+
     async def test_internal_request_ids_use_reserved_namespace(self):
         record = await self.service.create(
             ScheduleCreate(

@@ -42,7 +42,9 @@ def screenshotone_request(query: Mapping[str, str]) -> RenderRequest:
             },
             "full_page": full_page,
             "selector": selector,
-            "wait_for": {"delay_ms": int(query.get("delay", 0))},
+            "wait_for": {
+                "delay_ms": int(float(query.get("delay", 0)) * 1000)
+            },
             "cleanup": {
                 "block_ads": _boolean(query.get("block_ads"), False),
                 "consent_mode": "hide" if _boolean(query.get("block_cookie_banners"), False) else "none",

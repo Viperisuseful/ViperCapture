@@ -2,6 +2,8 @@ import io
 import json
 import os
 import base64
+import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -13,7 +15,12 @@ from pydantic import ValidationError
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from compatibility import screenshotone_request, urlbox_request
-from control_plane import BaselineQuotaError, ControlPlane, Metrics
+from control_plane import (
+    BaselineQuotaError,
+    ControlPlane,
+    Metrics,
+    ProfileQuotaError,
+)
 from render_contract import OutputFormat, RenderRequest
 from render_engine import RenderArtifact, RenderLimits, diagnostic_bundle
 
@@ -92,6 +99,9 @@ class ControlPlaneTests(unittest.IsolatedAsyncioTestCase):
                 "SELECT expires_at FROM profiles WHERE id='profile'"
             ).fetchone()[0]
         self.assertEqual(saved_expiration, expires_at)
+        with patch("control_plane.MAX_PROFILES_PER_PROJECT", 1):
+            with self.assertRaises(ProfileQuotaError):
+                self.control.put_profile(project_id, "second", {}, None)
         with patch("control_plane.MAX_BASELINES_PER_PROJECT", 1):
             self.control.put_baseline(project_id, "one", b"1")
             with self.assertRaises(BaselineQuotaError):
@@ -104,6 +114,12 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(request.output, OutputFormat.JPEG)
         self.assertEqual(request.viewport.width, 800)
         self.assertFalse(request.full_page)
+        self.assertEqual(
+            screenshotone_request(
+                {"url": "https://example.com", "delay": "5"}
+            ).wait_for.delay_ms,
+            5000,
+        )
 
     def test_urlbox_common_options(self):
         request = urlbox_request({"url": "https://example.com", "format": "jpg", "width": 900, "retina": True})
@@ -133,6 +149,11 @@ class ArtifactFeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(RenderRequest(url="https://example.com", output="mp4").video)
         with self.assertRaises(ValidationError):
             RenderRequest(url="https://example.com", output="pdf", slices={"height": 500})
+        with self.assertRaises(ValidationError):
+            RenderRequest(
+                url="https://example.com",
+                diagnostics={"bundle": True, "include_mhtml": True},
+            )
 
     def test_browser_ui_exposes_every_render_output(self):
         source = (Path(__file__).parent / "frontend" / "src" / "App.tsx").read_text()
@@ -182,8 +203,25 @@ class ArtifactFeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("http://localhost:8000/v1/render", action)
         self.assertNotIn('--url "${{ inputs.url }}"', action)
         self.assertIn("internal = 8000", terraform)
+        self.assertIn("VIPERCAPTURE_CONTROL_SECRET", terraform)
         self.assertIn("Pillow>=11.3.0", (root / "requirements.txt").read_text())
         self.assertIn("ffmpeg", (root / "Dockerfile").read_text())
+
+    def test_worker_role_requires_async_jobs(self):
+        result = subprocess.run(
+            [sys.executable, "-c", "import main"],
+            cwd=Path(__file__).parent,
+            env={
+                **os.environ,
+                "VIPERCAPTURE_ROLE": "worker",
+                "VIPERCAPTURE_ASYNC_JOBS": "0",
+            },
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires VIPERCAPTURE_ASYNC_JOBS=1", result.stderr)
 
 
 if __name__ == "__main__":

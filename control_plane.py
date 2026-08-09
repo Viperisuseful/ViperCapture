@@ -17,10 +17,16 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 MAX_BASELINES_PER_PROJECT = 100
 MAX_BASELINE_BYTES_PER_PROJECT = 512 * 1024 * 1024
+MAX_PROFILES_PER_PROJECT = 100
+MAX_PROFILE_BYTES_PER_PROJECT = 512 * 1024 * 1024
 LIMIT_LEASE_SECONDS = 15 * 60
 
 
 class BaselineQuotaError(RuntimeError):
+    pass
+
+
+class ProfileQuotaError(RuntimeError):
     pass
 
 
@@ -289,6 +295,28 @@ class ControlPlane:
         now = int(time.time())
         expires = expires_at if expires_at is not None else now + ttl if ttl else None
         with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "DELETE FROM profiles WHERE project_id=? AND expires_at IS NOT NULL AND expires_at<=?",
+                (project_id, now),
+            )
+            usage = db.execute(
+                "SELECT count(*) count, coalesce(sum(length(payload)),0) bytes "
+                "FROM profiles WHERE project_id=?",
+                (project_id,),
+            ).fetchone()
+            existing = db.execute(
+                "SELECT length(payload) bytes FROM profiles WHERE project_id=? AND id=?",
+                (project_id, profile_id),
+            ).fetchone()
+            count = int(usage["count"]) + (0 if existing else 1)
+            total = (
+                int(usage["bytes"])
+                - (int(existing["bytes"]) if existing else 0)
+                + len(payload)
+            )
+            if count > MAX_PROFILES_PER_PROJECT or total > MAX_PROFILE_BYTES_PER_PROJECT:
+                raise ProfileQuotaError
             db.execute("INSERT OR REPLACE INTO profiles VALUES (?, ?, ?, ?, ?)", (profile_id, project_id, payload, now, expires))
 
     def get_profile(self, project_id: str, profile_id: str) -> dict[str, object] | None:

@@ -7,23 +7,37 @@ import threading
 import unittest
 import zipfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from pydantic import ValidationError
 
-from render_contract import RenderRequest
+from render_contract import OutputFormat, RenderRequest
 from render_engine import (
     RenderArtifact,
     RenderLimits,
     _ffmpeg_executable,
     _redact_trace_archive,
+    _transcode_video,
     _warc_document,
     diagnostic_bundle,
     diagnostic_url,
 )
+from render_errors import RenderError
 
 
 class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
+    async def test_mp4_transcode_pads_odd_dimensions(self):
+        process = AsyncMock(return_value=(0, b""))
+        with (
+            patch("render_engine._ffmpeg_executable", return_value=Path("ffmpeg")),
+            patch("render_engine._run_process", process),
+        ):
+            await _transcode_video(
+                Path("capture.webm"), Path("capture.mp4"), OutputFormat.MP4
+            )
+        command = process.await_args.args[0]
+        self.assertIn("pad=ceil(iw/2)*2:ceil(ih/2)*2", command)
+
     def test_ffmpeg_discovery_checks_native_playwright_caches(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -73,13 +87,17 @@ class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
             )
             archive.writestr("trace.network", b"secret network body")
             archive.writestr("resources/body", b"secret response body")
-        sanitized = _redact_trace_archive(source.getvalue())
+        sanitized = _redact_trace_archive(source.getvalue(), 1024 * 1024)
         self.assertNotIn(b"secret", sanitized)
         with zipfile.ZipFile(io.BytesIO(sanitized)) as archive:
             self.assertEqual(archive.namelist(), ["trace.trace"])
             trace = archive.read("trace.trace")
             self.assertIn(b"[redacted]", trace)
             self.assertNotIn(b"token=", trace)
+
+        with self.assertRaises(RenderError) as raised:
+            _redact_trace_archive(source.getvalue(), 1)
+        self.assertEqual(raised.exception.code, "output_too_large")
 
     async def test_diagnostic_bundle_is_self_describing(self):
         request = RenderRequest(

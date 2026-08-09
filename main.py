@@ -29,6 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from async_jobs import (
     AsyncJobService,
+    JobDeferred,
     RenderedArtifact,
     current_job,
     load_providers,
@@ -37,7 +38,12 @@ from async_jobs import (
 )
 from bulk_jobs import BulkBodyLimitMiddleware, BulkJobRequest
 from compatibility import screenshotone_request, urlbox_request
-from control_plane import BaselineQuotaError, ControlPlane, Metrics
+from control_plane import (
+    BaselineQuotaError,
+    ControlPlane,
+    Metrics,
+    ProfileQuotaError,
+)
 from page_cleanup import (
     CleanupOptions,
     apply_visual_cleanup,
@@ -156,6 +162,8 @@ ASYNC_JOBS_ENABLED = os.getenv(
     "VIPERCAPTURE_ASYNC_JOBS",
     "0" if os.name == "nt" else "1",
 ) != "0"
+if PROCESS_ROLE == "worker" and not ASYNC_JOBS_ENABLED:
+    raise ValueError("VIPERCAPTURE_ROLE=worker requires VIPERCAPTURE_ASYNC_JOBS=1")
 ASYNC_JOB_SETTINGS = (
     settings_from_environment(
         default_workers=0 if PROCESS_ROLE == "api" else MAX_CONCURRENT_CAPTURES,
@@ -405,11 +413,20 @@ async def lifespan(app: FastAPI):
                     if project_id is not None:
                         await asyncio.to_thread(control.own, "job", job_id, project_id)
 
+                async def scheduled_project(schedule_id: str) -> str | None:
+                    control = getattr(app.state, "control", None)
+                    if control is None:
+                        return None
+                    return await asyncio.to_thread(
+                        control.owner, "schedule", schedule_id
+                    )
+
                 scheduler = ScheduleService(
                     load_schedule_store(ASYNC_JOB_SETTINGS),
                     service,
                     service.cipher,
                     on_job_created=own_scheduled_job,
+                    project_for_schedule=scheduled_project,
                 )
                 await scheduler.start()
                 app.state.schedules = scheduler
@@ -674,7 +691,21 @@ async def create_profile(payload: ProfileCreate, request: Request) -> JSONRespon
     if project_id is None:
         raise RenderError("project_required", "Use a project API key to create a profile.", 422, False)
     profile_id = secrets.token_urlsafe(24).replace("-", "_")
-    await asyncio.to_thread(control.put_profile, project_id, profile_id, payload.storage_state, payload.ttl_seconds)
+    try:
+        await asyncio.to_thread(
+            control.put_profile,
+            project_id,
+            profile_id,
+            payload.storage_state,
+            payload.ttl_seconds,
+        )
+    except ProfileQuotaError as exc:
+        raise RenderError(
+            "profile_quota_exceeded",
+            "The project profile storage quota was reached.",
+            413,
+            False,
+        ) from exc
     await asyncio.to_thread(control.own, "profile", profile_id, project_id)
     await asyncio.to_thread(control.audit, project_id, request.state.key_id, "profile.created", profile_id)
     return JSONResponse({"id": profile_id, "expires_in": payload.ttl_seconds}, status_code=201, headers={"Cache-Control": "private, no-store"})
@@ -880,7 +911,18 @@ def _render_engine() -> RenderEngine:
 
     async def save_profile(profile_id: str, state: dict[str, object]):
         control = getattr(app.state, "control", None)
-        if control is None or not await asyncio.to_thread(control.put_profile_any, profile_id, state):
+        try:
+            saved = control is not None and await asyncio.to_thread(
+                control.put_profile_any, profile_id, state
+            )
+        except ProfileQuotaError as exc:
+            raise RenderError(
+                "profile_quota_exceeded",
+                "The project profile storage quota was reached.",
+                413,
+                False,
+            ) from exc
+        if not saved:
             raise RenderError("profile_not_found", "The browser profile was not found.", 404, False)
 
     return RenderEngine(
@@ -915,12 +957,7 @@ async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
     if project_id is not None and control is not None:
         project_acquired = await control.acquire_worker(project_id)
         if not project_acquired:
-            raise RenderError(
-                "concurrency_limit_exceeded",
-                "The project background render limit was reached.",
-                429,
-                True,
-            )
+            raise JobDeferred()
     cache = getattr(app.state, "render_cache", None)
     try:
         if payload.cache and cache is not None:

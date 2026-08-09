@@ -22,6 +22,7 @@ from async_jobs import (
     ArtifactStoreConfig,
     AsyncJobService,
     JobConflictError,
+    JobDeferred,
     JobRecord,
     JobSettings,
     JobStoreConfig,
@@ -145,6 +146,37 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
                 base_dir=self.root, allow_zero_workers=True
             )
         self.assertEqual(settings.worker_count, 0)
+
+    async def test_deferred_claim_does_not_spend_a_render_attempt(self):
+        calls = 0
+
+        async def renderer(payload):
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                raise JobDeferred(0.01)
+            return await _successful_renderer(payload)
+
+        service = AsyncJobService(
+            self.settings,
+            self.store,
+            self.artifacts,
+            renderer,
+        )
+        await service.start()
+        try:
+            job = await service.submit(_payload(), request_id="deferred-job")
+            for _ in range(100):
+                current = await service.get(job.id)
+                if current and current.status == "succeeded":
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                self.fail("deferred job did not complete")
+            self.assertEqual(calls, 3)
+            self.assertEqual(current.attempt_count, 1)
+        finally:
+            await service.close()
 
     async def test_job_is_encrypted_rendered_and_downloadable(self):
         service = AsyncJobService(

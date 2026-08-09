@@ -34,7 +34,7 @@ and run the [reproducible benchmark](benchmarks/README.md) on your workload.
 - Visual regression ZIPs with pixel counts, pass/fail thresholds, bounds, and
   highlighted changes
 - Privacy-aware diagnostic ZIPs with console/network data and optional HAR,
-  Playwright trace, MHTML, and WARC; Ed25519-certified artifact bundles
+  redacted Playwright trace, and WARC; Ed25519-certified artifact bundles
 - Deterministic capture controls, sectioned slice ZIPs, project-owned visual
   baselines, and reproducible comparison reports
 - Optional projects, hashed API keys, quotas, resource ownership, encrypted
