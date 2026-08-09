@@ -1159,7 +1159,9 @@ def _record_render_metrics(
     METRICS.inc(
         "renders_total",
         output=payload.recorded_output_type,
-        cache="hit" if cache_hit else "miss",
+        cache=(
+            "hit" if cache_hit else "miss" if payload.cache else "disabled"
+        ),
     )
     METRICS.inc(
         "render_seconds_sum",
@@ -1987,11 +1989,23 @@ async def delete_schedule(schedule_id: UUID, request: Request) -> Response:
         owner = await asyncio.to_thread(
             app.state.control.owner, "schedule", str(schedule_id)
         )
-    deleted = await _schedule_service().delete(str(schedule_id))
+    service = _schedule_service()
+    try:
+        deleted = await service.delete(str(schedule_id))
+    except asyncio.CancelledError:
+        current = await service.store.get(str(schedule_id))
+        if CONTROL_ENABLED and owner is not None and current is None:
+            await _settled_thread(
+                app.state.control.disown,
+                "schedule",
+                str(schedule_id),
+                owner,
+            )
+        raise
     if not deleted:
         raise RenderError("schedule_not_found", "The schedule was not found.", 404, False)
     if CONTROL_ENABLED and owner is not None:
-        await asyncio.to_thread(
+        await _settled_thread(
             app.state.control.disown,
             "schedule",
             str(schedule_id),

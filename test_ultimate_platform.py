@@ -285,6 +285,15 @@ class ControlPlaneTests(unittest.IsolatedAsyncioTestCase):
             ).fetchall()
         self.assertEqual([column[2] for column in columns], ["expires_at"])
 
+    async def test_schedule_quota_has_a_project_leading_index(self):
+        with self.control._connect() as database:
+            columns = database.execute(
+                "PRAGMA index_info(resources_schedule_project)"
+            ).fetchall()
+        self.assertEqual(
+            [column[2] for column in columns], ["project_id", "id"]
+        )
+
 
 class CompatibilityTests(unittest.TestCase):
     def test_screenshotone_common_options(self):

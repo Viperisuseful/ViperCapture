@@ -315,6 +315,34 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
             "schedule", schedule_id, "project"
         )
 
+    async def test_cancelled_committed_schedule_delete_releases_quota(self):
+        schedule_id = "00000000-0000-0000-0000-000000000003"
+        control = SimpleNamespace(owner=Mock(return_value="project"), disown=Mock())
+        service = SimpleNamespace(
+            delete=AsyncMock(side_effect=asyncio.CancelledError),
+            store=SimpleNamespace(get=AsyncMock(return_value=None)),
+        )
+        original_control = getattr(main.app.state, "control", None)
+        original_schedules = getattr(main.app.state, "schedules", None)
+        main.app.state.control = control
+        main.app.state.schedules = service
+        request = SimpleNamespace(
+            state=SimpleNamespace(
+                is_admin=True, trusted_local=False, project_id=None
+            )
+        )
+        try:
+            with patch("main.CONTROL_ENABLED", True), self.assertRaises(
+                asyncio.CancelledError
+            ):
+                await main.delete_schedule(schedule_id, request)
+        finally:
+            main.app.state.control = original_control
+            main.app.state.schedules = original_schedules
+        control.disown.assert_called_once_with(
+            "schedule", schedule_id, "project"
+        )
+
     async def test_cached_render_bypasses_saturated_chromium_slots(self):
         original_cache = getattr(main.app.state, "render_cache", None)
         original_slots = getattr(main.app.state, "capture_slots", None)
@@ -646,7 +674,9 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
                 patch("main.METRICS", metrics),
                 patch("main._render_with_cache", AsyncMock(return_value=(artifact, False))),
             ):
-                result = await main._render_async_image(RenderRequest(html="render"))
+                result = await main._render_async_image(
+                    RenderRequest(html="render", cache=True)
+                )
         finally:
             main.app.state.capture_slots = original_slots
             main.app.state.browser = original_browser

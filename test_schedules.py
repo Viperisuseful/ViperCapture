@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import unittest
 from dataclasses import replace
@@ -140,6 +141,31 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(raised.exception.code, "schedule_conflict")
         self.assertEqual(resized[-1], (record.id, "project", len(winner.payload)))
+
+    async def test_cancelled_settled_resize_restores_stored_payload_quota(self):
+        resized = []
+
+        async def resize(_schedule_id, _project_id, size_bytes):
+            resized.append(size_bytes)
+            if len(resized) == 1:
+                raise asyncio.CancelledError
+
+        self.service.on_schedule_resize = resize
+        record = await self.service.create(
+            ScheduleCreate(
+                name="Cancelled resize",
+                cron="0 * * * *",
+                render=RenderRequest(html="original"),
+            ),
+            project_id="project",
+        )
+        with self.assertRaises(asyncio.CancelledError):
+            await self.service.update(
+                record,
+                ScheduleUpdate(render=RenderRequest(html="replacement")),
+            )
+        self.assertEqual(resized[-1], len(record.payload))
+        self.assertEqual((await self.store.get(record.id)).payload, record.payload)
 
     async def test_sqlite_operations_run_off_the_event_loop(self):
         def run_inline(operation, *args):

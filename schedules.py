@@ -700,11 +700,14 @@ class ScheduleService:
         )
         try:
             async with self.mutation_lock:
-                if request.render is not None and self.on_schedule_resize is not None:
-                    await self.on_schedule_resize(
-                        record.id, record.project_id, len(updated.payload)
-                    )
                 try:
+                    if (
+                        request.render is not None
+                        and self.on_schedule_resize is not None
+                    ):
+                        await self.on_schedule_resize(
+                            record.id, record.project_id, len(updated.payload)
+                        )
                     return await self.store.update(
                         updated, expected_updated_at=record.updated_at
                     )

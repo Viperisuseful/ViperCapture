@@ -134,6 +134,8 @@ class ControlPlane:
                 );
                 CREATE INDEX IF NOT EXISTS resources_expiry
                     ON resources(expires_at) WHERE expires_at IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS resources_schedule_project
+                    ON resources(project_id, id) WHERE kind = 'schedule';
                 CREATE TABLE IF NOT EXISTS profiles (
                     id TEXT NOT NULL, project_id TEXT NOT NULL, payload BLOB NOT NULL,
                     updated_at INTEGER NOT NULL, expires_at INTEGER,

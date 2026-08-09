@@ -319,6 +319,32 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await service.close()
 
+    async def test_defer_resets_started_at_for_the_final_claim(self):
+        await self.store.start()
+        try:
+            now = datetime.now(UTC)
+            job = JobRecord(
+                id=str(uuid4()),
+                request_id="deferred-timing",
+                status="queued",
+                payload=b"encrypted",
+                attempt_count=0,
+                available_at=now,
+                queue_expires_at=now + timedelta(minutes=1),
+                created_at=now,
+            )
+            await self.store.create(job, active_limit=1)
+            first = await self.store.claim(now, self.settings.max_attempts)
+            self.assertEqual(first.started_at, now)
+            retry_at = now + timedelta(seconds=10)
+            await self.store.defer(first.id, first.attempt_count, retry_at)
+            queued = await self.store.get(job.id, now)
+            self.assertIsNone(queued.started_at)
+            final = await self.store.claim(retry_at, self.settings.max_attempts)
+            self.assertEqual(final.started_at, retry_at)
+        finally:
+            await self.store.close()
+
     async def test_job_is_encrypted_rendered_and_downloadable(self):
         service = AsyncJobService(
             self.settings,

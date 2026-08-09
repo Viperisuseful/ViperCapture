@@ -1006,7 +1006,8 @@ class SQLiteJobStore:
                 """
                 UPDATE async_jobs
                 SET status = 'queued', available_at = ?,
-                    attempt_count = attempt_count - 1, claim_token = NULL
+                    attempt_count = attempt_count - 1, claim_token = NULL,
+                    started_at = NULL
                 WHERE id = ? AND status = 'running' AND attempt_count = ?
                 """,
                 (_epoch(available_at), job_id, expected_attempt),
