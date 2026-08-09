@@ -102,6 +102,19 @@ class RenderContractTest(unittest.TestCase):
         )
         self.assertEqual(bounded_ranges.pdf.page_ranges, "1-25,20-50")
 
+        single_page = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "output": "pdf",
+                "pdf": {
+                    "mode": "single_page",
+                    "paper_size": "A6",
+                    "margins": {"top": 0, "right": 3, "bottom": 0, "left": 3},
+                },
+            }
+        )
+        self.assertEqual(single_page.pdf.paper_size.value, "A6")
+
     def test_viewport_width_can_be_preserved_for_full_page_images(self):
         request = RenderRequest.model_validate(
             {"url": "https://example.com", "preserve_viewport_width": True}

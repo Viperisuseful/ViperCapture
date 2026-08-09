@@ -139,6 +139,7 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
         page.evaluate = AsyncMock(
             side_effect=[
                 len(page.html.encode("utf-8")),
+                len(page.html.encode("utf-8")) + 100,
                 '<html><body><x-card><template shadowrootmode="open"><p>Inside</p></template></x-card></body></html>',
             ]
         )
@@ -154,6 +155,26 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
             LIMITS,
         )
         self.assertIn(b'template shadowrootmode="open"', artifact.body)
+        page.content.assert_not_awaited()
+
+    async def test_open_shadow_dom_is_bounded_before_serialization(self):
+        page = FakePage()
+        page.content = AsyncMock(side_effect=AssertionError("content must not load"))
+        page.evaluate = AsyncMock(side_effect=[50, 101])
+        with self.assertRaises(RenderError) as raised:
+            await render_document_output(
+                page,
+                RenderRequest.model_validate(
+                    {
+                        "url": "https://example.com",
+                        "output": "html",
+                        "include_shadow_dom": True,
+                    }
+                ),
+                RenderLimits(output_bytes=100),
+            )
+        self.assertEqual(raised.exception.code, "output_too_large")
+        self.assertEqual(page.evaluate.await_count, 2)
         page.content.assert_not_awaited()
 
     async def test_markdown_hydrated_dom_size_is_bounded(self):

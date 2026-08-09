@@ -496,7 +496,7 @@ export default function App() {
         paper_size: paperSize,
         orientation,
         margins: { top: pdfMargin, right: pdfMargin, bottom: pdfMargin, left: pdfMargin },
-        page_ranges: pdfPageRanges.trim() || null,
+        page_ranges: pdfMode === "print" ? pdfPageRanges.trim() || null : null,
         header_template: pdfHeader.trim() || null,
         footer_template: pdfFooter.trim() || null,
       } : null,

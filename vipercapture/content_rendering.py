@@ -249,6 +249,61 @@ async def render_document_output(
                 {"max_bytes": maximum_html_bytes},
             )
         if request.include_shadow_dom:
+            serialized_bytes = await page.evaluate(
+                """({baseBytes, maxBytes}) => {
+                    const encoder = new TextEncoder();
+                    let total = baseBytes;
+                    const add = (value, expansion = 1) => {
+                        total += encoder.encode(value || "").byteLength * expansion;
+                    };
+                    const countRoot = (root) => {
+                        add('<template shadowrootmode="open"></template>');
+                        const stack = [];
+                        for (const child of root.childNodes) stack.push(child);
+                        while (stack.length && total <= maxBytes) {
+                            const node = stack.pop();
+                            if (node.nodeType === Node.TEXT_NODE) {
+                                add(node.data, 6);
+                            } else if (node.nodeType === Node.COMMENT_NODE) {
+                                add(node.data, 6);
+                                total += 7;
+                            } else if (node.nodeType === Node.ELEMENT_NODE) {
+                                add(node.tagName, 2);
+                                total += 5;
+                                for (const attribute of node.attributes) {
+                                    add(attribute.name);
+                                    add(attribute.value, 6);
+                                    total += 4;
+                                }
+                                for (const child of node.childNodes) stack.push(child);
+                                if (node.shadowRoot) countRoot(node.shadowRoot);
+                            }
+                        }
+                    };
+                    for (const element of document.querySelectorAll('*')) {
+                        if (total > maxBytes) break;
+                        if (element.shadowRoot) countRoot(element.shadowRoot);
+                    }
+                    return total;
+                }""",
+                {
+                    "baseBytes": int(serialized_bytes),
+                    "maxBytes": maximum_html_bytes,
+                },
+            )
+            if int(serialized_bytes) > maximum_html_bytes:
+                code = (
+                    "output_too_large"
+                    if request.output is OutputFormat.HTML
+                    else "document_too_large"
+                )
+                raise RenderError(
+                    code,
+                    "The hydrated document is too large to serialize.",
+                    413,
+                    False,
+                    {"max_bytes": maximum_html_bytes},
+                )
             document_html = await page.evaluate(
                 """() => {
                     const visit = (source, clone) => {

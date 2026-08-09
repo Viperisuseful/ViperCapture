@@ -461,6 +461,8 @@ class PdfOptions(StrictModel):
 
     @model_validator(mode="after")
     def validate_margins(self) -> "PdfOptions":
+        if self.mode is PdfMode.SINGLE_PAGE:
+            return self
         paper_width, paper_height = {
             PaperSize.A0: (33.1, 46.8),
             PaperSize.A1: (23.4, 33.1),
