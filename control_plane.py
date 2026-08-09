@@ -281,7 +281,11 @@ class ControlPlane:
         return result
 
     def _key_digest(self, raw: str) -> bytes:
-        return hmac.digest(self._key_hash_secret, raw.encode(), "sha256")
+        # API keys are generated 256-bit tokens, not human passwords. A keyed,
+        # constant-time digest is intentional; a password KDF would enable auth DoS.
+        return hmac.digest(  # lgtm[py/weak-sensitive-data-hashing]
+            self._key_hash_secret, raw.encode(), "sha256"
+        )
 
     async def acquire(
         self, identity: dict[str, object], *, concurrency: bool = True
