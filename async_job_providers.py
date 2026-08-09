@@ -995,6 +995,30 @@ class SQLiteJobStore:
 
         await self._run(operation, conditional_scrub=True)
 
+    async def defer(
+        self,
+        job_id: str,
+        expected_attempt: int,
+        available_at: datetime,
+    ) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            updated = connection.execute(
+                """
+                UPDATE async_jobs
+                SET status = 'queued', available_at = ?,
+                    attempt_count = attempt_count - 1, claim_token = NULL,
+                    started_at = NULL
+                WHERE id = ? AND status = 'running' AND attempt_count = ?
+                """,
+                (_epoch(available_at), job_id, expected_attempt),
+            )
+            if updated.rowcount != 1:
+                connection.rollback()
+                raise JobConflictError
+            connection.commit()
+
+        await self._run(operation)
+
     async def maintain(self, now: datetime) -> list[str]:
         return await self._run(
             self._maintain,
@@ -1216,18 +1240,21 @@ class SQLiteJobStore:
 
 
 _SAFE_KEY = re.compile(
-    r"^[0-9a-f-]{36}\.(png|jpg|webp|pdf|html|md|json|zip|webm)$"
+    r"^[0-9a-f-]{36}\.(png|jpg|webp|avif|gif|pdf|html|md|json|zip|webm|mp4)$"
 )
 _ARTIFACT_EXTENSIONS = {
     "image/png": "png",
     "image/jpeg": "jpg",
     "image/webp": "webp",
+    "image/avif": "avif",
+    "image/gif": "gif",
     "application/pdf": "pdf",
     "text/html; charset=utf-8": "html",
     "text/markdown; charset=utf-8": "md",
     "application/json": "json",
     "application/zip": "zip",
     "video/webm": "webm",
+    "video/mp4": "mp4",
 }
 
 

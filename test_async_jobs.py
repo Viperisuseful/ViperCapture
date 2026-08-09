@@ -12,7 +12,7 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, Mock, patch
 from uuid import uuid4
 
 import main
@@ -22,6 +22,7 @@ from async_jobs import (
     ArtifactStoreConfig,
     AsyncJobService,
     JobConflictError,
+    JobDeferred,
     JobRecord,
     JobSettings,
     JobStoreConfig,
@@ -29,6 +30,8 @@ from async_jobs import (
     RenderedArtifact,
     StoredArtifact,
     load_providers,
+    public_job_document,
+    settings_from_environment,
 )
 from render_contract import RenderRequest
 from render_errors import RenderError
@@ -111,6 +114,236 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.code, "webhooks_disabled")
         self.assertFalse(raised.exception.retryable)
         self.assertFalse(self.store.path.exists())
+
+    async def test_submit_reserves_ownership_before_queue_visibility(self):
+        reserved = False
+
+        async def reserve(_job_id, _request_id):
+            nonlocal reserved
+            reserved = True
+
+        async def create(job, _limit):
+            self.assertTrue(reserved)
+            return job
+
+        store = SimpleNamespace(
+            maintain=AsyncMock(return_value=[]),
+            create=AsyncMock(side_effect=create),
+        )
+        service = AsyncJobService(
+            self.settings,
+            store,
+            SimpleNamespace(maintain=AsyncMock()),
+            _successful_renderer,
+            ownership_reserver=reserve,
+        )
+        job = await service.submit(_payload(), request_id="owned-before-queue")
+        self.assertEqual(job.request_id, "owned-before-queue")
+
+    async def test_submit_releases_reserved_ownership_when_create_fails(self):
+        reserved_ids = []
+        release = AsyncMock()
+
+        async def reserve(job_id, _request_id):
+            reserved_ids.append(job_id)
+
+        store = SimpleNamespace(
+            maintain=AsyncMock(return_value=[]),
+            create=AsyncMock(side_effect=RuntimeError("database unavailable")),
+        )
+        service = AsyncJobService(
+            self.settings,
+            store,
+            SimpleNamespace(maintain=AsyncMock()),
+            _successful_renderer,
+            ownership_reserver=reserve,
+            ownership_releaser=release,
+        )
+        with self.assertRaisesRegex(RuntimeError, "database unavailable"):
+            await service.submit(_payload(), request_id="failed-create")
+        release.assert_awaited_once_with(reserved_ids[0])
+
+    async def test_cancelled_committed_create_preserves_ownership(self):
+        committed = None
+        release = AsyncMock()
+
+        async def create(job, _limit):
+            nonlocal committed
+            committed = job
+            raise asyncio.CancelledError
+
+        async def get(job_id, _now):
+            return committed if committed is not None and committed.id == job_id else None
+
+        store = SimpleNamespace(
+            maintain=AsyncMock(return_value=[]),
+            create=AsyncMock(side_effect=create),
+            get=AsyncMock(side_effect=get),
+        )
+        service = AsyncJobService(
+            self.settings,
+            store,
+            SimpleNamespace(maintain=AsyncMock()),
+            _successful_renderer,
+            ownership_reserver=AsyncMock(),
+            ownership_releaser=release,
+        )
+        with self.assertRaises(asyncio.CancelledError):
+            await service.submit(_payload(), request_id="cancelled-create")
+        release.assert_not_awaited()
+        store.get.assert_awaited_once_with(committed.id, ANY)
+
+    async def test_cancelled_create_keeps_ttl_reservation_if_reconcile_fails(self):
+        release = AsyncMock()
+        store = SimpleNamespace(
+            maintain=AsyncMock(return_value=[]),
+            create=AsyncMock(side_effect=asyncio.CancelledError),
+            get=AsyncMock(side_effect=RuntimeError("database unavailable")),
+        )
+        service = AsyncJobService(
+            self.settings,
+            store,
+            SimpleNamespace(maintain=AsyncMock()),
+            _successful_renderer,
+            ownership_reserver=AsyncMock(),
+            ownership_releaser=release,
+        )
+        with self.assertRaises(asyncio.CancelledError):
+            await service.submit(_payload(), request_id="ambiguous-create")
+        release.assert_not_awaited()
+
+    async def test_api_only_service_does_not_recover_distributed_jobs(self):
+        job_store = SimpleNamespace(
+            start=AsyncMock(),
+            close=AsyncMock(),
+            requeue_running=AsyncMock(),
+            maintain=AsyncMock(return_value=[]),
+        )
+        artifact_store = SimpleNamespace(
+            start=AsyncMock(), close=AsyncMock(), maintain=AsyncMock()
+        )
+        service = AsyncJobService(
+            _settings(self.root, worker_count=0),
+            job_store,
+            artifact_store,
+            _successful_renderer,
+            cipher=PayloadCipher(b"\0" * 32),
+            recover_running=False,
+        )
+        await service.start()
+        try:
+            job_store.requeue_running.assert_not_awaited()
+        finally:
+            await service.close()
+
+    async def test_split_worker_recovers_only_stale_leased_claims(self):
+        job_store = SimpleNamespace(
+            start=AsyncMock(),
+            close=AsyncMock(),
+            recover_stale=AsyncMock(),
+            requeue_running=AsyncMock(),
+            maintain=AsyncMock(return_value=[]),
+        )
+        artifact_store = SimpleNamespace(
+            start=AsyncMock(), close=AsyncMock(), maintain=AsyncMock()
+        )
+        service = AsyncJobService(
+            _settings(self.root, worker_count=0),
+            job_store,
+            artifact_store,
+            _successful_renderer,
+            cipher=PayloadCipher(b"\0" * 32),
+            recover_running=False,
+            recover_stale=True,
+        )
+        await service.start()
+        try:
+            job_store.recover_stale.assert_awaited_once()
+            job_store.requeue_running.assert_not_awaited()
+        finally:
+            await service.close()
+
+    def test_zero_workers_requires_explicit_api_role_opt_in(self):
+        with patch.dict("os.environ", {"VIPERCAPTURE_JOB_WORKERS": "0"}):
+            with self.assertRaisesRegex(ValueError, "must be positive"):
+                settings_from_environment(base_dir=self.root)
+            settings = settings_from_environment(
+                base_dir=self.root, allow_zero_workers=True
+            )
+        self.assertEqual(settings.worker_count, 0)
+
+    def test_public_job_document_hides_project_namespace(self):
+        now = datetime.now(UTC)
+        job = JobRecord(
+            id=str(uuid4()),
+            request_id=f"_project-{'a' * 24}:caller-visible",
+            status="queued",
+            payload=b"encrypted",
+            attempt_count=0,
+            available_at=now,
+            queue_expires_at=now + timedelta(minutes=1),
+            created_at=now,
+        )
+        self.assertEqual(
+            public_job_document(job)["request_id"], "caller-visible"
+        )
+
+    async def test_deferred_claim_does_not_spend_a_render_attempt(self):
+        calls = 0
+
+        async def renderer(payload):
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                raise JobDeferred(0.01)
+            return await _successful_renderer(payload)
+
+        service = AsyncJobService(
+            self.settings,
+            self.store,
+            self.artifacts,
+            renderer,
+        )
+        await service.start()
+        try:
+            job = await service.submit(_payload(), request_id="deferred-job")
+            for _ in range(100):
+                current = await service.get(job.id)
+                if current and current.status == "succeeded":
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                self.fail("deferred job did not complete")
+            self.assertEqual(calls, 3)
+            self.assertEqual(current.attempt_count, 1)
+        finally:
+            await service.close()
+
+    async def test_defer_resets_started_at_for_the_final_claim(self):
+        await self.store.start()
+        try:
+            now = datetime.now(UTC)
+            job = JobRecord(
+                id=str(uuid4()),
+                request_id="deferred-timing",
+                status="queued",
+                payload=b"encrypted",
+                attempt_count=0,
+                available_at=now,
+                queue_expires_at=now + timedelta(minutes=1),
+                created_at=now,
+            )
+            await self.store.create(job, active_limit=1)
+            first = await self.store.claim(now, self.settings.max_attempts)
+            self.assertEqual(first.started_at, now)
+            retry_at = now + timedelta(seconds=10)
+            await self.store.defer(first.id, first.attempt_count, retry_at)
+            queued = await self.store.get(job.id, now)
+            self.assertIsNone(queued.started_at)
+            final = await self.store.claim(retry_at, self.settings.max_attempts)
+            self.assertEqual(final.started_at, retry_at)
+        finally:
+            await self.store.close()
 
     async def test_job_is_encrypted_rendered_and_downloadable(self):
         service = AsyncJobService(
@@ -1731,12 +1964,15 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             "image/png": "png",
             "image/jpeg": "jpg",
             "image/webp": "webp",
+            "image/avif": "avif",
+            "image/gif": "gif",
             "application/pdf": "pdf",
             "text/html; charset=utf-8": "html",
             "text/markdown; charset=utf-8": "md",
             "application/json": "json",
             "application/zip": "zip",
             "video/webm": "webm",
+            "video/mp4": "mp4",
         }
         try:
             for media_type, extension in media.items():
@@ -3593,7 +3829,7 @@ class ProviderLoadingTests(unittest.TestCase):
                 (
                     "start", "close", "create", "claim",
                     "get", "cancel",
-                    "succeed", "fail", "requeue_running", "requeue", "maintain",
+                    "succeed", "fail", "requeue_running", "requeue", "defer", "maintain",
                     "expire_result",
                     "acknowledge_artifact_deletion",
                 ),
@@ -3965,11 +4201,16 @@ class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
         original_browser = getattr(main.app.state, "browser", None)
         main.app.state.capture_slots = asyncio.Semaphore(0)
         main.app.state.browser = SimpleNamespace()
+        metrics = SimpleNamespace(inc=Mock())
         try:
             with (
-                patch("main.time.perf_counter", side_effect=[10.0, 10.25])
+                patch(
+                    "main.time.perf_counter",
+                    side_effect=[10.0, 10.0, 10.25, 10.25, 10.35, 10.35],
+                )
                 as clock,
                 patch("main.RenderEngine") as engine_class,
+                patch("main.METRICS", metrics),
             ):
                 engine_class.return_value.render_image = AsyncMock(
                     return_value=SimpleNamespace(
@@ -3982,10 +4223,12 @@ class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
                     main._render_async_image(_payload())
                 )
                 await asyncio.sleep(0)
-                self.assertEqual(clock.call_count, 1)
+                self.assertEqual(clock.call_count, 2)
                 main.app.state.capture_slots.release()
                 rendered = await asyncio.wait_for(rendering, timeout=1)
-            self.assertEqual(rendered.render_ms, 250)
+            self.assertEqual(rendered.render_ms, 350)
+            self.assertEqual(metrics.inc.call_args_list[1].args[1], 0.1)
+            self.assertEqual(metrics.inc.call_args_list[2].args[1], 0.25)
         finally:
             main.app.state.capture_slots = original_slots
             main.app.state.browser = original_browser

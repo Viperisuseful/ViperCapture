@@ -1,0 +1,57 @@
+{
+  "name": "ViperCapture render",
+  "nodes": [
+    {
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [-80, 240],
+      "parameters": {}
+    },
+    {
+      "name": "Input URL",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [120, 240],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "vipercapture-url",
+              "name": "url",
+              "type": "string",
+              "value": "https://example.com"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "name": "Render screenshot",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [320, 240],
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.VIPERCAPTURE_URL + '/v1/render'}}",
+        "sendHeaders": true,
+        "headerParameters": {"parameters": [{"name": "Authorization", "value": "={{'Bearer ' + $env.VIPERCAPTURE_API_KEY}}"}]},
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {url: $json.url, output: 'png', deterministic: {enabled: true}} }}",
+        "options": {"response": {"response": {"responseFormat": "file"}}}
+      }
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [[{"node": "Input URL", "type": "main", "index": 0}]]
+    },
+    "Input URL": {
+      "main": [[{"node": "Render screenshot", "type": "main", "index": 0}]]
+    }
+  },
+  "active": false,
+  "settings": {}
+}

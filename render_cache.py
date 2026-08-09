@@ -15,7 +15,7 @@ from pathlib import Path
 
 from async_jobs import _ensure_private_directory, _sync_directory
 from render_contract import RenderRequest, canonical_render_document
-from render_engine import RenderArtifact
+from render_engine import RenderArtifact, certification_public_key
 
 UTC = timezone.utc
 
@@ -93,17 +93,26 @@ class RenderCache:
             raise RuntimeError("render cache key must contain exactly 32 bytes")
         return material
 
-    def key(self, request: RenderRequest) -> str:
+    def key(self, request: RenderRequest, namespace: str | None = None) -> str:
         if self._fingerprint_key is None:
             raise RuntimeError("render cache is not started")
         document = canonical_render_document(request)
         document["cache"] = False
         # Delivery affects notification, not pixels; never persist its URL in cache metadata.
         document["delivery"] = {"webhook_url": None}
+        if request.certification.enabled:
+            secret = os.getenv("VIPERCAPTURE_CERTIFICATION_SECRET", "")
+            document["certification_public_key"] = (
+                certification_public_key(secret)
+                if len(secret.encode()) >= 32
+                else "disabled"
+            )
         canonical = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         return hmac.digest(
             self._fingerprint_key,
             self.security_namespace.encode("utf-8")
+            + b"\0"
+            + (namespace or "").encode("utf-8")
             + b"\0"
             + canonical.encode("utf-8"),
             "sha256",
@@ -112,8 +121,10 @@ class RenderCache:
     def _paths(self, key: str) -> tuple[Path, Path]:
         return self.directory / f"{key}.bin", self.directory / f"{key}.json"
 
-    async def get(self, request: RenderRequest) -> RenderArtifact | None:
-        key = self.key(request)
+    async def get(
+        self, request: RenderRequest, namespace: str | None = None
+    ) -> RenderArtifact | None:
+        key = self.key(request, namespace)
         body_path, metadata_path = self._paths(key)
         return await self._run_locked(self._read, body_path, metadata_path)
 
@@ -156,8 +167,13 @@ class RenderCache:
         ):
             return None
 
-    async def put(self, request: RenderRequest, artifact: RenderArtifact) -> None:
-        key = self.key(request)
+    async def put(
+        self,
+        request: RenderRequest,
+        artifact: RenderArtifact,
+        namespace: str | None = None,
+    ) -> None:
+        key = self.key(request, namespace)
         body_path, metadata_path = self._paths(key)
         metadata = {
             "schema_version": 1,

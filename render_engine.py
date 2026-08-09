@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import io
 import ipaddress
 import json
@@ -12,18 +14,24 @@ import re
 import shutil
 import socket
 import tempfile
+import time
 import zipfile
 from base64 import b64decode
 from contextlib import suppress
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Awaitable, Callable
 from urllib.parse import urlsplit, urlunsplit
+from uuid import uuid4
 
 from playwright.async_api import Browser, Page
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from PIL import Image
 
 from render_contract import (
     ActionType,
@@ -40,11 +48,13 @@ MEDIA_TYPES = {
     OutputFormat.PNG: "image/png",
     OutputFormat.JPEG: "image/jpeg",
     OutputFormat.WEBP: "image/webp",
+    OutputFormat.AVIF: "image/avif",
 }
 EXTENSIONS = {
     OutputFormat.PNG: "png",
     OutputFormat.JPEG: "jpg",
     OutputFormat.WEBP: "webp",
+    OutputFormat.AVIF: "avif",
 }
 DEVICE_DESCRIPTOR_NAMES = {
     DevicePreset.IPHONE_14: "iPhone 14",
@@ -231,7 +241,7 @@ async def _trim_webm(
         str(destination),
     ]
     returncode, _ = await _run_process(command, 45)
-    if returncode != 0 or not destination.is_file():
+    if returncode != 0:
         raise RenderError(
             "video_encode_failed",
             "The requested WebM recording window could not be encoded.",
@@ -239,6 +249,25 @@ async def _trim_webm(
             True,
         )
     return await _webm_duration_ms(ffmpeg, destination)
+
+
+async def _transcode_video(source: Path, destination: Path, output: OutputFormat) -> None:
+    ffmpeg = _ffmpeg_executable()
+    if output is OutputFormat.MP4:
+        encoding = [
+            "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-c:v", "libx264",
+            "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        ]
+    elif output is OutputFormat.GIF:
+        encoding = ["-vf", "fps=12,scale='min(1280,iw)':-2:flags=lanczos", "-loop", "0"]
+    else:
+        return
+    returncode, _ = await _run_process(
+        [str(ffmpeg), "-hide_banner", "-loglevel", "error", "-i", str(source), *encoding, "-y", str(destination)],
+        45,
+    )
+    if returncode != 0:
+        raise RenderError("video_encode_failed", f"The requested {output.value.upper()} could not be encoded.", 502, True)
 
 
 def diagnostic_url(value: str) -> str:
@@ -260,14 +289,252 @@ def _write_diagnostic_zip(entries: list[tuple[str, bytes]]) -> bytes:
     return output.getvalue()
 
 
+def _convert_image(body: bytes, output: OutputFormat, quality: int | None) -> bytes:
+    destination = io.BytesIO()
+    with Image.open(io.BytesIO(body)) as image:
+        image.save(destination, format=output.value.upper(), quality=quality or 80)
+    return destination.getvalue()
+
+
+async def _encode_avif(body: bytes, quality: int | None) -> bytes:
+    try:
+        return await _settled_thread(
+            _convert_image, body, OutputFormat.AVIF, quality
+        )
+    except Exception as exc:
+        raise RenderError(
+            "image_encoder_unavailable",
+            "This Pillow build does not provide AVIF encoding.",
+            503,
+            False,
+        ) from exc
+
+
+def _slice_image(body: bytes, *, height: int, overlap: int, filename: str) -> bytes:
+    output = io.BytesIO()
+    with Image.open(io.BytesIO(body)) as image, zipfile.ZipFile(
+        output, "w", compression=zipfile.ZIP_DEFLATED
+    ) as archive:
+        step = height - overlap
+        slices = []
+        for index, top in enumerate(range(0, image.height, step)):
+            bottom = min(image.height, top + height)
+            part = image.crop((0, top, image.width, bottom))
+            part_body = io.BytesIO()
+            extension = filename.rsplit(".", 1)[-1].lower()
+            image_format = {"jpg": "JPEG"}.get(extension, extension.upper())
+            part.save(part_body, format=image_format)
+            name = f"slices/{index:04d}.{extension}"
+            archive.writestr(name, part_body.getvalue())
+            slices.append({"file": name, "top": top, "bottom": bottom})
+            if bottom == image.height:
+                break
+        archive.writestr(
+            "manifest.json",
+            json.dumps(
+                {"schema_version": 1, "width": image.width, "height": image.height, "slices": slices},
+                separators=(",", ":"),
+            ),
+        )
+    return output.getvalue()
+
+
+def _certify_artifact(artifact: "RenderArtifact", secret: str) -> bytes:
+    seed = hashlib.sha256(secret.encode("utf-8")).digest()
+    private_key = Ed25519PrivateKey.from_private_bytes(seed)
+    public_key = private_key.public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+    manifest = {
+        "schema_version": 1,
+        "algorithm": "Ed25519",
+        "created_at_unix_ms": round(time.time() * 1000),
+        "artifact": {
+            "filename": artifact.filename,
+            "media_type": artifact.media_type,
+            "bytes": len(artifact.body),
+            "sha256": hashlib.sha256(artifact.body).hexdigest(),
+        },
+        "public_key": base64.urlsafe_b64encode(public_key).decode().rstrip("="),
+    }
+    canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    signature = private_key.sign(canonical)
+    return _write_diagnostic_zip(
+        [
+            (artifact.filename, artifact.body),
+            ("manifest.json", canonical + b"\n"),
+            ("manifest.sig", base64.urlsafe_b64encode(signature).rstrip(b"=") + b"\n"),
+        ]
+    )
+
+
+def certification_public_key(secret: str) -> str:
+    seed = hashlib.sha256(secret.encode("utf-8")).digest()
+    public_key = Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+    return base64.urlsafe_b64encode(public_key).decode().rstrip("=")
+
+
+def _har_document(events: list[dict[str, object]]) -> bytes:
+    entries = [
+        {
+            "startedDateTime": event.get("timestamp", "1970-01-01T00:00:00.000Z"),
+            "time": 0,
+            "request": {
+                "method": event.get("method", "GET"),
+                "url": event.get("url", ""),
+                "httpVersion": "HTTP/2",
+                "headers": [],
+                "queryString": [],
+                "cookies": [],
+                "headersSize": -1,
+                "bodySize": -1,
+            },
+            "response": {
+                "status": event.get("status", 0),
+                "statusText": "",
+                "httpVersion": "HTTP/2",
+                "headers": [],
+                "cookies": [],
+                "content": {"size": 0, "mimeType": "application/octet-stream"},
+                "redirectURL": "",
+                "headersSize": -1,
+                "bodySize": -1,
+            },
+            "cache": {},
+            "timings": {"send": 0, "wait": 0, "receive": 0},
+        }
+        for event in events
+    ]
+    return (json.dumps({"log": {"version": "1.2", "creator": {"name": "ViperCapture", "version": "1"}, "entries": entries}}, indent=2) + "\n").encode()
+
+
+def _warc_document(events: list[dict[str, object]]) -> bytes:
+    def headers(record_type: str, content_type: str, length: int) -> bytes:
+        date = datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
+            "+00:00", "Z"
+        )
+        return (
+            f"WARC/1.1\r\nWARC-Type: {record_type}\r\n"
+            f"WARC-Date: {date}\r\nWARC-Record-ID: <urn:uuid:{uuid4()}>\r\n"
+            f"Content-Type: {content_type}\r\nContent-Length: {length}\r\n\r\n"
+        ).encode()
+
+    info = b'{"software":"ViperCapture","privacy":"headers, bodies, credentials, and query strings omitted"}'
+    records = [
+        headers("warcinfo", "application/json", len(info))
+        + info
+        + b"\r\n\r\n"
+    ]
+    for event in events:
+        url = str(event.get("url", ""))
+        payload = json.dumps(event, separators=(",", ":")).encode()
+        records.append(
+            headers("metadata", "application/json", len(payload))[:-2]
+            + b"WARC-Target-URI: "
+            + url.encode("utf-8", "replace")
+            + b"\r\n\r\n"
+            + payload
+            + b"\r\n\r\n"
+        )
+    return b"".join(records)
+
+
+def _redact_trace_archive(body: bytes, max_bytes: int) -> bytes:
+    sensitive = {
+        "authorization", "cookie", "cookies", "headers", "postdata",
+        "requestbody", "responsebody", "storagestate", "value",
+    }
+
+    def redact(value):
+        if isinstance(value, dict):
+            return {
+                key: (
+                    "[redacted]"
+                    if key.lower() in sensitive
+                    else diagnostic_url(item)
+                    if key.lower() in {"url", "documenturl", "baseurl"}
+                    and isinstance(item, str)
+                    else redact(item)
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [redact(item) for item in value]
+        return value
+
+    source = io.BytesIO(body)
+    destination = io.BytesIO()
+    with zipfile.ZipFile(source) as archive, zipfile.ZipFile(
+        destination, "w", zipfile.ZIP_DEFLATED
+    ) as output:
+        retained = [
+            item
+            for item in archive.infolist()
+            if not item.filename.lower().endswith(".network")
+            and "/resources/" not in f"/{item.filename.lower()}"
+        ]
+        if sum(item.file_size for item in retained) > max_bytes:
+            raise RenderError(
+                "output_too_large",
+                "The redacted trace exceeds the output limit.",
+                413,
+                False,
+            )
+        for item in retained:
+            name = item.filename
+            lowered = name.lower()
+            data = archive.read(item)
+            if lowered.endswith(".trace"):
+                lines = []
+                for line in data.splitlines():
+                    try:
+                        lines.append(
+                            json.dumps(redact(json.loads(line)), separators=(",", ":")).encode()
+                        )
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                data = b"\n".join(lines) + (b"\n" if lines else b"")
+            output.writestr(name, data)
+    return destination.getvalue()
+
+
 async def diagnostic_bundle(
     artifact: "RenderArtifact",
     request: RenderRequest,
     console_events: list[dict[str, object]],
     network_events: list[dict[str, object]],
     limits: "RenderLimits",
+    *,
+    page=None,
+    context=None,
 ) -> "RenderArtifact":
+    if request.slices is not None:
+        body = await _settled_thread(
+            _slice_image,
+            artifact.body,
+            height=request.slices.height,
+            overlap=request.slices.overlap,
+            filename=artifact.filename,
+        )
+        artifact = RenderArtifact(body, "application/zip", "vipercapture-slices.zip", artifact.metadata)
     if not request.diagnostics.bundle:
+        if request.certification.enabled:
+            secret = os.getenv("VIPERCAPTURE_CERTIFICATION_SECRET", "")
+            if len(secret.encode()) < 32:
+                raise RenderError(
+                    "certification_disabled",
+                    "Certified captures require VIPERCAPTURE_CERTIFICATION_SECRET with at least 32 bytes.",
+                    503,
+                    False,
+                )
+            body = await _settled_thread(_certify_artifact, artifact, secret)
+            if len(body) > limits.output_bytes:
+                raise RenderError("output_too_large", "The certified bundle exceeds the output limit.", 413, False)
+            return RenderArtifact(body, "application/zip", "vipercapture-certified.zip", artifact.metadata)
         return artifact
     artifact_metadata = dict(artifact.metadata)
     if isinstance(artifact_metadata.get("final_url"), str):
@@ -297,12 +564,50 @@ async def diagnostic_bundle(
         entries.append(
             ("network.json", (json.dumps(network_events, ensure_ascii=False, indent=2) + "\n").encode())
         )
+    if request.diagnostics.include_har:
+        entries.append(("network.har", _har_document(network_events)))
+    if request.diagnostics.include_warc:
+        entries.append(("network.warc", _warc_document(network_events)))
+    if request.diagnostics.include_trace and context is not None:
+        with tempfile.TemporaryDirectory(prefix="vipercapture-trace-") as directory:
+            trace_path = Path(directory) / "trace.zip"
+            await context.tracing.stop(path=trace_path)
+            if trace_path.stat().st_size > limits.output_bytes:
+                raise RenderError(
+                    "output_too_large",
+                    "The raw trace exceeds the output limit.",
+                    413,
+                    False,
+                )
+            raw_trace = await _settled_thread(trace_path.read_bytes)
+            entries.append(
+                (
+                    "trace.zip",
+                    await _settled_thread(
+                        _redact_trace_archive, raw_trace, limits.output_bytes
+                    ),
+                )
+            )
     if sum(len(entry) for _, entry in entries) > limits.output_bytes:
         raise RenderError("output_too_large", "The diagnostic bundle exceeds the output limit.", 413, False)
     body = await _settled_thread(_write_diagnostic_zip, entries)
     if len(body) > limits.output_bytes:
         raise RenderError("output_too_large", "The diagnostic bundle exceeds the output limit.", 413, False)
-    return RenderArtifact(body, "application/zip", "vipercapture-diagnostics.zip", artifact.metadata)
+    result = RenderArtifact(body, "application/zip", "vipercapture-diagnostics.zip", artifact.metadata)
+    if request.certification.enabled:
+        secret = os.getenv("VIPERCAPTURE_CERTIFICATION_SECRET", "")
+        if len(secret.encode()) < 32:
+            raise RenderError(
+                "certification_disabled",
+                "Certified captures require VIPERCAPTURE_CERTIFICATION_SECRET with at least 32 bytes.",
+                503,
+                False,
+            )
+        certified = await _settled_thread(_certify_artifact, result, secret)
+        if len(certified) > limits.output_bytes:
+            raise RenderError("output_too_large", "The certified bundle exceeds the output limit.", 413, False)
+        return RenderArtifact(certified, "application/zip", "vipercapture-certified.zip", artifact.metadata)
+    return result
 
 
 @dataclass(frozen=True)
@@ -776,6 +1081,8 @@ class RenderEngine:
         browser_replacer: Callable[[Browser], Awaitable[None]] | None = None,
         device_descriptors: dict[str, dict[str, object]] | None = None,
         allow_scripts: bool = False,
+        profile_loader: Callable[[str], Awaitable[dict[str, object] | None]] | None = None,
+        profile_saver: Callable[[str, dict[str, object]], Awaitable[None]] | None = None,
     ) -> None:
         self.hosted = hosted
         self.cleanup_hooks = cleanup_hooks
@@ -783,6 +1090,34 @@ class RenderEngine:
         self.browser_replacer = browser_replacer
         self.device_descriptors = device_descriptors or {}
         self.allow_scripts = allow_scripts
+        self.profile_loader = profile_loader
+        self.profile_saver = profile_saver
+
+    async def _persist_profile(self, request: RenderRequest, context) -> None:
+        if not request.save_profile or request.profile_id is None:
+            return
+        if self.profile_saver is None:
+            raise RenderError(
+                "profiles_disabled",
+                "Persistent browser profiles are disabled.",
+                503,
+                False,
+            )
+        await self.profile_saver(request.profile_id, await context.storage_state())
+
+    async def _persist_profile_state(
+        self, request: RenderRequest, state: dict[str, object] | None
+    ) -> None:
+        if state is None or request.profile_id is None:
+            return
+        if self.profile_saver is None:
+            raise RenderError(
+                "profiles_disabled",
+                "Persistent browser profiles are disabled.",
+                503,
+                False,
+            )
+        await self.profile_saver(request.profile_id, state)
 
     async def _wait(self, page: Page, request: RenderRequest, limits: RenderLimits) -> None:
         wait = request.wait_for
@@ -1123,7 +1458,14 @@ class RenderEngine:
         try:
             async with asyncio.timeout(limits.deadline_seconds):
                 context_options: dict[str, object] = {}
-                if request.output is OutputFormat.WEBM:
+                if request.profile_id is not None:
+                    if self.profile_loader is None:
+                        raise RenderError("profiles_disabled", "Persistent browser profiles are disabled.", 503, False)
+                    storage_state = await self.profile_loader(request.profile_id)
+                    if storage_state is None:
+                        raise RenderError("profile_not_found", "The browser profile was not found.", 404, False)
+                    context_options["storage_state"] = storage_state
+                if request.output in {OutputFormat.WEBM, OutputFormat.MP4, OutputFormat.GIF}:
                     video_directory = tempfile.TemporaryDirectory(prefix="vipercapture-video-")
                     context_options["record_video_dir"] = video_directory.name
                     context_options["record_video_size"] = {
@@ -1185,6 +1527,51 @@ class RenderEngine:
                 context_options["bypass_csp"] = request.network.bypass_csp
                 context_options["ignore_https_errors"] = request.network.ignore_https_errors
                 context = await browser.new_context(**context_options)
+                if request.diagnostics.bundle and request.diagnostics.include_trace:
+                    await context.tracing.start(screenshots=True, snapshots=True, sources=False)
+                if request.deterministic.enabled:
+                    await context.add_init_script(
+                        script=f"""(() => {{
+                            const fixed = {request.deterministic.timestamp_ms};
+                            const NativeDate = Date;
+                            function FixedDate(...args) {{
+                                if (new.target) return new NativeDate(...(args.length ? args : [fixed]));
+                                return new NativeDate(fixed).toString();
+                            }}
+                            Object.setPrototypeOf(FixedDate, NativeDate);
+                            FixedDate.prototype = NativeDate.prototype;
+                            FixedDate.now = () => fixed;
+                            Object.defineProperty(globalThis, 'Date', {{value: FixedDate}});
+                            let state = {request.deterministic.random_seed} >>> 0;
+                            const nextRandom = () => ((state = (1664525 * state + 1013904223) >>> 0) / 4294967296);
+                            Math.random = nextRandom;
+                            const deterministicBytes = (array) => {{
+                                if (!ArrayBuffer.isView(array) || array instanceof DataView ||
+                                    array instanceof Float32Array || array instanceof Float64Array) {{
+                                    throw new DOMException('Expected an integer TypedArray', 'TypeMismatchError');
+                                }}
+                                if (array.byteLength > 65536) {{
+                                    throw new DOMException('The requested length exceeds 65,536 bytes', 'QuotaExceededError');
+                                }}
+                                const bytes = new Uint8Array(array.buffer, array.byteOffset, array.byteLength);
+                                for (let index = 0; index < bytes.length; index += 1) {{
+                                    bytes[index] = Math.floor(nextRandom() * 256);
+                                }}
+                                return array;
+                            }};
+                            Object.defineProperty(Crypto.prototype, 'getRandomValues', {{value: deterministicBytes}});
+                            Object.defineProperty(Crypto.prototype, 'randomUUID', {{value: () => {{
+                                const bytes = deterministicBytes(new Uint8Array(16));
+                                bytes[6] = (bytes[6] & 0x0f) | 0x40;
+                                bytes[8] = (bytes[8] & 0x3f) | 0x80;
+                                const hex = [...bytes].map(value => value.toString(16).padStart(2, '0'));
+                                return `${{hex.slice(0, 4).join('')}}-${{hex.slice(4, 6).join('')}}-${{hex.slice(6, 8).join('')}}-${{hex.slice(8, 10).join('')}}-${{hex.slice(10).join('')}}`;
+                            }}}});
+                            let performanceTick = 0;
+                            Object.defineProperty(performance, 'timeOrigin', {{get: () => fixed}});
+                            Object.defineProperty(performance, 'now', {{value: () => (performanceTick += 0.1)}});
+                        }})()"""
+                    )
                 if request.network.cookies:
                     target_host = urlsplit(target).hostname or ""
                     cookies = []
@@ -1318,6 +1705,7 @@ class RenderEngine:
                     if len(network_events) >= MAX_DIAGNOSTIC_EVENTS:
                         return
                     network_events.append({
+                        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                         "method": response.request.method,
                         "url": diagnostic_url(response.url),
                         "status": response.status,
@@ -1474,11 +1862,17 @@ class RenderEngine:
                         await self.cleanup_hooks.apply(page, request.cleanup)
                     if self.challenge_checker:
                         await self.challenge_checker(page, request.proceed_on_captcha, navigation_status)
+                if request.deterministic.enabled and request.deterministic.wait_for_fonts:
+                    await page.evaluate("() => document.fonts?.ready")
                 await self._check_assertions(
                     page, request, failed_requests, matched_failure_patterns
                 )
-
-                if request.output is OutputFormat.WEBM:
+                is_video = request.output in {
+                    OutputFormat.WEBM,
+                    OutputFormat.MP4,
+                    OutputFormat.GIF,
+                }
+                if request.output in {OutputFormat.WEBM, OutputFormat.MP4, OutputFormat.GIF}:
                     options = request.video
                     if options is None or page.video is None:
                         raise RenderError("video_unavailable", "Chromium video recording is unavailable.", 500, True)
@@ -1508,6 +1902,11 @@ class RenderEngine:
                         failed_requests,
                         matched_failure_patterns,
                     )
+                    pending_profile_state = (
+                        await context.storage_state()
+                        if request.save_profile and request.profile_id is not None
+                        else None
+                    )
                     final_url = page.url
                     video = page.video
                     await page.close()
@@ -1520,16 +1919,25 @@ class RenderEngine:
                         trimmed_path,
                         duration_ms=options.duration_ms,
                     )
-                    size = (await asyncio.to_thread(trimmed_path.stat)).st_size
+                    final_path = trimmed_path
+                    if request.output is not OutputFormat.WEBM:
+                        final_path = Path(video_directory.name) / f"final.{request.output.value}"
+                        await _transcode_video(trimmed_path, final_path, request.output)
+                    size = (await asyncio.to_thread(final_path.stat)).st_size
                     if not size:
                         raise RenderError("empty_output", "The renderer produced an empty video.", 502, True)
                     if size > limits.output_bytes:
                         raise RenderError("output_too_large", "The rendered video exceeds the output limit.", 413, False)
-                    body = await _settled_thread(trimmed_path.read_bytes)
+                    body = await _settled_thread(final_path.read_bytes)
+                    media_type = {
+                        OutputFormat.WEBM: "video/webm",
+                        OutputFormat.MP4: "video/mp4",
+                        OutputFormat.GIF: "image/gif",
+                    }[request.output]
                     artifact = RenderArtifact(
                         body,
-                        "video/webm",
-                        "vipercapture.webm",
+                        media_type,
+                        f"vipercapture.{request.output.value}",
                         {
                             "width": request.viewport.width,
                             "height": request.viewport.height,
@@ -1540,7 +1948,13 @@ class RenderEngine:
                             "output_count": 1,
                         },
                     )
-                    return await diagnostic_bundle(artifact, request, console_events, network_events, limits)
+                    finalized = await diagnostic_bundle(
+                        artifact, request, console_events, network_events, limits
+                    )
+                    await self._persist_profile_state(
+                        request, pending_profile_state
+                    )
+                    return finalized
 
                 if request.output not in MEDIA_TYPES:
                     if request.output is OutputFormat.METADATA:
@@ -1585,14 +1999,22 @@ class RenderEngine:
                             "output_count": 1,
                         },
                     )
-                    return await diagnostic_bundle(artifact, request, console_events, network_events, limits)
+                    finalized = await diagnostic_bundle(
+                        artifact, request, console_events, network_events, limits,
+                        page=page, context=context,
+                    )
+                    await self._persist_profile(request, context)
+                    return finalized
 
+                screenshot_output = (
+                    OutputFormat.PNG if request.output is OutputFormat.AVIF else request.output
+                )
                 screenshot_options: dict[str, object] = {
-                    "type": request.output.value,
+                    "type": screenshot_output.value,
                     "animations": "disabled",
                     "omit_background": request.image.transparent_background,
                 }
-                if request.image.quality is not None:
+                if request.image.quality is not None and request.output is not OutputFormat.AVIF:
                     screenshot_options["quality"] = request.image.quality
 
                 if uses_cdp_capture:
@@ -1659,15 +2081,119 @@ class RenderEngine:
                             else max(page_width, request.viewport.width)
                         )
                         height = max(page_height, request.viewport.height)
-                        ensure_full_page_dimensions(
-                            width,
-                            height,
-                            request.viewport.device_scale_factor,
-                            limits,
-                            viewport_width=request.viewport.width,
-                        )
+                        if request.slices is not None:
+                            ensure_full_page_dimensions(
+                                width,
+                                1,
+                                request.viewport.device_scale_factor,
+                                limits,
+                                viewport_width=request.viewport.width,
+                            )
+                            if height > limits.max_full_page_height:
+                                raise RenderError(
+                                    "page_too_tall",
+                                    "The page is too tall to capture safely.",
+                                    413,
+                                    False,
+                                    {"max_full_page_height": limits.max_full_page_height},
+                                )
+                            ensure_dimensions(
+                                width,
+                                min(height, request.slices.height),
+                                request.viewport.device_scale_factor,
+                                limits,
+                            )
+                        else:
+                            ensure_full_page_dimensions(
+                                width,
+                                height,
+                                request.viewport.device_scale_factor,
+                                limits,
+                                viewport_width=request.viewport.width,
+                            )
                     else:
                         width, height = request.viewport.width, request.viewport.height
+                if request.slices is not None:
+                    slice_entries: list[tuple[str, bytes]] = []
+                    slice_manifest = []
+                    step = request.slices.height - request.slices.overlap
+                    total_bytes = 0
+                    for index, top in enumerate(range(0, math.ceil(height), step)):
+                        bottom = min(height, top + request.slices.height)
+                        part = await capture_clipped_image(
+                            page,
+                            output=screenshot_output,
+                            clip={
+                                "x": 0,
+                                "y": float(top),
+                                "width": float(width),
+                                "height": float(bottom - top),
+                                "scale": request.viewport.device_scale_factor,
+                            },
+                            quality=request.image.quality,
+                            transparent=request.image.transparent_background,
+                        )
+                        if request.output is OutputFormat.AVIF:
+                            part = await _encode_avif(
+                                part, request.image.quality
+                            )
+                        total_bytes += len(part)
+                        if total_bytes > limits.output_bytes:
+                            raise RenderError("output_too_large", "The rendered slices exceed the output limit.", 413, False)
+                        name = f"slices/{index:04d}.{EXTENSIONS[request.output]}"
+                        slice_entries.append((name, part))
+                        scale = request.viewport.device_scale_factor
+                        slice_manifest.append(
+                            {
+                                "file": name,
+                                "top": math.ceil(top * scale),
+                                "bottom": math.ceil(bottom * scale),
+                            }
+                        )
+                        if bottom == height:
+                            break
+                    slice_entries.append(
+                        (
+                            "manifest.json",
+                            json.dumps(
+                                {
+                                    "schema_version": 1,
+                                    "width": math.ceil(width * request.viewport.device_scale_factor),
+                                    "height": math.ceil(height * request.viewport.device_scale_factor),
+                                    "slices": slice_manifest,
+                                },
+                                separators=(",", ":"),
+                            ).encode(),
+                        )
+                    )
+                    body = await _settled_thread(_write_diagnostic_zip, slice_entries)
+                    if len(body) > limits.output_bytes:
+                        raise RenderError("output_too_large", "The rendered slice archive exceeds the output limit.", 413, False)
+                    artifact = RenderArtifact(
+                        body,
+                        "application/zip",
+                        "vipercapture-slices.zip",
+                        {
+                            "width": math.ceil(width * request.viewport.device_scale_factor),
+                            "height": math.ceil(height * request.viewport.device_scale_factor),
+                            "navigation_status": navigation_status,
+                            "final_url": page.url,
+                            "blocked_subresources": blocked_subresources,
+                            "output_count": len(slice_manifest),
+                        },
+                    )
+                    finalized_request = request.model_copy(update={"slices": None})
+                    finalized = await diagnostic_bundle(
+                        artifact,
+                        finalized_request,
+                        console_events,
+                        network_events,
+                        limits,
+                        page=page,
+                        context=context,
+                    )
+                    await self._persist_profile(request, context)
+                    return finalized
                 if request.output is OutputFormat.WEBP or (
                     request.output is OutputFormat.PNG
                     and request.image.optimize_for_speed
@@ -1713,7 +2239,7 @@ class RenderEngine:
                     else:
                         image = await capture_cdp_image(
                             page,
-                            output=request.output,
+                            output=screenshot_output,
                             clip=clip,
                             quality=request.image.quality,
                             transparent=request.image.transparent_background,
@@ -1724,7 +2250,7 @@ class RenderEngine:
                 elif request.clip:
                     image = await capture_clipped_image(
                         page,
-                        output=request.output,
+                        output=screenshot_output,
                         clip={
                             "x": float(request.clip.x),
                             "y": float(request.clip.y),
@@ -1738,7 +2264,7 @@ class RenderEngine:
                 elif request.full_page and request.preserve_viewport_width:
                     image = await capture_clipped_image(
                         page,
-                        output=request.output,
+                        output=screenshot_output,
                         clip={
                             "x": 0,
                             "y": 0,
@@ -1752,7 +2278,7 @@ class RenderEngine:
                 elif request.full_page:
                     image = await capture_clipped_image(
                         page,
-                        output=request.output,
+                        output=screenshot_output,
                         clip={
                             "x": 0,
                             "y": 0,
@@ -1771,6 +2297,8 @@ class RenderEngine:
 
                 if not image:
                     raise RenderError("empty_output", "The renderer produced an empty image.", 502, True)
+                if request.output is OutputFormat.AVIF:
+                    image = await _encode_avif(image, request.image.quality)
                 if len(image) > limits.output_bytes:
                     raise RenderError("output_too_large", "The rendered image exceeds the output limit.", 413, False)
                 artifact = RenderArtifact(
@@ -1786,7 +2314,12 @@ class RenderEngine:
                         "output_count": 1,
                     },
                 )
-                return await diagnostic_bundle(artifact, request, console_events, network_events, limits)
+                finalized = await diagnostic_bundle(
+                    artifact, request, console_events, network_events, limits,
+                    page=page, context=context,
+                )
+                await self._persist_profile(request, context)
+                return finalized
         except TimeoutError as exc:
             raise RenderError("render_timeout", "The render exceeded its total deadline.", 504, True) from exc
         except RenderError:

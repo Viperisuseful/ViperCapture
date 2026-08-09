@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import unittest
 from dataclasses import replace
@@ -96,6 +97,7 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(updated.name, "Updated")
         self.assertFalse(updated.enabled)
+
         database_files = (
             self.store.path,
             Path(f"{self.store.path}-wal"),
@@ -112,6 +114,58 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
             path.read_bytes() for path in database_files if path.exists()
         )
         self.assertNotIn(updated.payload, history)
+
+    async def test_conflicting_payload_update_restores_winning_quota(self):
+        resized = []
+
+        async def resize(schedule_id, project_id, size_bytes):
+            resized.append((schedule_id, project_id, size_bytes))
+
+        self.service.on_schedule_resize = resize
+        record = await self.service.create(
+            ScheduleCreate(
+                name="Race",
+                cron="0 * * * *",
+                render=RenderRequest(html="original"),
+            ),
+            project_id="project",
+        )
+        winner = await self.service.update(
+            record,
+            ScheduleUpdate(render=RenderRequest(html="winner")),
+        )
+        with self.assertRaises(RenderError) as raised:
+            await self.service.update(
+                record,
+                ScheduleUpdate(render=RenderRequest(html="stale")),
+            )
+        self.assertEqual(raised.exception.code, "schedule_conflict")
+        self.assertEqual(resized[-1], (record.id, "project", len(winner.payload)))
+
+    async def test_cancelled_settled_resize_restores_stored_payload_quota(self):
+        resized = []
+
+        async def resize(_schedule_id, _project_id, size_bytes):
+            resized.append(size_bytes)
+            if len(resized) == 1:
+                raise asyncio.CancelledError
+
+        self.service.on_schedule_resize = resize
+        record = await self.service.create(
+            ScheduleCreate(
+                name="Cancelled resize",
+                cron="0 * * * *",
+                render=RenderRequest(html="original"),
+            ),
+            project_id="project",
+        )
+        with self.assertRaises(asyncio.CancelledError):
+            await self.service.update(
+                record,
+                ScheduleUpdate(render=RenderRequest(html="replacement")),
+            )
+        self.assertEqual(resized[-1], len(record.payload))
+        self.assertEqual((await self.store.get(record.id)).payload, record.payload)
 
     async def test_sqlite_operations_run_off_the_event_loop(self):
         def run_inline(operation, *args):
@@ -154,6 +208,27 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
                 for statement in list_queries
             )
         )
+
+    async def test_list_filters_projects_inside_sqlite(self):
+        for project_id in ("project-a", "project-b"):
+            for index in range(2):
+                await self.service.create(
+                    ScheduleCreate(
+                        name=f"{project_id}-{index}",
+                        cron="0 * * * *",
+                        render=RenderRequest(html=project_id),
+                    ),
+                    project_id=project_id,
+                )
+        statements = []
+        self.store.connection.set_trace_callback(statements.append)
+        records = await self.store.list(project_id="project-b")
+        self.store.connection.set_trace_callback(None)
+        self.assertEqual(len(records), 2)
+        self.assertTrue(all(record.name.startswith("project-b") for record in records))
+        queries = [statement for statement in statements if "FROM schedules" in statement]
+        self.assertEqual(len(queries), 1)
+        self.assertIn("project_id=", queries[0])
 
     async def test_update_conflicts_with_concurrent_scheduler_advance(self):
         record = await self.service.create(
@@ -229,6 +304,23 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(stored.next_run_at, due)
         self.assertEqual(await self.service.run_due(due), 0)
 
+    async def test_project_schedule_prefix_reaches_the_worker(self):
+        project_id = "a" * 24
+        self.service.project_for_schedule = AsyncMock(return_value=project_id)
+        record = await self.service.create(
+            ScheduleCreate(
+                name="Owned",
+                cron="* * * * *",
+                render=RenderRequest(html="owned"),
+            )
+        )
+        await self.service.run_due(datetime.now(UTC) + timedelta(minutes=2))
+        self.assertTrue(
+            self.jobs.calls[0][1].startswith(
+                f"_project-{project_id}:_schedule-{record.id}-"
+            )
+        )
+
     async def test_internal_request_ids_use_reserved_namespace(self):
         record = await self.service.create(
             ScheduleCreate(
@@ -272,6 +364,31 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.jobs.calls[-1][1], request_id)
         retried = await self.store.get(record.id)
         self.assertEqual(retried.last_job_id, "job-1")
+
+    async def test_ownership_is_committed_before_occurrence_advances(self):
+        ownership = AsyncMock(side_effect=(RuntimeError("database busy"), None))
+        self.service.on_job_created = ownership
+        record = await self.service.create(
+            ScheduleCreate(
+                name="Ownership retry",
+                cron="* * * * *",
+                render=RenderRequest(html="owned"),
+            )
+        )
+        due = datetime.now(UTC) + timedelta(minutes=2)
+
+        self.assertEqual(await self.service.run_due(due), 1)
+        failed = await self.store.get(record.id)
+        self.assertIsNone(failed.last_job_id)
+        request_id = self.jobs.calls[0][1]
+
+        self.assertEqual(
+            await self.service.run_due(due + timedelta(seconds=1)), 1
+        )
+        self.assertEqual(self.jobs.calls[1][1], request_id)
+        ownership.assert_awaited_with(record.id, "job-2")
+        completed = await self.store.get(record.id)
+        self.assertEqual(completed.last_job_id, "job-2")
 
     async def test_claimed_occurrence_survives_store_restart(self):
         record = await self.service.create(

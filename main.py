@@ -2,15 +2,18 @@ import asyncio
 import hmac
 import os
 import re
+import secrets
 import subprocess
 import sys
 import time
 from contextlib import asynccontextmanager, suppress
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Awaitable, TypeVar
-from urllib.parse import urlencode
-from uuid import UUID
+from types import SimpleNamespace
+from typing import Annotated, Awaitable, Literal, TypeVar
+from urllib.parse import urlencode, urlsplit
+from uuid import UUID, uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,15 +25,26 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 from playwright.async_api import Browser, Playwright, async_playwright
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from async_jobs import (
     AsyncJobService,
+    JobDeferred,
     RenderedArtifact,
+    current_job,
     load_providers,
     public_job_document,
     settings_from_environment,
 )
 from bulk_jobs import BulkBodyLimitMiddleware, BulkJobRequest
+from compatibility import screenshotone_request, urlbox_request
+from control_plane import (
+    BaselineQuotaError,
+    ControlPlane,
+    Metrics,
+    ProfileQuotaError,
+    ScheduleQuotaError,
+)
 from page_cleanup import (
     CleanupOptions,
     apply_visual_cleanup,
@@ -46,18 +60,25 @@ from render_engine import (
     RenderEngine,
     RenderLimits,
     _settled_thread,
+    certification_public_key,
 )
-from render_errors import RenderError, install_render_error_layer
+from render_errors import RenderError, error_response, install_render_error_layer
 from schedules import (
     ScheduleCreate,
     ScheduleService,
-    ScheduleStore,
     ScheduleUpdate,
+    load_schedule_store,
     public_schedule_document,
     schedule_cursor,
 )
 from signed_urls import sign_render_request, verify_render_request
-from visual_diff import MAX_DIFF_INPUT_BYTES, compare_images, create_diff_bundle
+from telemetry import configure_telemetry
+from visual_diff import (
+    MAX_DIFF_INPUT_BYTES,
+    compare_images,
+    create_diff_bundle,
+    validate_image,
+)
 from webhooks import WebhookDispatcher
 
 if sys.platform.startswith("win"):
@@ -85,7 +106,7 @@ DESKTOP_ALLOW_HEADERS = [
     "Content-Type",
     "X-Request-Id",
 ]
-DESKTOP_ALLOW_METHODS = ["GET", "POST", "PATCH", "DELETE"]
+DESKTOP_ALLOW_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"]
 
 
 def _load_local_env() -> None:
@@ -128,6 +149,9 @@ if GPU_BACKEND not in {"default", "vulkan"}:
 MAX_CONCURRENT_CAPTURES = max(
     1, int(os.getenv("VIPERCAPTURE_MAX_CONCURRENCY", "1"))
 )
+PROCESS_ROLE = os.getenv("VIPERCAPTURE_ROLE", "all").lower()
+if PROCESS_ROLE not in {"all", "api", "worker"}:
+    raise ValueError("VIPERCAPTURE_ROLE must be all, api, or worker")
 MAX_ASYNC_RESULT_DOWNLOADS = max(
     1, int(os.getenv("VIPERCAPTURE_ASYNC_RESULT_CONCURRENCY", "2"))
 )
@@ -144,11 +168,39 @@ ASYNC_JOBS_ENABLED = os.getenv(
     "VIPERCAPTURE_ASYNC_JOBS",
     "0" if os.name == "nt" else "1",
 ) != "0"
+if PROCESS_ROLE == "worker" and not ASYNC_JOBS_ENABLED:
+    raise ValueError("VIPERCAPTURE_ROLE=worker requires VIPERCAPTURE_ASYNC_JOBS=1")
 ASYNC_JOB_SETTINGS = (
-    settings_from_environment(default_workers=MAX_CONCURRENT_CAPTURES)
+    settings_from_environment(
+        default_workers=0 if PROCESS_ROLE == "api" else MAX_CONCURRENT_CAPTURES,
+        allow_zero_workers=PROCESS_ROLE == "api",
+    )
     if ASYNC_JOBS_ENABLED
     else None
 )
+if ASYNC_JOB_SETTINGS is not None and PROCESS_ROLE == "api":
+    ASYNC_JOB_SETTINGS = replace(ASYNC_JOB_SETTINGS, worker_count=0)
+
+
+def _job_ownership_ttl() -> int | None:
+    if ASYNC_JOB_SETTINGS is None:
+        return None
+    return int(
+        (
+            ASYNC_JOB_SETTINGS.queue_ttl
+            + ASYNC_JOB_SETTINGS.result_ttl
+            + ASYNC_JOB_SETTINGS.metadata_ttl
+        ).total_seconds()
+    )
+
+
+def _internal_project_id(request_id: str) -> str | None:
+    candidate = request_id.partition(":")[0]
+    if re.fullmatch(r"_project-[0-9a-f]{24}", candidate):
+        return candidate.removeprefix("_project-")
+    return None
+
+
 SCHEDULES_ENABLED = os.getenv(
     "VIPERCAPTURE_SCHEDULES",
     "0" if os.name == "nt" else "1",
@@ -177,6 +229,19 @@ CACHE_MAX_BYTES = max(
     1,
     int(os.getenv("VIPERCAPTURE_CACHE_MAX_BYTES", str(512 * 1024 * 1024))),
 )
+CONTROL_ADMIN_TOKEN = os.getenv("VIPERCAPTURE_ADMIN_TOKEN", "")
+CONTROL_ENABLED = bool(CONTROL_ADMIN_TOKEN)
+if CONTROL_ENABLED and len(CONTROL_ADMIN_TOKEN.encode()) < 32:
+    raise ValueError("VIPERCAPTURE_ADMIN_TOKEN must contain at least 32 bytes")
+CONTROL_SECRET = os.getenv("VIPERCAPTURE_CONTROL_SECRET", "")
+if CONTROL_ENABLED and len(CONTROL_SECRET.encode()) < 32:
+    raise ValueError(
+        "VIPERCAPTURE_CONTROL_SECRET must contain at least 32 bytes when the control plane is enabled"
+    )
+CONTROL_DATABASE = Path(
+    os.getenv("VIPERCAPTURE_CONTROL_DATABASE", str(CACHE_DIRECTORY.parent / "control.sqlite3"))
+).expanduser()
+METRICS = Metrics()
 
 
 class _SlotStreamingResponse(StreamingResponse):
@@ -287,6 +352,32 @@ async def _replace_browser(app: FastAPI, failed_browser: Browser) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    app.state.control = None
+    if CONTROL_ENABLED:
+        if PROCESS_ROLE != "all":
+            raise RuntimeError(
+                "the built-in SQLite control plane supports only VIPERCAPTURE_ROLE=all; "
+                "put authentication and quotas in shared infrastructure for split roles"
+            )
+        control = ControlPlane(CONTROL_DATABASE, encryption_secret=CONTROL_SECRET)
+        await asyncio.to_thread(control.initialize)
+        app.state.control = control
+    if PROCESS_ROLE in {"api", "worker"} and ASYNC_JOBS_ENABLED:
+        if not os.getenv("VIPERCAPTURE_JOB_STORE_FACTORY"):
+            raise RuntimeError("split api/worker roles require VIPERCAPTURE_JOB_STORE_FACTORY")
+        if not (
+            os.getenv("VIPERCAPTURE_ARTIFACT_STORE_FACTORY")
+            or os.getenv("VIPERCAPTURE_S3_BUCKET")
+        ):
+            raise RuntimeError("split api/worker roles require shared artifact storage")
+        if not os.getenv("VIPERCAPTURE_JOB_SECRET"):
+            raise RuntimeError("split api/worker roles require VIPERCAPTURE_JOB_SECRET")
+        if SCHEDULES_ENABLED and not os.getenv(
+            "VIPERCAPTURE_SCHEDULE_STORE_FACTORY"
+        ):
+            raise RuntimeError(
+                "split api/worker roles require VIPERCAPTURE_SCHEDULE_STORE_FACTORY or VIPERCAPTURE_SCHEDULES=0"
+            )
     playwright: Playwright = await async_playwright().start()
     browser = await _launch_browser(playwright)
     app.state.playwright = playwright
@@ -330,20 +421,101 @@ async def lifespan(app: FastAPI):
             if ASYNC_JOB_SETTINGS is None:
                 raise RuntimeError("async job settings were not initialized")
             job_store, artifact_store = load_providers(ASYNC_JOB_SETTINGS)
+            if PROCESS_ROLE == "worker" and not callable(
+                getattr(job_store, "recover_stale", None)
+            ):
+                raise RuntimeError(
+                    "split workers require a job store with lease-based recover_stale()"
+                )
+
+            async def reserve_job_ownership(job_id: str, request_id: str) -> None:
+                control = getattr(app.state, "control", None)
+                project_id = _internal_project_id(request_id)
+                if control is None or project_id is None:
+                    return
+                await _settled_thread(
+                    control.own,
+                    "job",
+                    job_id,
+                    project_id,
+                    _job_ownership_ttl(),
+                )
+                if not await asyncio.to_thread(
+                    control.is_owner, "job", job_id, project_id
+                ):
+                    raise RuntimeError("job ownership reservation conflicted")
+
+            async def release_job_ownership(job_id: str) -> None:
+                control = getattr(app.state, "control", None)
+                if control is not None:
+                    await _settled_thread(control.disown, "job", job_id)
+
             service = AsyncJobService(
                 ASYNC_JOB_SETTINGS,
                 job_store,
                 artifact_store,
                 _render_async_image,
                 notifier=_notify_job if app.state.webhooks is not None else None,
+                recover_running=PROCESS_ROLE == "all",
+                recover_stale=PROCESS_ROLE == "worker",
+                ownership_reserver=(
+                    reserve_job_ownership if CONTROL_ENABLED else None
+                ),
+                ownership_releaser=(
+                    release_job_ownership if CONTROL_ENABLED else None
+                ),
             )
             await service.start()
             app.state.async_jobs = service
             if SCHEDULES_ENABLED:
+                async def own_scheduled_job(schedule_id: str, job_id: str) -> None:
+                    control = getattr(app.state, "control", None)
+                    if control is None:
+                        return
+                    project_id = await asyncio.to_thread(control.owner, "schedule", schedule_id)
+                    if project_id is not None:
+                        await asyncio.to_thread(
+                            control.own,
+                            "job",
+                            job_id,
+                            project_id,
+                            _job_ownership_ttl(),
+                        )
+
+                async def scheduled_project(schedule_id: str) -> str | None:
+                    control = getattr(app.state, "control", None)
+                    if control is None:
+                        return None
+                    return await asyncio.to_thread(
+                        control.owner, "schedule", schedule_id
+                    )
+
+                async def resize_scheduled_payload(
+                    schedule_id: str,
+                    project_id: str | None,
+                    size_bytes: int,
+                ) -> None:
+                    control = getattr(app.state, "control", None)
+                    if control is None:
+                        return
+                    owner = project_id or await asyncio.to_thread(
+                        control.owner, "schedule", schedule_id
+                    )
+                    if owner is not None:
+                        await _settled_thread(
+                            control.resize_schedule,
+                            schedule_id,
+                            owner,
+                            size_bytes,
+                        )
+
                 scheduler = ScheduleService(
-                    ScheduleStore(ASYNC_JOB_SETTINGS.data_dir / "schedules.sqlite3"),
+                    load_schedule_store(ASYNC_JOB_SETTINGS),
                     service,
                     service.cipher,
+                    on_job_created=own_scheduled_job,
+                    project_for_schedule=scheduled_project,
+                    on_schedule_resize=resize_scheduled_payload,
                 )
                 await scheduler.start()
                 app.state.schedules = scheduler
@@ -361,8 +533,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+TELEMETRY_ENABLED = configure_telemetry(app)
 app.add_middleware(BulkBodyLimitMiddleware)
-install_render_error_layer(app)
 if DESKTOP_TOKEN:
     app.add_middleware(
         CORSMiddleware,
@@ -385,6 +557,7 @@ if STATIC_DIR.exists():
 @app.middleware("http")
 async def require_desktop_token(request: Request, call_next):
     path = request.url.path
+    protected_api = path.startswith("/v1") or path == "/take" or path.startswith("/compat/")
     signed_render = request.method == "GET" and path == "/v1/render/signed"
     signing_token = SIGNING_ADMIN_TOKEN or SIGNING_SECRET
     signing_admin = (
@@ -396,21 +569,362 @@ async def require_desktop_token(request: Request, call_next):
             f"Bearer {signing_token}",
         )
     )
+    if not hasattr(request, "state"):
+        request.state = SimpleNamespace()
+    request.state.project_id = None
+    request.state.key_id = None
+    request.state.scopes = []
+    request.state.is_admin = False
+    request.state.trusted_local = False
+    request_app = getattr(request, "app", app)
+    control = getattr(request_app.state, "control", None)
+    acquired_project = None
+    authorization = request.headers.get("authorization", "")
+    desktop_authenticated = bool(
+        DESKTOP_TOKEN
+        and hmac.compare_digest(authorization, f"Bearer {DESKTOP_TOKEN}")
+    )
+    request.state.trusted_local = desktop_authenticated
+    if CONTROL_ENABLED and hmac.compare_digest(authorization, f"Bearer {CONTROL_ADMIN_TOKEN}"):
+        request.state.is_admin = True
+    elif (
+        CONTROL_ENABLED
+        and request.method != "OPTIONS"
+        and protected_api
+        and not signed_render
+        and not signing_admin
+        and not desktop_authenticated
+    ):
+        raw = authorization.removeprefix("Bearer ") if authorization.startswith("Bearer ") else ""
+        if not raw and path == "/take":
+            raw = request.query_params.get("access_key", "")
+        identity = await asyncio.to_thread(control.authenticate, raw) if raw else None
+        if identity is None:
+            return error_response(
+                request,
+                code="unauthorized",
+                message="A valid project API key is required.",
+                status_code=401,
+                retryable=False,
+            )
+        uses_render_capacity = (
+            path == "/take"
+            or path == "/compat/urlbox/v1/render/sync"
+            or (path == "/v1/render" and request.method == "POST")
+        )
+        allowed, reason = await control.acquire(
+            identity, concurrency=uses_render_capacity
+        )
+        if not allowed:
+            return error_response(
+                request,
+                code=str(reason),
+                message="The project request limit was reached.",
+                status_code=429,
+                retryable=True,
+                headers={"Retry-After": "1"},
+            )
+        request.state.project_id = str(identity["project_id"])
+        request.state.key_id = str(identity["key_id"])
+        request.state.scopes = list(identity["scopes"])
+        required_scopes = {"render"}
+        if path.startswith("/v1/jobs") or path.endswith("/async"):
+            required_scopes = {"jobs"}
+        elif path.startswith("/v1/schedules"):
+            required_scopes = {"schedules"}
+        elif path.startswith("/v1/profiles"):
+            required_scopes = {"profiles"}
+        elif path.startswith("/v1/baselines") or path == "/v1/diff":
+            required_scopes = {"baselines"}
+        elif path == "/v1/certification/public-key":
+            required_scopes = {"render", "jobs"}
+        if required_scopes.isdisjoint(request.state.scopes):
+            if uses_render_capacity:
+                await control.release(request.state.project_id)
+            return error_response(
+                request,
+                code="insufficient_scope",
+                message=(
+                    "The API key requires one of these scopes: "
+                    + ", ".join(sorted(required_scopes))
+                    + "."
+                ),
+                status_code=403,
+                retryable=False,
+            )
+        if uses_render_capacity:
+            acquired_project = request.state.project_id
     if (
         DESKTOP_TOKEN
         and request.method != "OPTIONS"
-        and path != "/health"
+        and path not in {"/health", "/ready"}
         and not signed_render
         and not signing_admin
-        and request.headers.get("authorization") != f"Bearer {DESKTOP_TOKEN}"
+        and not desktop_authenticated
+        and not request.state.is_admin
+        and request.state.project_id is None
     ):
-        return Response(status_code=401)
-    return await call_next(request)
+        if acquired_project is not None:
+            await control.release(acquired_project)
+        return error_response(
+            request,
+            code="unauthorized",
+            message="A valid desktop or project credential is required.",
+            status_code=401,
+            retryable=False,
+        )
+    if (
+        PROCESS_ROLE == "worker"
+        and protected_api
+        and not path.startswith("/v1/admin/")
+    ):
+        if acquired_project is not None:
+            await control.release(acquired_project)
+        return error_response(
+            request,
+            code="worker_only",
+            message="This process accepts background work only.",
+            status_code=503,
+            retryable=False,
+        )
+    try:
+        response = await call_next(request)
+    finally:
+        if acquired_project is not None:
+            await control.release(acquired_project)
+    return response
+
+
+@app.middleware("http")
+async def record_http_metrics(request: Request, call_next):
+    started = time.perf_counter()
+    status = 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        matched_route = getattr(request, "scope", {}).get("route")
+        metric_route = getattr(matched_route, "path", None) or "unmatched"
+        METRICS.inc(
+            "http_requests_total",
+            method=request.method,
+            route=metric_route,
+            status=status,
+        )
+        METRICS.inc(
+            "http_request_duration_seconds_sum", time.perf_counter() - started
+        )
+
+
+install_render_error_layer(app)
 
 
 @app.get("/health")
 async def health() -> dict[str, bool]:
     return {"ready": True}
+
+
+@app.get("/ready")
+async def ready() -> JSONResponse:
+    browser = getattr(app.state, "browser", None)
+    is_ready = browser is not None and browser.is_connected()
+    return JSONResponse({
+        "ready": is_ready,
+        "role": PROCESS_ROLE,
+        "async_jobs": getattr(app.state, "async_jobs", None) is not None,
+    }, status_code=200 if is_ready else 503)
+
+
+@app.get("/metrics", response_class=Response)
+async def metrics() -> Response:
+    METRICS.gauge("capture_capacity", MAX_CONCURRENT_CAPTURES)
+    METRICS.gauge("worker_count", ASYNC_JOB_SETTINGS.worker_count if ASYNC_JOB_SETTINGS else 0)
+    return Response(METRICS.prometheus(), media_type="text/plain; version=0.0.4")
+
+
+@app.get("/v1/certification/public-key")
+async def certified_capture_public_key() -> dict[str, str]:
+    secret = os.getenv("VIPERCAPTURE_CERTIFICATION_SECRET", "")
+    if len(secret.encode()) < 32:
+        raise RenderError("certification_disabled", "Certified captures are disabled.", 503, False)
+    return {"algorithm": "Ed25519", "public_key": certification_public_key(secret)}
+
+
+class ProjectCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=128)
+    requests_per_minute: int = Field(default=60, ge=1, le=100_000)
+    concurrency: int = Field(default=2, ge=1, le=1_000)
+
+
+class ApiKeyCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(default="default", min_length=1, max_length=128)
+    scopes: list[Literal["render", "jobs", "schedules", "profiles", "baselines"]] = Field(
+        default_factory=lambda: ["render", "jobs", "schedules", "profiles", "baselines"],
+        min_length=1,
+    )
+
+
+class BrowserCookie(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    name: str
+    value: str
+    domain: str
+    path: str
+    expires: float
+    http_only: bool = Field(alias="httpOnly")
+    secure: bool
+    same_site: Literal["Strict", "Lax", "None"] = Field(alias="sameSite")
+
+
+class BrowserLocalStorageEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str
+    value: str
+
+
+class BrowserOriginState(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    origin: str = Field(min_length=1)
+    local_storage: list[BrowserLocalStorageEntry] = Field(
+        default_factory=list, alias="localStorage"
+    )
+
+    @field_validator("origin")
+    @classmethod
+    def validate_origin(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        try:
+            parsed.port
+        except ValueError as exc:
+            raise ValueError("origin has an invalid port") from exc
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("origin must be an HTTP(S) origin without a path")
+        return f"{parsed.scheme}://{parsed.netloc}"
+
+
+class BrowserStorageState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    cookies: list[BrowserCookie] = Field(default_factory=list)
+    origins: list[BrowserOriginState] = Field(default_factory=list)
+
+
+class ProfileCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    storage_state: BrowserStorageState
+    ttl_seconds: int | None = Field(default=None, ge=60, le=31_536_000)
+
+
+def _admin(request: Request) -> ControlPlane:
+    control = getattr(request.app.state, "control", None)
+    if control is None:
+        raise RenderError("control_plane_disabled", "Set VIPERCAPTURE_ADMIN_TOKEN to enable the control plane.", 503, False)
+    if not request.state.is_admin:
+        raise RenderError("admin_unauthorized", "A valid administrator token is required.", 401, False)
+    return control
+
+
+@app.post("/v1/admin/projects", status_code=201)
+async def create_project(payload: ProjectCreate, request: Request) -> JSONResponse:
+    control = _admin(request)
+    project = await asyncio.to_thread(control.create_project, payload.name, payload.requests_per_minute, payload.concurrency)
+    await asyncio.to_thread(control.audit, str(project["id"]), "admin", "project.created", str(project["id"]))
+    return JSONResponse(project, status_code=201)
+
+
+@app.get("/v1/admin/projects")
+async def list_projects(request: Request) -> list[dict[str, object]]:
+    return await asyncio.to_thread(_admin(request).list_projects)
+
+
+@app.post("/v1/admin/projects/{project_id}/keys", status_code=201)
+async def create_api_key(project_id: str, payload: ApiKeyCreate, request: Request) -> JSONResponse:
+    control = _admin(request)
+    try:
+        document = await asyncio.to_thread(control.create_key, project_id, payload.name, payload.scopes)
+    except KeyError as exc:
+        raise RenderError("project_not_found", "The project was not found.", 404, False) from exc
+    await asyncio.to_thread(control.audit, project_id, "admin", "api_key.created", document["id"])
+    return JSONResponse(document, status_code=201, headers={"Cache-Control": "private, no-store"})
+
+
+@app.delete("/v1/admin/keys/{key_id}", status_code=204)
+async def revoke_api_key(key_id: str, request: Request) -> Response:
+    control = _admin(request)
+    if not await asyncio.to_thread(control.revoke_key, key_id):
+        raise RenderError("api_key_not_found", "The API key was not found.", 404, False)
+    await asyncio.to_thread(control.audit, None, "admin", "api_key.revoked", key_id)
+    return Response(status_code=204)
+
+
+@app.get("/v1/admin/audit")
+async def audit_events(request: Request, limit: Annotated[int, Query(ge=1, le=1000)] = 100) -> list[dict[str, object]]:
+    return await asyncio.to_thread(_admin(request).audits, limit)
+
+
+@app.get("/v1/admin/status")
+async def operator_status(request: Request) -> dict[str, object]:
+    _admin(request)
+    service = getattr(app.state, "async_jobs", None)
+    return {
+        "role": PROCESS_ROLE,
+        "browser_connected": app.state.browser.is_connected(),
+        "async_jobs": service is not None,
+        "worker_count": ASYNC_JOB_SETTINGS.worker_count if ASYNC_JOB_SETTINGS else 0,
+        "control_plane": CONTROL_ENABLED,
+    }
+
+
+@app.post("/v1/profiles", status_code=201)
+async def create_profile(payload: ProfileCreate, request: Request) -> JSONResponse:
+    control = getattr(request.app.state, "control", None)
+    if control is None or (request.state.project_id is None and not request.state.is_admin):
+        raise RenderError("profiles_disabled", "Project authentication is required for profiles.", 503, False)
+    project_id = request.state.project_id
+    if project_id is None:
+        raise RenderError("project_required", "Use a project API key to create a profile.", 422, False)
+    profile_id = secrets.token_urlsafe(24).replace("-", "_")
+    try:
+        await _settled_thread(
+            control.put_profile,
+            project_id,
+            profile_id,
+            payload.storage_state.model_dump(mode="json", by_alias=True),
+            payload.ttl_seconds,
+        )
+    except ProfileQuotaError as exc:
+        raise RenderError(
+            "profile_quota_exceeded",
+            "The project profile storage quota was reached.",
+            413,
+            False,
+        ) from exc
+    except asyncio.CancelledError:
+        await _settled_thread(control.delete_profile, project_id, profile_id)
+        raise
+    await asyncio.to_thread(control.audit, project_id, request.state.key_id, "profile.created", profile_id)
+    return JSONResponse({"id": profile_id, "expires_in": payload.ttl_seconds}, status_code=201, headers={"Cache-Control": "private, no-store"})
+
+
+@app.delete("/v1/profiles/{profile_id}", status_code=204)
+async def delete_profile(profile_id: str, request: Request) -> Response:
+    control = getattr(request.app.state, "control", None)
+    project_id = request.state.project_id
+    if control is None or project_id is None or not await asyncio.to_thread(control.is_owner, "profile", profile_id, project_id):
+        raise RenderError("profile_not_found", "The browser profile was not found.", 404, False)
+    await asyncio.to_thread(control.delete_profile, project_id, profile_id)
+    await asyncio.to_thread(control.audit, project_id, request.state.key_id, "profile.deleted", profile_id)
+    return Response(status_code=204)
 
 
 if DESKTOP_TOKEN:
@@ -593,6 +1107,29 @@ def _blocked_resource_category(url: str, options) -> str | None:
 
 def _render_engine() -> RenderEngine:
     playwright = getattr(app.state, "playwright", None)
+
+    async def load_profile(profile_id: str):
+        control = getattr(app.state, "control", None)
+        if control is None:
+            return None
+        return await asyncio.to_thread(control.get_profile_any, profile_id)
+
+    async def save_profile(profile_id: str, state: dict[str, object]):
+        control = getattr(app.state, "control", None)
+        try:
+            saved = control is not None and await asyncio.to_thread(
+                control.put_profile_any, profile_id, state
+            )
+        except ProfileQuotaError as exc:
+            raise RenderError(
+                "profile_quota_exceeded",
+                "The project profile storage quota was reached.",
+                413,
+                False,
+            ) from exc
+        if not saved:
+            raise RenderError("profile_not_found", "The browser profile was not found.", 404, False)
+
     return RenderEngine(
         hosted=HOSTED,
         cleanup_hooks=CleanupHooks(
@@ -607,49 +1144,126 @@ def _render_engine() -> RenderEngine:
             dict(playwright.devices) if playwright is not None else None
         ),
         allow_scripts=ALLOW_SCRIPTS,
+        profile_loader=load_profile,
+        profile_saver=save_profile,
     )
+
+
+def _record_render_metrics(
+    payload: RenderRequest,
+    *,
+    cache_hit: bool,
+    render_ms: int,
+    queue_ms: int,
+) -> None:
+    METRICS.inc(
+        "renders_total",
+        output=payload.recorded_output_type,
+        cache=(
+            "hit" if cache_hit else "miss" if payload.cache else "disabled"
+        ),
+    )
+    METRICS.inc(
+        "render_seconds_sum",
+        render_ms / 1000,
+        output=payload.recorded_output_type,
+    )
+    METRICS.inc("queue_seconds_sum", queue_ms / 1000)
 
 
 async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
     started = time.perf_counter()
-    cache = getattr(app.state, "render_cache", None)
-    if payload.cache and cache is not None:
-        cached = await cache.get(payload)
-        if cached is not None:
-            return RenderedArtifact(
-                body=cached.body,
-                media_type=cached.media_type,
-                filename=cached.filename,
-                render_ms=round((time.perf_counter() - started) * 1000),
-            )
-    await app.state.capture_slots.acquire()
-    browser: Browser = app.state.browser
-    engine = _render_engine()
-    try:
-        artifact, _cache_hit = await _render_with_cache(engine, browser, payload)
-    except RenderError:
-        if not browser.is_connected():
-            with suppress(Exception):
-                await _replace_browser(app, browser)
-        raise
-    finally:
-        app.state.capture_slots.release()
-    return RenderedArtifact(
-        body=artifact.body,
-        media_type=artifact.media_type,
-        filename=artifact.filename,
-        render_ms=round((time.perf_counter() - started) * 1000),
+    job = current_job()
+    durable_queue_ms = (
+        max(
+            0,
+            round((job.started_at - job.created_at).total_seconds() * 1000),
+        )
+        if job is not None and job.started_at is not None
+        else None
     )
+    project_id = (
+        _internal_project_id(job.request_id)
+        if CONTROL_ENABLED and job is not None
+        else None
+    )
+    control = getattr(app.state, "control", None)
+    project_acquired = False
+    if project_id is not None and control is not None:
+        project_acquired = await control.acquire_worker(project_id)
+        if not project_acquired:
+            raise JobDeferred()
+    cache = getattr(app.state, "render_cache", None)
+    try:
+        if payload.cache and cache is not None:
+            cached = await cache.get(payload, project_id)
+            if cached is not None:
+                _record_render_metrics(
+                    payload,
+                    cache_hit=True,
+                    render_ms=0,
+                    queue_ms=durable_queue_ms or 0,
+                )
+                return RenderedArtifact(
+                    body=cached.body,
+                    media_type=cached.media_type,
+                    filename=cached.filename,
+                    render_ms=round((time.perf_counter() - started) * 1000),
+                )
+        queue_started = time.perf_counter()
+        await app.state.capture_slots.acquire()
+        slot_queue_ms = round((time.perf_counter() - queue_started) * 1000)
+        queue_ms = (
+            durable_queue_ms
+            if durable_queue_ms is not None
+            else slot_queue_ms
+        )
+        browser: Browser = app.state.browser
+        engine = _render_engine()
+        render_started = time.perf_counter()
+        try:
+            artifact, cache_hit = await _render_with_cache(
+                engine, browser, payload, namespace=project_id
+            )
+        except RenderError:
+            if not browser.is_connected():
+                with suppress(Exception):
+                    await _replace_browser(app, browser)
+            raise
+        finally:
+            app.state.capture_slots.release()
+        render_ms = (
+            0
+            if cache_hit
+            else round((time.perf_counter() - render_started) * 1000)
+        )
+        _record_render_metrics(
+            payload,
+            cache_hit=cache_hit,
+            render_ms=render_ms,
+            queue_ms=queue_ms,
+        )
+        return RenderedArtifact(
+            body=artifact.body,
+            media_type=artifact.media_type,
+            filename=artifact.filename,
+            render_ms=round((time.perf_counter() - started) * 1000),
+        )
+    finally:
+        if project_acquired:
+            await control.release(project_id)
 
 
 async def _render_with_cache(
     engine: RenderEngine,
     browser: Browser,
     payload: RenderRequest,
+    *,
+    namespace: str | None = None,
 ) -> tuple[RenderArtifact, bool]:
     cache = getattr(app.state, "render_cache", None)
     if payload.cache and cache is not None:
-        cached = await cache.get(payload)
+        cached = await cache.get(payload, namespace)
         if cached is not None:
             return cached, True
     artifact = await engine.render_image(
@@ -658,7 +1272,7 @@ async def _render_with_cache(
         RenderLimits(max_pixels=MAX_SCREENSHOT_PIXELS),
     )
     if payload.cache and cache is not None:
-        await cache.put(payload, artifact)
+        await cache.put(payload, artifact, namespace)
     return artifact, False
 
 
@@ -673,6 +1287,7 @@ async def _notify_job(webhook_url: str, job) -> None:
 
 
 async def _render_response(payload: RenderRequest, request: Request) -> Response:
+    await _validate_profile_access(payload, request)
     if payload.delivery.webhook_url is not None:
         raise RenderError(
             "delivery_requires_async_job",
@@ -685,8 +1300,11 @@ async def _render_response(payload: RenderRequest, request: Request) -> Response
     cache_hit = False
     queue_ms = 0
     render_ms = 0
+    cache_namespace = getattr(getattr(request, "state", None), "project_id", None)
     if payload.cache and cache is not None:
-        artifact = await _await_while_connected(request, cache.get(payload))
+        artifact = await _await_while_connected(
+            request, cache.get(payload, cache_namespace)
+        )
         cache_hit = artifact is not None
 
     if artifact is None:
@@ -709,7 +1327,7 @@ async def _render_response(payload: RenderRequest, request: Request) -> Response
         try:
             if payload.cache and cache is not None:
                 artifact = await _await_while_connected(
-                    request, cache.get(payload)
+                    request, cache.get(payload, cache_namespace)
                 )
                 cache_hit = artifact is not None
             if artifact is None:
@@ -726,7 +1344,7 @@ async def _render_response(payload: RenderRequest, request: Request) -> Response
                     (time.perf_counter() - render_started) * 1000
                 )
                 if payload.cache and cache is not None:
-                    await cache.put(payload, artifact)
+                    await cache.put(payload, artifact, cache_namespace)
         except RenderError:
             if not browser.is_connected():
                 with suppress(Exception):
@@ -735,6 +1353,12 @@ async def _render_response(payload: RenderRequest, request: Request) -> Response
         finally:
             app.state.capture_slots.release()
     metadata = artifact.metadata or {}
+    _record_render_metrics(
+        payload,
+        cache_hit=cache_hit,
+        render_ms=render_ms,
+        queue_ms=queue_ms,
+    )
     diagnostic_headers = {
         "X-ViperCapture-Queue-Ms": str(max(0, queue_ms)),
         "X-ViperCapture-Render-Ms": str(max(0, render_ms)),
@@ -761,6 +1385,41 @@ async def _render_response(payload: RenderRequest, request: Request) -> Response
 @app.post("/v1/render", response_class=Response)
 async def render_v1(payload: RenderRequest, request: Request) -> Response:
     return await _render_response(payload, request)
+
+
+@app.get("/take", response_class=Response)
+async def screenshotone_compatible(request: Request) -> Response:
+    try:
+        payload = screenshotone_request(dict(request.query_params))
+    except (TypeError, ValueError) as exc:
+        raise RenderError("compatibility_options_invalid", str(exc), 422, False) from exc
+    return await _render_response(payload, request)
+
+
+@app.post("/compat/urlbox/v1/render/sync", response_class=Response)
+async def urlbox_compatible_sync(document: dict[str, object], request: Request) -> Response:
+    try:
+        payload = urlbox_request(document)
+    except (TypeError, ValueError) as exc:
+        raise RenderError("compatibility_options_invalid", str(exc), 422, False) from exc
+    return await _render_response(payload, request)
+
+
+@app.post("/compat/urlbox/v1/render/async", status_code=202)
+async def urlbox_compatible_async(document: dict[str, object], request: Request) -> JSONResponse:
+    try:
+        payload = urlbox_request(document)
+    except (TypeError, ValueError) as exc:
+        raise RenderError("compatibility_options_invalid", str(exc), 422, False) from exc
+    await _validate_profile_access(payload, request)
+    job = await _submit_job(
+        _async_job_service(),
+        payload,
+        request_id=_project_request_id(request, request.state.request_id),
+    )
+    await _own_resource(request, "job", job.id)
+    result = public_job_document(job)
+    return JSONResponse(result, status_code=202, headers={"Location": str(result["status_url"]), "Retry-After": "1"})
 
 
 @app.post("/v1/diff", response_class=Response)
@@ -806,6 +1465,91 @@ async def visual_diff(
     )
 
 
+def _baseline_context(request: Request, name: str) -> tuple[ControlPlane, str]:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", name):
+        raise RenderError("baseline_name_invalid", "Baseline names use letters, numbers, dot, dash, and underscore.", 422, False)
+    control = getattr(request.app.state, "control", None)
+    if control is None or request.state.project_id is None:
+        raise RenderError("baselines_disabled", "Project authentication is required for baselines.", 503, False)
+    return control, request.state.project_id
+
+
+@app.put("/v1/baselines/{name}")
+async def put_baseline(name: str, image: UploadFile, request: Request) -> JSONResponse:
+    control, project_id = _baseline_context(request, name)
+    body = await image.read(MAX_DIFF_INPUT_BYTES + 1)
+    if not body or len(body) > MAX_DIFF_INPUT_BYTES:
+        raise RenderError("baseline_too_large", "The baseline image exceeds the input limit.", 413, False)
+    await _settled_thread(validate_image, body, "baseline")
+    try:
+        document = await asyncio.to_thread(
+            control.put_baseline, project_id, name, body
+        )
+    except BaselineQuotaError as exc:
+        raise RenderError(
+            "baseline_quota_exceeded",
+            "The project baseline storage quota was reached.",
+            413,
+            False,
+        ) from exc
+    await asyncio.to_thread(control.audit, project_id, request.state.key_id, "baseline.updated", name)
+    return JSONResponse(document)
+
+
+@app.get("/v1/baselines")
+async def list_baselines(request: Request) -> list[dict[str, object]]:
+    control, project_id = _baseline_context(request, "all")
+    return await asyncio.to_thread(control.list_baselines, project_id)
+
+
+@app.delete("/v1/baselines/{name}", status_code=204)
+async def delete_baseline(name: str, request: Request) -> Response:
+    control, project_id = _baseline_context(request, name)
+    if not await asyncio.to_thread(control.delete_baseline, project_id, name):
+        raise RenderError("baseline_not_found", "The baseline was not found.", 404, False)
+    await asyncio.to_thread(
+        control.audit,
+        project_id,
+        request.state.key_id,
+        "baseline.deleted",
+        name,
+    )
+    return Response(status_code=204)
+
+
+@app.post("/v1/baselines/{name}/compare", response_class=Response)
+async def compare_baseline(
+    name: str,
+    current: UploadFile,
+    request: Request,
+    pixel_threshold: int = Form(0),
+    max_difference_ratio: float = Form(0),
+) -> Response:
+    control, project_id = _baseline_context(request, name)
+    try:
+        await asyncio.wait_for(
+            app.state.diff_slots.acquire(),
+            timeout=CAPTURE_QUEUE_TIMEOUT_SECONDS,
+        )
+    except TimeoutError as exc:
+        raise RenderError(
+            "diff_queue_busy", "The visual diff queue is busy.", 503, True
+        ) from exc
+    try:
+        baseline = await asyncio.to_thread(control.get_baseline, project_id, name)
+        if baseline is None:
+            raise RenderError("baseline_not_found", "The baseline was not found.", 404, False)
+        current_body = await current.read(MAX_DIFF_INPUT_BYTES + 1)
+        try:
+            result = await _settled_thread(compare_images, baseline, current_body, pixel_threshold=pixel_threshold, max_difference_ratio=max_difference_ratio)
+            bundle = await _settled_thread(create_diff_bundle, result)
+        except ValueError as exc:
+            raise RenderError("diff_options_invalid", str(exc), 422, False) from exc
+    finally:
+        app.state.diff_slots.release()
+    return Response(bundle, media_type="application/zip", headers={"X-ViperCapture-Diff-Passed": str(result.passed).lower(), "X-ViperCapture-Difference-Ratio": f"{result.ratio:.8f}"})
+
+
 @app.get("/v1/render/signed", response_class=Response)
 async def render_signed(
     request: Request,
@@ -826,6 +1570,13 @@ async def render_signed(
         signature,
         secret=SIGNING_SECRET,
     )
+    if render_request.profile_id is not None:
+        raise RenderError(
+            "signed_profile_unsupported",
+            "Signed render URLs cannot use persistent browser profiles.",
+            422,
+            False,
+        )
     response = await _render_response(render_request, request)
     if render_request.output is not OutputFormat.HTML:
         disposition = response.headers.get("Content-Disposition", "")
@@ -868,6 +1619,13 @@ async def create_signed_url(
             422,
             False,
         )
+    if payload.profile_id is not None:
+        raise RenderError(
+            "signed_profile_unsupported",
+            "Signed render URLs cannot use persistent browser profiles.",
+            422,
+            False,
+        )
     try:
         encoded, expires, signature = sign_render_request(
             payload,
@@ -900,16 +1658,72 @@ def _async_job_service() -> AsyncJobService:
     return service
 
 
+def _project_request_id(request: Request, request_id: str) -> str:
+    project_id = getattr(request.state, "project_id", None)
+    return f"_project-{project_id}:{request_id}" if project_id else request_id
+
+
+async def _validate_profile_access(payload: RenderRequest, request: Request) -> None:
+    if (
+        payload.profile_id is None
+        or not CONTROL_ENABLED
+        or request.state.is_admin
+        or request.state.trusted_local
+    ):
+        return
+    project_id = getattr(request.state, "project_id", None)
+    if project_id is None or not await asyncio.to_thread(
+        app.state.control.is_owner,
+        "profile",
+        payload.profile_id,
+        project_id,
+    ):
+        raise RenderError("profile_not_found", "The browser profile was not found.", 404, False)
+
+
+async def _own_resource(request: Request, kind: str, resource_id: str) -> None:
+    if CONTROL_ENABLED and request.state.project_id is not None:
+        ttl = _job_ownership_ttl() if kind == "job" else None
+        await asyncio.to_thread(
+            app.state.control.own,
+            kind,
+            resource_id,
+            request.state.project_id,
+            ttl,
+        )
+        if not await asyncio.to_thread(
+            app.state.control.is_owner, kind, resource_id, request.state.project_id
+        ):
+            raise RenderError("resource_conflict", "The resource belongs to another project.", 409, False)
+        await asyncio.to_thread(app.state.control.audit, request.state.project_id, request.state.key_id, f"{kind}.created", resource_id)
+
+
+async def _require_resource(request: Request | None, kind: str, resource_id: str) -> None:
+    if (
+        request is None
+        or not CONTROL_ENABLED
+        or request.state.is_admin
+        or request.state.trusted_local
+    ):
+        return
+    if request.state.project_id is None or not await asyncio.to_thread(
+        app.state.control.is_owner, kind, resource_id, request.state.project_id
+    ):
+        raise RenderError(f"{kind}_not_found", f"The {kind} was not found.", 404, False)
+
+
 @app.post("/v1/jobs", status_code=202)
 async def create_render_job(
     payload: RenderRequest,
     request: Request,
 ) -> JSONResponse:
+    await _validate_profile_access(payload, request)
     job = await _submit_job(
         _async_job_service(),
         payload,
-        request_id=request.state.request_id,
+        request_id=_project_request_id(request, request.state.request_id),
     )
+    await _own_resource(request, "job", job.id)
     document = public_job_document(job)
     return JSONResponse(
         document,
@@ -933,11 +1747,15 @@ async def create_bulk_render_jobs(
     existing_jobs = [None] * len(payload.items)
     preflight_errors: list[RenderError | None] = [None] * len(payload.items)
     request_ids = [
-        item.request_id or f"{request.state.request_id}-{index + 1}"
+        _project_request_id(
+            request,
+            item.request_id or f"{request.state.request_id}-{index + 1}",
+        )
         for index, item in enumerate(payload.items)
     ]
     for index, item in enumerate(payload.items):
         try:
+            await _validate_profile_access(item.render, request)
             existing_jobs[index] = await service.existing(
                 item.render,
                 request_id=request_ids[index],
@@ -995,6 +1813,7 @@ async def create_bulk_render_jobs(
                     "error": None,
                 }
             )
+            await _own_resource(request, "job", job.id)
         except RenderError as exc:
             failures += 1
             results.append(
@@ -1071,9 +1890,48 @@ async def _submit_job(
 
 
 @app.post("/v1/schedules", status_code=201)
-async def create_schedule(payload: ScheduleCreate) -> JSONResponse:
+async def create_schedule(payload: ScheduleCreate, request: Request) -> JSONResponse:
+    await _validate_profile_access(payload.render, request)
     await _validate_webhook(payload.render)
-    record = await _schedule_service().create(payload)
+    service = _schedule_service()
+    schedule_id = str(uuid4())
+    control = getattr(request.app.state, "control", None)
+    project_id = request.state.project_id
+    reserved = CONTROL_ENABLED and control is not None and project_id is not None
+    if reserved:
+        try:
+            size_bytes = await _settled_thread(
+                service.payload_size, schedule_id, payload.render
+            )
+            await _settled_thread(
+                control.reserve_schedule,
+                schedule_id,
+                project_id,
+                size_bytes,
+            )
+        except asyncio.CancelledError:
+            await _settled_thread(
+                control.disown, "schedule", schedule_id, project_id
+            )
+            raise
+        except ScheduleQuotaError as exc:
+            raise RenderError(
+                "schedule_quota_exceeded",
+                "The project schedule storage quota was reached.",
+                413,
+                False,
+            ) from exc
+    try:
+        record = await service.create(
+            payload, schedule_id=schedule_id, project_id=project_id
+        )
+    except BaseException:
+        if reserved and await service.store.get(schedule_id) is None:
+            await _settled_thread(
+                control.disown, "schedule", schedule_id, project_id
+            )
+        raise
+    await _own_resource(request, "schedule", record.id)
     return JSONResponse(
         public_schedule_document(record),
         status_code=201,
@@ -1083,13 +1941,19 @@ async def create_schedule(payload: ScheduleCreate) -> JSONResponse:
 
 @app.get("/v1/schedules")
 async def list_schedules(
+    request: Request,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     after: Annotated[str | None, Query(max_length=256)] = None,
 ) -> JSONResponse:
-    records = await _schedule_service().store.list(
-        limit=limit + 1,
-        after=after,
-    )
+    service = _schedule_service()
+    if CONTROL_ENABLED and not request.state.is_admin:
+        records = await service.store.list(
+            limit=limit + 1,
+            after=after,
+            project_id=request.state.project_id,
+        )
+    else:
+        records = await service.store.list(limit=limit + 1, after=after)
     has_more = len(records) > limit
     records = records[:limit]
     return JSONResponse(
@@ -1103,7 +1967,8 @@ async def list_schedules(
 
 
 @app.get("/v1/schedules/{schedule_id}")
-async def read_schedule(schedule_id: UUID) -> JSONResponse:
+async def read_schedule(schedule_id: UUID, request: Request) -> JSONResponse:
+    await _require_resource(request, "schedule", str(schedule_id))
     record = await _schedule_service().store.get(str(schedule_id))
     if record is None:
         raise RenderError("schedule_not_found", "The schedule was not found.", 404, False)
@@ -1111,27 +1976,63 @@ async def read_schedule(schedule_id: UUID) -> JSONResponse:
 
 
 @app.patch("/v1/schedules/{schedule_id}")
-async def update_schedule(schedule_id: UUID, payload: ScheduleUpdate) -> JSONResponse:
+async def update_schedule(schedule_id: UUID, payload: ScheduleUpdate, request: Request) -> JSONResponse:
+    await _require_resource(request, "schedule", str(schedule_id))
     service = _schedule_service()
     record = await service.store.get(str(schedule_id))
     if record is None:
         raise RenderError("schedule_not_found", "The schedule was not found.", 404, False)
     if payload.render is not None:
+        await _validate_profile_access(payload.render, request)
         await _validate_webhook(payload.render)
-    updated = await service.update(record, payload)
+    try:
+        updated = await service.update(record, payload)
+    except ScheduleQuotaError as exc:
+        raise RenderError(
+            "schedule_quota_exceeded",
+            "The project schedule storage quota was reached.",
+            413,
+            False,
+        ) from exc
     return JSONResponse(public_schedule_document(updated), headers={"Cache-Control": "private, no-store"})
 
 
 @app.delete("/v1/schedules/{schedule_id}", status_code=204)
-async def delete_schedule(schedule_id: UUID) -> Response:
-    deleted = await _schedule_service().delete(str(schedule_id))
+async def delete_schedule(schedule_id: UUID, request: Request) -> Response:
+    await _require_resource(request, "schedule", str(schedule_id))
+    owner = None
+    if CONTROL_ENABLED:
+        owner = await asyncio.to_thread(
+            app.state.control.owner, "schedule", str(schedule_id)
+        )
+    service = _schedule_service()
+    try:
+        deleted = await service.delete(str(schedule_id))
+    except asyncio.CancelledError:
+        current = await service.store.get(str(schedule_id))
+        if CONTROL_ENABLED and owner is not None and current is None:
+            await _settled_thread(
+                app.state.control.disown,
+                "schedule",
+                str(schedule_id),
+                owner,
+            )
+        raise
     if not deleted:
         raise RenderError("schedule_not_found", "The schedule was not found.", 404, False)
+    if CONTROL_ENABLED and owner is not None:
+        await _settled_thread(
+            app.state.control.disown,
+            "schedule",
+            str(schedule_id),
+            owner,
+        )
     return Response(status_code=204)
 
 
 @app.get("/v1/jobs/{job_id}")
-async def read_render_job(job_id: UUID) -> JSONResponse:
+async def read_render_job(job_id: UUID, request: Request = None) -> JSONResponse:
+    await _require_resource(request, "job", str(job_id))
     job = await _async_job_service().get(str(job_id))
     if job is None:
         raise RenderError(
@@ -1147,7 +2048,8 @@ async def read_render_job(job_id: UUID) -> JSONResponse:
 
 
 @app.delete("/v1/jobs/{job_id}")
-async def cancel_render_job(job_id: UUID) -> JSONResponse:
+async def cancel_render_job(job_id: UUID, request: Request) -> JSONResponse:
+    await _require_resource(request, "job", str(job_id))
     job = await _async_job_service().cancel(str(job_id))
     if job is None:
         raise RenderError(
@@ -1164,6 +2066,7 @@ async def cancel_render_job(job_id: UUID) -> JSONResponse:
 
 @app.get("/v1/jobs/{job_id}/result", response_class=Response)
 async def read_render_job_result(job_id: UUID, request: Request) -> Response:
+    await _require_resource(request, "job", str(job_id))
     service = _async_job_service()
     job = await service.get(str(job_id))
     if job is None:
@@ -1307,6 +2210,7 @@ async def _gpu_config(app: FastAPI) -> dict[str, object]:
 async def app_config():
     return {
         "server_saves": not HOSTED,
+        "control_plane": CONTROL_ENABLED,
         "max_screenshot_pixels": MAX_SCREENSHOT_PIXELS,
         "async_jobs": {
             "enabled": ASYNC_JOBS_ENABLED,

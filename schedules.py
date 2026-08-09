@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import logging
 import os
 import sqlite3
@@ -26,6 +27,18 @@ from render_errors import RenderError
 
 UTC = timezone.utc
 logger = logging.getLogger("vipercapture.schedules")
+
+
+def load_schedule_store(settings) -> "ScheduleStore":
+    spec = os.getenv("VIPERCAPTURE_SCHEDULE_STORE_FACTORY", "")
+    if not spec:
+        return ScheduleStore(settings.data_dir / "schedules.sqlite3")
+    module_name, separator, attribute = spec.partition(":")
+    if not separator or not module_name or not attribute:
+        raise ValueError(
+            "VIPERCAPTURE_SCHEDULE_STORE_FACTORY must use module:function syntax"
+        )
+    return getattr(importlib.import_module(module_name), attribute)(settings)
 
 
 class StrictModel(BaseModel):
@@ -68,6 +81,7 @@ class ScheduleRecord:
     last_job_id: str | None = None
     last_error: str | None = None
     pending_attempt: int = 0
+    project_id: str | None = None
 
 
 def validate_cron(expression: str, timezone_name: str) -> None:
@@ -168,7 +182,8 @@ class ScheduleStore:
                 last_job_id TEXT,
                 last_error TEXT,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                project_id TEXT
             );
             CREATE INDEX IF NOT EXISTS schedules_due_idx
                 ON schedules(enabled, next_run_at);
@@ -186,6 +201,12 @@ class ScheduleStore:
             self.connection.execute(
                 "ALTER TABLE schedules ADD COLUMN pending_attempt INTEGER NOT NULL DEFAULT 0"
             )
+        if "project_id" not in columns:
+            self.connection.execute("ALTER TABLE schedules ADD COLUMN project_id TEXT")
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS schedules_project_list_idx "
+            "ON schedules(project_id, created_at, id)"
+        )
         self.connection.commit()
         self._scrub_pending = existed
         self._try_scrub_payload_history()
@@ -250,6 +271,11 @@ class ScheduleStore:
                 if "pending_attempt" in columns
                 else 0
             ),
+            project_id=(
+                str(row["project_id"])
+                if "project_id" in columns and row["project_id"] is not None
+                else None
+            ),
         )
 
     async def create(self, record: ScheduleRecord) -> ScheduleRecord:
@@ -261,8 +287,8 @@ class ScheduleStore:
         connection.execute(
             """INSERT INTO schedules
             (id,name,cron,timezone,enabled,payload,next_run_at,last_run_at,
-             last_job_id,last_error,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+             last_job_id,last_error,created_at,updated_at,project_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 record.id,
                 record.name,
@@ -276,6 +302,7 @@ class ScheduleStore:
                 None,
                 record.created_at.isoformat(),
                 record.updated_at.isoformat(),
+                record.project_id,
             ),
         )
         connection.commit()
@@ -290,12 +317,18 @@ class ScheduleStore:
         ).fetchone()
 
     async def list(
-        self, *, limit: int = 50, after: str | None = None
+        self,
+        *,
+        limit: int = 50,
+        after: str | None = None,
+        project_id: str | None = None,
     ) -> list[ScheduleRecord]:
-        rows = await self._run(self._list, limit, after)
+        rows = await self._run(self._list, limit, after, project_id)
         return [self._record(row) for row in rows]
 
-    def _list(self, limit: int, after: str | None) -> list[sqlite3.Row]:
+    def _list(
+        self, limit: int, after: str | None, project_id: str | None
+    ) -> list[sqlite3.Row]:
         connection = self._require()
         cursor_created_at = None
         cursor_id = None
@@ -306,15 +339,27 @@ class ScheduleStore:
             "last_error,created_at,updated_at"
         )
         if cursor_created_at is None:
+            if project_id is not None:
+                return connection.execute(
+                    f"SELECT {columns} FROM schedules WHERE project_id=? "
+                    "ORDER BY created_at,id LIMIT ?",
+                    (project_id, limit),
+                ).fetchall()
             return connection.execute(
                 f"SELECT {columns} FROM schedules ORDER BY created_at,id LIMIT ?",
                 (limit,),
             ).fetchall()
+        project_filter = "project_id=? AND " if project_id is not None else ""
+        parameters = (
+            (project_id, cursor_created_at, cursor_created_at, cursor_id, limit)
+            if project_id is not None
+            else (cursor_created_at, cursor_created_at, cursor_id, limit)
+        )
         return connection.execute(
-            f"SELECT {columns} FROM schedules "
-            "WHERE created_at > ? OR (created_at = ? AND id > ?) "
+            f"SELECT {columns} FROM schedules WHERE {project_filter}"
+            "(created_at > ? OR (created_at = ? AND id > ?)) "
             "ORDER BY created_at,id LIMIT ?",
-            (cursor_created_at, cursor_created_at, cursor_id, limit),
+            parameters,
         ).fetchall()
 
     async def update(
@@ -556,11 +601,17 @@ class ScheduleService:
         cipher: PayloadCipher,
         *,
         poll_seconds: float = 1.0,
+        on_job_created=None,
+        project_for_schedule=None,
+        on_schedule_resize=None,
     ) -> None:
         self.store = store
         self.jobs = jobs
         self.cipher = cipher
         self.poll_seconds = max(0.1, poll_seconds)
+        self.on_job_created = on_job_created
+        self.project_for_schedule = project_for_schedule
+        self.on_schedule_resize = on_schedule_resize
         self.task: asyncio.Task | None = None
         self.mutation_lock = asyncio.Lock()
 
@@ -582,9 +633,18 @@ class ScheduleService:
     def _decrypt(self, record: ScheduleRecord) -> RenderRequest:
         return self.cipher.decrypt(SimpleNamespace(id=record.id, payload=record.payload))
 
-    async def create(self, request: ScheduleCreate) -> ScheduleRecord:
+    def payload_size(self, schedule_id: str, request: RenderRequest) -> int:
+        return len(self._encrypt(schedule_id, request))
+
+    async def create(
+        self,
+        request: ScheduleCreate,
+        *,
+        schedule_id: str | None = None,
+        project_id: str | None = None,
+    ) -> ScheduleRecord:
         now = datetime.now(UTC)
-        schedule_id = str(uuid4())
+        schedule_id = schedule_id or str(uuid4())
         record = ScheduleRecord(
             id=schedule_id,
             name=request.name,
@@ -595,6 +655,7 @@ class ScheduleService:
             next_run_at=next_run(request.cron, request.timezone, now),
             created_at=now,
             updated_at=now,
+            project_id=project_id,
         )
         return await self.store.create(record)
 
@@ -639,9 +700,27 @@ class ScheduleService:
         )
         try:
             async with self.mutation_lock:
-                return await self.store.update(
-                    updated, expected_updated_at=record.updated_at
-                )
+                try:
+                    if (
+                        request.render is not None
+                        and self.on_schedule_resize is not None
+                    ):
+                        await self.on_schedule_resize(
+                            record.id, record.project_id, len(updated.payload)
+                        )
+                    return await self.store.update(
+                        updated, expected_updated_at=record.updated_at
+                    )
+                except BaseException:
+                    if request.render is not None and self.on_schedule_resize is not None:
+                        current = await self.store.get(record.id)
+                        if current is not None:
+                            await self.on_schedule_resize(
+                                current.id,
+                                current.project_id,
+                                len(current.payload),
+                            )
+                    raise
         except KeyError as exc:
             raise RenderError(
                 "schedule_conflict",
@@ -695,6 +774,10 @@ class ScheduleService:
                             else ""
                         )
                     )
+                    if self.project_for_schedule is not None:
+                        project_id = await self.project_for_schedule(record.id)
+                        if project_id is not None:
+                            request_id = f"_project-{project_id}:{request_id}"
                     job = await self.jobs.submit(
                         render,
                         request_id=request_id,
@@ -706,6 +789,8 @@ class ScheduleService:
                             expected_attempt=record.pending_attempt,
                         )
                         continue
+                    if self.on_job_created is not None:
+                        await self.on_job_created(record.id, job.id)
                     await self.store.record_result(
                         record.id, job_id=job.id, error=None
                     )

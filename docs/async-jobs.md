@@ -142,8 +142,14 @@ ambiguous acknowledgements and retried even after result expiry.
 `get` and `cancel` must normalize an overdue queued job to `expired`; `get`
 must likewise normalize an overdue successful result so route order cannot
 change the terminal state.
-`requeue_running` supplies restart recovery without exceeding its
-`max_attempts` argument. `maintain` returns expired artifact keys for deletion
+`requeue_running` supplies single-process restart recovery without exceeding
+its `max_attempts` argument. A store used by a split worker process must also
+implement `recover_stale(now, max_attempts)` with durable claim leases or
+heartbeats. It may recover only expired claims; blanket requeueing can duplicate
+work still running in another worker. `defer` must atomically move the current
+claimed attempt from `running` back to `queued`, clear its claim, and decrement
+the attempt counter because capacity deferral does not spend an attempt.
+`maintain` returns expired artifact keys for deletion
 and must preserve successful metadata and artifacts until `result_expires_at`,
 even when the metadata TTL is shorter. `requeue` receives the claimed job's
 `expected_attempt` and must use it as a compare-and-swap token. Retrying an
@@ -220,9 +226,9 @@ Keep it on loopback or protect every render and job endpoint with the same
 reverse-proxy authentication. UUID job IDs are useful locators, not access
 control.
 
-Run one application process. The bundled SQLite adapter coordinates its
-workers within that process; a custom distributed adapter still does not change
-the repository's one-process-per-Chromium-tree deployment recommendation.
+The bundled SQLite adapter supports the default combined process. Split API and
+worker roles require an external job adapter with lease-based stale-claim
+recovery; each worker still owns one Chromium tree.
 Custom providers should use TLS, least-privilege credentials, bounded retries,
 and server-side expiry. Never put provider credentials in browser JavaScript or
 the repository.

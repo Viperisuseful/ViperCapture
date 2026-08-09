@@ -12,6 +12,7 @@ import os
 import stat
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
@@ -29,6 +30,9 @@ PAYLOAD_VERSION = b"vipercapture-open-async-v1\0"
 MAX_WEBHOOK_ATTEMPTS = 10
 MAX_WEBHOOK_CONCURRENCY = 4
 logger = logging.getLogger("vipercapture.async_jobs")
+_CURRENT_JOB: ContextVar[JobRecord | None] = ContextVar(
+    "vipercapture_current_job", default=None
+)
 
 
 @dataclass(frozen=True)
@@ -84,6 +88,10 @@ class JobRecord:
     error_retryable: bool | None = None
 
 
+def current_job() -> JobRecord | None:
+    return _CURRENT_JOB.get()
+
+
 @dataclass(frozen=True)
 class Artifact:
     key: str
@@ -112,6 +120,14 @@ class QueueFullError(Exception):
 
 class JobConflictError(Exception):
     pass
+
+
+class JobDeferred(Exception):
+    """Return a claimed job to its queue without spending an attempt."""
+
+    def __init__(self, delay_seconds: float = 1.0) -> None:
+        self.delay_seconds = delay_seconds
+        super().__init__("job execution deferred")
 
 
 class IdempotencyConflictError(Exception):
@@ -289,6 +305,12 @@ class JobStore(Protocol):
         expected_attempt: int,
         available_at: datetime,
     ) -> None: ...
+    async def defer(
+        self,
+        job_id: str,
+        expected_attempt: int,
+        available_at: datetime,
+    ) -> None: ...
     async def maintain(self, now: datetime) -> list[str]: ...
     async def expire_result(
         self,
@@ -345,10 +367,18 @@ def _positive_int(name: str, default: int) -> int:
     return value
 
 
+def _nonnegative_int(name: str, default: int) -> int:
+    value = int(os.getenv(name, str(default)))
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative")
+    return value
+
+
 def settings_from_environment(
     *,
     default_workers: int = 1,
     base_dir: Path | None = None,
+    allow_zero_workers: bool = False,
 ) -> JobSettings:
     root = Path(
         os.getenv(
@@ -359,9 +389,10 @@ def settings_from_environment(
     return JobSettings(
         data_dir=root,
         queue_limit=_positive_int("VIPERCAPTURE_JOB_QUEUE_LIMIT", 30),
-        worker_count=_positive_int(
-            "VIPERCAPTURE_JOB_WORKERS",
-            default_workers,
+        worker_count=(
+            _nonnegative_int("VIPERCAPTURE_JOB_WORKERS", default_workers)
+            if allow_zero_workers
+            else _positive_int("VIPERCAPTURE_JOB_WORKERS", default_workers)
         ),
         queue_ttl=timedelta(
             seconds=_positive_int("VIPERCAPTURE_JOB_QUEUE_TTL_SECONDS", 900)
@@ -543,6 +574,10 @@ class AsyncJobService:
         *,
         cipher: PayloadCipher | None = None,
         notifier: JobNotifier | None = None,
+        recover_running: bool = True,
+        recover_stale: bool = False,
+        ownership_reserver: Callable[[str, str], Awaitable[None]] | None = None,
+        ownership_releaser: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self.settings = settings
         self.job_store = job_store
@@ -550,6 +585,10 @@ class AsyncJobService:
         self.renderer = renderer
         self.cipher = cipher or PayloadCipher.for_data_dir(settings.data_dir)
         self.notifier = notifier
+        self.recover_running = recover_running
+        self.recover_stale = recover_stale
+        self.ownership_reserver = ownership_reserver
+        self.ownership_releaser = ownership_releaser
         if notifier is not None and not isinstance(
             job_store, NotificationJobStore
         ):
@@ -578,10 +617,16 @@ class AsyncJobService:
             await self.job_store.start()
             artifact_store_started = True
             await self.artifact_store.start()
-            await self.job_store.requeue_running(
-                datetime.now(UTC),
-                self.settings.max_attempts,
-            )
+            if self.recover_running:
+                await self.job_store.requeue_running(
+                    datetime.now(UTC),
+                    self.settings.max_attempts,
+                )
+            elif self.recover_stale:
+                await getattr(self.job_store, "recover_stale")(
+                    datetime.now(UTC),
+                    self.settings.max_attempts,
+                )
             await self._maintain(force=True)
             if self.notifier is not None:
                 self._notification_wakeup.set()
@@ -676,9 +721,15 @@ class AsyncJobService:
                 else None
             ),
         )
+        reserved = False
+        if self.ownership_reserver is not None:
+            await self.ownership_reserver(job_id, request_id)
+            reserved = True
         try:
             stored = await self.job_store.create(job, self.settings.queue_limit)
         except QueueFullError as exc:
+            if reserved and self.ownership_releaser is not None:
+                await self.ownership_releaser(job_id)
             raise RenderError(
                 "async_queue_full",
                 "The async render queue is full.",
@@ -688,12 +739,41 @@ class AsyncJobService:
                 {"Retry-After": "5"},
             ) from exc
         except IdempotencyConflictError as exc:
+            if reserved and self.ownership_releaser is not None:
+                await self.ownership_releaser(job_id)
             raise RenderError(
                 "idempotency_key_conflict",
                 "X-Request-Id was already used for a different render.",
                 409,
                 False,
             ) from exc
+        except asyncio.CancelledError:
+            committed = None
+            reconciled = False
+            try:
+                committed = await self.job_store.get(job_id, datetime.now(UTC))
+                reconciled = True
+            except BaseException:
+                pass
+            if committed is not None:
+                self._wake_workers()
+            elif (
+                reconciled
+                and reserved
+                and self.ownership_releaser is not None
+            ):
+                await self.ownership_releaser(job_id)
+            raise
+        except BaseException:
+            if reserved and self.ownership_releaser is not None:
+                await self.ownership_releaser(job_id)
+            raise
+        if (
+            reserved
+            and stored.id != job_id
+            and self.ownership_releaser is not None
+        ):
+            await self.ownership_releaser(job_id)
         self._wake_workers()
         return stored
 
@@ -1208,7 +1288,11 @@ class AsyncJobService:
         payload: RenderRequest | None = None
         try:
             payload = self.cipher.decrypt(job)
-            rendered = await self.renderer(payload)
+            token = _CURRENT_JOB.set(job)
+            try:
+                rendered = await self.renderer(payload)
+            finally:
+                _CURRENT_JOB.reset(token)
             if self._closing:
                 return
             stored = await self.artifact_store.put(
@@ -1274,6 +1358,21 @@ class AsyncJobService:
             # a committed success from interrupted work and enforce attempts.
             # An uploaded-but-uncommitted artifact retains its storage TTL.
             raise
+        except JobDeferred as exc:
+            available_at = datetime.now(UTC) + timedelta(
+                seconds=max(0.1, exc.delay_seconds)
+            )
+            await self._retry_state_transition(
+                "defer",
+                lambda: self.job_store.defer(
+                    job.id,
+                    job.attempt_count,
+                    available_at,
+                ),
+                lambda: self._transition_conflict_resolved(job),
+            )
+            self._wake_at(available_at)
+            return
         except Exception as exc:
             if stored_key:
                 await self._safe_delete(stored_key)
@@ -1321,6 +1420,14 @@ class AsyncJobService:
             self._wake_workers()
 
 def public_job_document(job: JobRecord) -> dict[str, object]:
+    prefix, separator, request_id = job.request_id.partition(":")
+    if not (
+        separator
+        and prefix.startswith("_project-")
+        and len(prefix) == 33
+        and all(character in "0123456789abcdef" for character in prefix[9:])
+    ):
+        request_id = job.request_id
     result = None
     if job.status == "succeeded":
         result = {
@@ -1337,7 +1444,7 @@ def public_job_document(job: JobRecord) -> dict[str, object]:
         }
     return {
         "id": job.id,
-        "request_id": job.request_id,
+        "request_id": request_id,
         "status": job.status,
         "status_url": f"/v1/jobs/{job.id}",
         "result_url": (

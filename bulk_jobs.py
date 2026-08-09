@@ -2,21 +2,15 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from render_contract import RenderRequest
-from render_errors import RenderError
+from render_errors import RenderError, reserved_request_id
 
 MAX_BULK_BODY_BYTES = 6 * 1024 * 1024
 MAX_JSON_BODY_BYTES = 32 * 1024 * 1024
 MAX_DIFF_BODY_BYTES = 2 * 20 * 1024 * 1024 + 1024 * 1024
-JSON_BODY_PATHS = {
-    "/v1/render",
-    "/v1/signed-url",
-    "/v1/jobs",
-    "/v1/jobs/bulk",
-    "/v1/schedules",
-}
+MAX_BASELINE_BODY_BYTES = 20 * 1024 * 1024 + 1024 * 1024
 
 
 class StrictModel(BaseModel):
@@ -33,6 +27,13 @@ class BulkJobItem(StrictModel):
     )
     render: RenderRequest
 
+    @field_validator("request_id")
+    @classmethod
+    def reject_reserved_request_id(cls, value: str | None) -> str | None:
+        if value is not None and reserved_request_id(value):
+            raise ValueError("request_id uses a reserved internal namespace")
+        return value
+
 
 class BulkJobRequest(StrictModel):
     items: list[BulkJobItem] = Field(min_length=1, max_length=100)
@@ -48,16 +49,18 @@ class BulkBodyLimitMiddleware:
     async def __call__(self, scope, receive, send) -> None:
         path = scope.get("path", "")
         method = scope.get("method")
-        if scope["type"] != "http" or method not in {"POST", "PATCH"}:
+        if scope["type"] != "http" or method not in {"POST", "PATCH", "PUT"}:
             await self.app(scope, receive, send)
             return
-        if path == "/v1/diff":
+        if path == "/v1/diff" or (
+            path.startswith("/v1/baselines/") and path.endswith("/compare")
+        ):
             maximum = MAX_DIFF_BODY_BYTES
+        elif method == "PUT" and path.startswith("/v1/baselines/"):
+            maximum = MAX_BASELINE_BODY_BYTES
         elif path == "/v1/jobs/bulk":
             maximum = self.max_bytes
-        elif path in JSON_BODY_PATHS or (
-            method == "PATCH" and path.startswith("/v1/schedules/")
-        ):
+        elif path.startswith("/v1/") or path.startswith("/compat/"):
             maximum = MAX_JSON_BODY_BYTES
         else:
             await self.app(scope, receive, send)

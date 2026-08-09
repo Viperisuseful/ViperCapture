@@ -49,7 +49,7 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectVa
 import { Switch } from "@/components/ui/switch"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 
-type Output = "png" | "jpeg" | "webp" | "pdf" | "html" | "markdown" | "metadata" | "webm"
+type Output = "png" | "jpeg" | "webp" | "avif" | "pdf" | "html" | "markdown" | "metadata" | "webm" | "mp4" | "gif"
 type Capture = {
   name: string
   url: string
@@ -63,6 +63,7 @@ type Capture = {
 type ActiveRun = { waitConditions: string; waitTimeout: number }
 type AppConfig = {
   max_screenshot_pixels?: number
+  control_plane?: boolean
   gpu?: { mode?: "off" | "auto" | "required"; hardware_active?: boolean; mutable?: boolean }
 }
 type CaptchaWarning = { provider: string; requestId?: string }
@@ -85,6 +86,7 @@ const providerNames: Record<string, string> = {
   unknown: "A page-level CAPTCHA",
 }
 const docsUrl = "https://github.com/Viperisuseful/ViperCapture/blob/master/docs/self-hosting.md"
+const siteAccessUrl = "https://github.com/Viperisuseful/ViperCapture/blob/master/docs/site-access.md"
 const blockedHeaderNames = new Set([
   "connection", "content-length", "forwarded", "host", "keep-alive",
   "proxy-authenticate", "proxy-authorization", "te", "trailer",
@@ -196,6 +198,7 @@ function ResultMetric({ label, value, mono = false }: { label: string; value: st
 export default function App() {
   const [dark, setDark] = useState(() => localStorage.getItem("theme") === "dark")
   const [url, setUrl] = useState("https://example.com")
+  const [apiKey, setApiKey] = useState("")
   const [output, setOutput] = useState<Output>("png")
   const [width, setWidth] = useState(1280)
   const [height, setHeight] = useState(720)
@@ -255,7 +258,8 @@ export default function App() {
   }, [busy])
 
   const maxPixels = config?.max_screenshot_pixels ?? 50_000_000
-  const imageOutput = output === "png" || output === "jpeg" || output === "webp"
+  const imageOutput = output === "png" || output === "jpeg" || output === "webp" || output === "avif"
+  const videoOutput = output === "webm" || output === "mp4" || output === "gif"
   const gpuEnabled = config?.gpu?.mode !== "off"
   const gpuCopy = useMemo(() => {
     if (!gpuEnabled) return "Uses Chromium's default software-compatible mode."
@@ -366,12 +370,12 @@ export default function App() {
       lazy_load: lazyLoad,
       selector: imageOutput ? selector || null : null,
       image: {
-        quality: output === "jpeg" || output === "webp" ? quality : null,
-        transparent_background: (output === "png" || output === "webp") && transparent,
+        quality: output === "jpeg" || output === "webp" || output === "avif" ? quality : null,
+        transparent_background: (output === "png" || output === "webp" || output === "avif") && transparent,
         optimize_for_speed: output === "png" && optimizePng,
       },
       diagnostics: { bundle: diagnostics },
-      video: output === "webm" ? { duration_ms: videoDuration * 1000, scroll: videoScroll } : null,
+      video: videoOutput ? { duration_ms: videoDuration * 1000, scroll: videoScroll } : null,
       headers: customHeaders,
       wait_for: {
         event: waitEvent,
@@ -392,7 +396,10 @@ export default function App() {
     try {
       const response = await fetch("/v1/render", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+        },
         body: JSON.stringify(payload),
         signal: controller.signal,
       })
@@ -486,14 +493,14 @@ export default function App() {
             <Badge variant="outline" className="mb-4"><Sparkles data-icon="inline-start" />Local Chromium renderer</Badge>
             <h1 className="page-title">The whole webpage, in one capture.</h1>
             <p className="mt-4 max-w-2xl text-base leading-7 text-muted-foreground sm:text-lg">
-              Self-host screenshots, documents, metadata, and WebM video with the same render contract as ViperCapture Cloud.
+              Self-host screenshots, documents, metadata, and video with the complete ViperCapture render contract.
             </p>
           </div>
           <div className="grid grid-cols-3 gap-2">
             {[
               [Gauge, "Local", "Private"],
               [Zap, "Fast", "Chromium"],
-              [ImageIcon, "8", "Outputs"],
+              [ImageIcon, "11", "Outputs"],
             ].map(([Icon, value, label]) => (
               <Card key={String(label)} size="sm" className="min-w-24">
                 <CardContent className="flex items-center gap-2">
@@ -514,6 +521,13 @@ export default function App() {
                 <InputGroupTextarea id="capture-url" rows={1} value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://example.com" className="min-h-10" />
               </InputGroup>
             </Field>
+            {config?.control_plane && (
+              <Field className="lg:w-72">
+                <FieldLabel htmlFor="project-api-key">Project API key</FieldLabel>
+                <Input id="project-api-key" type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="vcp_…" />
+                <FieldDescription>Kept only in memory until this page closes.</FieldDescription>
+              </Field>
+            )}
             <Button size="lg" onClick={() => void capture()} disabled={busy} className="lg:min-w-36">
               {busy ? <Loader2 data-icon="inline-start" className="animate-spin" /> : <ImageIcon data-icon="inline-start" />}
               {busy ? "Rendering" : "Capture"}
@@ -533,9 +547,9 @@ export default function App() {
                     <Select value={output} onValueChange={(value: string) => setOutput(value as Output)}>
                       <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
                       <SelectContent><SelectGroup>
-                        <SelectItem value="png">PNG image</SelectItem><SelectItem value="jpeg">JPEG image</SelectItem><SelectItem value="webp">WebP image</SelectItem>
+                        <SelectItem value="png">PNG image</SelectItem><SelectItem value="jpeg">JPEG image</SelectItem><SelectItem value="webp">WebP image</SelectItem><SelectItem value="avif">AVIF image</SelectItem>
                         <SelectItem value="pdf">PDF document</SelectItem><SelectItem value="html">Hydrated HTML</SelectItem><SelectItem value="markdown">Markdown</SelectItem>
-                        <SelectItem value="metadata">Metadata JSON</SelectItem><SelectItem value="webm">WebM video</SelectItem>
+                        <SelectItem value="metadata">Metadata JSON</SelectItem><SelectItem value="webm">WebM video</SelectItem><SelectItem value="mp4">MP4 video</SelectItem><SelectItem value="gif">Animated GIF</SelectItem>
                       </SelectGroup></SelectContent>
                     </Select>
                   </Field>
@@ -608,15 +622,15 @@ export default function App() {
                         </Field>
                         <Field><FieldLabel htmlFor="wait-text">Wait text</FieldLabel><Input id="wait-text" value={waitText} onChange={(event) => setWaitText(event.target.value)} placeholder="Loaded" /></Field>
                       </div>
-                      {(output === "jpeg" || output === "webp") && <Field><FieldLabel htmlFor="quality">Image quality</FieldLabel><Input id="quality" type="number" min={1} max={100} value={quality} onChange={(event) => setQuality(Number(event.target.value))} /></Field>}
-                      {(output === "png" || output === "webp") && <Field orientation="horizontal"><FieldLabel htmlFor="transparent">Transparent background</FieldLabel><Switch id="transparent" checked={transparent} onCheckedChange={setTransparent} /></Field>}
+                      {(output === "jpeg" || output === "webp" || output === "avif") && <Field><FieldLabel htmlFor="quality">Image quality</FieldLabel><Input id="quality" type="number" min={1} max={100} value={quality} onChange={(event) => setQuality(Number(event.target.value))} /></Field>}
+                      {(output === "png" || output === "webp" || output === "avif") && <Field orientation="horizontal"><FieldLabel htmlFor="transparent">Transparent background</FieldLabel><Switch id="transparent" checked={transparent} onCheckedChange={setTransparent} /></Field>}
                       {output === "png" && <Field orientation="horizontal"><FieldLabel htmlFor="optimize-png"><span><span className="block">Fast PNG encoding</span><FieldDescription>Uses less encoding work, with a larger file.</FieldDescription></span></FieldLabel><Switch id="optimize-png" checked={optimizePng} onCheckedChange={setOptimizePng} /></Field>}
-                      {output === "webm" && <><Field><FieldLabel htmlFor="video-duration">Video duration (seconds)</FieldLabel><Input id="video-duration" type="number" min={1} max={30} value={videoDuration} onChange={(event) => setVideoDuration(Number(event.target.value))} /></Field><Field orientation="horizontal"><FieldLabel htmlFor="video-scroll">Scroll while recording</FieldLabel><Switch id="video-scroll" checked={videoScroll} onCheckedChange={setVideoScroll} /></Field></>}
+                      {videoOutput && <><Field><FieldLabel htmlFor="video-duration">Video duration (seconds)</FieldLabel><Input id="video-duration" type="number" min={1} max={30} value={videoDuration} onChange={(event) => setVideoDuration(Number(event.target.value))} /></Field><Field orientation="horizontal"><FieldLabel htmlFor="video-scroll">Scroll while recording</FieldLabel><Switch id="video-scroll" checked={videoScroll} onCheckedChange={setVideoScroll} /></Field></>}
                       <Field orientation="horizontal"><FieldLabel htmlFor="diagnostics"><span><span className="block">Diagnostic bundle</span><FieldDescription>ZIP the artifact with console and network reports.</FieldDescription></span></FieldLabel><Switch id="diagnostics" checked={diagnostics} onCheckedChange={setDiagnostics} /></Field>
                       <Field data-invalid={headersTouched && Boolean(headersValidation.error)}>
                         <FieldLabel htmlFor="headers">Same-origin headers · <a href={`${docsUrl}#custom-headers`} target="_blank" rel="noreferrer">Docs</a></FieldLabel>
                         <Input id="headers" value={headers} onChange={(event) => setHeaders(event.target.value)} onBlur={() => setHeadersTouched(true)} placeholder={'{"Authorization":"Bearer …"}'} aria-invalid={headersTouched && Boolean(headersValidation.error)} />
-                        <FieldDescription>Sent only to the exact target origin.</FieldDescription>
+                        <FieldDescription>Sent only to the exact target origin. <a href={siteAccessUrl} target="_blank" rel="noreferrer">Authorize a site you control.</a></FieldDescription>
                         {headersTouched && <FieldError>{headersValidation.error}</FieldError>}
                       </Field>
                     </FieldGroup>

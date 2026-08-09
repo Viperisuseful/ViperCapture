@@ -4,7 +4,10 @@ import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
+
+from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 import main
 from async_jobs import JobRecord
@@ -33,21 +36,89 @@ class PlatformRouteTests(unittest.TestCase):
 
     def test_desktop_cors_allows_schedule_updates(self):
         self.assertIn("PATCH", main.DESKTOP_ALLOW_METHODS)
+        self.assertIn("PUT", main.DESKTOP_ALLOW_METHODS)
+
+    def test_profile_storage_state_is_validated_before_persistence(self):
+        with self.assertRaises(ValidationError):
+            main.ProfileCreate(storage_state={"cookies": "invalid", "origins": []})
+        with self.assertRaises(ValidationError):
+            main.ProfileCreate(
+                storage_state={
+                    "cookies": [{"name": "missing-fields"}],
+                    "origins": [],
+                }
+            )
+        for origin in ("https://example.com:abc", "https://example.com:70000"):
+            with self.subTest(origin=origin), self.assertRaises(ValidationError):
+                main.ProfileCreate(
+                    storage_state={
+                        "cookies": [],
+                        "origins": [
+                            {"origin": origin, "localStorage": []}
+                        ],
+                    }
+                )
+        with self.assertRaises(ValidationError):
+            main.ProfileCreate(
+                storage_state={
+                    "cookies": [],
+                    "origins": [
+                        {"origin": "not-an-origin", "localStorage": []}
+                    ],
+                }
+            )
+        profile = main.ProfileCreate(
+            storage_state={
+                "cookies": [],
+                "origins": [
+                    {
+                        "origin": "https://example.com/",
+                        "localStorage": [],
+                    }
+                ],
+            }
+        )
+        self.assertEqual(
+            profile.storage_state.origins[0].origin, "https://example.com"
+        )
 
 
 class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
-    async def test_health_bypasses_desktop_token(self):
+    async def test_invalid_baseline_is_rejected_before_persistence(self):
+        control = SimpleNamespace(put_baseline=Mock(), audit=Mock())
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(control=control)),
+            state=SimpleNamespace(project_id="project", key_id="key"),
+        )
+        image = SimpleNamespace(read=AsyncMock(return_value=b"not-an-image"))
+        with self.assertRaises(RenderError) as raised:
+            await main.put_baseline("home", image, request)
+        self.assertEqual(raised.exception.code, "diff_input_invalid")
+        control.put_baseline.assert_not_called()
+
+    async def test_readiness_is_unavailable_without_a_browser(self):
+        original_browser = getattr(main.app.state, "browser", None)
+        main.app.state.browser = None
+        try:
+            response = await main.ready()
+        finally:
+            main.app.state.browser = original_browser
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(json.loads(response.body)["ready"])
+
+    async def test_health_and_readiness_bypass_desktop_token(self):
         expected = main.Response(status_code=200)
         call_next = AsyncMock(return_value=expected)
-        request = SimpleNamespace(
-            method="GET",
-            url=SimpleNamespace(path="/health"),
-            headers={},
-        )
         with patch("main.DESKTOP_TOKEN", "secret"):
-            response = await main.require_desktop_token(request, call_next)
-        self.assertIs(response, expected)
-        call_next.assert_awaited_once_with(request)
+            for path in ("/health", "/ready"):
+                request = SimpleNamespace(
+                    method="GET",
+                    url=SimpleNamespace(path=path),
+                    headers={},
+                )
+                response = await main.require_desktop_token(request, call_next)
+                self.assertIs(response, expected)
+        self.assertEqual(call_next.await_count, 2)
 
     async def test_signed_routes_use_their_own_authentication(self):
         expected = main.Response(status_code=200)
@@ -75,6 +146,202 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertIs(response, expected)
         self.assertEqual(call_next.await_count, 2)
+
+    async def test_control_credentials_also_satisfy_desktop_auth(self):
+        expected = main.Response(status_code=200)
+        call_next = AsyncMock(return_value=expected)
+        control = SimpleNamespace(
+            authenticate=Mock(
+                return_value={
+                    "project_id": "project",
+                    "key_id": "key",
+                    "scopes": ["render"],
+                }
+            ),
+            acquire=AsyncMock(return_value=(True, None)),
+            release=AsyncMock(),
+        )
+        with (
+            patch("main.DESKTOP_TOKEN", "desktop"),
+            patch("main.CONTROL_ENABLED", True),
+            patch("main.CONTROL_ADMIN_TOKEN", "admin"),
+        ):
+            for authorization in ("Bearer admin", "Bearer project-key"):
+                request = SimpleNamespace(
+                    method="POST",
+                    url=SimpleNamespace(path="/v1/render"),
+                    headers={"authorization": authorization},
+                    query_params={},
+                    app=SimpleNamespace(state=SimpleNamespace(control=control)),
+                )
+                response = await main.require_desktop_token(request, call_next)
+                self.assertIs(response, expected)
+        self.assertEqual(call_next.await_count, 2)
+
+    async def test_metrics_include_authentication_rejections(self):
+        metrics = main.Metrics()
+        request = SimpleNamespace(
+            method="POST",
+            url=SimpleNamespace(path="/v1/render"),
+            headers={},
+            query_params={},
+            scope={},
+        )
+
+        async def authenticate(inner_request):
+            return await main.require_desktop_token(
+                inner_request,
+                AsyncMock(return_value=main.Response(status_code=200)),
+            )
+
+        with (
+            patch("main.METRICS", metrics),
+            patch("main.DESKTOP_TOKEN", "desktop"),
+        ):
+            response = await main.record_http_metrics(request, authenticate)
+        self.assertEqual(response.status_code, 401)
+        self.assertIn(
+            'vipercapture_http_requests_total{method="POST",route="unmatched",status="401"} 1',
+            metrics.prometheus(),
+        )
+
+    def test_early_auth_failure_has_correlated_request_id(self):
+        with (
+            patch("main.DESKTOP_TOKEN", "desktop"),
+            patch("main.CONTROL_ENABLED", False),
+        ):
+            response = TestClient(main.app).get(
+                "/v1/jobs", headers={"X-Request-Id": "early-auth"}
+            )
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.headers["X-Request-Id"], "early-auth")
+        self.assertEqual(response.json()["error"]["request_id"], "early-auth")
+
+    async def test_status_requests_skip_concurrency_and_jobs_can_read_cert_key(self):
+        expected = main.Response(status_code=200)
+        call_next = AsyncMock(return_value=expected)
+        control = SimpleNamespace(
+            authenticate=Mock(
+                return_value={
+                    "project_id": "project",
+                    "key_id": "key",
+                    "scopes": ["jobs"],
+                }
+            ),
+            acquire=AsyncMock(return_value=(True, None)),
+            release=AsyncMock(),
+        )
+        with (
+            patch("main.CONTROL_ENABLED", True),
+            patch("main.CONTROL_ADMIN_TOKEN", "admin"),
+        ):
+            for path in (
+                "/v1/jobs/00000000-0000-0000-0000-000000000000",
+                "/v1/certification/public-key",
+            ):
+                request = SimpleNamespace(
+                    method="GET",
+                    url=SimpleNamespace(path=path),
+                    headers={"authorization": "Bearer project-key"},
+                    query_params={},
+                    app=SimpleNamespace(state=SimpleNamespace(control=control)),
+                )
+                self.assertIs(
+                    await main.require_desktop_token(request, call_next), expected
+                )
+        self.assertTrue(
+            all(
+                call.kwargs["concurrency"] is False
+                for call in control.acquire.await_args_list
+            )
+        )
+        control.release.assert_not_awaited()
+
+    async def test_urlbox_async_submission_skips_render_concurrency(self):
+        expected = main.Response(status_code=200)
+        call_next = AsyncMock(return_value=expected)
+        control = SimpleNamespace(
+            authenticate=Mock(
+                return_value={
+                    "project_id": "project",
+                    "key_id": "key",
+                    "scopes": ["render", "jobs"],
+                }
+            ),
+            acquire=AsyncMock(return_value=(True, None)),
+            release=AsyncMock(),
+        )
+        with (
+            patch("main.CONTROL_ENABLED", True),
+            patch("main.CONTROL_ADMIN_TOKEN", "admin"),
+        ):
+            for path in (
+                "/compat/urlbox/v1/render/async",
+                "/compat/urlbox/v1/render/sync",
+            ):
+                request = SimpleNamespace(
+                    method="POST",
+                    url=SimpleNamespace(path=path),
+                    headers={"authorization": "Bearer project-key"},
+                    query_params={},
+                    app=SimpleNamespace(state=SimpleNamespace(control=control)),
+                )
+                await main.require_desktop_token(request, call_next)
+        self.assertFalse(control.acquire.await_args_list[0].kwargs["concurrency"])
+        self.assertTrue(control.acquire.await_args_list[1].kwargs["concurrency"])
+        control.release.assert_awaited_once_with("project")
+
+    async def test_admin_schedule_delete_releases_stored_owner_quota(self):
+        schedule_id = "00000000-0000-0000-0000-000000000001"
+        control = SimpleNamespace(owner=Mock(return_value="project"), disown=Mock())
+        service = SimpleNamespace(delete=AsyncMock(return_value=True))
+        original_control = getattr(main.app.state, "control", None)
+        original_schedules = getattr(main.app.state, "schedules", None)
+        main.app.state.control = control
+        main.app.state.schedules = service
+        request = SimpleNamespace(
+            state=SimpleNamespace(
+                is_admin=True, trusted_local=False, project_id=None
+            )
+        )
+        try:
+            with patch("main.CONTROL_ENABLED", True):
+                response = await main.delete_schedule(schedule_id, request)
+        finally:
+            main.app.state.control = original_control
+            main.app.state.schedules = original_schedules
+        self.assertEqual(response.status_code, 204)
+        control.disown.assert_called_once_with(
+            "schedule", schedule_id, "project"
+        )
+
+    async def test_cancelled_committed_schedule_delete_releases_quota(self):
+        schedule_id = "00000000-0000-0000-0000-000000000003"
+        control = SimpleNamespace(owner=Mock(return_value="project"), disown=Mock())
+        service = SimpleNamespace(
+            delete=AsyncMock(side_effect=asyncio.CancelledError),
+            store=SimpleNamespace(get=AsyncMock(return_value=None)),
+        )
+        original_control = getattr(main.app.state, "control", None)
+        original_schedules = getattr(main.app.state, "schedules", None)
+        main.app.state.control = control
+        main.app.state.schedules = service
+        request = SimpleNamespace(
+            state=SimpleNamespace(
+                is_admin=True, trusted_local=False, project_id=None
+            )
+        )
+        try:
+            with patch("main.CONTROL_ENABLED", True), self.assertRaises(
+                asyncio.CancelledError
+            ):
+                await main.delete_schedule(schedule_id, request)
+        finally:
+            main.app.state.control = original_control
+            main.app.state.schedules = original_schedules
+        control.disown.assert_called_once_with(
+            "schedule", schedule_id, "project"
+        )
 
     async def test_cached_render_bypasses_saturated_chromium_slots(self):
         original_cache = getattr(main.app.state, "render_cache", None)
@@ -146,6 +413,19 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(RenderError) as raised:
                 await main.create_signed_url(payload, request)
         self.assertEqual(raised.exception.code, "delivery_requires_async_job")
+
+    async def test_signed_url_rejects_persistent_profiles(self):
+        payload = RenderRequest.model_validate(
+            {"url": "https://example.com", "profile_id": "profile-1"}
+        )
+        request = SimpleNamespace(headers={"authorization": "Bearer admin"})
+        with (
+            patch("main.SIGNING_SECRET", "s" * 32),
+            patch("main.SIGNING_ADMIN_TOKEN", "admin"),
+            self.assertRaises(RenderError) as raised,
+        ):
+            await main.create_signed_url(payload, request)
+        self.assertEqual(raised.exception.code, "signed_profile_unsupported")
 
     async def test_signed_html_remains_an_attachment(self):
         html_request = RenderRequest.model_validate(
@@ -356,17 +636,63 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         main.app.state.capture_slots = asyncio.Semaphore(0)
+        metrics = SimpleNamespace(inc=Mock())
         try:
-            artifact = await asyncio.wait_for(
-                main._render_async_image(
-                    RenderRequest(html="cached", cache=True)
-                ),
-                timeout=0.25,
-            )
+            with patch("main.METRICS", metrics):
+                artifact = await asyncio.wait_for(
+                    main._render_async_image(
+                        RenderRequest(html="cached", cache=True)
+                    ),
+                    timeout=0.25,
+                )
         finally:
             main.app.state.render_cache = original_cache
             main.app.state.capture_slots = original_slots
         self.assertEqual(artifact.body, b"cached")
+        self.assertEqual(
+            metrics.inc.call_args_list,
+            [
+                unittest.mock.call(
+                    "renders_total", output="png", cache="hit"
+                ),
+                unittest.mock.call(
+                    "render_seconds_sum", 0, output="png"
+                ),
+                unittest.mock.call("queue_seconds_sum", 0),
+            ],
+        )
+
+    async def test_async_render_records_miss_and_timing_metrics(self):
+        original_slots = getattr(main.app.state, "capture_slots", None)
+        original_browser = getattr(main.app.state, "browser", None)
+        main.app.state.capture_slots = asyncio.Semaphore(1)
+        main.app.state.browser = SimpleNamespace(is_connected=Mock(return_value=True))
+        metrics = SimpleNamespace(inc=Mock())
+        artifact = RenderArtifact(b"rendered", "image/png", "capture.png")
+        created_at = datetime.now(timezone.utc)
+        job = SimpleNamespace(
+            request_id="metrics-job",
+            created_at=created_at,
+            started_at=created_at + timedelta(seconds=7),
+        )
+        try:
+            with (
+                patch("main.METRICS", metrics),
+                patch("main.current_job", return_value=job),
+                patch("main._render_with_cache", AsyncMock(return_value=(artifact, False))),
+            ):
+                result = await main._render_async_image(
+                    RenderRequest(html="render", cache=True)
+                )
+        finally:
+            main.app.state.capture_slots = original_slots
+            main.app.state.browser = original_browser
+        self.assertEqual(result.body, b"rendered")
+        self.assertEqual(metrics.inc.call_args_list[0].kwargs["cache"], "miss")
+        self.assertEqual(metrics.inc.call_args_list[0].args[0], "renders_total")
+        self.assertEqual(metrics.inc.call_args_list[1].args[0], "render_seconds_sum")
+        self.assertEqual(metrics.inc.call_args_list[2].args[0], "queue_seconds_sum")
+        self.assertEqual(metrics.inc.call_args_list[2].args[1], 7)
 
     async def test_visual_diff_queue_is_bounded(self):
         original_slots = getattr(main.app.state, "diff_slots", None)
