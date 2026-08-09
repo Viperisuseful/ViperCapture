@@ -8,7 +8,7 @@ import os
 
 import uvicorn
 
-from main import app
+from vipercapture.main import app
 
 
 def parent_is_running(pid: int) -> bool:

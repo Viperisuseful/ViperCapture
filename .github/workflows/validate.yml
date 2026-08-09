@@ -45,7 +45,7 @@ jobs:
         run: |
           python -m http.server 8099 --directory benchmarks/fixtures >/tmp/vipercapture-fixture.log 2>&1 &
           fixture_pid=$!
-          uvicorn main:app --host 127.0.0.1 --port 8000 >/tmp/vipercapture-api.log 2>&1 &
+          uvicorn vipercapture.main:app --host 127.0.0.1 --port 8000 >/tmp/vipercapture-api.log 2>&1 &
           api_pid=$!
           trap 'kill "$fixture_pid" "$api_pid"' EXIT
           for attempt in $(seq 1 30); do

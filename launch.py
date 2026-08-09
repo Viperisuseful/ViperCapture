@@ -144,7 +144,7 @@ def main() -> None:
     print("  Press Ctrl+C here to stop the server.\n")
 
     server = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "main:app",
+        [sys.executable, "-m", "uvicorn", "vipercapture.main:app",
          "--host", HOST, "--port", str(PORT)],
         cwd=str(ROOT),
     )

@@ -2,7 +2,7 @@
 
 All request models reject unknown fields. Exactly one of `url`, `html`, or
 `markdown` is required. The canonical schema is `RenderRequest` in
-`render_contract.py`; FastAPI also exposes interactive OpenAPI documentation at
+`vipercapture/render_contract.py`; FastAPI also exposes interactive OpenAPI documentation at
 `/docs` when the service is running.
 
 ## Outputs
