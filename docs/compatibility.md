@@ -1,6 +1,6 @@
 # ScreenshotOne and Urlbox compatibility matrix
 
-Last verified against public vendor documentation: **2026-08-01**.
+Last verified against public vendor documentation: **2026-08-09**.
 
 This matrix compares workflows, not marketing plan entitlements. “Yes” means
 the repository implements and tests that capability. “Partial” identifies a
@@ -28,6 +28,9 @@ so corrections can be submitted as pull requests.
 | Signed webhooks | Yes | Yes | Yes |
 | Expiring signed render links | Yes | Yes | Yes, tokenized render links |
 | Native S3-compatible results | Yes: S3/R2/MinIO/B2 | Yes | Yes, plan-dependent |
+| Chromium / Firefox / WebKit rendering | **Yes** | Chromium | Chromium |
+| Open shadow-DOM HTML extraction | Yes | Yes | Not documented |
+| Output thumbnail resizing | Yes | Yes | Yes |
 | Bulk endpoint | Yes, up to 100 | Yes | Client/batch workflow |
 | Cron schedules | Yes | External scheduler | Product/no-code workflows documented |
 | Pixel visual diff reports | Yes | Not documented as core render API | Schedule/compare workflow documented |

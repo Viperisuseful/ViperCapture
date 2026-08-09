@@ -133,6 +133,29 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(markdown.media_type, "text/markdown; charset=utf-8")
         self.assertIn(b"Hello document", markdown.body)
 
+    async def test_open_shadow_dom_is_serialized(self):
+        page = FakePage()
+        page.content = AsyncMock(side_effect=AssertionError("content must not load"))
+        page.evaluate = AsyncMock(
+            side_effect=[
+                len(page.html.encode("utf-8")),
+                '<html><body><x-card><template shadowrootmode="open"><p>Inside</p></template></x-card></body></html>',
+            ]
+        )
+        artifact = await render_document_output(
+            page,
+            RenderRequest.model_validate(
+                {
+                    "url": "https://example.com",
+                    "output": "html",
+                    "include_shadow_dom": True,
+                }
+            ),
+            LIMITS,
+        )
+        self.assertIn(b'template shadowrootmode="open"', artifact.body)
+        page.content.assert_not_awaited()
+
     async def test_markdown_hydrated_dom_size_is_bounded(self):
         page = FakePage(html="x" * (5 * 1024 * 1024 + 1))
         with self.assertRaises(RenderError) as raised:
@@ -200,6 +223,26 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(print_page.pdf_options["format"], "A4")
         self.assertEqual(print_page.pdf_options["page_ranges"], "1-51")
         self.assertEqual(print_page.emulated_media, "print")
+
+        custom_print = FakePage()
+        await render_document_output(
+            custom_print,
+            RenderRequest.model_validate(
+                {
+                    "url": "https://example.com",
+                    "output": "pdf",
+                    "pdf": {
+                        "paper_size": "Legal",
+                        "page_ranges": "2-3",
+                        "header_template": '<span class="title"></span>',
+                    },
+                }
+            ),
+            LIMITS,
+        )
+        self.assertEqual(custom_print.pdf_options["format"], "Legal")
+        self.assertEqual(custom_print.pdf_options["page_ranges"], "2-3")
+        self.assertTrue(custom_print.pdf_options["display_header_footer"])
 
         single_page = FakePage()
         single = await render_document_output(

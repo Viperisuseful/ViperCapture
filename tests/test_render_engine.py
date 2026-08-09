@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from playwright.async_api import Error as PlaywrightError
+from PIL import Image
 
 from vipercapture.render_contract import LazyLoadMode, OutputFormat, RenderRequest
 from vipercapture.render_engine import (
@@ -19,6 +20,7 @@ from vipercapture.render_engine import (
     RenderEngine,
     RenderLimits,
     _encode_avif,
+    _postprocess_image,
     _resolve_public_origin,
     _run_process,
     capture_clipped_image,
@@ -31,6 +33,17 @@ from vipercapture.render_engine import (
     routed_headers,
 )
 from vipercapture.render_errors import RenderError
+
+
+class ImageParityTest(unittest.TestCase):
+    def test_resize_preserves_aspect_ratio_and_converts_format(self):
+        source = io.BytesIO()
+        Image.new("RGBA", (400, 200), (255, 0, 0, 128)).save(source, format="PNG")
+        body, width, height = _postprocess_image(
+            source.getvalue(), OutputFormat.JPEG, 80, 100, 100
+        )
+        self.assertEqual((width, height), (100, 50))
+        self.assertTrue(body.startswith(b"\xff\xd8"))
 
 
 class FakeNavigation:

@@ -69,6 +69,12 @@ class OutputFormat(str, Enum):
     AVIF = "avif"
 
 
+class BrowserEngine(str, Enum):
+    CHROMIUM = "chromium"
+    FIREFOX = "firefox"
+    WEBKIT = "webkit"
+
+
 class DevicePreset(str, Enum):
     DESKTOP = "desktop"
     IPHONE_14 = "iphone_14"
@@ -138,8 +144,16 @@ class PdfMode(str, Enum):
 
 
 class PaperSize(str, Enum):
+    A0 = "A0"
+    A1 = "A1"
+    A2 = "A2"
+    A3 = "A3"
     A4 = "A4"
+    A5 = "A5"
+    A6 = "A6"
+    LEGAL = "Legal"
     LETTER = "Letter"
+    TABLOID = "Tabloid"
 
 
 class Orientation(str, Enum):
@@ -389,6 +403,8 @@ class ClipOptions(StrictModel):
 
 class ImageOptions(StrictModel):
     quality: int | None = Field(default=None, ge=1, le=100)
+    width: int | None = Field(default=None, ge=1, le=65_535)
+    height: int | None = Field(default=None, ge=1, le=65_535)
     transparent_background: bool = False
     optimize_for_speed: bool = Field(
         default=False,
@@ -409,6 +425,13 @@ class PdfOptions(StrictModel):
     orientation: Orientation = Orientation.PORTRAIT
     print_background: bool = True
     margins: PdfMargins = Field(default_factory=PdfMargins)
+    header_template: str | None = Field(default=None, max_length=16_384)
+    footer_template: str | None = Field(default=None, max_length=16_384)
+    page_ranges: str | None = Field(
+        default=None,
+        max_length=256,
+        pattern=r"^\s*\d+(?:\s*-\s*\d+)?(?:\s*,\s*\d+(?:\s*-\s*\d+)?)*\s*$",
+    )
 
 
 class WaitOptions(StrictModel):
@@ -462,6 +485,7 @@ class RenderRequest(StrictModel):
     html: str | None = None
     markdown: str | None = None
     base_url: HttpUrl | None = None
+    engine: BrowserEngine = BrowserEngine.CHROMIUM
     output: OutputFormat = OutputFormat.PNG
     viewport: Viewport = Field(default_factory=Viewport)
     viewports: list[NamedViewport] | None = Field(
@@ -498,6 +522,7 @@ class RenderRequest(StrictModel):
     image: ImageOptions = Field(default_factory=ImageOptions)
     pdf: PdfOptions | None = None
     extract_mode: ExtractMode = ExtractMode.DOCUMENT
+    include_shadow_dom: bool = False
     headers: dict[str, str] = Field(default_factory=dict)
     wait_for: WaitOptions = Field(default_factory=WaitOptions)
     cleanup: CleanupOptions = Field(default_factory=CleanupOptions)
@@ -608,15 +633,35 @@ class RenderRequest(StrictModel):
             OutputFormat.WEBP,
         }:
             raise ValueError("optimize_for_speed is accepted only for PNG or WebP")
+        if (
+            self.image.optimize_for_speed
+            and self.engine.value != BrowserEngine.CHROMIUM.value
+        ):
+            raise ValueError("optimize_for_speed requires the Chromium engine")
+        if self.image.width is not None or self.image.height is not None:
+            if not is_image or self.viewports is not None or self.slices is not None:
+                raise ValueError("image width and height require a single image output")
         if self.pdf is not None and self.output is not OutputFormat.PDF:
             raise ValueError("pdf settings require PDF output")
         if self.output is OutputFormat.PDF and self.pdf is None:
             self.pdf = PdfOptions()
+        if (
+            self.output is OutputFormat.PDF
+            and self.engine.value != BrowserEngine.CHROMIUM.value
+        ):
+            raise ValueError("PDF output requires the Chromium engine")
+        if self.pdf is not None and self.pdf.mode is PdfMode.SINGLE_PAGE and self.pdf.page_ranges:
+            raise ValueError("single-page PDF cannot use page_ranges")
         if self.extract_mode is not ExtractMode.DOCUMENT and self.output not in {
             OutputFormat.HTML,
             OutputFormat.MARKDOWN,
         }:
             raise ValueError("article extraction requires HTML or Markdown output")
+        if self.include_shadow_dom and self.output not in {
+            OutputFormat.HTML,
+            OutputFormat.MARKDOWN,
+        }:
+            raise ValueError("include_shadow_dom requires HTML or Markdown output")
         self.headers = _validate_headers(self.headers)
         return self
 

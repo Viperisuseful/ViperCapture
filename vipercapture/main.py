@@ -53,7 +53,7 @@ from .page_cleanup import (
     should_block_resource,
 )
 from .render_cache import RenderCache
-from .render_contract import OutputFormat, RenderRequest
+from .render_contract import BrowserEngine, OutputFormat, RenderRequest
 from .render_engine import (
     CleanupHooks,
     RenderArtifact,
@@ -326,13 +326,15 @@ async def _detect_hardware_gpu(browser: Browser, mode: str) -> bool:
 async def _launch_browser(
     playwright: Playwright,
     gpu_mode: str | None = None,
+    engine: BrowserEngine = BrowserEngine.CHROMIUM,
 ) -> Browser:
     selected_mode = gpu_mode or GPU_MODE
-    browser = await playwright.chromium.launch(
+    browser_type = getattr(playwright, engine.value)
+    browser = await browser_type.launch(
         headless=True,
-        args=gpu_launch_args(selected_mode),
+        args=gpu_launch_args(selected_mode) if engine.value == BrowserEngine.CHROMIUM.value else [],
     )
-    if selected_mode == "required":
+    if selected_mode == "required" and engine.value == BrowserEngine.CHROMIUM.value:
         try:
             active = await _hardware_gpu_active(browser)
         except Exception as exc:
@@ -346,20 +348,66 @@ async def _launch_browser(
     return browser
 
 
+async def _browser_for(app: FastAPI, engine: BrowserEngine) -> Browser:
+    browsers = getattr(app.state, "browsers", None)
+    if browsers is None:
+        return app.state.browser
+    browser = browsers.get(engine)
+    if browser is not None and browser.is_connected():
+        return browser
+    async with app.state.browser_restart_lock:
+        browser = browsers.get(engine)
+        if browser is not None and browser.is_connected():
+            return browser
+        try:
+            browser = await asyncio.wait_for(
+                _launch_browser(
+                    app.state.playwright,
+                    app.state.gpu_mode,
+                    engine,
+                ),
+                timeout=20,
+            )
+        except Exception as exc:
+            raise RenderError(
+                "browser_unavailable",
+                f"The {engine.value} browser is not installed or could not start.",
+                503,
+                False,
+            ) from exc
+        browsers[engine] = browser
+        if engine.value == BrowserEngine.CHROMIUM.value:
+            app.state.browser = browser
+        return browser
+
+
 async def _replace_browser(app: FastAPI, failed_browser: Browser) -> None:
     async with app.state.browser_restart_lock:
-        if app.state.browser is not failed_browser:
+        browsers = getattr(app.state, "browsers", None)
+        engine = next(
+            (
+                name
+                for name, browser in (browsers or {}).items()
+                if browser is failed_browser
+            ),
+            BrowserEngine.CHROMIUM if app.state.browser is failed_browser else None,
+        )
+        if engine is None:
             return
         with suppress(Exception):
             await asyncio.wait_for(failed_browser.close(), timeout=5)
-        app.state.browser = await asyncio.wait_for(
-            _launch_browser(app.state.playwright, app.state.gpu_mode),
+        replacement = await asyncio.wait_for(
+            _launch_browser(app.state.playwright, app.state.gpu_mode, engine),
             timeout=15,
         )
-        app.state.gpu_hardware_active = await _detect_hardware_gpu(
-            app.state.browser,
-            app.state.gpu_mode,
-        )
+        if browsers is not None:
+            browsers[engine] = replacement
+        if engine.value == BrowserEngine.CHROMIUM.value:
+            app.state.browser = replacement
+            app.state.gpu_hardware_active = await _detect_hardware_gpu(
+                replacement,
+                app.state.gpu_mode,
+            )
 
 
 @asynccontextmanager
@@ -394,6 +442,7 @@ async def lifespan(app: FastAPI):
     browser = await _launch_browser(playwright)
     app.state.playwright = playwright
     app.state.browser = browser
+    app.state.browsers = {BrowserEngine.CHROMIUM: browser}
     app.state.gpu_mode = GPU_MODE
     app.state.gpu_hardware_active = await _detect_hardware_gpu(browser, GPU_MODE)
     app.state.capture_slots = asyncio.Semaphore(MAX_CONCURRENT_CAPTURES)
@@ -539,8 +588,13 @@ async def lifespan(app: FastAPI):
             if app.state.async_jobs is not None:
                 await app.state.async_jobs.close()
         finally:
-            with suppress(Exception):
-                await app.state.browser.close()
+            closed_browser_ids: set[int] = set()
+            for active_browser in app.state.browsers.values():
+                if id(active_browser) in closed_browser_ids:
+                    continue
+                closed_browser_ids.add(id(active_browser))
+                with suppress(Exception):
+                    await active_browser.close()
             await playwright.stop()
 
 
@@ -891,6 +945,10 @@ async def operator_status(request: Request) -> dict[str, object]:
     return {
         "role": PROCESS_ROLE,
         "browser_connected": app.state.browser.is_connected(),
+        "browsers": {
+            engine.value: browser.is_connected()
+            for engine, browser in getattr(app.state, "browsers", {}).items()
+        },
         "async_jobs": service is not None,
         "worker_count": ASYNC_JOB_SETTINGS.worker_count if ASYNC_JOB_SETTINGS else 0,
         "control_plane": CONTROL_ENABLED,
@@ -1230,7 +1288,7 @@ async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
             if durable_queue_ms is not None
             else slot_queue_ms
         )
-        browser: Browser = app.state.browser
+        browser = await _browser_for(app, payload.engine)
         engine = _render_engine()
         render_started = time.perf_counter()
         try:
@@ -1340,7 +1398,7 @@ async def _render_response(payload: RenderRequest, request: Request) -> Response
                 "capture_queue_busy", "The render queue is busy.", 503, True
             ) from exc
         queue_ms = round((time.perf_counter() - queue_started) * 1000)
-        browser: Browser = app.state.browser
+        browser = await _browser_for(app, payload.engine)
         engine = _render_engine()
         try:
             if payload.cache and cache is not None:
@@ -2240,6 +2298,7 @@ async def app_config():
         "max_viewport_height": MAX_VIEWPORT_HEIGHT,
         "max_full_page_height": MAX_FULL_PAGE_HEIGHT,
         "max_output_bytes": MAX_OUTPUT_BYTES,
+        "browser_engines": [engine.value for engine in BrowserEngine],
         "async_jobs": {
             "enabled": ASYNC_JOBS_ENABLED,
             "workers": (
@@ -2288,6 +2347,7 @@ if not HOSTED:
                 hardware_active = await _detect_hardware_gpu(replacement, mode)
                 previous = app.state.browser
                 app.state.browser = replacement
+                app.state.browsers[BrowserEngine.CHROMIUM] = replacement
                 app.state.gpu_mode = mode
                 app.state.gpu_hardware_active = hardware_active
                 with suppress(Exception):

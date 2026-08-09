@@ -32,7 +32,9 @@
         "default-src": "'self' customprotocol: asset:",
         "connect-src": "ipc: http://ipc.localhost http://127.0.0.1:*",
         "font-src": "'self' data:",
+        "frame-src": "blob:",
         "img-src": "'self' asset: http://asset.localhost blob: data:",
+        "media-src": "blob:",
         "style-src": "'self' 'unsafe-inline'"
       }
     }

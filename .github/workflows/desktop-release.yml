@@ -101,7 +101,7 @@ jobs:
 
       - name: Install Playwright system dependencies
         if: runner.os == 'Linux'
-        run: python -m playwright install-deps chromium
+        run: python -m playwright install-deps chromium firefox webkit
 
       - name: Build and test packaged renderer
         run: |

@@ -2,6 +2,7 @@ export type RenderRequest = {
   url?: string;
   html?: string;
   markdown?: string;
+  engine?: "chromium" | "firefox" | "webkit";
   output?: "png" | "jpeg" | "webp" | "avif" | "pdf" | "html" | "markdown" | "metadata" | "webm" | "mp4" | "gif";
   [key: string]: unknown;
 };

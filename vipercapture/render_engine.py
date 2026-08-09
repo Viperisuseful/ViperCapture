@@ -34,6 +34,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from PIL import Image
 
 from .render_contract import (
+    BrowserEngine,
     ActionType,
     DevicePreset,
     LazyLoadMode,
@@ -292,8 +293,29 @@ def _write_diagnostic_zip(entries: list[tuple[str, bytes]]) -> bytes:
 def _convert_image(body: bytes, output: OutputFormat, quality: int | None) -> bytes:
     destination = io.BytesIO()
     with Image.open(io.BytesIO(body)) as image:
+        if output is OutputFormat.JPEG and image.mode not in {"RGB", "L"}:
+            image = image.convert("RGB")
         image.save(destination, format=output.value.upper(), quality=quality or 80)
     return destination.getvalue()
+
+
+def _postprocess_image(
+    body: bytes,
+    output: OutputFormat,
+    quality: int | None,
+    width: int | None,
+    height: int | None,
+) -> tuple[bytes, int, int]:
+    destination = io.BytesIO()
+    with Image.open(io.BytesIO(body)) as image:
+        if width is not None or height is not None:
+            target_width = width or max(1, round(image.width * (height or image.height) / image.height))
+            target_height = height or max(1, round(image.height * (width or image.width) / image.width))
+            image.thumbnail((target_width, target_height), Image.Resampling.LANCZOS)
+        if output is OutputFormat.JPEG and image.mode not in {"RGB", "L"}:
+            image = image.convert("RGB")
+        image.save(destination, format=output.value.upper(), quality=quality or 80)
+        return destination.getvalue(), image.width, image.height
 
 
 async def _encode_avif(body: bytes, quality: int | None) -> bytes:
@@ -972,8 +994,19 @@ async def capture_clipped_image(
     clip: dict[str, float],
     quality: int | None,
     transparent: bool,
+    use_cdp: bool = True,
 ) -> bytes:
     """Capture a tall explicit clip beyond the visible viewport."""
+    if not use_cdp:
+        options: dict[str, object] = {
+            "type": output.value,
+            "clip": {key: value for key, value in clip.items() if key != "scale"},
+            "animations": "disabled",
+            "omit_background": transparent,
+        }
+        if output is OutputFormat.JPEG:
+            options["quality"] = quality if quality is not None else 80
+        return await page.screenshot(**options)
     session = await page.context.new_cdp_session(page)
     try:
         with suppress(Exception):
@@ -1032,6 +1065,14 @@ async def render_metadata(page: Page) -> RenderArtifact:
                 theme_color: attr('meta[name="theme-color"]'),
                 open_graph: pairs("property", "og:"),
                 twitter: pairs("name", "twitter:"),
+                fonts: [...(document.fonts || [])]
+                    .slice(0, maxItems)
+                    .map((font) => ({
+                        family: clean(font.family, 256),
+                        style: clean(font.style, 64),
+                        weight: clean(font.weight, 64),
+                        status: clean(font.status, 32)
+                    })),
                 icons: [...document.querySelectorAll('link[rel~="icon"][href]')]
                     .slice(0, 16)
                     .map((element) => ({
@@ -1062,7 +1103,16 @@ async def render_metadata(page: Page) -> RenderArtifact:
                         width: Number(element.naturalWidth || element.width || 0),
                         height: Number(element.naturalHeight || element.height || 0)
                     }))
-                }
+                },
+                forms: [...document.forms].slice(0, maxItems).map((form) => ({
+                    action: clean(form.action),
+                    method: clean(form.method, 16),
+                    controls: form.elements.length
+                })),
+                structured_data: [...document.querySelectorAll('script[type="application/ld+json"]')]
+                    .slice(0, 16)
+                    .map((element) => clean(element.textContent))
+                    .filter(Boolean)
             };
         }""",
         {"maxItems": MAX_METADATA_ITEMS, "maxChars": MAX_METADATA_VALUE_CHARS},
@@ -1829,16 +1879,19 @@ class RenderEngine:
                     await self.cleanup_hooks.apply(page, request.cleanup)
                 if self.challenge_checker:
                     await self.challenge_checker(page, request.proceed_on_captcha, navigation_status)
-                uses_cdp_capture = (
+                uses_cdp_capture = request.engine.value == BrowserEngine.CHROMIUM.value and (
                     request.output is OutputFormat.WEBP
                     or (
                         request.output is OutputFormat.PNG
                         and request.image.optimize_for_speed
                     )
-                    or request.clip is not None
-                    or (request.full_page and request.selector is None)
                 )
-                if uses_cdp_capture and request.full_page:
+                stabilizes_full_page = (
+                    request.engine.value == BrowserEngine.CHROMIUM.value
+                    and request.full_page
+                    and request.selector is None
+                )
+                if stabilizes_full_page:
                     with suppress(Exception):
                         await page.evaluate(STABILIZE_ANIMATIONS_SCRIPT)
                 if request.full_page:
@@ -2007,17 +2060,23 @@ class RenderEngine:
                     return finalized
 
                 screenshot_output = (
-                    OutputFormat.PNG if request.output is OutputFormat.AVIF else request.output
+                    OutputFormat.PNG
+                    if request.output is OutputFormat.AVIF
+                    or (
+                        request.engine.value != BrowserEngine.CHROMIUM.value
+                        and request.output is OutputFormat.WEBP
+                    )
+                    else request.output
                 )
                 screenshot_options: dict[str, object] = {
                     "type": screenshot_output.value,
                     "animations": "disabled",
                     "omit_background": request.image.transparent_background,
                 }
-                if request.image.quality is not None and request.output is not OutputFormat.AVIF:
+                if request.image.quality is not None and screenshot_output is OutputFormat.JPEG:
                     screenshot_options["quality"] = request.image.quality
 
-                if uses_cdp_capture:
+                if uses_cdp_capture or stabilizes_full_page:
                     with suppress(Exception):
                         await page.evaluate(STABILIZE_ANIMATIONS_SCRIPT)
 
@@ -2132,10 +2191,11 @@ class RenderEngine:
                             },
                             quality=request.image.quality,
                             transparent=request.image.transparent_background,
+                            use_cdp=request.engine.value == BrowserEngine.CHROMIUM.value,
                         )
-                        if request.output is OutputFormat.AVIF:
-                            part = await _encode_avif(
-                                part, request.image.quality
+                        if request.output in {OutputFormat.AVIF, OutputFormat.WEBP} and screenshot_output is OutputFormat.PNG:
+                            part = await _settled_thread(
+                                _convert_image, part, request.output, request.image.quality
                             )
                         total_bytes += len(part)
                         if total_bytes > limits.output_bytes:
@@ -2194,10 +2254,7 @@ class RenderEngine:
                     )
                     await self._persist_profile(request, context)
                     return finalized
-                if request.output is OutputFormat.WEBP or (
-                    request.output is OutputFormat.PNG
-                    and request.image.optimize_for_speed
-                ):
+                if uses_cdp_capture:
                     scroll = {"x": 0, "y": 0}
                     if not request.full_page and not request.clip:
                         measured_scroll = await page.evaluate(
@@ -2260,6 +2317,7 @@ class RenderEngine:
                         },
                         quality=request.image.quality,
                         transparent=request.image.transparent_background,
+                        use_cdp=request.engine.value == BrowserEngine.CHROMIUM.value,
                     )
                 elif request.full_page and request.preserve_viewport_width:
                     image = await capture_clipped_image(
@@ -2274,8 +2332,9 @@ class RenderEngine:
                         },
                         quality=request.image.quality,
                         transparent=request.image.transparent_background,
+                        use_cdp=request.engine.value == BrowserEngine.CHROMIUM.value,
                     )
-                elif request.full_page:
+                elif request.full_page and request.engine.value == BrowserEngine.CHROMIUM.value:
                     image = await capture_clipped_image(
                         page,
                         output=screenshot_output,
@@ -2297,8 +2356,34 @@ class RenderEngine:
 
                 if not image:
                     raise RenderError("empty_output", "The renderer produced an empty image.", 502, True)
-                if request.output is OutputFormat.AVIF:
-                    image = await _encode_avif(image, request.image.quality)
+                if (
+                    request.output is OutputFormat.AVIF
+                    or request.image.width is not None
+                    or request.image.height is not None
+                    or (
+                        request.output is OutputFormat.WEBP
+                        and screenshot_output is OutputFormat.PNG
+                    )
+                ):
+                    try:
+                        image, pixel_width, pixel_height = await _settled_thread(
+                            _postprocess_image,
+                            image,
+                            request.output,
+                            request.image.quality,
+                            request.image.width,
+                            request.image.height,
+                        )
+                    except Exception as exc:
+                        raise RenderError(
+                            "image_encoder_unavailable",
+                            f"This Pillow build cannot encode {request.output.value.upper()}.",
+                            503,
+                            False,
+                        ) from exc
+                    ensure_dimensions(pixel_width, pixel_height, 1, limits)
+                    width = pixel_width / request.viewport.device_scale_factor
+                    height = pixel_height / request.viewport.device_scale_factor
                 if len(image) > limits.output_bytes:
                     raise RenderError("output_too_large", "The rendered image exceeds the output limit.", 413, False)
                 artifact = RenderArtifact(

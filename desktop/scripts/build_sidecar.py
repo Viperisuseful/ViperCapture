@@ -38,7 +38,15 @@ def main() -> None:
     browser_env = os.environ.copy()
     browser_env["PLAYWRIGHT_BROWSERS_PATH"] = str(PLAYWRIGHT_DIR)
     run(
-        [sys.executable, "-m", "playwright", "install", "--only-shell", "chromium"],
+        [
+            sys.executable,
+            "-m",
+            "playwright",
+            "install",
+            "chromium",
+            "firefox",
+            "webkit",
+        ],
         env=browser_env,
     )
 

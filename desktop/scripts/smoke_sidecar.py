@@ -102,35 +102,39 @@ def main() -> None:
             else:
                 raise RuntimeError("Unauthenticated request unexpectedly succeeded")
 
-            image = request(
-                base_url,
-                token,
-                "/v1/render",
-                {
-                    "url": "https://example.com",
-                    "output": "png",
-                    "viewport": {
-                        "width": 640,
-                        "height": 480,
-                        "device_scale_factor": 1,
+            capture_bytes = {}
+            for engine in ("chromium", "firefox", "webkit"):
+                image = request(
+                    base_url,
+                    token,
+                    "/v1/render",
+                    {
+                        "url": "https://example.com",
+                        "engine": engine,
+                        "output": "png",
+                        "viewport": {
+                            "width": 640,
+                            "height": 480,
+                            "device_scale_factor": 1,
+                        },
+                        "full_page": False,
+                        "lazy_load": "none",
+                        "wait_for": {
+                            "event": "load",
+                            "delay_ms": 0,
+                            "timeout_ms": 15_000,
+                        },
                     },
-                    "full_page": False,
-                    "lazy_load": "none",
-                    "wait_for": {
-                        "event": "load",
-                        "delay_ms": 0,
-                        "timeout_ms": 15_000,
-                    },
-                },
-            )
-            if not image.startswith(b"\x89PNG\r\n\x1a\n"):
-                raise RuntimeError("Renderer response was not a PNG")
+                )
+                if not image.startswith(b"\x89PNG\r\n\x1a\n"):
+                    raise RuntimeError(f"{engine} response was not a PNG")
+                capture_bytes[engine] = len(image)
             print(
                 json.dumps(
                     {
                         "ready": True,
                         "unauthenticated_blocked": True,
-                        "capture_bytes": len(image),
+                        "capture_bytes": capture_bytes,
                         "port": port,
                     }
                 )

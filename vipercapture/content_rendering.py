@@ -26,8 +26,16 @@ MAX_SINGLE_PAGE_WIDTH = 20_000
 MAX_SINGLE_PAGE_HEIGHT = 20_000
 MAX_MARKDOWN_HTML_BYTES = 5 * 1024 * 1024
 PAPER_INCHES = {
+    "A0": (33.1, 46.8),
+    "A1": (23.4, 33.1),
+    "A2": (16.5, 23.4),
+    "A3": (11.7, 16.5),
     "A4": (8.27, 11.69),
+    "A5": (5.83, 8.27),
+    "A6": (4.13, 5.83),
+    "Legal": (8.5, 14.0),
     "Letter": (8.5, 11.0),
+    "Tabloid": (11.0, 17.0),
 }
 
 
@@ -107,6 +115,14 @@ async def _render_pdf(
             "left": f"{options.margins.left}in",
         },
     }
+    if options.header_template is not None or options.footer_template is not None:
+        common.update(
+            {
+                "display_header_footer": True,
+                "header_template": options.header_template or "<span></span>",
+                "footer_template": options.footer_template or "<span></span>",
+            }
+        )
     single_page = options.mode is PdfMode.SINGLE_PAGE
     if single_page:
         common["landscape"] = False
@@ -162,7 +178,7 @@ async def _render_pdf(
         # Render one sentinel page beyond the public limit. Chromium may
         # paginate due to fragmentation rules that scroll-height preflight
         # cannot predict, but never needs to emit the full document.
-        common["page_ranges"] = f"1-{MAX_PRINT_PAGES + 1}"
+        common["page_ranges"] = options.page_ranges or f"1-{MAX_PRINT_PAGES + 1}"
         await page.emulate_media(media="print")
         dimensions = await page.evaluate("""() => {
             return {
@@ -180,7 +196,7 @@ async def _render_pdf(
         estimated_pages = math.ceil(
             max(1, float(dimensions["height"])) / printable_height
         )
-        if estimated_pages > MAX_PRINT_PAGES:
+        if options.page_ranges is None and estimated_pages > MAX_PRINT_PAGES:
             raise RenderError(
                 "pdf_page_limit_exceeded",
                 f"The PDF exceeds the {MAX_PRINT_PAGES}-page limit.",
@@ -224,11 +240,7 @@ async def render_document_output(
             }"""
         )
         if int(serialized_bytes) > maximum_html_bytes:
-            code = (
-                "output_too_large"
-                if request.output is OutputFormat.HTML
-                else "document_too_large"
-            )
+            code = "output_too_large" if request.output is OutputFormat.HTML else "document_too_large"
             raise RenderError(
                 code,
                 "The hydrated document is too large to serialize.",
@@ -236,12 +248,40 @@ async def render_document_output(
                 False,
                 {"max_bytes": maximum_html_bytes},
             )
-        document_html = await page.content()
+        if request.include_shadow_dom:
+            document_html = await page.evaluate(
+                """() => {
+                    const visit = (source, clone) => {
+                        for (let index = 0; index < source.children.length; index += 1) {
+                            const sourceChild = source.children[index];
+                            const cloneChild = clone.children[index];
+                            if (!cloneChild) continue;
+                            visit(sourceChild, cloneChild);
+                            if (sourceChild.shadowRoot) {
+                                const template = document.createElement("template");
+                                template.setAttribute("shadowrootmode", sourceChild.shadowRoot.mode);
+                                template.innerHTML = sourceChild.shadowRoot.innerHTML;
+                                visit(sourceChild.shadowRoot, template.content);
+                                cloneChild.prepend(template);
+                            }
+                        }
+                    };
+                    const clone = document.documentElement.cloneNode(true);
+                    visit(document.documentElement, clone);
+                    const doctype = document.doctype ? `<!DOCTYPE ${document.doctype.name}>` : "";
+                    return doctype + clone.outerHTML;
+                }"""
+            )
+        else:
+            document_html = await page.content()
         if len(document_html.encode("utf-8")) > maximum_html_bytes:
-            raise RenderError(
+            code = (
                 "output_too_large"
                 if request.output is OutputFormat.HTML
-                else "document_too_large",
+                else "document_too_large"
+            )
+            raise RenderError(
+                code,
                 "The hydrated document is too large to serialize.",
                 413,
                 False,
