@@ -29,6 +29,8 @@ def screenshotone_request(query: Mapping[str, str]) -> RenderRequest:
     if "url" not in query:
         raise ValueError("url is required")
     output = {"jpg": "jpeg"}.get(query.get("format", "png"), query.get("format", "png"))
+    selector = query.get("selector")
+    full_page = _boolean(query.get("full_page"), selector is None)
     return RenderRequest.model_validate(
         {
             "url": query["url"],
@@ -38,8 +40,8 @@ def screenshotone_request(query: Mapping[str, str]) -> RenderRequest:
                 "height": int(query.get("viewport_height", 720)),
                 "device_scale_factor": float(query.get("device_scale_factor", 1)),
             },
-            "full_page": _boolean(query.get("full_page"), True),
-            "selector": query.get("selector"),
+            "full_page": full_page,
+            "selector": selector,
             "wait_for": {"delay_ms": int(query.get("delay", 0))},
             "cleanup": {
                 "block_ads": _boolean(query.get("block_ads"), False),
@@ -80,4 +82,6 @@ def urlbox_request(document: Mapping[str, object]) -> RenderRequest:
         (viewport if group == "viewport" else result)[target] = value
     if viewport:
         result["viewport"] = viewport
+    if result.get("selector") is not None and "full_page" not in result:
+        result["full_page"] = False
     return RenderRequest.model_validate(result)

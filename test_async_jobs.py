@@ -29,6 +29,7 @@ from async_jobs import (
     RenderedArtifact,
     StoredArtifact,
     load_providers,
+    settings_from_environment,
 )
 from render_contract import RenderRequest
 from render_errors import RenderError
@@ -111,6 +112,39 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.code, "webhooks_disabled")
         self.assertFalse(raised.exception.retryable)
         self.assertFalse(self.store.path.exists())
+
+    async def test_api_only_service_does_not_recover_distributed_jobs(self):
+        job_store = SimpleNamespace(
+            start=AsyncMock(),
+            close=AsyncMock(),
+            requeue_running=AsyncMock(),
+            maintain=AsyncMock(return_value=[]),
+        )
+        artifact_store = SimpleNamespace(
+            start=AsyncMock(), close=AsyncMock(), maintain=AsyncMock()
+        )
+        service = AsyncJobService(
+            _settings(self.root, worker_count=0),
+            job_store,
+            artifact_store,
+            _successful_renderer,
+            cipher=PayloadCipher(b"\0" * 32),
+            recover_running=False,
+        )
+        await service.start()
+        try:
+            job_store.requeue_running.assert_not_awaited()
+        finally:
+            await service.close()
+
+    def test_zero_workers_requires_explicit_api_role_opt_in(self):
+        with patch.dict("os.environ", {"VIPERCAPTURE_JOB_WORKERS": "0"}):
+            with self.assertRaisesRegex(ValueError, "must be positive"):
+                settings_from_environment(base_dir=self.root)
+            settings = settings_from_environment(
+                base_dir=self.root, allow_zero_workers=True
+            )
+        self.assertEqual(settings.worker_count, 0)
 
     async def test_job_is_encrypted_rendered_and_downloadable(self):
         service = AsyncJobService(

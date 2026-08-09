@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 from contextlib import asynccontextmanager, suppress
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Awaitable, Literal, TypeVar
@@ -29,13 +30,14 @@ from pydantic import BaseModel, ConfigDict, Field
 from async_jobs import (
     AsyncJobService,
     RenderedArtifact,
+    current_job,
     load_providers,
     public_job_document,
     settings_from_environment,
 )
 from bulk_jobs import BulkBodyLimitMiddleware, BulkJobRequest
 from compatibility import screenshotone_request, urlbox_request
-from control_plane import ControlPlane, Metrics
+from control_plane import BaselineQuotaError, ControlPlane, Metrics
 from page_cleanup import (
     CleanupOptions,
     apply_visual_cleanup,
@@ -57,8 +59,8 @@ from render_errors import RenderError, install_render_error_layer
 from schedules import (
     ScheduleCreate,
     ScheduleService,
-    ScheduleStore,
     ScheduleUpdate,
+    load_schedule_store,
     public_schedule_document,
     schedule_cursor,
 )
@@ -156,11 +158,14 @@ ASYNC_JOBS_ENABLED = os.getenv(
 ) != "0"
 ASYNC_JOB_SETTINGS = (
     settings_from_environment(
-        default_workers=0 if PROCESS_ROLE == "api" else MAX_CONCURRENT_CAPTURES
+        default_workers=0 if PROCESS_ROLE == "api" else MAX_CONCURRENT_CAPTURES,
+        allow_zero_workers=PROCESS_ROLE == "api",
     )
     if ASYNC_JOBS_ENABLED
     else None
 )
+if ASYNC_JOB_SETTINGS is not None and PROCESS_ROLE == "api":
+    ASYNC_JOB_SETTINGS = replace(ASYNC_JOB_SETTINGS, worker_count=0)
 SCHEDULES_ENABLED = os.getenv(
     "VIPERCAPTURE_SCHEDULES",
     "0" if os.name == "nt" else "1",
@@ -193,6 +198,11 @@ CONTROL_ADMIN_TOKEN = os.getenv("VIPERCAPTURE_ADMIN_TOKEN", "")
 CONTROL_ENABLED = bool(CONTROL_ADMIN_TOKEN)
 if CONTROL_ENABLED and len(CONTROL_ADMIN_TOKEN.encode()) < 32:
     raise ValueError("VIPERCAPTURE_ADMIN_TOKEN must contain at least 32 bytes")
+CONTROL_SECRET = os.getenv("VIPERCAPTURE_CONTROL_SECRET", "")
+if CONTROL_ENABLED and len(CONTROL_SECRET.encode()) < 32:
+    raise ValueError(
+        "VIPERCAPTURE_CONTROL_SECRET must contain at least 32 bytes when the control plane is enabled"
+    )
 CONTROL_DATABASE = Path(
     os.getenv("VIPERCAPTURE_CONTROL_DATABASE", str(CACHE_DIRECTORY.parent / "control.sqlite3"))
 ).expanduser()
@@ -309,7 +319,12 @@ async def _replace_browser(app: FastAPI, failed_browser: Browser) -> None:
 async def lifespan(app: FastAPI):
     app.state.control = None
     if CONTROL_ENABLED:
-        control = ControlPlane(CONTROL_DATABASE, encryption_secret=CONTROL_ADMIN_TOKEN)
+        if PROCESS_ROLE != "all":
+            raise RuntimeError(
+                "the built-in SQLite control plane supports only VIPERCAPTURE_ROLE=all; "
+                "put authentication and quotas in shared infrastructure for split roles"
+            )
+        control = ControlPlane(CONTROL_DATABASE, encryption_secret=CONTROL_SECRET)
         await asyncio.to_thread(control.initialize)
         app.state.control = control
     if PROCESS_ROLE in {"api", "worker"} and ASYNC_JOBS_ENABLED:
@@ -322,6 +337,12 @@ async def lifespan(app: FastAPI):
             raise RuntimeError("split api/worker roles require shared artifact storage")
         if not os.getenv("VIPERCAPTURE_JOB_SECRET"):
             raise RuntimeError("split api/worker roles require VIPERCAPTURE_JOB_SECRET")
+        if SCHEDULES_ENABLED and not os.getenv(
+            "VIPERCAPTURE_SCHEDULE_STORE_FACTORY"
+        ):
+            raise RuntimeError(
+                "split api/worker roles require VIPERCAPTURE_SCHEDULE_STORE_FACTORY or VIPERCAPTURE_SCHEDULES=0"
+            )
     playwright: Playwright = await async_playwright().start()
     browser = await _launch_browser(playwright)
     app.state.playwright = playwright
@@ -371,10 +392,11 @@ async def lifespan(app: FastAPI):
                 artifact_store,
                 _render_async_image,
                 notifier=_notify_job if app.state.webhooks is not None else None,
+                recover_running=PROCESS_ROLE == "all",
             )
             await service.start()
             app.state.async_jobs = service
-            if SCHEDULES_ENABLED and PROCESS_ROLE == "all":
+            if SCHEDULES_ENABLED:
                 async def own_scheduled_job(schedule_id: str, job_id: str) -> None:
                     control = getattr(app.state, "control", None)
                     if control is None:
@@ -384,7 +406,7 @@ async def lifespan(app: FastAPI):
                         await asyncio.to_thread(control.own, "job", job_id, project_id)
 
                 scheduler = ScheduleService(
-                    ScheduleStore(ASYNC_JOB_SETTINGS.data_dir / "schedules.sqlite3"),
+                    load_schedule_store(ASYNC_JOB_SETTINGS),
                     service,
                     service.cipher,
                     on_job_created=own_scheduled_job,
@@ -518,11 +540,8 @@ async def require_desktop_token(request: Request, call_next):
     finally:
         if acquired_project is not None:
             await control.release(acquired_project)
-    metric_route = re.sub(
-        r"/(?:[0-9a-fA-F-]{24,}|[A-Za-z0-9_-]{32,})(?=/|$)",
-        "/{id}",
-        path,
-    )
+    matched_route = getattr(request, "scope", {}).get("route")
+    metric_route = getattr(matched_route, "path", None) or "unmatched"
     METRICS.inc(
         "http_requests_total",
         method=request.method,
@@ -539,13 +558,14 @@ async def health() -> dict[str, bool]:
 
 
 @app.get("/ready")
-async def ready() -> dict[str, object]:
+async def ready() -> JSONResponse:
     browser = getattr(app.state, "browser", None)
-    return {
-        "ready": browser is not None and browser.is_connected(),
+    is_ready = browser is not None and browser.is_connected()
+    return JSONResponse({
+        "ready": is_ready,
         "role": PROCESS_ROLE,
         "async_jobs": getattr(app.state, "async_jobs", None) is not None,
-    }
+    }, status_code=200 if is_ready else 503)
 
 
 @app.get("/metrics", response_class=Response)
@@ -884,44 +904,69 @@ def _render_engine() -> RenderEngine:
 
 async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
     started = time.perf_counter()
-    cache = getattr(app.state, "render_cache", None)
-    if payload.cache and cache is not None:
-        cached = await cache.get(payload)
-        if cached is not None:
-            return RenderedArtifact(
-                body=cached.body,
-                media_type=cached.media_type,
-                filename=cached.filename,
-                render_ms=round((time.perf_counter() - started) * 1000),
+    job = current_job()
+    project_id = None
+    if CONTROL_ENABLED and job is not None:
+        candidate = job.request_id.partition(":")[0]
+        if re.fullmatch(r"[0-9a-f]{24}", candidate):
+            project_id = candidate
+    control = getattr(app.state, "control", None)
+    project_acquired = False
+    if project_id is not None and control is not None:
+        project_acquired = await control.acquire_worker(project_id)
+        if not project_acquired:
+            raise RenderError(
+                "concurrency_limit_exceeded",
+                "The project background render limit was reached.",
+                429,
+                True,
             )
-    await app.state.capture_slots.acquire()
-    browser: Browser = app.state.browser
-    engine = _render_engine()
+    cache = getattr(app.state, "render_cache", None)
     try:
-        artifact, _cache_hit = await _render_with_cache(engine, browser, payload)
-    except RenderError:
-        if not browser.is_connected():
-            with suppress(Exception):
-                await _replace_browser(app, browser)
-        raise
+        if payload.cache and cache is not None:
+            cached = await cache.get(payload, project_id)
+            if cached is not None:
+                return RenderedArtifact(
+                    body=cached.body,
+                    media_type=cached.media_type,
+                    filename=cached.filename,
+                    render_ms=round((time.perf_counter() - started) * 1000),
+                )
+        await app.state.capture_slots.acquire()
+        browser: Browser = app.state.browser
+        engine = _render_engine()
+        try:
+            artifact, _cache_hit = await _render_with_cache(
+                engine, browser, payload, namespace=project_id
+            )
+        except RenderError:
+            if not browser.is_connected():
+                with suppress(Exception):
+                    await _replace_browser(app, browser)
+            raise
+        finally:
+            app.state.capture_slots.release()
+        return RenderedArtifact(
+            body=artifact.body,
+            media_type=artifact.media_type,
+            filename=artifact.filename,
+            render_ms=round((time.perf_counter() - started) * 1000),
+        )
     finally:
-        app.state.capture_slots.release()
-    return RenderedArtifact(
-        body=artifact.body,
-        media_type=artifact.media_type,
-        filename=artifact.filename,
-        render_ms=round((time.perf_counter() - started) * 1000),
-    )
+        if project_acquired:
+            await control.release(project_id)
 
 
 async def _render_with_cache(
     engine: RenderEngine,
     browser: Browser,
     payload: RenderRequest,
+    *,
+    namespace: str | None = None,
 ) -> tuple[RenderArtifact, bool]:
     cache = getattr(app.state, "render_cache", None)
     if payload.cache and cache is not None:
-        cached = await cache.get(payload)
+        cached = await cache.get(payload, namespace)
         if cached is not None:
             return cached, True
     artifact = await engine.render_image(
@@ -930,7 +975,7 @@ async def _render_with_cache(
         RenderLimits(max_pixels=MAX_SCREENSHOT_PIXELS),
     )
     if payload.cache and cache is not None:
-        await cache.put(payload, artifact)
+        await cache.put(payload, artifact, namespace)
     return artifact, False
 
 
@@ -958,8 +1003,11 @@ async def _render_response(payload: RenderRequest, request: Request) -> Response
     cache_hit = False
     queue_ms = 0
     render_ms = 0
+    cache_namespace = getattr(getattr(request, "state", None), "project_id", None)
     if payload.cache and cache is not None:
-        artifact = await _await_while_connected(request, cache.get(payload))
+        artifact = await _await_while_connected(
+            request, cache.get(payload, cache_namespace)
+        )
         cache_hit = artifact is not None
 
     if artifact is None:
@@ -982,7 +1030,7 @@ async def _render_response(payload: RenderRequest, request: Request) -> Response
         try:
             if payload.cache and cache is not None:
                 artifact = await _await_while_connected(
-                    request, cache.get(payload)
+                    request, cache.get(payload, cache_namespace)
                 )
                 cache_hit = artifact is not None
             if artifact is None:
@@ -999,7 +1047,7 @@ async def _render_response(payload: RenderRequest, request: Request) -> Response
                     (time.perf_counter() - render_started) * 1000
                 )
                 if payload.cache and cache is not None:
-                    await cache.put(payload, artifact)
+                    await cache.put(payload, artifact, cache_namespace)
         except RenderError:
             if not browser.is_connected():
                 with suppress(Exception):
@@ -1132,7 +1180,17 @@ async def put_baseline(name: str, image: UploadFile, request: Request) -> JSONRe
     body = await image.read(MAX_DIFF_INPUT_BYTES + 1)
     if not body or len(body) > MAX_DIFF_INPUT_BYTES:
         raise RenderError("baseline_too_large", "The baseline image exceeds the input limit.", 413, False)
-    document = await asyncio.to_thread(control.put_baseline, project_id, name, body)
+    try:
+        document = await asyncio.to_thread(
+            control.put_baseline, project_id, name, body
+        )
+    except BaselineQuotaError as exc:
+        raise RenderError(
+            "baseline_quota_exceeded",
+            "The project baseline storage quota was reached.",
+            413,
+            False,
+        ) from exc
     await asyncio.to_thread(control.audit, project_id, request.state.key_id, "baseline.updated", name)
     return JSONResponse(document)
 
@@ -1141,6 +1199,21 @@ async def put_baseline(name: str, image: UploadFile, request: Request) -> JSONRe
 async def list_baselines(request: Request) -> list[dict[str, object]]:
     control, project_id = _baseline_context(request, "all")
     return await asyncio.to_thread(control.list_baselines, project_id)
+
+
+@app.delete("/v1/baselines/{name}", status_code=204)
+async def delete_baseline(name: str, request: Request) -> Response:
+    control, project_id = _baseline_context(request, name)
+    if not await asyncio.to_thread(control.delete_baseline, project_id, name):
+        raise RenderError("baseline_not_found", "The baseline was not found.", 404, False)
+    await asyncio.to_thread(
+        control.audit,
+        project_id,
+        request.state.key_id,
+        "baseline.deleted",
+        name,
+    )
+    return Response(status_code=204)
 
 
 @app.post("/v1/baselines/{name}/compare", response_class=Response)
@@ -1152,15 +1225,27 @@ async def compare_baseline(
     max_difference_ratio: float = Form(0),
 ) -> Response:
     control, project_id = _baseline_context(request, name)
-    baseline = await asyncio.to_thread(control.get_baseline, project_id, name)
-    if baseline is None:
-        raise RenderError("baseline_not_found", "The baseline was not found.", 404, False)
-    current_body = await current.read(MAX_DIFF_INPUT_BYTES + 1)
     try:
-        result = await _settled_thread(compare_images, baseline, current_body, pixel_threshold=pixel_threshold, max_difference_ratio=max_difference_ratio)
-        bundle = await _settled_thread(create_diff_bundle, result)
-    except ValueError as exc:
-        raise RenderError("diff_options_invalid", str(exc), 422, False) from exc
+        await asyncio.wait_for(
+            app.state.diff_slots.acquire(),
+            timeout=CAPTURE_QUEUE_TIMEOUT_SECONDS,
+        )
+    except TimeoutError as exc:
+        raise RenderError(
+            "diff_queue_busy", "The visual diff queue is busy.", 503, True
+        ) from exc
+    try:
+        baseline = await asyncio.to_thread(control.get_baseline, project_id, name)
+        if baseline is None:
+            raise RenderError("baseline_not_found", "The baseline was not found.", 404, False)
+        current_body = await current.read(MAX_DIFF_INPUT_BYTES + 1)
+        try:
+            result = await _settled_thread(compare_images, baseline, current_body, pixel_threshold=pixel_threshold, max_difference_ratio=max_difference_ratio)
+            bundle = await _settled_thread(create_diff_bundle, result)
+        except ValueError as exc:
+            raise RenderError("diff_options_invalid", str(exc), 422, False) from exc
+    finally:
+        app.state.diff_slots.release()
     return Response(bundle, media_type="application/zip", headers={"X-ViperCapture-Diff-Passed": str(result.passed).lower(), "X-ViperCapture-Difference-Ratio": f"{result.ratio:.8f}"})
 
 
@@ -1184,6 +1269,13 @@ async def render_signed(
         signature,
         secret=SIGNING_SECRET,
     )
+    if render_request.profile_id is not None:
+        raise RenderError(
+            "signed_profile_unsupported",
+            "Signed render URLs cannot use persistent browser profiles.",
+            422,
+            False,
+        )
     response = await _render_response(render_request, request)
     if render_request.output is not OutputFormat.HTML:
         disposition = response.headers.get("Content-Disposition", "")
@@ -1223,6 +1315,13 @@ async def create_signed_url(
         raise RenderError(
             "delivery_requires_async_job",
             "Webhook delivery is accepted only by POST /v1/jobs.",
+            422,
+            False,
+        )
+    if payload.profile_id is not None:
+        raise RenderError(
+            "signed_profile_unsupported",
+            "Signed render URLs cannot use persistent browser profiles.",
             422,
             False,
         )
@@ -1271,11 +1370,12 @@ async def _validate_profile_access(payload: RenderRequest, request: Request) -> 
         or request.state.trusted_local
     ):
         return
-    if not await asyncio.to_thread(
+    project_id = getattr(request.state, "project_id", None)
+    if project_id is None or not await asyncio.to_thread(
         app.state.control.is_owner,
         "profile",
         payload.profile_id,
-        request.state.project_id,
+        project_id,
     ):
         raise RenderError("profile_not_found", "The browser profile was not found.", 404, False)
 
@@ -1500,15 +1600,29 @@ async def list_schedules(
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     after: Annotated[str | None, Query(max_length=256)] = None,
 ) -> JSONResponse:
-    records = await _schedule_service().store.list(
-        limit=101 if CONTROL_ENABLED and not request.state.is_admin else limit + 1,
-        after=after,
-    )
+    service = _schedule_service()
     if CONTROL_ENABLED and not request.state.is_admin:
-        records = [
-            item for item in records
-            if await asyncio.to_thread(app.state.control.is_owner, "schedule", item.id, request.state.project_id)
-        ]
+        records = []
+        cursor = after
+        while len(records) <= limit:
+            batch = await service.store.list(limit=100, after=cursor)
+            if not batch:
+                break
+            for item in batch:
+                if await asyncio.to_thread(
+                    app.state.control.is_owner,
+                    "schedule",
+                    item.id,
+                    request.state.project_id,
+                ):
+                    records.append(item)
+                    if len(records) > limit:
+                        break
+            cursor = schedule_cursor(batch[-1])
+            if len(batch) < 100:
+                break
+    else:
+        records = await service.store.list(limit=limit + 1, after=after)
     has_more = len(records) > limit
     records = records[:limit]
     return JSONResponse(
@@ -1733,6 +1847,7 @@ async def _gpu_config(app: FastAPI) -> dict[str, object]:
 async def app_config():
     return {
         "server_saves": not HOSTED,
+        "control_plane": CONTROL_ENABLED,
         "max_screenshot_pixels": MAX_SCREENSHOT_PIXELS,
         "async_jobs": {
             "enabled": ASYNC_JOBS_ENABLED,

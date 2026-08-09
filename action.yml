@@ -1,5 +1,5 @@
 name: ViperCapture visual check
-description: Capture a page deterministically and optionally compare it with a baseline.
+description: Capture a page deterministically with a self-hosted ViperCapture server.
 inputs:
   url:
     description: URL to capture
@@ -7,7 +7,7 @@ inputs:
   api-url:
     description: ViperCapture render endpoint
     required: false
-    default: http://localhost:8765/v1/render
+    default: http://localhost:8000/v1/render
   api-key:
     description: Project API key
     required: false
@@ -21,7 +21,11 @@ runs:
     - shell: bash
       env:
         VIPERCAPTURE_API_KEY: ${{ inputs.api-key }}
+        VIPERCAPTURE_ACTION_PATH: ${{ github.action_path }}
+        VIPERCAPTURE_ACTION_API_URL: ${{ inputs.api-url }}
+        VIPERCAPTURE_ACTION_URL: ${{ inputs.url }}
+        VIPERCAPTURE_ACTION_OUTPUT: ${{ inputs.output }}
       run: >-
-        python3 "${{ github.action_path }}/skills/vipercapture/scripts/capture.py"
-        --api-url "${{ inputs.api-url }}" --url "${{ inputs.url }}"
-        --output-path "${{ inputs.output }}" --deterministic --force
+        python3 "$VIPERCAPTURE_ACTION_PATH/skills/vipercapture/scripts/capture.py"
+        --api-url "$VIPERCAPTURE_ACTION_API_URL" --url "$VIPERCAPTURE_ACTION_URL"
+        --output-path "$VIPERCAPTURE_ACTION_OUTPUT" --deterministic --force

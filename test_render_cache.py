@@ -103,6 +103,18 @@ class RenderCacheTests(unittest.IsolatedAsyncioTestCase):
             second = RenderRequest(html="two", cache=True)
             self.assertNotEqual(cache.key(first), cache.key(second))
 
+    async def test_project_namespace_changes_key_and_visibility(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = RenderCache(Path(directory))
+            await cache.start()
+            request = RenderRequest(html="one", cache=True)
+            artifact = RenderArtifact(b"png", "image/png", "capture.png")
+            self.assertNotEqual(
+                cache.key(request, "project-a"), cache.key(request, "project-b")
+            )
+            await cache.put(request, artifact, "project-a")
+            self.assertIsNone(await cache.get(request, "project-b"))
+
     async def test_security_mode_changes_key(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

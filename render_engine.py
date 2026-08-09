@@ -24,6 +24,7 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Awaitable, Callable
 from urllib.parse import urlsplit, urlunsplit
+from uuid import uuid4
 
 from playwright.async_api import Browser, Page
 from playwright.async_api import Error as PlaywrightError
@@ -395,11 +396,19 @@ def _har_document(events: list[dict[str, object]]) -> bytes:
 
 
 def _warc_document(events: list[dict[str, object]]) -> bytes:
+    def headers(record_type: str, content_type: str, length: int) -> bytes:
+        date = datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
+            "+00:00", "Z"
+        )
+        return (
+            f"WARC/1.1\r\nWARC-Type: {record_type}\r\n"
+            f"WARC-Date: {date}\r\nWARC-Record-ID: <urn:uuid:{uuid4()}>\r\n"
+            f"Content-Type: {content_type}\r\nContent-Length: {length}\r\n\r\n"
+        ).encode()
+
     info = b'{"software":"ViperCapture","privacy":"headers, bodies, credentials, and query strings omitted"}'
     records = [
-        b"WARC/1.1\r\nWARC-Type: warcinfo\r\nContent-Type: application/json\r\nContent-Length: "
-        + str(len(info)).encode()
-        + b"\r\n\r\n"
+        headers("warcinfo", "application/json", len(info))
         + info
         + b"\r\n\r\n"
     ]
@@ -407,15 +416,61 @@ def _warc_document(events: list[dict[str, object]]) -> bytes:
         url = str(event.get("url", ""))
         payload = json.dumps(event, separators=(",", ":")).encode()
         records.append(
-            b"WARC/1.1\r\nWARC-Type: metadata\r\nWARC-Target-URI: "
+            headers("metadata", "application/json", len(payload))[:-2]
+            + b"WARC-Target-URI: "
             + url.encode("utf-8", "replace")
-            + b"\r\nContent-Type: application/json\r\nContent-Length: "
-            + str(len(payload)).encode()
             + b"\r\n\r\n"
             + payload
             + b"\r\n\r\n"
         )
     return b"".join(records)
+
+
+def _redact_trace_archive(body: bytes) -> bytes:
+    sensitive = {
+        "authorization", "cookie", "cookies", "headers", "postdata",
+        "requestbody", "responsebody", "storagestate", "value",
+    }
+
+    def redact(value):
+        if isinstance(value, dict):
+            return {
+                key: (
+                    "[redacted]"
+                    if key.lower() in sensitive
+                    else diagnostic_url(item)
+                    if key.lower() in {"url", "documenturl", "baseurl"}
+                    and isinstance(item, str)
+                    else redact(item)
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [redact(item) for item in value]
+        return value
+
+    source = io.BytesIO(body)
+    destination = io.BytesIO()
+    with zipfile.ZipFile(source) as archive, zipfile.ZipFile(
+        destination, "w", zipfile.ZIP_DEFLATED
+    ) as output:
+        for name in archive.namelist():
+            lowered = name.lower()
+            if lowered.endswith(".network") or "/resources/" in f"/{lowered}":
+                continue
+            data = archive.read(name)
+            if lowered.endswith(".trace"):
+                lines = []
+                for line in data.splitlines():
+                    try:
+                        lines.append(
+                            json.dumps(redact(json.loads(line)), separators=(",", ":")).encode()
+                        )
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                data = b"\n".join(lines) + (b"\n" if lines else b"")
+            output.writestr(name, data)
+    return destination.getvalue()
 
 
 async def diagnostic_bundle(
@@ -495,7 +550,10 @@ async def diagnostic_bundle(
         with tempfile.TemporaryDirectory(prefix="vipercapture-trace-") as directory:
             trace_path = Path(directory) / "trace.zip"
             await context.tracing.stop(path=trace_path)
-            entries.append(("trace.zip", await _settled_thread(trace_path.read_bytes)))
+            raw_trace = await _settled_thread(trace_path.read_bytes)
+            entries.append(
+                ("trace.zip", await _settled_thread(_redact_trace_archive, raw_trace))
+            )
     if sum(len(entry) for _, entry in entries) > limits.output_bytes:
         raise RenderError("output_too_large", "The diagnostic bundle exceeds the output limit.", 413, False)
     body = await _settled_thread(_write_diagnostic_zip, entries)
@@ -1416,10 +1474,13 @@ class RenderEngine:
                         script=f"""(() => {{
                             const fixed = {request.deterministic.timestamp_ms};
                             const NativeDate = Date;
-                            class FixedDate extends NativeDate {{
-                                constructor(...args) {{ super(...(args.length ? args : [fixed])); }}
-                                static now() {{ return fixed; }}
+                            function FixedDate(...args) {{
+                                if (new.target) return new NativeDate(...(args.length ? args : [fixed]));
+                                return new NativeDate(fixed).toString();
                             }}
+                            Object.setPrototypeOf(FixedDate, NativeDate);
+                            FixedDate.prototype = NativeDate.prototype;
+                            FixedDate.now = () => fixed;
                             Object.defineProperty(globalThis, 'Date', {{value: FixedDate}});
                             let state = {request.deterministic.random_seed} >>> 0;
                             Math.random = () => ((state = (1664525 * state + 1013904223) >>> 0) / 4294967296);
@@ -1675,8 +1736,6 @@ class RenderEngine:
                             False,
                         ) from exc
                 await self._wait(page, request, limits)
-                if request.deterministic.enabled and request.deterministic.wait_for_fonts:
-                    await page.evaluate("() => document.fonts?.ready")
                 if self.cleanup_hooks:
                     await self.cleanup_hooks.apply(page, request.cleanup)
                 await self._run_actions(page, request, limits)
@@ -1717,10 +1776,17 @@ class RenderEngine:
                         await self.cleanup_hooks.apply(page, request.cleanup)
                     if self.challenge_checker:
                         await self.challenge_checker(page, request.proceed_on_captcha, navigation_status)
+                if request.deterministic.enabled and request.deterministic.wait_for_fonts:
+                    await page.evaluate("() => document.fonts?.ready")
                 await self._check_assertions(
                     page, request, failed_requests, matched_failure_patterns
                 )
-                if request.save_profile and request.profile_id is not None:
+                is_video = request.output in {
+                    OutputFormat.WEBM,
+                    OutputFormat.MP4,
+                    OutputFormat.GIF,
+                }
+                if request.save_profile and request.profile_id is not None and not is_video:
                     if self.profile_saver is None:
                         raise RenderError("profiles_disabled", "Persistent browser profiles are disabled.", 503, False)
                     await self.profile_saver(request.profile_id, await context.storage_state())
@@ -1755,6 +1821,12 @@ class RenderEngine:
                         failed_requests,
                         matched_failure_patterns,
                     )
+                    if request.save_profile and request.profile_id is not None:
+                        if self.profile_saver is None:
+                            raise RenderError("profiles_disabled", "Persistent browser profiles are disabled.", 503, False)
+                        await self.profile_saver(
+                            request.profile_id, await context.storage_state()
+                        )
                     final_url = page.url
                     video = page.video
                     await page.close()
@@ -1982,7 +2054,14 @@ class RenderEngine:
                             raise RenderError("output_too_large", "The rendered slices exceed the output limit.", 413, False)
                         name = f"slices/{index:04d}.{EXTENSIONS[request.output]}"
                         slice_entries.append((name, part))
-                        slice_manifest.append({"file": name, "top": top, "bottom": bottom})
+                        scale = request.viewport.device_scale_factor
+                        slice_manifest.append(
+                            {
+                                "file": name,
+                                "top": math.ceil(top * scale),
+                                "bottom": math.ceil(bottom * scale),
+                            }
+                        )
                         if bottom == height:
                             break
                     slice_entries.append(

@@ -11,6 +11,6 @@ resource "docker_container" "vipercapture" {
   name  = "vipercapture"
   image = docker_image.vipercapture.image_id
   restart = "unless-stopped"
-  ports { internal = 8765; external = var.port; ip = "127.0.0.1" }
+  ports { internal = 8000; external = var.port; ip = "127.0.0.1" }
   env = ["VIPERCAPTURE_ADMIN_TOKEN=${var.admin_token}"]
 }

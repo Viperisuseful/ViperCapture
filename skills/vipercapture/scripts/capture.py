@@ -295,9 +295,10 @@ def source_label(args: argparse.Namespace) -> str:
 
 def output_path(args: argparse.Namespace) -> Path:
     if args.output_path:
-        return args.output_path.expanduser()
+        target = args.output_path.expanduser()
+        return target.with_suffix(".zip") if args.diagnostic_bundle else target
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    extension = EXTENSIONS.get(args.output, args.output)
+    extension = "zip" if args.diagnostic_bundle else EXTENSIONS.get(args.output, args.output)
     name = f"{source_label(args)}-{timestamp}.{extension}"
     return args.output_dir.expanduser() / name
 
@@ -308,6 +309,7 @@ def validate_artifact(output: str, content: bytes) -> None:
         "jpeg": b"\xff\xd8\xff",
         "webp": b"RIFF",
         "pdf": b"%PDF-",
+        "zip": b"PK\x03\x04",
     }
     signature = signatures.get(output)
     if signature and not content.startswith(signature):
@@ -361,7 +363,7 @@ def main() -> int:
                         True,
                         result_request_id,
                     )
-                validate_artifact(args.output, content)
+                validate_artifact("zip" if args.diagnostic_bundle else args.output, content)
                 with target.open("wb" if args.force else "xb") as artifact:
                     artifact.write(content)
                 print(

@@ -63,6 +63,7 @@ type Capture = {
 type ActiveRun = { waitConditions: string; waitTimeout: number }
 type AppConfig = {
   max_screenshot_pixels?: number
+  control_plane?: boolean
   gpu?: { mode?: "off" | "auto" | "required"; hardware_active?: boolean; mutable?: boolean }
 }
 type CaptchaWarning = { provider: string; requestId?: string }
@@ -197,6 +198,7 @@ function ResultMetric({ label, value, mono = false }: { label: string; value: st
 export default function App() {
   const [dark, setDark] = useState(() => localStorage.getItem("theme") === "dark")
   const [url, setUrl] = useState("https://example.com")
+  const [apiKey, setApiKey] = useState(() => sessionStorage.getItem("vipercapture-api-key") ?? "")
   const [output, setOutput] = useState<Output>("png")
   const [width, setWidth] = useState(1280)
   const [height, setHeight] = useState(720)
@@ -237,6 +239,10 @@ export default function App() {
     document.documentElement.classList.toggle("dark", dark)
     localStorage.setItem("theme", dark ? "dark" : "light")
   }, [dark])
+  useEffect(() => {
+    if (apiKey) sessionStorage.setItem("vipercapture-api-key", apiKey)
+    else sessionStorage.removeItem("vipercapture-api-key")
+  }, [apiKey])
   useEffect(() => {
     fetch("/app-config").then((response) => response.json()).then(setConfig).catch(() => null)
   }, [])
@@ -394,7 +400,10 @@ export default function App() {
     try {
       const response = await fetch("/v1/render", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+        },
         body: JSON.stringify(payload),
         signal: controller.signal,
       })
@@ -516,6 +525,13 @@ export default function App() {
                 <InputGroupTextarea id="capture-url" rows={1} value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://example.com" className="min-h-10" />
               </InputGroup>
             </Field>
+            {config?.control_plane && (
+              <Field className="lg:w-72">
+                <FieldLabel htmlFor="project-api-key">Project API key</FieldLabel>
+                <Input id="project-api-key" type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="vcp_…" />
+                <FieldDescription>Kept only in this browser tab.</FieldDescription>
+              </Field>
+            )}
             <Button size="lg" onClick={() => void capture()} disabled={busy} className="lg:min-w-36">
               {busy ? <Loader2 data-icon="inline-start" className="animate-spin" /> : <ImageIcon data-icon="inline-start" />}
               {busy ? "Rendering" : "Capture"}

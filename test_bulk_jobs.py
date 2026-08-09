@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from bulk_jobs import (
+    MAX_BASELINE_BODY_BYTES,
     MAX_DIFF_BODY_BYTES,
     MAX_JSON_BODY_BYTES,
     BulkBodyLimitMiddleware,
@@ -93,12 +94,20 @@ class BulkBodyLimitTests(unittest.IsolatedAsyncioTestCase):
                 "/v1/schedules/00000000-0000-0000-0000-000000000001",
                 MAX_JSON_BODY_BYTES + 1,
             ),
+            ("/v1/profiles", MAX_JSON_BODY_BYTES + 1),
+            ("/compat/urlbox/v1/render/sync", MAX_JSON_BODY_BYTES + 1),
+            ("/v1/baselines/home", MAX_BASELINE_BODY_BYTES + 1),
+            ("/v1/baselines/home/compare", MAX_DIFF_BODY_BYTES + 1),
         ):
             with self.assertRaises(RenderError):
                 await middleware(
                     {
                         "type": "http",
-                        "method": "PATCH" if "schedules/" in path else "POST",
+                        "method": (
+                            "PATCH" if "schedules/" in path
+                            else "PUT" if path == "/v1/baselines/home"
+                            else "POST"
+                        ),
                         "path": path,
                         "headers": [(b"content-length", str(size).encode())],
                     },

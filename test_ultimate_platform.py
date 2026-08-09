@@ -13,7 +13,7 @@ from pydantic import ValidationError
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from compatibility import screenshotone_request, urlbox_request
-from control_plane import ControlPlane, Metrics
+from control_plane import BaselineQuotaError, ControlPlane, Metrics
 from render_contract import OutputFormat, RenderRequest
 from render_engine import RenderArtifact, RenderLimits, diagnostic_bundle
 
@@ -60,6 +60,42 @@ class ControlPlaneTests(unittest.IsolatedAsyncioTestCase):
         document = self.control.put_baseline(str(project["id"]), "home", b"png")
         self.assertEqual(document["sha256"], "8f8cbb7dcf46e0bc7d53265749a6c17d116093a6ba95e442764060c76fd4a86c")
         self.assertEqual(self.control.get_baseline(str(project["id"]), "home"), b"png")
+        self.assertTrue(self.control.delete_baseline(str(project["id"]), "home"))
+
+    async def test_project_concurrency_is_atomic_across_control_instances(self):
+        project = self.control.create_project("replicas", 10, 1)
+        key = self.control.create_key(str(project["id"]), "ci")
+        identity = self.control.authenticate(key["api_key"])
+        replica = ControlPlane(
+            Path(self.directory.name) / "control.sqlite3",
+            encryption_secret="test-secret-that-is-at-least-32-bytes",
+        )
+        replica.initialize()
+        allowed, _ = await self.control.acquire(identity)
+        second, reason = await replica.acquire(identity)
+        self.assertTrue(allowed)
+        self.assertFalse(second)
+        self.assertEqual(reason, "concurrency_limit_exceeded")
+        await self.control.release(str(project["id"]))
+
+    async def test_profile_save_preserves_expiration_and_baselines_are_bounded(self):
+        project = self.control.create_project("tests", 10, 1)
+        project_id = str(project["id"])
+        self.control.put_profile(project_id, "profile", {}, 60)
+        with self.control._connect() as database:
+            expires_at = database.execute(
+                "SELECT expires_at FROM profiles WHERE id='profile'"
+            ).fetchone()[0]
+        self.assertTrue(self.control.put_profile_any("profile", {"cookies": []}))
+        with self.control._connect() as database:
+            saved_expiration = database.execute(
+                "SELECT expires_at FROM profiles WHERE id='profile'"
+            ).fetchone()[0]
+        self.assertEqual(saved_expiration, expires_at)
+        with patch("control_plane.MAX_BASELINES_PER_PROJECT", 1):
+            self.control.put_baseline(project_id, "one", b"1")
+            with self.assertRaises(BaselineQuotaError):
+                self.control.put_baseline(project_id, "two", b"2")
 
 
 class CompatibilityTests(unittest.TestCase):
@@ -77,6 +113,18 @@ class CompatibilityTests(unittest.TestCase):
     def test_unknown_vendor_option_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "unsupported"):
             screenshotone_request({"url": "https://example.com", "magic": "1"})
+
+    def test_selector_adapters_disable_full_page_by_default(self):
+        self.assertFalse(
+            screenshotone_request(
+                {"url": "https://example.com", "selector": "main"}
+            ).full_page
+        )
+        self.assertFalse(
+            urlbox_request(
+                {"url": "https://example.com", "selector": "main"}
+            ).full_page
+        )
 
 
 class ArtifactFeatureTests(unittest.IsolatedAsyncioTestCase):
@@ -124,8 +172,18 @@ class ArtifactFeatureTests(unittest.IsolatedAsyncioTestCase):
 
     def test_prometheus_metrics(self):
         metrics = Metrics()
-        metrics.inc("renders_total", output="png")
-        self.assertIn('vipercapture_renders_total{output="png"} 1', metrics.prometheus())
+        metrics.inc("renders_total", output='png"\\\n')
+        self.assertIn('output="png\\"\\\\\\n"', metrics.prometheus())
+
+    def test_integrations_use_safe_defaults(self):
+        root = Path(__file__).parent
+        action = (root / "action.yml").read_text()
+        terraform = (root / "integrations" / "terraform" / "main.tf").read_text()
+        self.assertIn("http://localhost:8000/v1/render", action)
+        self.assertNotIn('--url "${{ inputs.url }}"', action)
+        self.assertIn("internal = 8000", terraform)
+        self.assertIn("Pillow>=11.3.0", (root / "requirements.txt").read_text())
+        self.assertIn("ffmpeg", (root / "Dockerfile").read_text())
 
 
 if __name__ == "__main__":

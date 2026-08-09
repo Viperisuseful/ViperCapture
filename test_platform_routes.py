@@ -36,6 +36,16 @@ class PlatformRouteTests(unittest.TestCase):
 
 
 class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_readiness_is_unavailable_without_a_browser(self):
+        original_browser = getattr(main.app.state, "browser", None)
+        main.app.state.browser = None
+        try:
+            response = await main.ready()
+        finally:
+            main.app.state.browser = original_browser
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(json.loads(response.body)["ready"])
+
     async def test_health_bypasses_desktop_token(self):
         expected = main.Response(status_code=200)
         call_next = AsyncMock(return_value=expected)
@@ -146,6 +156,19 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(RenderError) as raised:
                 await main.create_signed_url(payload, request)
         self.assertEqual(raised.exception.code, "delivery_requires_async_job")
+
+    async def test_signed_url_rejects_persistent_profiles(self):
+        payload = RenderRequest.model_validate(
+            {"url": "https://example.com", "profile_id": "profile-1"}
+        )
+        request = SimpleNamespace(headers={"authorization": "Bearer admin"})
+        with (
+            patch("main.SIGNING_SECRET", "s" * 32),
+            patch("main.SIGNING_ADMIN_TOKEN", "admin"),
+            self.assertRaises(RenderError) as raised,
+        ):
+            await main.create_signed_url(payload, request)
+        self.assertEqual(raised.exception.code, "signed_profile_unsupported")
 
     async def test_signed_html_remains_an_attachment(self):
         html_request = RenderRequest.model_validate(

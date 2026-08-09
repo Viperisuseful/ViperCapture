@@ -16,6 +16,8 @@ from render_engine import (
     RenderArtifact,
     RenderLimits,
     _ffmpeg_executable,
+    _redact_trace_archive,
+    _warc_document,
     diagnostic_bundle,
     diagnostic_url,
 )
@@ -52,6 +54,32 @@ class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
     def test_diagnostic_urls_drop_secrets(self):
         sanitized = diagnostic_url("https://user:pass@example.com/path?token=secret#fragment")
         self.assertEqual(sanitized, "https://example.com/path")
+
+    def test_warc_has_required_fields_and_trace_drops_sensitive_data(self):
+        warc = _warc_document([{"url": "https://example.com", "status": 200}])
+        self.assertEqual(warc.count(b"WARC-Date:"), 2)
+        self.assertEqual(warc.count(b"WARC-Record-ID: <urn:uuid:"), 2)
+        source = io.BytesIO()
+        with zipfile.ZipFile(source, "w") as archive:
+            archive.writestr(
+                "trace.trace",
+                json.dumps(
+                    {
+                        "headers": [{"name": "Authorization", "value": "secret"}],
+                        "url": "https://example.com/path?token=secret",
+                        "value": "password",
+                    }
+                ),
+            )
+            archive.writestr("trace.network", b"secret network body")
+            archive.writestr("resources/body", b"secret response body")
+        sanitized = _redact_trace_archive(source.getvalue())
+        self.assertNotIn(b"secret", sanitized)
+        with zipfile.ZipFile(io.BytesIO(sanitized)) as archive:
+            self.assertEqual(archive.namelist(), ["trace.trace"])
+            trace = archive.read("trace.trace")
+            self.assertIn(b"[redacted]", trace)
+            self.assertNotIn(b"token=", trace)
 
     async def test_diagnostic_bundle_is_self_describing(self):
         request = RenderRequest(

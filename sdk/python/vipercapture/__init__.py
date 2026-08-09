@@ -15,6 +15,11 @@ class ViperCaptureError(RuntimeError):
         super().__init__(f"ViperCapture returned HTTP {status}: {body.decode('utf-8', 'replace')}")
 
 
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 class Client:
     def __init__(self, base_url: str, api_key: str | None = None, timeout: float = 180) -> None:
         self.base_url = base_url.rstrip("/")
@@ -32,7 +37,8 @@ class Client:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(operation, timeout=self.timeout) as response:
+            opener = urllib.request.build_opener(_RejectRedirects())
+            with opener.open(operation, timeout=self.timeout) as response:
                 return response.read()
         except urllib.error.HTTPError as exc:
             raise ViperCaptureError(exc.code, exc.read()) from None

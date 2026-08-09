@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import logging
 import os
 import sqlite3
@@ -26,6 +27,18 @@ from render_errors import RenderError
 
 UTC = timezone.utc
 logger = logging.getLogger("vipercapture.schedules")
+
+
+def load_schedule_store(settings) -> "ScheduleStore":
+    spec = os.getenv("VIPERCAPTURE_SCHEDULE_STORE_FACTORY", "")
+    if not spec:
+        return ScheduleStore(settings.data_dir / "schedules.sqlite3")
+    module_name, separator, attribute = spec.partition(":")
+    if not separator or not module_name or not attribute:
+        raise ValueError(
+            "VIPERCAPTURE_SCHEDULE_STORE_FACTORY must use module:function syntax"
+        )
+    return getattr(importlib.import_module(module_name), attribute)(settings)
 
 
 class StrictModel(BaseModel):

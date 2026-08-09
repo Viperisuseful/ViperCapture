@@ -12,6 +12,7 @@ import os
 import stat
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
@@ -29,6 +30,9 @@ PAYLOAD_VERSION = b"vipercapture-open-async-v1\0"
 MAX_WEBHOOK_ATTEMPTS = 10
 MAX_WEBHOOK_CONCURRENCY = 4
 logger = logging.getLogger("vipercapture.async_jobs")
+_CURRENT_JOB: ContextVar[JobRecord | None] = ContextVar(
+    "vipercapture_current_job", default=None
+)
 
 
 @dataclass(frozen=True)
@@ -82,6 +86,10 @@ class JobRecord:
     error_code: str | None = None
     error_message: str | None = None
     error_retryable: bool | None = None
+
+
+def current_job() -> JobRecord | None:
+    return _CURRENT_JOB.get()
 
 
 @dataclass(frozen=True)
@@ -356,6 +364,7 @@ def settings_from_environment(
     *,
     default_workers: int = 1,
     base_dir: Path | None = None,
+    allow_zero_workers: bool = False,
 ) -> JobSettings:
     root = Path(
         os.getenv(
@@ -366,9 +375,10 @@ def settings_from_environment(
     return JobSettings(
         data_dir=root,
         queue_limit=_positive_int("VIPERCAPTURE_JOB_QUEUE_LIMIT", 30),
-        worker_count=_nonnegative_int(
-            "VIPERCAPTURE_JOB_WORKERS",
-            default_workers,
+        worker_count=(
+            _nonnegative_int("VIPERCAPTURE_JOB_WORKERS", default_workers)
+            if allow_zero_workers
+            else _positive_int("VIPERCAPTURE_JOB_WORKERS", default_workers)
         ),
         queue_ttl=timedelta(
             seconds=_positive_int("VIPERCAPTURE_JOB_QUEUE_TTL_SECONDS", 900)
@@ -550,6 +560,7 @@ class AsyncJobService:
         *,
         cipher: PayloadCipher | None = None,
         notifier: JobNotifier | None = None,
+        recover_running: bool = True,
     ) -> None:
         self.settings = settings
         self.job_store = job_store
@@ -557,6 +568,7 @@ class AsyncJobService:
         self.renderer = renderer
         self.cipher = cipher or PayloadCipher.for_data_dir(settings.data_dir)
         self.notifier = notifier
+        self.recover_running = recover_running
         if notifier is not None and not isinstance(
             job_store, NotificationJobStore
         ):
@@ -585,10 +597,11 @@ class AsyncJobService:
             await self.job_store.start()
             artifact_store_started = True
             await self.artifact_store.start()
-            await self.job_store.requeue_running(
-                datetime.now(UTC),
-                self.settings.max_attempts,
-            )
+            if self.recover_running:
+                await self.job_store.requeue_running(
+                    datetime.now(UTC),
+                    self.settings.max_attempts,
+                )
             await self._maintain(force=True)
             if self.notifier is not None:
                 self._notification_wakeup.set()
@@ -1215,7 +1228,11 @@ class AsyncJobService:
         payload: RenderRequest | None = None
         try:
             payload = self.cipher.decrypt(job)
-            rendered = await self.renderer(payload)
+            token = _CURRENT_JOB.set(job)
+            try:
+                rendered = await self.renderer(payload)
+            finally:
+                _CURRENT_JOB.reset(token)
             if self._closing:
                 return
             stored = await self.artifact_store.put(

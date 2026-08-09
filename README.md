@@ -68,7 +68,8 @@ docker compose up --build
 The Compose default binds only to loopback and stores durable queue state,
 encryption keys, schedules, cache entries, and local artifacts in a named
 volume. Read [self-hosting](docs/self-hosting.md) before exposing it to a
-network. Set `VIPERCAPTURE_ADMIN_TOKEN` to enable the built-in project control
+network. Set separate `VIPERCAPTURE_ADMIN_TOKEN` and
+`VIPERCAPTURE_CONTROL_SECRET` values to enable the built-in project control
 plane before exposing API routes to multiple tenants.
 
 ## Render API

@@ -5,26 +5,34 @@ older ViperCapture installations.
 
 ## Projects, keys, quotas, and profiles
 
-Set a random `VIPERCAPTURE_ADMIN_TOKEN` of at least 32 bytes. Every `/v1`,
+Set separate random `VIPERCAPTURE_ADMIN_TOKEN` and
+`VIPERCAPTURE_CONTROL_SECRET` values of at least 32 bytes. The first
+authenticates administrators; the stable second value encrypts profiles and
+keys API-token fingerprints so administrator-token rotation does not corrupt
+stored state. Every `/v1`,
 `/take`, and `/compat` request then requires either that administrator token or
 a project key. Create a project and its first key:
 
 ```bash
 curl -H "Authorization: Bearer $VIPERCAPTURE_ADMIN_TOKEN" \
   -H 'Content-Type: application/json' -d '{"name":"ci","requests_per_minute":120,"concurrency":4}' \
-  http://127.0.0.1:8765/v1/admin/projects
+  http://127.0.0.1:8000/v1/admin/projects
 
 curl -H "Authorization: Bearer $VIPERCAPTURE_ADMIN_TOKEN" \
   -H 'Content-Type: application/json' -d '{"name":"github-actions"}' \
-  http://127.0.0.1:8765/v1/admin/projects/PROJECT_ID/keys
+  http://127.0.0.1:8000/v1/admin/projects/PROJECT_ID/keys
 ```
 
-Raw keys are returned once and only SHA-256 hashes are stored. Keys can be
+Raw keys are returned once and only server-keyed digests are stored. Keys can be
 restricted to any combination of the `render`, `jobs`, `schedules`, `profiles`,
 and `baselines` scopes. Jobs, schedules,
 profiles, and visual baselines are project-owned. Profile storage state is
 AES-GCM encrypted at rest; profile IDs are unguessable and can be supplied as
 `profile_id` on a render request.
+
+RPM events and active-render leases are transactionally recorded in the
+control database. Processes using that same database therefore share project
+limits; abandoned concurrency leases expire after 15 minutes.
 
 ## Deterministic, diagnostic, and certified artifacts
 
@@ -43,6 +51,12 @@ make a legal-admissibility claim.
 `all` remains the default. Split roles require a shared job-store factory,
 shared artifact storage (S3/R2 or a factory), and `VIPERCAPTURE_JOB_SECRET`.
 This makes accidental split deployment with local SQLite/files impossible.
+The built-in SQLite control plane is intentionally restricted to `role=all`;
+split deployments must enforce shared authentication and quotas at their
+gateway. Schedules in split mode require a shared
+`VIPERCAPTURE_SCHEDULE_STORE_FACTORY`; disable them explicitly otherwise.
+Running-job recovery is performed only by the exclusive `all` role so starting
+a distributed replica cannot steal a live worker's claim.
 
 `GET /metrics` exports Prometheus text, `GET /ready` reports role and browser
 readiness, and `/v1/admin/status` exposes authenticated operator state. Set

@@ -10,9 +10,22 @@ import sqlite3
 import threading
 import time
 from collections import defaultdict, deque
+from contextlib import contextmanager
 from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+MAX_BASELINES_PER_PROJECT = 100
+MAX_BASELINE_BYTES_PER_PROJECT = 512 * 1024 * 1024
+LIMIT_LEASE_SECONDS = 15 * 60
+
+
+class BaselineQuotaError(RuntimeError):
+    pass
+
+
+def _metric_label(value: object) -> str:
+    return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
 
 
 class Metrics:
@@ -38,7 +51,7 @@ class Metrics:
         for (name, labels), value in sorted(values.items()):
             suffix = ""
             if labels:
-                suffix = "{" + ",".join(f'{key}="{item}"' for key, item in labels) + "}"
+                suffix = "{" + ",".join(f'{key}="{_metric_label(item)}"' for key, item in labels) + "}"
             lines.append(f"vipercapture_{name}{suffix} {value:g}")
         return "\n".join(lines) + "\n"
 
@@ -49,8 +62,7 @@ class ControlPlane:
         secret = encryption_secret.encode()
         self._cipher = AESGCM(hashlib.sha256(secret).digest())
         self._key_hash_secret = hashlib.sha256(b"vipercapture-api-key\0" + secret).digest()
-        self._windows: dict[str, deque[float]] = defaultdict(deque)
-        self._active: dict[str, int] = defaultdict(int)
+        self._leases: dict[str, deque[str]] = defaultdict(deque)
         self._limit_lock = asyncio.Lock()
 
     def initialize(self) -> None:
@@ -85,6 +97,18 @@ class ControlPlane:
                     sha256 TEXT NOT NULL, updated_at INTEGER NOT NULL,
                     PRIMARY KEY(name, project_id)
                 );
+                CREATE TABLE IF NOT EXISTS rate_events (
+                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS rate_events_project_time
+                    ON rate_events(project_id, created_at);
+                CREATE TABLE IF NOT EXISTS active_leases (
+                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+                    expires_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS active_leases_project
+                    ON active_leases(project_id);
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(api_keys)")}
             if "scopes" not in columns:
@@ -92,12 +116,20 @@ class ControlPlane:
                     "ALTER TABLE api_keys ADD COLUMN scopes TEXT NOT NULL DEFAULT '[\"render\",\"jobs\",\"schedules\",\"profiles\",\"baselines\"]'"
                 )
 
+    @contextmanager
     def _connect(self):
         connection = sqlite3.connect(self.path, timeout=10)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA journal_mode=WAL")
-        return connection
+        try:
+            yield connection
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def create_project(self, name: str, rpm: int, concurrency: int) -> dict[str, object]:
         project_id = secrets.token_hex(12)
@@ -153,28 +185,77 @@ class ControlPlane:
 
     async def acquire(self, identity: dict[str, object]) -> tuple[bool, str | None]:
         project_id = str(identity["project_id"])
-        now = time.monotonic()
         async with self._limit_lock:
-            window = self._windows[project_id]
-            while window and window[0] <= now - 60:
-                window.popleft()
-            if len(window) >= int(identity["rpm"]):
-                return False, "rate_limit_exceeded"
-            if self._active[project_id] >= int(identity["concurrency"]):
-                return False, "concurrency_limit_exceeded"
-            window.append(now)
-            self._active[project_id] += 1
+            now = time.time()
+            lease_id = secrets.token_hex(16)
+            with self._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("DELETE FROM rate_events WHERE created_at<=?", (now - 60,))
+                db.execute("DELETE FROM active_leases WHERE expires_at<=?", (now,))
+                rpm = db.execute(
+                    "SELECT count(*) FROM rate_events WHERE project_id=?",
+                    (project_id,),
+                ).fetchone()[0]
+                if int(rpm) >= int(identity["rpm"]):
+                    return False, "rate_limit_exceeded"
+                active = db.execute(
+                    "SELECT count(*) FROM active_leases WHERE project_id=?",
+                    (project_id,),
+                ).fetchone()[0]
+                if int(active) >= int(identity["concurrency"]):
+                    return False, "concurrency_limit_exceeded"
+                db.execute(
+                    "INSERT INTO rate_events VALUES (?, ?, ?)",
+                    (secrets.token_hex(16), project_id, now),
+                )
+                db.execute(
+                    "INSERT INTO active_leases VALUES (?, ?, ?)",
+                    (lease_id, project_id, now + LIMIT_LEASE_SECONDS),
+                )
+            self._leases[project_id].append(lease_id)
         return True, None
 
     async def release(self, project_id: str) -> None:
         async with self._limit_lock:
-            self._active[project_id] = max(0, self._active[project_id] - 1)
+            if not self._leases[project_id]:
+                return
+            lease_id = self._leases[project_id].popleft()
+            with self._connect() as db:
+                db.execute("DELETE FROM active_leases WHERE id=?", (lease_id,))
+
+    async def acquire_worker(self, project_id: str) -> bool:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT concurrency FROM projects WHERE id=?", (project_id,)
+            ).fetchone()
+        if row is None:
+            return False
+        async with self._limit_lock:
+            now = time.time()
+            lease_id = secrets.token_hex(16)
+            with self._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("DELETE FROM active_leases WHERE expires_at<=?", (now,))
+                active = db.execute(
+                    "SELECT count(*) FROM active_leases WHERE project_id=?",
+                    (project_id,),
+                ).fetchone()[0]
+                if int(active) >= int(row["concurrency"]):
+                    return False
+                db.execute(
+                    "INSERT INTO active_leases VALUES (?, ?, ?)",
+                    (lease_id, project_id, now + LIMIT_LEASE_SECONDS),
+                )
+            self._leases[project_id].append(lease_id)
+        return True
 
     def own(self, kind: str, resource_id: str, project_id: str) -> None:
         with self._connect() as db:
             db.execute("INSERT OR IGNORE INTO resources VALUES (?, ?, ?)", (kind, resource_id, project_id))
 
-    def is_owner(self, kind: str, resource_id: str, project_id: str) -> bool:
+    def is_owner(self, kind: str, resource_id: str, project_id: str | None) -> bool:
+        if project_id is None:
+            return False
         with self._connect() as db:
             row = db.execute("SELECT project_id FROM resources WHERE kind=? AND id=?", (kind, resource_id)).fetchone()
         return row is not None and secrets.compare_digest(str(row[0]), project_id)
@@ -193,12 +274,20 @@ class ControlPlane:
             rows = db.execute("SELECT * FROM audit_events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [dict(row) for row in rows]
 
-    def put_profile(self, project_id: str, profile_id: str, state: dict[str, object], ttl: int | None) -> None:
+    def put_profile(
+        self,
+        project_id: str,
+        profile_id: str,
+        state: dict[str, object],
+        ttl: int | None,
+        *,
+        expires_at: int | None = None,
+    ) -> None:
         nonce = secrets.token_bytes(12)
         aad = f"{project_id}:{profile_id}".encode()
         payload = nonce + self._cipher.encrypt(nonce, json.dumps(state, separators=(",", ":")).encode(), aad)
         now = int(time.time())
-        expires = now + ttl if ttl else None
+        expires = expires_at if expires_at is not None else now + ttl if ttl else None
         with self._connect() as db:
             db.execute("INSERT OR REPLACE INTO profiles VALUES (?, ?, ?, ?, ?)", (profile_id, project_id, payload, now, expires))
 
@@ -224,8 +313,17 @@ class ControlPlane:
             row = db.execute("SELECT project_id, expires_at FROM profiles WHERE id=?", (profile_id,)).fetchone()
         if row is None:
             return False
-        ttl = max(60, int(row["expires_at"]) - int(time.time())) if row["expires_at"] else None
-        self.put_profile(str(row["project_id"]), profile_id, state, ttl)
+        expires_at = int(row["expires_at"]) if row["expires_at"] else None
+        if expires_at is not None and expires_at <= int(time.time()):
+            self.delete_profile(str(row["project_id"]), profile_id)
+            return False
+        self.put_profile(
+            str(row["project_id"]),
+            profile_id,
+            state,
+            None,
+            expires_at=expires_at,
+        )
         return True
 
     def delete_profile(self, project_id: str, profile_id: str) -> bool:
@@ -237,6 +335,20 @@ class ControlPlane:
         digest = hashlib.sha256(body).hexdigest()
         updated_at = int(time.time())
         with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            usage = db.execute(
+                "SELECT count(*) count, coalesce(sum(length(body)),0) bytes "
+                "FROM baselines WHERE project_id=?",
+                (project_id,),
+            ).fetchone()
+            existing = db.execute(
+                "SELECT length(body) bytes FROM baselines WHERE project_id=? AND name=?",
+                (project_id, name),
+            ).fetchone()
+            count = int(usage["count"]) + (0 if existing else 1)
+            total = int(usage["bytes"]) - (int(existing["bytes"]) if existing else 0) + len(body)
+            if count > MAX_BASELINES_PER_PROJECT or total > MAX_BASELINE_BYTES_PER_PROJECT:
+                raise BaselineQuotaError
             db.execute("INSERT OR REPLACE INTO baselines VALUES (?, ?, ?, ?, ?)", (name, project_id, body, digest, updated_at))
         return {"name": name, "sha256": digest, "bytes": len(body), "updated_at": updated_at}
 
@@ -249,3 +361,11 @@ class ControlPlane:
         with self._connect() as db:
             rows = db.execute("SELECT name, sha256, length(body) bytes, updated_at FROM baselines WHERE project_id=? ORDER BY name", (project_id,)).fetchall()
         return [dict(row) for row in rows]
+
+    def delete_baseline(self, project_id: str, name: str) -> bool:
+        with self._connect() as db:
+            cursor = db.execute(
+                "DELETE FROM baselines WHERE project_id=? AND name=?",
+                (project_id, name),
+            )
+        return cursor.rowcount == 1
