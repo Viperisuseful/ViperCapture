@@ -6,7 +6,7 @@ on:
       tag:
         description: Release tag
         required: true
-        default: android-v0.1.5
+        default: android-v0.1.6
       publish:
         description: Publish a GitHub release after the build passes
         required: true
