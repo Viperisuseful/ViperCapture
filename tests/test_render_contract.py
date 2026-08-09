@@ -80,6 +80,28 @@ class RenderContractTest(unittest.TestCase):
             with self.subTest(payload=payload), self.assertRaises(ValidationError):
                 RenderRequest.model_validate(payload)
 
+        for pdf in (
+            {"page_ranges": "1-51"},
+            {"page_ranges": "5-2"},
+            {
+                "paper_size": "A6",
+                "margins": {"top": 0, "right": 3, "bottom": 0, "left": 3},
+            },
+        ):
+            with self.subTest(pdf=pdf), self.assertRaises(ValidationError):
+                RenderRequest.model_validate(
+                    {"url": "https://example.com", "output": "pdf", "pdf": pdf}
+                )
+
+        bounded_ranges = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "output": "pdf",
+                "pdf": {"page_ranges": "1-25,20-50"},
+            }
+        )
+        self.assertEqual(bounded_ranges.pdf.page_ranges, "1-25,20-50")
+
     def test_viewport_width_can_be_preserved_for_full_page_images(self):
         request = RenderRequest.model_validate(
             {"url": "https://example.com", "preserve_viewport_width": True}

@@ -443,6 +443,9 @@ export default function App() {
       if (Object.values(customHeaders).some((value) => typeof value !== "string")) {
         return toast.error("Every custom header value must be text.")
       }
+      if (sourceType !== "url" && !baseUrl.trim()) {
+        return toast.error("A base URL is required for raw-input custom headers.")
+      }
     }
     let overrides: Record<string, unknown>
     try {
@@ -454,6 +457,8 @@ export default function App() {
     const normalized = sourceType === "url" && !/^https?:\/\//i.test(url.trim()) ? `https://${url.trim()}` : url.trim()
     const imageOutput = ["png", "jpeg", "webp", "avif"].includes(output)
     const documentOutput = ["html", "markdown"].includes(output)
+    const videoOutput = ["webm", "mp4", "gif"].includes(output)
+    const effectiveFullPage = imageOutput && !selector && !clipEnabled && fullPage
     const source = sourceType === "url"
       ? { url: normalized }
       : { [sourceType]: normalized, base_url: baseUrl.trim() || null }
@@ -469,8 +474,8 @@ export default function App() {
         locale: locale.trim() || null,
         timezone: timezone.trim() || null,
       },
-      full_page: imageOutput && (selector || clipEnabled) ? false : fullPage,
-      preserve_viewport_width: imageOutput && !selector && !clipEnabled && fullPage && preserveViewportWidth,
+      full_page: imageOutput ? effectiveFullPage : fullPage,
+      preserve_viewport_width: effectiveFullPage && preserveViewportWidth,
       lazy_load: lazyLoad,
       selector: imageOutput && !clipEnabled ? selector || null : null,
       clip: imageOutput && clipEnabled ? { x: clipX, y: clipY, width: clipWidth, height: clipHeight } : null,
@@ -483,7 +488,7 @@ export default function App() {
         transparent_background: ["png", "webp", "avif"].includes(output) && transparent,
         optimize_for_speed: engine === "chromium" && (output === "png" || output === "webp") && optimizePng,
       },
-      video: ["webm", "mp4", "gif"].includes(output)
+      video: videoOutput
         ? { duration_ms: videoDuration * 1000, scroll: videoScroll }
         : null,
       pdf: output === "pdf" ? {
@@ -497,13 +502,13 @@ export default function App() {
       } : null,
       extract_mode: documentOutput ? extractMode : "document",
       include_shadow_dom: documentOutput && includeShadowDom,
-      slices: imageOutput && fullPage && sliceHeight ? { height: Number(sliceHeight), overlap: sliceOverlap } : null,
+      slices: effectiveFullPage && sliceHeight ? { height: Number(sliceHeight), overlap: sliceOverlap } : null,
       diagnostics: {
         bundle: diagnostics,
         include_console: true,
         include_network: true,
         include_har: diagnostics && includeHar,
-        include_trace: diagnostics && includeTrace,
+        include_trace: diagnostics && !videoOutput && includeTrace,
         include_warc: diagnostics && includeWarc,
       },
       deterministic: { enabled: deterministic },
@@ -590,7 +595,7 @@ export default function App() {
           return "capture"
         }
       })()
-      const text = ["html", "markdown", "metadata"].includes(output)
+      const text = blob.type.startsWith("text/") || blob.type === "application/json"
         ? await blob.text()
         : undefined
       const item = {
@@ -727,7 +732,7 @@ export default function App() {
 
                 {!isAndroid && <FieldSet>
                   <FieldLegend>Browser engine</FieldLegend>
-                  <Field><Select value={engine} onValueChange={(value) => setEngine(value as BrowserEngine)}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup>
+                  <Field data-disabled={output === "pdf"}><Select value={engine} onValueChange={(value) => setEngine(value as BrowserEngine)} disabled={output === "pdf"}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup>
                     {(config?.browser_engines ?? ["chromium", "firefox", "webkit"]).map((browser) => <SelectItem key={browser} value={browser}>{browser[0].toUpperCase() + browser.slice(1)}</SelectItem>)}
                   </SelectGroup></SelectContent></Select><FieldDescription>Firefox and WebKit start on first use. PDF and fast encoding require Chromium.</FieldDescription></Field>
                 </FieldSet>}
@@ -796,7 +801,7 @@ export default function App() {
                       <Field><FieldLabel>Lazy content loading</FieldLabel><Select value={lazyLoad} onValueChange={setLazyLoad}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="thorough">Thorough (default)</SelectItem><SelectItem value="adaptive">Adaptive (faster)</SelectItem><SelectItem value="none">None (fastest)</SelectItem></SelectGroup></SelectContent></Select></Field>
                       {!isAndroid && ["png", "jpeg", "webp", "avif"].includes(output) && <FieldSet><FieldLegend>Image delivery</FieldLegend>
                         <FieldGroup className="grid grid-cols-2 gap-3"><Field><FieldLabel htmlFor="resize-width">Maximum width</FieldLabel><Input id="resize-width" type="number" min={1} max={65535} value={resizeWidth} onChange={(event) => setResizeWidth(event.target.value)} placeholder="Original" /></Field><Field><FieldLabel htmlFor="resize-height">Maximum height</FieldLabel><Input id="resize-height" type="number" min={1} max={65535} value={resizeHeight} onChange={(event) => setResizeHeight(event.target.value)} placeholder="Original" /></Field></FieldGroup>
-                        {fullPage && <FieldGroup className="grid grid-cols-2 gap-3"><Field><FieldLabel htmlFor="slice-height">Slice height</FieldLabel><Input id="slice-height" type="number" min={100} max={10000} value={sliceHeight} onChange={(event) => setSliceHeight(event.target.value)} placeholder="No slices" /></Field><Field><FieldLabel htmlFor="slice-overlap">Overlap</FieldLabel><Input id="slice-overlap" type="number" min={0} max={1000} value={sliceOverlap} onChange={(event) => setSliceOverlap(Number(event.target.value))} /></Field></FieldGroup>}
+                        {fullPage && !selector && !clipEnabled && <FieldGroup className="grid grid-cols-2 gap-3"><Field><FieldLabel htmlFor="slice-height">Slice height</FieldLabel><Input id="slice-height" type="number" min={100} max={10000} value={sliceHeight} onChange={(event) => setSliceHeight(event.target.value)} placeholder="No slices" /></Field><Field><FieldLabel htmlFor="slice-overlap">Overlap</FieldLabel><Input id="slice-overlap" type="number" min={0} max={1000} value={sliceOverlap} onChange={(event) => setSliceOverlap(Number(event.target.value))} /></Field></FieldGroup>}
                       </FieldSet>}
                       {!isAndroid && ["html", "markdown"].includes(output) && <FieldSet><FieldLegend>Document extraction</FieldLegend>
                         <Field><FieldLabel>Extraction mode</FieldLabel><Select value={extractMode} onValueChange={setExtractMode}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="document">Complete document</SelectItem><SelectItem value="article">Readable article</SelectItem></SelectGroup></SelectContent></Select></Field>
@@ -813,7 +818,7 @@ export default function App() {
                       {!isAndroid && <FieldSet><FieldLegend>Evidence and reproducibility</FieldLegend>
                         <Field orientation="horizontal"><FieldLabel htmlFor="deterministic">Deterministic time, randomness, motion, and fonts</FieldLabel><Switch id="deterministic" checked={deterministic} onCheckedChange={setDeterministic} /></Field>
                         <Field orientation="horizontal"><FieldLabel htmlFor="diagnostics">Diagnostic ZIP</FieldLabel><Switch id="diagnostics" checked={diagnostics} onCheckedChange={setDiagnostics} /></Field>
-                        {diagnostics && <FieldGroup className="gap-3">{[["har", "HAR", includeHar, setIncludeHar], ["trace", "Playwright trace", includeTrace, setIncludeTrace], ["warc", "WARC", includeWarc, setIncludeWarc]].map(([id, label, checked, setter]) => <Field key={String(id)} orientation="horizontal"><FieldLabel htmlFor={String(id)}>{String(label)}</FieldLabel><Switch id={String(id)} checked={checked as boolean} onCheckedChange={setter as (value: boolean) => void} /></Field>)}</FieldGroup>}
+                        {diagnostics && <FieldGroup className="gap-3">{[["har", "HAR", includeHar, setIncludeHar], ...(["webm", "mp4", "gif"].includes(output) ? [] : [["trace", "Playwright trace", includeTrace, setIncludeTrace]]), ["warc", "WARC", includeWarc, setIncludeWarc]].map(([id, label, checked, setter]) => <Field key={String(id)} orientation="horizontal"><FieldLabel htmlFor={String(id)}>{String(label)}</FieldLabel><Switch id={String(id)} checked={checked as boolean} onCheckedChange={setter as (value: boolean) => void} /></Field>)}</FieldGroup>}
                       </FieldSet>}
                       <div className="grid grid-cols-3 gap-3">
                         {!isAndroid && <Field><FieldLabel>Load event</FieldLabel><Select value={waitEvent} onValueChange={setWaitEvent}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="load">Load</SelectItem><SelectItem value="domcontentloaded">DOM ready</SelectItem><SelectItem value="networkidle">Network idle</SelectItem></SelectGroup></SelectContent></Select></Field>}

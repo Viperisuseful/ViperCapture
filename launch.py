@@ -105,12 +105,12 @@ def ensure_playwright() -> None:
     Install Playwright's Chromium, Firefox, and WebKit browsers.
     Skipped when the installed browser matches the Playwright package version.
     """
-    playwright_version = version("playwright")
+    playwright_stamp = f"{version('playwright')}:chromium,firefox,webkit"
     if (
         PLAYWRIGHT_STAMP.exists()
-        and PLAYWRIGHT_STAMP.read_text().strip() == playwright_version
+        and PLAYWRIGHT_STAMP.read_text().strip() == playwright_stamp
     ):
-        print("  [3/3] Playwright browser already installed — skipping.")
+        print("  [3/3] Playwright browsers already installed — skipping.")
         return
 
     print("  [3/3] Installing Playwright browsers...")
@@ -118,7 +118,7 @@ def ensure_playwright() -> None:
     if sys.platform.startswith("linux"):
         command.append("--with-deps")
     run(*command, "chromium", "firefox", "webkit", label="playwright install")
-    PLAYWRIGHT_STAMP.write_text(playwright_version)
+    PLAYWRIGHT_STAMP.write_text(playwright_stamp)
 
 
 # ── Main ──────────────────────────────────────────────────────

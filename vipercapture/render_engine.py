@@ -2194,9 +2194,20 @@ class RenderEngine:
                             use_cdp=request.engine.value == BrowserEngine.CHROMIUM.value,
                         )
                         if request.output in {OutputFormat.AVIF, OutputFormat.WEBP} and screenshot_output is OutputFormat.PNG:
-                            part = await _settled_thread(
-                                _convert_image, part, request.output, request.image.quality
-                            )
+                            try:
+                                part = await _settled_thread(
+                                    _convert_image,
+                                    part,
+                                    request.output,
+                                    request.image.quality,
+                                )
+                            except Exception as exc:
+                                raise RenderError(
+                                    "image_encoder_unavailable",
+                                    f"This Pillow build cannot encode {request.output.value.upper()}.",
+                                    503,
+                                    False,
+                                ) from exc
                         total_bytes += len(part)
                         if total_bytes > limits.output_bytes:
                             raise RenderError("output_too_large", "The rendered slices exceed the output limit.", 413, False)

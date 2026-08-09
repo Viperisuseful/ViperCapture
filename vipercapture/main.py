@@ -1288,18 +1288,19 @@ async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
             if durable_queue_ms is not None
             else slot_queue_ms
         )
-        browser = await _browser_for(app, payload.engine)
-        engine = _render_engine()
-        render_started = time.perf_counter()
         try:
-            artifact, cache_hit = await _render_with_cache(
-                engine, browser, payload, namespace=project_id
-            )
-        except RenderError:
-            if not browser.is_connected():
-                with suppress(Exception):
-                    await _replace_browser(app, browser)
-            raise
+            browser = await _browser_for(app, payload.engine)
+            engine = _render_engine()
+            render_started = time.perf_counter()
+            try:
+                artifact, cache_hit = await _render_with_cache(
+                    engine, browser, payload, namespace=project_id
+                )
+            except RenderError:
+                if not browser.is_connected():
+                    with suppress(Exception):
+                        await _replace_browser(app, browser)
+                raise
         finally:
             app.state.capture_slots.release()
         render_ms = (
@@ -1398,40 +1399,41 @@ async def _render_response(payload: RenderRequest, request: Request) -> Response
                 "capture_queue_busy", "The render queue is busy.", 503, True
             ) from exc
         queue_ms = round((time.perf_counter() - queue_started) * 1000)
-        browser = await _browser_for(app, payload.engine)
-        engine = _render_engine()
         try:
-            if payload.cache and cache is not None:
-                artifact = await _await_while_connected(
-                    request, cache.get(payload, cache_namespace)
-                )
-                cache_hit = artifact is not None
-            if artifact is None:
-                render_started = time.perf_counter()
-                artifact = await _await_while_connected(
-                    request,
-                    engine.render_image(
-                        browser,
-                        payload,
-                        RenderLimits(
-                            max_width=MAX_VIEWPORT_WIDTH,
-                            max_height=MAX_VIEWPORT_HEIGHT,
-                            max_pixels=MAX_SCREENSHOT_PIXELS,
-                            max_full_page_height=MAX_FULL_PAGE_HEIGHT,
-                            output_bytes=MAX_OUTPUT_BYTES,
-                        ),
-                    ),
-                )
-                render_ms = round(
-                    (time.perf_counter() - render_started) * 1000
-                )
+            browser = await _browser_for(app, payload.engine)
+            engine = _render_engine()
+            try:
                 if payload.cache and cache is not None:
-                    await cache.put(payload, artifact, cache_namespace)
-        except RenderError:
-            if not browser.is_connected():
-                with suppress(Exception):
-                    await _replace_browser(app, browser)
-            raise
+                    artifact = await _await_while_connected(
+                        request, cache.get(payload, cache_namespace)
+                    )
+                    cache_hit = artifact is not None
+                if artifact is None:
+                    render_started = time.perf_counter()
+                    artifact = await _await_while_connected(
+                        request,
+                        engine.render_image(
+                            browser,
+                            payload,
+                            RenderLimits(
+                                max_width=MAX_VIEWPORT_WIDTH,
+                                max_height=MAX_VIEWPORT_HEIGHT,
+                                max_pixels=MAX_SCREENSHOT_PIXELS,
+                                max_full_page_height=MAX_FULL_PAGE_HEIGHT,
+                                output_bytes=MAX_OUTPUT_BYTES,
+                            ),
+                        ),
+                    )
+                    render_ms = round(
+                        (time.perf_counter() - render_started) * 1000
+                    )
+                    if payload.cache and cache is not None:
+                        await cache.put(payload, artifact, cache_namespace)
+            except RenderError:
+                if not browser.is_connected():
+                    with suppress(Exception):
+                        await _replace_browser(app, browser)
+                raise
         finally:
             app.state.capture_slots.release()
     metadata = artifact.metadata or {}

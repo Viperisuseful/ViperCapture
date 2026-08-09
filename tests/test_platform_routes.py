@@ -398,6 +398,29 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cache.get.await_count, 2)
         engine.render_image.assert_not_awaited()
 
+    async def test_browser_start_failure_releases_capture_slots(self):
+        original_slots = getattr(main.app.state, "capture_slots", None)
+        main.app.state.capture_slots = asyncio.Semaphore(1)
+        unavailable = RenderError(
+            "browser_unavailable", "Browser could not start.", 503, False
+        )
+        request = SimpleNamespace(is_disconnected=AsyncMock(return_value=False))
+        try:
+            with patch(
+                "vipercapture.main._browser_for",
+                AsyncMock(side_effect=unavailable),
+            ):
+                with self.assertRaises(RenderError):
+                    await main._render_response(RenderRequest(html="sync"), request)
+                await asyncio.wait_for(main.app.state.capture_slots.acquire(), 0.1)
+                main.app.state.capture_slots.release()
+                with self.assertRaises(RenderError):
+                    await main._render_async_image(RenderRequest(html="async"))
+                await asyncio.wait_for(main.app.state.capture_slots.acquire(), 0.1)
+                main.app.state.capture_slots.release()
+        finally:
+            main.app.state.capture_slots = original_slots
+
     async def test_signed_url_rejects_webhook_delivery(self):
         payload = RenderRequest.model_validate(
             {
