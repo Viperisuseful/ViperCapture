@@ -846,6 +846,7 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
         request = RenderRequest.model_validate(
             {
                 "url": "https://example.com",
+                "engine": "firefox",
                 "full_page": False,
                 "environment": {
                     "device": "pixel_7",
@@ -879,11 +880,32 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(page.styles, ["nav { display: none }"])
         self.assertEqual(browser.context_options["user_agent"], "Pixel Test")
+        self.assertNotIn("is_mobile", browser.context_options)
+        self.assertTrue(browser.context_options["has_touch"])
         self.assertEqual(browser.context_options["color_scheme"], "dark")
         self.assertEqual(browser.context_options["timezone_id"], "Europe/Paris")
         self.assertIn("Linux armv8l", browser.context.init_scripts[0])
         self.assertEqual(clipped.await_args.kwargs["clip"]["x"], 5)
         self.assertEqual(artifact.metadata["width"], 320)
+
+    async def test_resize_rejects_sources_above_pillow_pixel_ceiling(self):
+        page = FakePage()
+        request = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "full_page": False,
+                "viewport": {"width": 5, "height": 5},
+                "image": {"width": 1},
+            }
+        )
+        with patch.object(Image, "MAX_IMAGE_PIXELS", 10):
+            with self.assertRaises(RenderError) as raised:
+                await RenderEngine(hosted=False).render(
+                    FakeBrowser(FakeContext(page)),
+                    request,
+                    RenderLimits(max_width=100, max_height=100, max_pixels=100),
+                )
+        self.assertEqual(raised.exception.code, "image_resize_source_too_large")
 
     async def test_empty_live_request_match_set_is_preserved(self):
         matched: set[str] = set()

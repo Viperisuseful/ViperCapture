@@ -1526,6 +1526,8 @@ class RenderEngine:
                 if descriptor_name:
                     context_options.update(self.device_descriptors.get(descriptor_name, {}))
                     context_options.pop("default_browser_type", None)
+                    if request.engine.value == BrowserEngine.FIREFOX.value:
+                        context_options.pop("is_mobile", None)
                 context_options.update(
                     {
                         "viewport": {
@@ -2172,6 +2174,25 @@ class RenderEngine:
                             )
                     else:
                         width, height = request.viewport.width, request.viewport.height
+                pillow_pixel_limit = (
+                    int(Image.MAX_IMAGE_PIXELS * 2)
+                    if Image.MAX_IMAGE_PIXELS is not None
+                    else None
+                )
+                if (
+                    (request.image.width is not None or request.image.height is not None)
+                    and pillow_pixel_limit is not None
+                    and math.ceil(width * request.viewport.device_scale_factor)
+                    * math.ceil(height * request.viewport.device_scale_factor)
+                    > pillow_pixel_limit
+                ):
+                    raise RenderError(
+                        "image_resize_source_too_large",
+                        "The source image is too large for safe resizing.",
+                        413,
+                        False,
+                        {"max_source_pixels": pillow_pixel_limit},
+                    )
                 if request.slices is not None:
                     slice_entries: list[tuple[str, bytes]] = []
                     slice_manifest = []
