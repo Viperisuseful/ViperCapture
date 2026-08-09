@@ -87,6 +87,8 @@ const providerNames: Record<string, string> = {
   unknown: "A page-level CAPTCHA",
 }
 
+const MAX_TEXT_PREVIEW_BYTES = 1024 * 1024
+
 function extension(output: Output) {
   if (output === "jpeg") return "jpg"
   if (output === "markdown") return "md"
@@ -459,6 +461,9 @@ export default function App() {
     const documentOutput = ["html", "markdown"].includes(output)
     const videoOutput = ["webm", "mp4", "gif"].includes(output)
     const effectiveFullPage = imageOutput && !selector && !clipEnabled && fullPage
+    if (effectiveFullPage && sliceHeight && (resizeWidth || resizeHeight)) {
+      return toast.error("Image resizing and sliced output cannot be combined.")
+    }
     if (effectiveFullPage && sliceHeight && sliceOverlap >= Number(sliceHeight)) {
       return toast.error("Slice overlap must be smaller than slice height.")
     }
@@ -598,7 +603,7 @@ export default function App() {
           return "capture"
         }
       })()
-      const text = blob.type.startsWith("text/") || blob.type === "application/json"
+      const text = (blob.type.startsWith("text/") || blob.type === "application/json") && blob.size <= MAX_TEXT_PREVIEW_BYTES
         ? await blob.text()
         : undefined
       const item = {
@@ -803,8 +808,8 @@ export default function App() {
                       {!isAndroid && <Field><FieldLabel htmlFor="fail-statuses">Fail on HTTP status</FieldLabel><Input id="fail-statuses" value={failStatuses} onChange={(event) => setFailStatuses(event.target.value)} placeholder="404,429,500,502,503" /></Field>}
                       <Field><FieldLabel>Lazy content loading</FieldLabel><Select value={lazyLoad} onValueChange={setLazyLoad}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="thorough">Thorough (default)</SelectItem><SelectItem value="adaptive">Adaptive (faster)</SelectItem><SelectItem value="none">None (fastest)</SelectItem></SelectGroup></SelectContent></Select></Field>
                       {!isAndroid && ["png", "jpeg", "webp", "avif"].includes(output) && <FieldSet><FieldLegend>Image delivery</FieldLegend>
-                        <FieldGroup className="grid grid-cols-2 gap-3"><Field><FieldLabel htmlFor="resize-width">Maximum width</FieldLabel><Input id="resize-width" type="number" min={1} max={65535} value={resizeWidth} onChange={(event) => setResizeWidth(event.target.value)} placeholder="Original" /></Field><Field><FieldLabel htmlFor="resize-height">Maximum height</FieldLabel><Input id="resize-height" type="number" min={1} max={65535} value={resizeHeight} onChange={(event) => setResizeHeight(event.target.value)} placeholder="Original" /></Field></FieldGroup>
-                        {fullPage && !selector && !clipEnabled && <FieldGroup className="grid grid-cols-2 gap-3"><Field><FieldLabel htmlFor="slice-height">Slice height</FieldLabel><Input id="slice-height" type="number" min={100} max={10000} value={sliceHeight} onChange={(event) => setSliceHeight(event.target.value)} placeholder="No slices" /></Field><Field><FieldLabel htmlFor="slice-overlap">Overlap</FieldLabel><Input id="slice-overlap" type="number" min={0} max={sliceHeight ? Math.min(1000, Number(sliceHeight) - 1) : 1000} value={sliceOverlap} onChange={(event) => setSliceOverlap(Number(event.target.value))} /></Field></FieldGroup>}
+                        <FieldGroup className="grid grid-cols-2 gap-3"><Field><FieldLabel htmlFor="resize-width">Maximum width</FieldLabel><Input id="resize-width" type="number" min={1} max={65535} value={resizeWidth} onChange={(event) => { setResizeWidth(event.target.value); if (event.target.value) setSliceHeight("") }} placeholder="Original" /></Field><Field><FieldLabel htmlFor="resize-height">Maximum height</FieldLabel><Input id="resize-height" type="number" min={1} max={65535} value={resizeHeight} onChange={(event) => { setResizeHeight(event.target.value); if (event.target.value) setSliceHeight("") }} placeholder="Original" /></Field></FieldGroup>
+                        {fullPage && !selector && !clipEnabled && <FieldGroup className="grid grid-cols-2 gap-3"><Field><FieldLabel htmlFor="slice-height">Slice height</FieldLabel><Input id="slice-height" type="number" min={100} max={10000} value={sliceHeight} onChange={(event) => { setSliceHeight(event.target.value); if (event.target.value) { setResizeWidth(""); setResizeHeight("") } }} placeholder="No slices" /></Field><Field><FieldLabel htmlFor="slice-overlap">Overlap</FieldLabel><Input id="slice-overlap" type="number" min={0} max={sliceHeight ? Math.min(1000, Number(sliceHeight) - 1) : 1000} value={sliceOverlap} onChange={(event) => setSliceOverlap(Number(event.target.value))} /></Field></FieldGroup>}
                       </FieldSet>}
                       {!isAndroid && ["html", "markdown"].includes(output) && <FieldSet><FieldLegend>Document extraction</FieldLegend>
                         <Field><FieldLabel>Extraction mode</FieldLabel><Select value={extractMode} onValueChange={setExtractMode}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="document">Complete document</SelectItem><SelectItem value="article">Readable article</SelectItem></SelectGroup></SelectContent></Select></Field>
