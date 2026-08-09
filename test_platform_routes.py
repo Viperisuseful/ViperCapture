@@ -48,6 +48,16 @@ class PlatformRouteTests(unittest.TestCase):
                     "origins": [],
                 }
             )
+        for origin in ("https://example.com:abc", "https://example.com:70000"):
+            with self.subTest(origin=origin), self.assertRaises(ValidationError):
+                main.ProfileCreate(
+                    storage_state={
+                        "cookies": [],
+                        "origins": [
+                            {"origin": origin, "localStorage": []}
+                        ],
+                    }
+                )
         with self.assertRaises(ValidationError):
             main.ProfileCreate(
                 storage_state={
@@ -598,17 +608,53 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         main.app.state.capture_slots = asyncio.Semaphore(0)
+        metrics = SimpleNamespace(inc=Mock())
         try:
-            artifact = await asyncio.wait_for(
-                main._render_async_image(
-                    RenderRequest(html="cached", cache=True)
-                ),
-                timeout=0.25,
-            )
+            with patch("main.METRICS", metrics):
+                artifact = await asyncio.wait_for(
+                    main._render_async_image(
+                        RenderRequest(html="cached", cache=True)
+                    ),
+                    timeout=0.25,
+                )
         finally:
             main.app.state.render_cache = original_cache
             main.app.state.capture_slots = original_slots
         self.assertEqual(artifact.body, b"cached")
+        self.assertEqual(
+            metrics.inc.call_args_list,
+            [
+                unittest.mock.call(
+                    "renders_total", output="png", cache="hit"
+                ),
+                unittest.mock.call(
+                    "render_seconds_sum", 0, output="png"
+                ),
+                unittest.mock.call("queue_seconds_sum", 0),
+            ],
+        )
+
+    async def test_async_render_records_miss_and_timing_metrics(self):
+        original_slots = getattr(main.app.state, "capture_slots", None)
+        original_browser = getattr(main.app.state, "browser", None)
+        main.app.state.capture_slots = asyncio.Semaphore(1)
+        main.app.state.browser = SimpleNamespace(is_connected=Mock(return_value=True))
+        metrics = SimpleNamespace(inc=Mock())
+        artifact = RenderArtifact(b"rendered", "image/png", "capture.png")
+        try:
+            with (
+                patch("main.METRICS", metrics),
+                patch("main._render_with_cache", AsyncMock(return_value=(artifact, False))),
+            ):
+                result = await main._render_async_image(RenderRequest(html="render"))
+        finally:
+            main.app.state.capture_slots = original_slots
+            main.app.state.browser = original_browser
+        self.assertEqual(result.body, b"rendered")
+        self.assertEqual(metrics.inc.call_args_list[0].kwargs["cache"], "miss")
+        self.assertEqual(metrics.inc.call_args_list[0].args[0], "renders_total")
+        self.assertEqual(metrics.inc.call_args_list[1].args[0], "render_seconds_sum")
+        self.assertEqual(metrics.inc.call_args_list[2].args[0], "queue_seconds_sum")
 
     async def test_visual_diff_queue_is_bounded(self):
         original_slots = getattr(main.app.state, "diff_slots", None)

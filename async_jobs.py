@@ -747,6 +747,23 @@ class AsyncJobService:
                 409,
                 False,
             ) from exc
+        except asyncio.CancelledError:
+            committed = None
+            reconciled = False
+            try:
+                committed = await self.job_store.get(job_id, datetime.now(UTC))
+                reconciled = True
+            except BaseException:
+                pass
+            if committed is not None:
+                self._wake_workers()
+            elif (
+                reconciled
+                and reserved
+                and self.ownership_releaser is not None
+            ):
+                await self.ownership_releaser(job_id)
+            raise
         except BaseException:
             if reserved and self.ownership_releaser is not None:
                 await self.ownership_releaser(job_id)

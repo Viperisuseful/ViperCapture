@@ -12,7 +12,7 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, Mock, patch
 from uuid import uuid4
 
 import main
@@ -162,6 +162,55 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "database unavailable"):
             await service.submit(_payload(), request_id="failed-create")
         release.assert_awaited_once_with(reserved_ids[0])
+
+    async def test_cancelled_committed_create_preserves_ownership(self):
+        committed = None
+        release = AsyncMock()
+
+        async def create(job, _limit):
+            nonlocal committed
+            committed = job
+            raise asyncio.CancelledError
+
+        async def get(job_id, _now):
+            return committed if committed is not None and committed.id == job_id else None
+
+        store = SimpleNamespace(
+            maintain=AsyncMock(return_value=[]),
+            create=AsyncMock(side_effect=create),
+            get=AsyncMock(side_effect=get),
+        )
+        service = AsyncJobService(
+            self.settings,
+            store,
+            SimpleNamespace(maintain=AsyncMock()),
+            _successful_renderer,
+            ownership_reserver=AsyncMock(),
+            ownership_releaser=release,
+        )
+        with self.assertRaises(asyncio.CancelledError):
+            await service.submit(_payload(), request_id="cancelled-create")
+        release.assert_not_awaited()
+        store.get.assert_awaited_once_with(committed.id, ANY)
+
+    async def test_cancelled_create_keeps_ttl_reservation_if_reconcile_fails(self):
+        release = AsyncMock()
+        store = SimpleNamespace(
+            maintain=AsyncMock(return_value=[]),
+            create=AsyncMock(side_effect=asyncio.CancelledError),
+            get=AsyncMock(side_effect=RuntimeError("database unavailable")),
+        )
+        service = AsyncJobService(
+            self.settings,
+            store,
+            SimpleNamespace(maintain=AsyncMock()),
+            _successful_renderer,
+            ownership_reserver=AsyncMock(),
+            ownership_releaser=release,
+        )
+        with self.assertRaises(asyncio.CancelledError):
+            await service.submit(_payload(), request_id="ambiguous-create")
+        release.assert_not_awaited()
 
     async def test_api_only_service_does_not_recover_distributed_jobs(self):
         job_store = SimpleNamespace(
@@ -4126,11 +4175,16 @@ class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
         original_browser = getattr(main.app.state, "browser", None)
         main.app.state.capture_slots = asyncio.Semaphore(0)
         main.app.state.browser = SimpleNamespace()
+        metrics = SimpleNamespace(inc=Mock())
         try:
             with (
-                patch("main.time.perf_counter", side_effect=[10.0, 10.25])
+                patch(
+                    "main.time.perf_counter",
+                    side_effect=[10.0, 10.0, 10.25, 10.25, 10.35, 10.35],
+                )
                 as clock,
                 patch("main.RenderEngine") as engine_class,
+                patch("main.METRICS", metrics),
             ):
                 engine_class.return_value.render_image = AsyncMock(
                     return_value=SimpleNamespace(
@@ -4143,10 +4197,12 @@ class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
                     main._render_async_image(_payload())
                 )
                 await asyncio.sleep(0)
-                self.assertEqual(clock.call_count, 1)
+                self.assertEqual(clock.call_count, 2)
                 main.app.state.capture_slots.release()
                 rendered = await asyncio.wait_for(rendering, timeout=1)
-            self.assertEqual(rendered.render_ms, 250)
+            self.assertEqual(rendered.render_ms, 350)
+            self.assertEqual(metrics.inc.call_args_list[1].args[1], 0.1)
+            self.assertEqual(metrics.inc.call_args_list[2].args[1], 0.25)
         finally:
             main.app.state.capture_slots = original_slots
             main.app.state.browser = original_browser

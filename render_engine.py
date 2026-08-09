@@ -296,6 +296,20 @@ def _convert_image(body: bytes, output: OutputFormat, quality: int | None) -> by
     return destination.getvalue()
 
 
+async def _encode_avif(body: bytes, quality: int | None) -> bytes:
+    try:
+        return await _settled_thread(
+            _convert_image, body, OutputFormat.AVIF, quality
+        )
+    except Exception as exc:
+        raise RenderError(
+            "image_encoder_unavailable",
+            "This Pillow build does not provide AVIF encoding.",
+            503,
+            False,
+        ) from exc
+
+
 def _slice_image(body: bytes, *, height: int, overlap: int, filename: str) -> bytes:
     output = io.BytesIO()
     with Image.open(io.BytesIO(body)) as image, zipfile.ZipFile(
@@ -2120,8 +2134,8 @@ class RenderEngine:
                             transparent=request.image.transparent_background,
                         )
                         if request.output is OutputFormat.AVIF:
-                            part = await _settled_thread(
-                                _convert_image, part, request.output, request.image.quality
+                            part = await _encode_avif(
+                                part, request.image.quality
                             )
                         total_bytes += len(part)
                         if total_bytes > limits.output_bytes:
@@ -2284,17 +2298,7 @@ class RenderEngine:
                 if not image:
                     raise RenderError("empty_output", "The renderer produced an empty image.", 502, True)
                 if request.output is OutputFormat.AVIF:
-                    try:
-                        image = await _settled_thread(
-                            _convert_image, image, request.output, request.image.quality
-                        )
-                    except Exception as exc:
-                        raise RenderError(
-                            "image_encoder_unavailable",
-                            "This Pillow build does not provide AVIF encoding.",
-                            503,
-                            False,
-                        ) from exc
+                    image = await _encode_avif(image, request.image.quality)
                 if len(image) > limits.output_bytes:
                     raise RenderError("output_too_large", "The rendered image exceeds the output limit.", 413, False)
                 artifact = RenderArtifact(

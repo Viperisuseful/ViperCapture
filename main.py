@@ -796,6 +796,10 @@ class BrowserOriginState(BaseModel):
     @classmethod
     def validate_origin(cls, value: str) -> str:
         parsed = urlsplit(value)
+        try:
+            parsed.port
+        except ValueError as exc:
+            raise ValueError("origin has an invalid port") from exc
         if (
             parsed.scheme not in {"http", "https"}
             or not parsed.hostname
@@ -1145,6 +1149,26 @@ def _render_engine() -> RenderEngine:
     )
 
 
+def _record_render_metrics(
+    payload: RenderRequest,
+    *,
+    cache_hit: bool,
+    render_ms: int,
+    queue_ms: int,
+) -> None:
+    METRICS.inc(
+        "renders_total",
+        output=payload.recorded_output_type,
+        cache="hit" if cache_hit else "miss",
+    )
+    METRICS.inc(
+        "render_seconds_sum",
+        render_ms / 1000,
+        output=payload.recorded_output_type,
+    )
+    METRICS.inc("queue_seconds_sum", queue_ms / 1000)
+
+
 async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
     started = time.perf_counter()
     job = current_job()
@@ -1164,17 +1188,23 @@ async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
         if payload.cache and cache is not None:
             cached = await cache.get(payload, project_id)
             if cached is not None:
+                _record_render_metrics(
+                    payload, cache_hit=True, render_ms=0, queue_ms=0
+                )
                 return RenderedArtifact(
                     body=cached.body,
                     media_type=cached.media_type,
                     filename=cached.filename,
                     render_ms=round((time.perf_counter() - started) * 1000),
                 )
+        queue_started = time.perf_counter()
         await app.state.capture_slots.acquire()
+        queue_ms = round((time.perf_counter() - queue_started) * 1000)
         browser: Browser = app.state.browser
         engine = _render_engine()
+        render_started = time.perf_counter()
         try:
-            artifact, _cache_hit = await _render_with_cache(
+            artifact, cache_hit = await _render_with_cache(
                 engine, browser, payload, namespace=project_id
             )
         except RenderError:
@@ -1184,6 +1214,17 @@ async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
             raise
         finally:
             app.state.capture_slots.release()
+        render_ms = (
+            0
+            if cache_hit
+            else round((time.perf_counter() - render_started) * 1000)
+        )
+        _record_render_metrics(
+            payload,
+            cache_hit=cache_hit,
+            render_ms=render_ms,
+            queue_ms=queue_ms,
+        )
         return RenderedArtifact(
             body=artifact.body,
             media_type=artifact.media_type,
@@ -1294,9 +1335,12 @@ async def _render_response(payload: RenderRequest, request: Request) -> Response
         finally:
             app.state.capture_slots.release()
     metadata = artifact.metadata or {}
-    METRICS.inc("renders_total", output=payload.recorded_output_type, cache="hit" if cache_hit else "miss")
-    METRICS.inc("render_seconds_sum", render_ms / 1000, output=payload.recorded_output_type)
-    METRICS.inc("queue_seconds_sum", queue_ms / 1000)
+    _record_render_metrics(
+        payload,
+        cache_hit=cache_hit,
+        render_ms=render_ms,
+        queue_ms=queue_ms,
+    )
     diagnostic_headers = {
         "X-ViperCapture-Queue-Ms": str(max(0, queue_ms)),
         "X-ViperCapture-Render-Ms": str(max(0, render_ms)),

@@ -18,6 +18,7 @@ from render_engine import (
     RenderArtifact,
     RenderEngine,
     RenderLimits,
+    _encode_avif,
     _resolve_public_origin,
     _run_process,
     capture_clipped_image,
@@ -151,6 +152,15 @@ class FakeBrowser:
 
 
 class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
+    async def test_avif_encoder_failure_is_nonretryable_for_every_path(self):
+        with patch(
+            "render_engine._convert_image",
+            side_effect=OSError("encoder unavailable"),
+        ), self.assertRaises(RenderError) as raised:
+            await _encode_avif(b"png", 80)
+        self.assertEqual(raised.exception.code, "image_encoder_unavailable")
+        self.assertFalse(raised.exception.retryable)
+
     async def test_clipped_capture_hides_and_restores_caret(self):
         page = FakePage()
         page.context = FakeContext(page)
