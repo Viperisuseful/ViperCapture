@@ -198,7 +198,7 @@ function ResultMetric({ label, value, mono = false }: { label: string; value: st
 export default function App() {
   const [dark, setDark] = useState(() => localStorage.getItem("theme") === "dark")
   const [url, setUrl] = useState("https://example.com")
-  const [apiKey, setApiKey] = useState(() => sessionStorage.getItem("vipercapture-api-key") ?? "")
+  const [apiKey, setApiKey] = useState("")
   const [output, setOutput] = useState<Output>("png")
   const [width, setWidth] = useState(1280)
   const [height, setHeight] = useState(720)
@@ -239,10 +239,6 @@ export default function App() {
     document.documentElement.classList.toggle("dark", dark)
     localStorage.setItem("theme", dark ? "dark" : "light")
   }, [dark])
-  useEffect(() => {
-    if (apiKey) sessionStorage.setItem("vipercapture-api-key", apiKey)
-    else sessionStorage.removeItem("vipercapture-api-key")
-  }, [apiKey])
   useEffect(() => {
     fetch("/app-config").then((response) => response.json()).then(setConfig).catch(() => null)
   }, [])
@@ -529,7 +525,7 @@ export default function App() {
               <Field className="lg:w-72">
                 <FieldLabel htmlFor="project-api-key">Project API key</FieldLabel>
                 <Input id="project-api-key" type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="vcp_…" />
-                <FieldDescription>Kept only in this browser tab.</FieldDescription>
+                <FieldDescription>Kept only in memory until this page closes.</FieldDescription>
               </Field>
             )}
             <Button size="lg" onClick={() => void capture()} disabled={busy} className="lg:min-w-36">
