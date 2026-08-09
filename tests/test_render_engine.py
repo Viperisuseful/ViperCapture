@@ -936,6 +936,29 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
                 )
         self.assertEqual(raised.exception.code, "image_resize_source_too_large")
 
+    async def test_resize_uses_a_lossless_screenshot_intermediate(self):
+        page = FakePage()
+        request = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "output": "jpeg",
+                "full_page": False,
+                "viewport": {"width": 320, "height": 180},
+                "image": {"width": 160, "quality": 40},
+            }
+        )
+        with patch(
+            "vipercapture.render_engine._postprocess_image",
+            return_value=(b"jpeg", 160, 90),
+        ):
+            await RenderEngine(hosted=False).render(
+                FakeBrowser(FakeContext(page)),
+                request,
+                RenderLimits(max_width=1000, max_height=1000, max_pixels=1_000_000),
+            )
+        self.assertEqual(page.screenshot_options["type"], "png")
+        self.assertNotIn("quality", page.screenshot_options)
+
     async def test_empty_live_request_match_set_is_preserved(self):
         matched: set[str] = set()
         pattern = "https://example.com/failure*"

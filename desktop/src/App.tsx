@@ -58,6 +58,7 @@ type AppConfig = {
   max_viewport_height?: number
   max_full_page_height?: number
   browser_engines?: BrowserEngine[]
+  output_formats?: Output[]
   gpu?: { mode?: "off" | "auto" | "required"; hardware_active?: boolean; mutable?: boolean }
 }
 type BackendConfig = { baseUrl: string; token: string }
@@ -687,7 +688,7 @@ export default function App() {
             {[
               [Gauge, "Local", "Private"],
               [Zap, "Fast", isAndroid ? "WebView" : "3 engines"],
-              [ImageIcon, isAndroid ? "3" : "11", "Formats"],
+              [ImageIcon, isAndroid ? "3" : String(config?.output_formats?.length ?? 10), "Formats"],
             ].map(([Icon, value, label]) => (
               <Card key={String(label)} size="sm" className="min-w-24">
                 <CardContent className="flex items-center gap-2">
@@ -733,8 +734,9 @@ export default function App() {
                     {isAndroid ? <Tabs value={output} onValueChange={(value: string) => setOutput(value as Output)}>
                       <TabsList className="w-full"><TabsTrigger value="png">PNG</TabsTrigger><TabsTrigger value="jpeg">JPEG</TabsTrigger><TabsTrigger value="webp">WebP</TabsTrigger></TabsList>
                     </Tabs> : <Select value={output} onValueChange={(value) => { setOutput(value as Output); if (value === "pdf") setEngine("chromium") }}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup>
-                      {(["png", "jpeg", "webp", "avif", "pdf", "html", "markdown", "metadata", "webm", "mp4", "gif"] as Output[]).map((format) => <SelectItem key={format} value={format}>{format.toUpperCase()}</SelectItem>)}
+                      {(config?.output_formats ?? ["png", "jpeg", "webp", "avif", "pdf", "html", "markdown", "metadata", "webm", "gif"]).map((format) => <SelectItem key={format} value={format}>{format.toUpperCase()}</SelectItem>)}
                     </SelectGroup></SelectContent></Select>}
+                    {!isAndroid && <FieldDescription>MP4 is available when the local FFmpeg build includes libx264.</FieldDescription>}
                   </Field>
                 </FieldSet>
 

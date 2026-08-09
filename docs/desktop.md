@@ -68,7 +68,7 @@ The `Desktop Release` GitHub Actions workflow builds on each native runner:
 - Windows x64: NSIS setup executable and MSI
 - macOS Apple Silicon: DMG
 - macOS Intel: DMG
-- Linux x64: AppImage, Debian package, and RPM
+- Linux x64: Debian package with declared Chromium, Firefox, WebKit, and FFmpeg runtime dependencies
 
 The first release artifacts are unsigned. Windows SmartScreen and macOS
 Gatekeeper may warn until repository secrets for platform code-signing
@@ -78,3 +78,5 @@ Markdown input, resizing, extraction, PDF, video, diagnostics, deterministic
 rendering, slices, and the cleanup/network controls. Expert JSON overrides are
 deep-merged into the generated strict request for actions, assertions, cookies,
 proxies, profiles, viewport packs, certification, and newly added API fields.
+MP4 is shown only when the installed or packaged FFmpeg exposes the required
+libx264 encoder; WebM and GIF remain available through Playwright's runtime.

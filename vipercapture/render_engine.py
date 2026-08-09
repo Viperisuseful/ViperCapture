@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import socket
+import subprocess
 import tempfile
 import time
 import zipfile
@@ -21,6 +22,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from fnmatch import fnmatchcase
+from functools import lru_cache
 from pathlib import Path
 from typing import Awaitable, Callable
 from urllib.parse import urlsplit, urlunsplit
@@ -156,6 +158,20 @@ def _ffmpeg_executable() -> Path:
     )
 
 
+@lru_cache(maxsize=8)
+def ffmpeg_has_encoder(name: str) -> bool:
+    try:
+        result = subprocess.run(
+            [str(_ffmpeg_executable()), "-hide_banner", "-encoders"],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, RenderError):
+        return False
+    return result.returncode == 0 and name.encode() in result.stdout
+
+
 def _timestamp_ms(value: str) -> int:
     hours, minutes, seconds = value.split(":")
     return round(
@@ -255,6 +271,13 @@ async def _trim_webm(
 async def _transcode_video(source: Path, destination: Path, output: OutputFormat) -> None:
     ffmpeg = _ffmpeg_executable()
     if output is OutputFormat.MP4:
+        if not await _settled_thread(ffmpeg_has_encoder, "libx264"):
+            raise RenderError(
+                "video_encoder_unavailable",
+                "This FFmpeg build cannot encode MP4 with libx264.",
+                503,
+                False,
+            )
         encoding = [
             "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-c:v", "libx264",
             "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
@@ -1065,14 +1088,19 @@ async def render_metadata(page: Page) -> RenderArtifact:
                 theme_color: attr('meta[name="theme-color"]'),
                 open_graph: pairs("property", "og:"),
                 twitter: pairs("name", "twitter:"),
-                fonts: [...(document.fonts || [])]
-                    .slice(0, maxItems)
-                    .map((font) => ({
-                        family: clean(font.family, 256),
-                        style: clean(font.style, 64),
-                        weight: clean(font.weight, 64),
-                        status: clean(font.status, 32)
-                    })),
+                fonts: (() => {
+                    const fonts = [];
+                    for (const font of document.fonts || []) {
+                        fonts.push({
+                            family: clean(font.family, 256),
+                            style: clean(font.style, 64),
+                            weight: clean(font.weight, 64),
+                            status: clean(font.status, 32)
+                        });
+                        if (fonts.length >= maxItems) break;
+                    }
+                    return fonts;
+                })(),
                 icons: [...document.querySelectorAll('link[rel~="icon"][href]')]
                     .slice(0, 16)
                     .map((element) => ({
@@ -1881,8 +1909,12 @@ class RenderEngine:
                     await self.cleanup_hooks.apply(page, request.cleanup)
                 if self.challenge_checker:
                     await self.challenge_checker(page, request.proceed_on_captcha, navigation_status)
+                resizing_image = (
+                    request.image.width is not None
+                    or request.image.height is not None
+                )
                 uses_cdp_capture = request.engine.value == BrowserEngine.CHROMIUM.value and (
-                    request.output is OutputFormat.WEBP
+                    (request.output is OutputFormat.WEBP and not resizing_image)
                     or (
                         request.output is OutputFormat.PNG
                         and request.image.optimize_for_speed
@@ -2062,7 +2094,8 @@ class RenderEngine:
 
                 screenshot_output = (
                     OutputFormat.PNG
-                    if request.output is OutputFormat.AVIF
+                    if resizing_image
+                    or request.output is OutputFormat.AVIF
                     or (
                         request.engine.value != BrowserEngine.CHROMIUM.value
                         and request.output is OutputFormat.WEBP

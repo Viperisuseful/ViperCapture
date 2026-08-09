@@ -61,6 +61,7 @@ from .render_engine import (
     RenderLimits,
     _settled_thread,
     certification_public_key,
+    ffmpeg_has_encoder,
 )
 from .render_errors import RenderError, error_response, install_render_error_layer
 from .schedules import (
@@ -2292,6 +2293,9 @@ async def _gpu_config(app: FastAPI) -> dict[str, object]:
 
 @app.get("/app-config")
 async def app_config():
+    output_formats = [output.value for output in OutputFormat]
+    if not await _settled_thread(ffmpeg_has_encoder, "libx264"):
+        output_formats.remove(OutputFormat.MP4.value)
     return {
         "server_saves": not HOSTED,
         "control_plane": CONTROL_ENABLED,
@@ -2301,6 +2305,7 @@ async def app_config():
         "max_full_page_height": MAX_FULL_PAGE_HEIGHT,
         "max_output_bytes": MAX_OUTPUT_BYTES,
         "browser_engines": [engine.value for engine in BrowserEngine],
+        "output_formats": output_formats,
         "async_jobs": {
             "enabled": ASYNC_JOBS_ENABLED,
             "workers": (

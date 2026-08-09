@@ -84,6 +84,14 @@ class PlatformRouteTests(unittest.TestCase):
 
 
 class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_app_config_hides_mp4_without_libx264(self):
+        with (
+            patch("vipercapture.main.ffmpeg_has_encoder", return_value=False),
+            patch("vipercapture.main._gpu_config", AsyncMock(return_value={})),
+        ):
+            config = await main.app_config()
+        self.assertNotIn("mp4", config["output_formats"])
+
     async def test_invalid_baseline_is_rejected_before_persistence(self):
         control = SimpleNamespace(put_baseline=Mock(), audit=Mock())
         request = SimpleNamespace(

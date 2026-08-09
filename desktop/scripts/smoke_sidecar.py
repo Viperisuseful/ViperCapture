@@ -102,6 +102,8 @@ def main() -> None:
             else:
                 raise RuntimeError("Unauthenticated request unexpectedly succeeded")
 
+            app_config = json.loads(request(base_url, token, "/app-config"))
+
             capture_bytes = {}
             for engine in ("chromium", "firefox", "webkit"):
                 image = request(
@@ -129,6 +131,24 @@ def main() -> None:
                 if not image.startswith(b"\x89PNG\r\n\x1a\n"):
                     raise RuntimeError(f"{engine} response was not a PNG")
                 capture_bytes[engine] = len(image)
+            if "mp4" in app_config.get("output_formats", []):
+                video = request(
+                    base_url,
+                    token,
+                    "/v1/render",
+                    {
+                        "url": "https://example.com",
+                        "engine": "chromium",
+                        "output": "mp4",
+                        "full_page": False,
+                        "viewport": {"width": 320, "height": 240},
+                        "video": {"duration_ms": 1000},
+                        "lazy_load": "none",
+                    },
+                )
+                if b"ftyp" not in video[:32]:
+                    raise RuntimeError("MP4 response did not contain an ftyp box")
+                capture_bytes["mp4"] = len(video)
             print(
                 json.dumps(
                     {
