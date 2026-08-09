@@ -305,6 +305,12 @@ class JobStore(Protocol):
         expected_attempt: int,
         available_at: datetime,
     ) -> None: ...
+    async def defer(
+        self,
+        job_id: str,
+        expected_attempt: int,
+        available_at: datetime,
+    ) -> None: ...
     async def maintain(self, now: datetime) -> list[str]: ...
     async def expire_result(
         self,
@@ -569,6 +575,7 @@ class AsyncJobService:
         cipher: PayloadCipher | None = None,
         notifier: JobNotifier | None = None,
         recover_running: bool = True,
+        recover_stale: bool = False,
     ) -> None:
         self.settings = settings
         self.job_store = job_store
@@ -577,6 +584,7 @@ class AsyncJobService:
         self.cipher = cipher or PayloadCipher.for_data_dir(settings.data_dir)
         self.notifier = notifier
         self.recover_running = recover_running
+        self.recover_stale = recover_stale
         if notifier is not None and not isinstance(
             job_store, NotificationJobStore
         ):
@@ -607,6 +615,11 @@ class AsyncJobService:
             await self.artifact_store.start()
             if self.recover_running:
                 await self.job_store.requeue_running(
+                    datetime.now(UTC),
+                    self.settings.max_attempts,
+                )
+            elif self.recover_stale:
+                await getattr(self.job_store, "recover_stale")(
                     datetime.now(UTC),
                     self.settings.max_attempts,
                 )
@@ -1312,7 +1325,7 @@ class AsyncJobService:
             )
             await self._retry_state_transition(
                 "defer",
-                lambda: getattr(self.job_store, "defer")(
+                lambda: self.job_store.defer(
                     job.id,
                     job.attempt_count,
                     available_at,

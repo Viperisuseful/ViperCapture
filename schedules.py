@@ -727,11 +727,11 @@ class ScheduleService:
                             expected_attempt=record.pending_attempt,
                         )
                         continue
+                    if self.on_job_created is not None:
+                        await self.on_job_created(record.id, job.id)
                     await self.store.record_result(
                         record.id, job_id=job.id, error=None
                     )
-                    if self.on_job_created is not None:
-                        await self.on_job_created(record.id, job.id)
             except Exception as exc:
                 retryable = not isinstance(exc, RenderError) or exc.retryable
                 if retryable:

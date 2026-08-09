@@ -174,6 +174,20 @@ ASYNC_JOB_SETTINGS = (
 )
 if ASYNC_JOB_SETTINGS is not None and PROCESS_ROLE == "api":
     ASYNC_JOB_SETTINGS = replace(ASYNC_JOB_SETTINGS, worker_count=0)
+
+
+def _job_ownership_ttl() -> int | None:
+    if ASYNC_JOB_SETTINGS is None:
+        return None
+    return int(
+        (
+            ASYNC_JOB_SETTINGS.queue_ttl
+            + ASYNC_JOB_SETTINGS.result_ttl
+            + ASYNC_JOB_SETTINGS.metadata_ttl
+        ).total_seconds()
+    )
+
+
 SCHEDULES_ENABLED = os.getenv(
     "VIPERCAPTURE_SCHEDULES",
     "0" if os.name == "nt" else "1",
@@ -394,6 +408,12 @@ async def lifespan(app: FastAPI):
             if ASYNC_JOB_SETTINGS is None:
                 raise RuntimeError("async job settings were not initialized")
             job_store, artifact_store = load_providers(ASYNC_JOB_SETTINGS)
+            if PROCESS_ROLE == "worker" and not callable(
+                getattr(job_store, "recover_stale", None)
+            ):
+                raise RuntimeError(
+                    "split workers require a job store with lease-based recover_stale()"
+                )
             service = AsyncJobService(
                 ASYNC_JOB_SETTINGS,
                 job_store,
@@ -401,6 +421,7 @@ async def lifespan(app: FastAPI):
                 _render_async_image,
                 notifier=_notify_job if app.state.webhooks is not None else None,
                 recover_running=PROCESS_ROLE == "all",
+                recover_stale=PROCESS_ROLE == "worker",
             )
             await service.start()
             app.state.async_jobs = service
@@ -411,7 +432,13 @@ async def lifespan(app: FastAPI):
                         return
                     project_id = await asyncio.to_thread(control.owner, "schedule", schedule_id)
                     if project_id is not None:
-                        await asyncio.to_thread(control.own, "job", job_id, project_id)
+                        await asyncio.to_thread(
+                            control.own,
+                            "job",
+                            job_id,
+                            project_id,
+                            _job_ownership_ttl(),
+                        )
 
                 async def scheduled_project(schedule_id: str) -> str | None:
                     control = getattr(app.state, "control", None)
@@ -468,7 +495,6 @@ if STATIC_DIR.exists():
 
 @app.middleware("http")
 async def require_desktop_token(request: Request, call_next):
-    started = time.perf_counter()
     path = request.url.path
     protected_api = path.startswith("/v1") or path == "/take" or path.startswith("/compat/")
     signed_render = request.method == "GET" and path == "/v1/render/signed"
@@ -536,10 +562,12 @@ async def require_desktop_token(request: Request, call_next):
     if (
         DESKTOP_TOKEN
         and request.method != "OPTIONS"
-        and path != "/health"
+        and path not in {"/health", "/ready"}
         and not signed_render
         and not signing_admin
-        and request.headers.get("authorization") != f"Bearer {DESKTOP_TOKEN}"
+        and not desktop_authenticated
+        and not request.state.is_admin
+        and request.state.project_id is None
     ):
         if acquired_project is not None:
             await control.release(acquired_project)
@@ -557,16 +585,29 @@ async def require_desktop_token(request: Request, call_next):
     finally:
         if acquired_project is not None:
             await control.release(acquired_project)
-    matched_route = getattr(request, "scope", {}).get("route")
-    metric_route = getattr(matched_route, "path", None) or "unmatched"
-    METRICS.inc(
-        "http_requests_total",
-        method=request.method,
-        route=metric_route,
-        status=getattr(response, "status_code", 500),
-    )
-    METRICS.inc("http_request_duration_seconds_sum", time.perf_counter() - started)
     return response
+
+
+@app.middleware("http")
+async def record_http_metrics(request: Request, call_next):
+    started = time.perf_counter()
+    status = 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        matched_route = getattr(request, "scope", {}).get("route")
+        metric_route = getattr(matched_route, "path", None) or "unmatched"
+        METRICS.inc(
+            "http_requests_total",
+            method=request.method,
+            route=metric_route,
+            status=status,
+        )
+        METRICS.inc(
+            "http_request_duration_seconds_sum", time.perf_counter() - started
+        )
 
 
 @app.get("/health")
@@ -706,7 +747,9 @@ async def create_profile(payload: ProfileCreate, request: Request) -> JSONRespon
             413,
             False,
         ) from exc
-    await asyncio.to_thread(control.own, "profile", profile_id, project_id)
+    await asyncio.to_thread(
+        control.own, "profile", profile_id, project_id, payload.ttl_seconds
+    )
     await asyncio.to_thread(control.audit, project_id, request.state.key_id, "profile.created", profile_id)
     return JSONResponse({"id": profile_id, "expires_in": payload.ttl_seconds}, status_code=201, headers={"Cache-Control": "private, no-store"})
 
@@ -1419,7 +1462,14 @@ async def _validate_profile_access(payload: RenderRequest, request: Request) -> 
 
 async def _own_resource(request: Request, kind: str, resource_id: str) -> None:
     if CONTROL_ENABLED and request.state.project_id is not None:
-        await asyncio.to_thread(app.state.control.own, kind, resource_id, request.state.project_id)
+        ttl = _job_ownership_ttl() if kind == "job" else None
+        await asyncio.to_thread(
+            app.state.control.own,
+            kind,
+            resource_id,
+            request.state.project_id,
+            ttl,
+        )
         if not await asyncio.to_thread(
             app.state.control.is_owner, kind, resource_id, request.state.project_id
         ):
@@ -1701,6 +1751,13 @@ async def delete_schedule(schedule_id: UUID, request: Request) -> Response:
     deleted = await _schedule_service().delete(str(schedule_id))
     if not deleted:
         raise RenderError("schedule_not_found", "The schedule was not found.", 404, False)
+    if CONTROL_ENABLED and request.state.project_id is not None:
+        await asyncio.to_thread(
+            app.state.control.disown,
+            "schedule",
+            str(schedule_id),
+            request.state.project_id,
+        )
     return Response(status_code=204)
 
 

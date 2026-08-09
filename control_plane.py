@@ -23,6 +23,7 @@ MAX_BASELINES_PER_PROJECT = 100
 MAX_BASELINE_BYTES_PER_PROJECT = 512 * 1024 * 1024
 MAX_PROFILES_PER_PROJECT = 100
 MAX_PROFILE_BYTES_PER_PROJECT = 512 * 1024 * 1024
+MAX_AUDIT_EVENTS = 100_000
 LIMIT_LEASE_SECONDS = 15 * 60
 
 
@@ -95,6 +96,7 @@ class ControlPlane:
                 );
                 CREATE TABLE IF NOT EXISTS resources (
                     kind TEXT NOT NULL, id TEXT NOT NULL, project_id TEXT NOT NULL,
+                    created_at INTEGER NOT NULL DEFAULT 0, expires_at INTEGER,
                     PRIMARY KEY(kind, id)
                 );
                 CREATE TABLE IF NOT EXISTS audit_events (
@@ -129,6 +131,15 @@ class ControlPlane:
                 db.execute(
                     "ALTER TABLE api_keys ADD COLUMN scopes TEXT NOT NULL DEFAULT '[\"render\",\"jobs\",\"schedules\",\"profiles\",\"baselines\"]'"
                 )
+            resource_columns = {
+                row[1] for row in db.execute("PRAGMA table_info(resources)")
+            }
+            if "created_at" not in resource_columns:
+                db.execute(
+                    "ALTER TABLE resources ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0"
+                )
+            if "expires_at" not in resource_columns:
+                db.execute("ALTER TABLE resources ADD COLUMN expires_at INTEGER")
 
     @staticmethod
     def _secure_file(path: Path, *, create: bool = False) -> None:
@@ -197,7 +208,12 @@ class ControlPlane:
     def list_projects(self) -> list[dict[str, object]]:
         with self._connect() as db:
             rows = db.execute("SELECT * FROM projects ORDER BY created_at, id").fetchall()
-        return [dict(row) for row in rows]
+        projects = []
+        for row in rows:
+            project = dict(row)
+            project["requests_per_minute"] = project.pop("rpm")
+            projects.append(project)
+        return projects
 
     def create_key(self, project_id: str, name: str, scopes: list[str] | None = None) -> dict[str, object]:
         key_id = secrets.token_hex(12)
@@ -302,25 +318,62 @@ class ControlPlane:
             self._leases[project_id].append(lease_id)
         return True
 
-    def own(self, kind: str, resource_id: str, project_id: str) -> None:
+    def own(
+        self,
+        kind: str,
+        resource_id: str,
+        project_id: str,
+        ttl_seconds: int | None = None,
+    ) -> None:
+        now = int(time.time())
+        expires_at = now + ttl_seconds if ttl_seconds is not None else None
         with self._connect() as db:
-            db.execute("INSERT OR IGNORE INTO resources VALUES (?, ?, ?)", (kind, resource_id, project_id))
+            db.execute(
+                "INSERT OR IGNORE INTO resources(kind,id,project_id,created_at,expires_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (kind, resource_id, project_id, now, expires_at),
+            )
+
+    def disown(
+        self, kind: str, resource_id: str, project_id: str | None = None
+    ) -> bool:
+        query = "DELETE FROM resources WHERE kind=? AND id=?"
+        values: tuple[object, ...] = (kind, resource_id)
+        if project_id is not None:
+            query += " AND project_id=?"
+            values += (project_id,)
+        with self._connect() as db:
+            cursor = db.execute(query, values)
+        return cursor.rowcount == 1
 
     def is_owner(self, kind: str, resource_id: str, project_id: str | None) -> bool:
         if project_id is None:
             return False
         with self._connect() as db:
+            db.execute(
+                "DELETE FROM resources WHERE expires_at IS NOT NULL AND expires_at<=?",
+                (int(time.time()),),
+            )
             row = db.execute("SELECT project_id FROM resources WHERE kind=? AND id=?", (kind, resource_id)).fetchone()
         return row is not None and secrets.compare_digest(str(row[0]), project_id)
 
     def owner(self, kind: str, resource_id: str) -> str | None:
         with self._connect() as db:
+            db.execute(
+                "DELETE FROM resources WHERE expires_at IS NOT NULL AND expires_at<=?",
+                (int(time.time()),),
+            )
             row = db.execute("SELECT project_id FROM resources WHERE kind=? AND id=?", (kind, resource_id)).fetchone()
         return str(row[0]) if row else None
 
     def audit(self, project_id: str | None, actor: str, action: str, resource: str | None = None) -> None:
         with self._connect() as db:
             db.execute("INSERT INTO audit_events(project_id, actor, action, resource, created_at) VALUES (?, ?, ?, ?, ?)", (project_id, actor, action, resource, int(time.time())))
+            db.execute(
+                "DELETE FROM audit_events WHERE id < ("
+                "SELECT id FROM audit_events ORDER BY id DESC LIMIT 1 OFFSET ?)",
+                (MAX_AUDIT_EVENTS - 1,),
+            )
 
     def audits(self, limit: int = 100) -> list[dict[str, object]]:
         with self._connect() as db:
@@ -418,7 +471,13 @@ class ControlPlane:
 
     def delete_profile(self, project_id: str, profile_id: str) -> bool:
         with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             cursor = db.execute("DELETE FROM profiles WHERE id=? AND project_id=?", (profile_id, project_id))
+            if cursor.rowcount == 1:
+                db.execute(
+                    "DELETE FROM resources WHERE kind='profile' AND id=? AND project_id=?",
+                    (profile_id, project_id),
+                )
         return cursor.rowcount == 1
 
     def put_baseline(self, project_id: str, name: str, body: bytes) -> dict[str, object]:
@@ -454,8 +513,14 @@ class ControlPlane:
 
     def delete_baseline(self, project_id: str, name: str) -> bool:
         with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             cursor = db.execute(
                 "DELETE FROM baselines WHERE project_id=? AND name=?",
                 (project_id, name),
             )
+            if cursor.rowcount == 1:
+                db.execute(
+                    "DELETE FROM resources WHERE kind='baseline' AND id=? AND project_id=?",
+                    (name, project_id),
+                )
         return cursor.rowcount == 1

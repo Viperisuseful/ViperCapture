@@ -4,7 +4,7 @@ import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import main
 from async_jobs import JobRecord
@@ -46,18 +46,19 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 503)
         self.assertFalse(json.loads(response.body)["ready"])
 
-    async def test_health_bypasses_desktop_token(self):
+    async def test_health_and_readiness_bypass_desktop_token(self):
         expected = main.Response(status_code=200)
         call_next = AsyncMock(return_value=expected)
-        request = SimpleNamespace(
-            method="GET",
-            url=SimpleNamespace(path="/health"),
-            headers={},
-        )
         with patch("main.DESKTOP_TOKEN", "secret"):
-            response = await main.require_desktop_token(request, call_next)
-        self.assertIs(response, expected)
-        call_next.assert_awaited_once_with(request)
+            for path in ("/health", "/ready"):
+                request = SimpleNamespace(
+                    method="GET",
+                    url=SimpleNamespace(path=path),
+                    headers={},
+                )
+                response = await main.require_desktop_token(request, call_next)
+                self.assertIs(response, expected)
+        self.assertEqual(call_next.await_count, 2)
 
     async def test_signed_routes_use_their_own_authentication(self):
         expected = main.Response(status_code=200)
@@ -85,6 +86,64 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertIs(response, expected)
         self.assertEqual(call_next.await_count, 2)
+
+    async def test_control_credentials_also_satisfy_desktop_auth(self):
+        expected = main.Response(status_code=200)
+        call_next = AsyncMock(return_value=expected)
+        control = SimpleNamespace(
+            authenticate=Mock(
+                return_value={
+                    "project_id": "project",
+                    "key_id": "key",
+                    "scopes": ["render"],
+                }
+            ),
+            acquire=AsyncMock(return_value=(True, None)),
+            release=AsyncMock(),
+        )
+        with (
+            patch("main.DESKTOP_TOKEN", "desktop"),
+            patch("main.CONTROL_ENABLED", True),
+            patch("main.CONTROL_ADMIN_TOKEN", "admin"),
+        ):
+            for authorization in ("Bearer admin", "Bearer project-key"):
+                request = SimpleNamespace(
+                    method="POST",
+                    url=SimpleNamespace(path="/v1/render"),
+                    headers={"authorization": authorization},
+                    query_params={},
+                    app=SimpleNamespace(state=SimpleNamespace(control=control)),
+                )
+                response = await main.require_desktop_token(request, call_next)
+                self.assertIs(response, expected)
+        self.assertEqual(call_next.await_count, 2)
+
+    async def test_metrics_include_authentication_rejections(self):
+        metrics = main.Metrics()
+        request = SimpleNamespace(
+            method="POST",
+            url=SimpleNamespace(path="/v1/render"),
+            headers={},
+            query_params={},
+            scope={},
+        )
+
+        async def authenticate(inner_request):
+            return await main.require_desktop_token(
+                inner_request,
+                AsyncMock(return_value=main.Response(status_code=200)),
+            )
+
+        with (
+            patch("main.METRICS", metrics),
+            patch("main.DESKTOP_TOKEN", "desktop"),
+        ):
+            response = await main.record_http_metrics(request, authenticate)
+        self.assertEqual(response.status_code, 401)
+        self.assertIn(
+            'vipercapture_http_requests_total{method="POST",route="unmatched",status="401"} 1',
+            metrics.prometheus(),
+        )
 
     async def test_cached_render_bypasses_saturated_chromium_slots(self):
         original_cache = getattr(main.app.state, "render_cache", None)

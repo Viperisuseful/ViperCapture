@@ -38,6 +38,10 @@ class ControlPlaneTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_keys_limits_ownership_profiles_and_audit(self):
         project = self.control.create_project("tests", 1, 1)
+        self.assertEqual(
+            self.control.list_projects()[0]["requests_per_minute"], 1
+        )
+        self.assertNotIn("rpm", self.control.list_projects()[0])
         key = self.control.create_key(str(project["id"]), "ci")
         identity = self.control.authenticate(key["api_key"])
         self.assertEqual(identity["project_id"], project["id"])
@@ -63,6 +67,29 @@ class ControlPlaneTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.control.audits()[0]["action"], "test")
         self.assertTrue(self.control.revoke_key(key["id"]))
         self.assertIsNone(self.control.authenticate(key["api_key"]))
+
+    async def test_resource_expiry_deletion_and_audit_retention(self):
+        project = self.control.create_project("tests", 10, 1)
+        project_id = str(project["id"])
+        self.control.own("job", "expired", project_id, 60)
+        with self.control._connect() as database:
+            database.execute(
+                "UPDATE resources SET expires_at=0 WHERE kind='job' AND id='expired'"
+            )
+        self.assertFalse(self.control.is_owner("job", "expired", project_id))
+
+        self.control.put_profile(project_id, "profile", {}, None)
+        self.control.own("profile", "profile", project_id)
+        self.assertTrue(self.control.delete_profile(project_id, "profile"))
+        self.assertFalse(self.control.is_owner("profile", "profile", project_id))
+
+        with patch("control_plane.MAX_AUDIT_EVENTS", 3):
+            for index in range(5):
+                self.control.audit(project_id, "test", f"event-{index}")
+        self.assertEqual(
+            [event["action"] for event in reversed(self.control.audits(10))],
+            ["event-2", "event-3", "event-4"],
+        )
 
     async def test_baseline_store(self):
         project = self.control.create_project("tests", 10, 1)

@@ -290,6 +290,31 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
         retried = await self.store.get(record.id)
         self.assertEqual(retried.last_job_id, "job-1")
 
+    async def test_ownership_is_committed_before_occurrence_advances(self):
+        ownership = AsyncMock(side_effect=(RuntimeError("database busy"), None))
+        self.service.on_job_created = ownership
+        record = await self.service.create(
+            ScheduleCreate(
+                name="Ownership retry",
+                cron="* * * * *",
+                render=RenderRequest(html="owned"),
+            )
+        )
+        due = datetime.now(UTC) + timedelta(minutes=2)
+
+        self.assertEqual(await self.service.run_due(due), 1)
+        failed = await self.store.get(record.id)
+        self.assertIsNone(failed.last_job_id)
+        request_id = self.jobs.calls[0][1]
+
+        self.assertEqual(
+            await self.service.run_due(due + timedelta(seconds=1)), 1
+        )
+        self.assertEqual(self.jobs.calls[1][1], request_id)
+        ownership.assert_awaited_with(record.id, "job-2")
+        completed = await self.store.get(record.id)
+        self.assertEqual(completed.last_job_id, "job-2")
+
     async def test_claimed_occurrence_survives_store_restart(self):
         record = await self.service.create(
             ScheduleCreate(

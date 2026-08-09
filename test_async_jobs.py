@@ -139,6 +139,33 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await service.close()
 
+    async def test_split_worker_recovers_only_stale_leased_claims(self):
+        job_store = SimpleNamespace(
+            start=AsyncMock(),
+            close=AsyncMock(),
+            recover_stale=AsyncMock(),
+            requeue_running=AsyncMock(),
+            maintain=AsyncMock(return_value=[]),
+        )
+        artifact_store = SimpleNamespace(
+            start=AsyncMock(), close=AsyncMock(), maintain=AsyncMock()
+        )
+        service = AsyncJobService(
+            _settings(self.root, worker_count=0),
+            job_store,
+            artifact_store,
+            _successful_renderer,
+            cipher=PayloadCipher(b"\0" * 32),
+            recover_running=False,
+            recover_stale=True,
+        )
+        await service.start()
+        try:
+            job_store.recover_stale.assert_awaited_once()
+            job_store.requeue_running.assert_not_awaited()
+        finally:
+            await service.close()
+
     def test_zero_workers_requires_explicit_api_role_opt_in(self):
         with patch.dict("os.environ", {"VIPERCAPTURE_JOB_WORKERS": "0"}):
             with self.assertRaisesRegex(ValueError, "must be positive"):
@@ -3676,7 +3703,7 @@ class ProviderLoadingTests(unittest.TestCase):
                 (
                     "start", "close", "create", "claim",
                     "get", "cancel",
-                    "succeed", "fail", "requeue_running", "requeue", "maintain",
+                    "succeed", "fail", "requeue_running", "requeue", "defer", "maintain",
                     "expire_result",
                     "acknowledge_artifact_deletion",
                 ),
