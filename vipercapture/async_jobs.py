@@ -424,7 +424,7 @@ def load_providers(settings: JobSettings) -> tuple[JobStore, ArtifactStore]:
     job_spec = os.getenv("VIPERCAPTURE_JOB_STORE_FACTORY")
     artifact_spec = os.getenv("VIPERCAPTURE_ARTIFACT_STORE_FACTORY")
     if not artifact_spec and os.getenv("VIPERCAPTURE_S3_BUCKET"):
-        artifact_spec = "s3_artifact_store:create_s3_artifact_store"
+        artifact_spec = "vipercapture.s3_artifact_store:create_s3_artifact_store"
     job_config = JobStoreConfig(settings.data_dir, settings.metadata_ttl)
     artifact_config = ArtifactStoreConfig(settings.data_dir, settings.result_ttl)
     job_store = (

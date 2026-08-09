@@ -3820,6 +3820,35 @@ class ProviderLoadingTests(unittest.TestCase):
             _sync_directory(directory)
         open_file.assert_not_called()
 
+    def test_documented_provider_contract_import_remains_compatible(self):
+        import async_jobs as provider_contract
+
+        self.assertIs(provider_contract.JobStoreConfig, JobStoreConfig)
+        self.assertIs(provider_contract.ArtifactStoreConfig, ArtifactStoreConfig)
+
+    def test_s3_environment_uses_packaged_provider(self):
+        received = []
+
+        def load_factory(spec, config):
+            received.append(spec)
+            return LocalArtifactStore(config)
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            "os.environ",
+            {
+                "VIPERCAPTURE_S3_BUCKET": "screenshots",
+                "VIPERCAPTURE_ARTIFACT_STORE_FACTORY": "",
+                "VIPERCAPTURE_JOB_STORE_FACTORY": "",
+            },
+            clear=False,
+        ), patch("vipercapture.async_jobs._factory", side_effect=load_factory):
+            load_providers(_settings(Path(directory)))
+
+        self.assertEqual(
+            received,
+            ["vipercapture.s3_artifact_store:create_s3_artifact_store"],
+        )
+
     def test_external_factories_receive_provider_specific_config(self):
         module = ModuleType("test_async_provider_module")
         job_store = AsyncMock()
