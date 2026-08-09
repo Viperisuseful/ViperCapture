@@ -354,6 +354,38 @@ class BrowserCaptureRegressionTests(unittest.IsolatedAsyncioTestCase):
                 await browser.close()
         self.assertEqual(first.body, second.body)
 
+    async def test_failed_artifact_does_not_persist_profile_state(self):
+        loader = AsyncMock(return_value={"cookies": [], "origins": []})
+        saver = AsyncMock()
+        request = RenderRequest(
+            html="profile",
+            full_page=False,
+            profile_id="profile",
+            save_profile=True,
+        )
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                with (
+                    patch(
+                        "render_engine.diagnostic_bundle",
+                        AsyncMock(
+                            side_effect=RenderError(
+                                "output_too_large", "failed", 413, False
+                            )
+                        ),
+                    ),
+                    self.assertRaises(RenderError),
+                ):
+                    await RenderEngine(
+                        hosted=False,
+                        profile_loader=loader,
+                        profile_saver=saver,
+                    ).render_image(browser, request, RenderLimits())
+            finally:
+                await browser.close()
+        saver.assert_not_awaited()
+
     async def test_diagnostic_console_is_bounded_before_transport(self):
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=True)

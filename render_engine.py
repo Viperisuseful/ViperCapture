@@ -1079,6 +1079,32 @@ class RenderEngine:
         self.profile_loader = profile_loader
         self.profile_saver = profile_saver
 
+    async def _persist_profile(self, request: RenderRequest, context) -> None:
+        if not request.save_profile or request.profile_id is None:
+            return
+        if self.profile_saver is None:
+            raise RenderError(
+                "profiles_disabled",
+                "Persistent browser profiles are disabled.",
+                503,
+                False,
+            )
+        await self.profile_saver(request.profile_id, await context.storage_state())
+
+    async def _persist_profile_state(
+        self, request: RenderRequest, state: dict[str, object] | None
+    ) -> None:
+        if state is None or request.profile_id is None:
+            return
+        if self.profile_saver is None:
+            raise RenderError(
+                "profiles_disabled",
+                "Persistent browser profiles are disabled.",
+                503,
+                False,
+            )
+        await self.profile_saver(request.profile_id, state)
+
     async def _wait(self, page: Page, request: RenderRequest, limits: RenderLimits) -> None:
         wait = request.wait_for
         timeout = min(wait.timeout_ms, limits.wait_timeout_ms)
@@ -1832,11 +1858,6 @@ class RenderEngine:
                     OutputFormat.MP4,
                     OutputFormat.GIF,
                 }
-                if request.save_profile and request.profile_id is not None and not is_video:
-                    if self.profile_saver is None:
-                        raise RenderError("profiles_disabled", "Persistent browser profiles are disabled.", 503, False)
-                    await self.profile_saver(request.profile_id, await context.storage_state())
-
                 if request.output in {OutputFormat.WEBM, OutputFormat.MP4, OutputFormat.GIF}:
                     options = request.video
                     if options is None or page.video is None:
@@ -1867,12 +1888,11 @@ class RenderEngine:
                         failed_requests,
                         matched_failure_patterns,
                     )
-                    if request.save_profile and request.profile_id is not None:
-                        if self.profile_saver is None:
-                            raise RenderError("profiles_disabled", "Persistent browser profiles are disabled.", 503, False)
-                        await self.profile_saver(
-                            request.profile_id, await context.storage_state()
-                        )
+                    pending_profile_state = (
+                        await context.storage_state()
+                        if request.save_profile and request.profile_id is not None
+                        else None
+                    )
                     final_url = page.url
                     video = page.video
                     await page.close()
@@ -1914,7 +1934,13 @@ class RenderEngine:
                             "output_count": 1,
                         },
                     )
-                    return await diagnostic_bundle(artifact, request, console_events, network_events, limits)
+                    finalized = await diagnostic_bundle(
+                        artifact, request, console_events, network_events, limits
+                    )
+                    await self._persist_profile_state(
+                        request, pending_profile_state
+                    )
+                    return finalized
 
                 if request.output not in MEDIA_TYPES:
                     if request.output is OutputFormat.METADATA:
@@ -1959,10 +1985,12 @@ class RenderEngine:
                             "output_count": 1,
                         },
                     )
-                    return await diagnostic_bundle(
+                    finalized = await diagnostic_bundle(
                         artifact, request, console_events, network_events, limits,
                         page=page, context=context,
                     )
+                    await self._persist_profile(request, context)
+                    return finalized
 
                 screenshot_output = (
                     OutputFormat.PNG if request.output is OutputFormat.AVIF else request.output
@@ -2141,7 +2169,7 @@ class RenderEngine:
                         },
                     )
                     finalized_request = request.model_copy(update={"slices": None})
-                    return await diagnostic_bundle(
+                    finalized = await diagnostic_bundle(
                         artifact,
                         finalized_request,
                         console_events,
@@ -2150,6 +2178,8 @@ class RenderEngine:
                         page=page,
                         context=context,
                     )
+                    await self._persist_profile(request, context)
+                    return finalized
                 if request.output is OutputFormat.WEBP or (
                     request.output is OutputFormat.PNG
                     and request.image.optimize_for_speed
@@ -2280,10 +2310,12 @@ class RenderEngine:
                         "output_count": 1,
                     },
                 )
-                return await diagnostic_bundle(
+                finalized = await diagnostic_bundle(
                     artifact, request, console_events, network_events, limits,
                     page=page, context=context,
                 )
+                await self._persist_profile(request, context)
+                return finalized
         except TimeoutError as exc:
             raise RenderError("render_timeout", "The render exceeded its total deadline.", 504, True) from exc
         except RenderError:

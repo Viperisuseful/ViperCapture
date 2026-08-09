@@ -271,6 +271,13 @@ class ControlPlaneTests(unittest.IsolatedAsyncioTestCase):
                 if path.exists():
                     self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
+    async def test_rate_expiry_has_a_time_leading_index(self):
+        with self.control._connect() as database:
+            columns = database.execute(
+                "PRAGMA index_info(rate_events_time)"
+            ).fetchall()
+        self.assertEqual([column[2] for column in columns], ["created_at"])
+
 
 class CompatibilityTests(unittest.TestCase):
     def test_screenshotone_common_options(self):

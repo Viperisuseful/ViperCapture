@@ -548,7 +548,7 @@ async def require_desktop_token(request: Request, call_next):
             )
         uses_render_capacity = (
             path == "/take"
-            or path.startswith("/compat/")
+            or path == "/compat/urlbox/v1/render/sync"
             or (path == "/v1/render" and request.method == "POST")
         )
         allowed, reason = await control.acquire(
@@ -706,9 +706,41 @@ class ApiKeyCreate(BaseModel):
     )
 
 
+class BrowserCookie(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    name: str
+    value: str
+    domain: str
+    path: str
+    expires: float
+    http_only: bool = Field(alias="httpOnly")
+    secure: bool
+    same_site: Literal["Strict", "Lax", "None"] = Field(alias="sameSite")
+
+
+class BrowserLocalStorageEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str
+    value: str
+
+
+class BrowserOriginState(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    origin: str = Field(min_length=1)
+    local_storage: list[BrowserLocalStorageEntry] = Field(
+        default_factory=list, alias="localStorage"
+    )
+
+
+class BrowserStorageState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    cookies: list[BrowserCookie] = Field(default_factory=list)
+    origins: list[BrowserOriginState] = Field(default_factory=list)
+
+
 class ProfileCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    storage_state: dict[str, object]
+    storage_state: BrowserStorageState
     ttl_seconds: int | None = Field(default=None, ge=60, le=31_536_000)
 
 
@@ -786,7 +818,7 @@ async def create_profile(payload: ProfileCreate, request: Request) -> JSONRespon
             control.put_profile,
             project_id,
             profile_id,
-            payload.storage_state,
+            payload.storage_state.model_dump(mode="json", by_alias=True),
             payload.ttl_seconds,
         )
     except ProfileQuotaError as exc:
@@ -1815,11 +1847,21 @@ async def update_schedule(schedule_id: UUID, payload: ScheduleUpdate, request: R
         await _validate_webhook(payload.render)
     control = getattr(request.app.state, "control", None)
     project_id = request.state.project_id
+    quota_project_id = project_id
+    if (
+        payload.render is not None
+        and CONTROL_ENABLED
+        and control is not None
+        and quota_project_id is None
+    ):
+        quota_project_id = await asyncio.to_thread(
+            control.owner, "schedule", str(schedule_id)
+        )
     resized = (
         payload.render is not None
         and CONTROL_ENABLED
         and control is not None
-        and project_id is not None
+        and quota_project_id is not None
     )
     if resized:
         try:
@@ -1829,14 +1871,14 @@ async def update_schedule(schedule_id: UUID, payload: ScheduleUpdate, request: R
             await _settled_thread(
                 control.resize_schedule,
                 str(schedule_id),
-                project_id,
+                quota_project_id,
                 size_bytes,
             )
         except asyncio.CancelledError:
             await _settled_thread(
                 control.resize_schedule,
                 str(schedule_id),
-                project_id,
+                quota_project_id,
                 len(record.payload),
             )
             raise
@@ -1856,7 +1898,7 @@ async def update_schedule(schedule_id: UUID, payload: ScheduleUpdate, request: R
                 await _settled_thread(
                     control.resize_schedule,
                     str(schedule_id),
-                    project_id,
+                    quota_project_id,
                     len(record.payload),
                 )
         raise

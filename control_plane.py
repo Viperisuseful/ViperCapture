@@ -148,6 +148,8 @@ class ControlPlane:
                 );
                 CREATE INDEX IF NOT EXISTS rate_events_project_time
                     ON rate_events(project_id, created_at);
+                CREATE INDEX IF NOT EXISTS rate_events_time
+                    ON rate_events(created_at);
                 CREATE TABLE IF NOT EXISTS active_leases (
                     id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
                     expires_at REAL NOT NULL

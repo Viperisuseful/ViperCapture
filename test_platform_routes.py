@@ -8,11 +8,13 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import main
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from async_jobs import JobRecord
 from bulk_jobs import BulkJobRequest
 from render_contract import RenderRequest
 from render_engine import RenderArtifact
 from render_errors import RenderError
+from schedules import ScheduleRecord
 
 
 class PlatformRouteTests(unittest.TestCase):
@@ -35,6 +37,17 @@ class PlatformRouteTests(unittest.TestCase):
     def test_desktop_cors_allows_schedule_updates(self):
         self.assertIn("PATCH", main.DESKTOP_ALLOW_METHODS)
         self.assertIn("PUT", main.DESKTOP_ALLOW_METHODS)
+
+    def test_profile_storage_state_is_validated_before_persistence(self):
+        with self.assertRaises(ValidationError):
+            main.ProfileCreate(storage_state={"cookies": "invalid", "origins": []})
+        with self.assertRaises(ValidationError):
+            main.ProfileCreate(
+                storage_state={
+                    "cookies": [{"name": "missing-fields"}],
+                    "origins": [],
+                }
+            )
 
 
 class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
@@ -199,6 +212,40 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         )
         control.release.assert_not_awaited()
 
+    async def test_urlbox_async_submission_skips_render_concurrency(self):
+        expected = main.Response(status_code=200)
+        call_next = AsyncMock(return_value=expected)
+        control = SimpleNamespace(
+            authenticate=Mock(
+                return_value={
+                    "project_id": "project",
+                    "key_id": "key",
+                    "scopes": ["render", "jobs"],
+                }
+            ),
+            acquire=AsyncMock(return_value=(True, None)),
+            release=AsyncMock(),
+        )
+        with (
+            patch("main.CONTROL_ENABLED", True),
+            patch("main.CONTROL_ADMIN_TOKEN", "admin"),
+        ):
+            for path in (
+                "/compat/urlbox/v1/render/async",
+                "/compat/urlbox/v1/render/sync",
+            ):
+                request = SimpleNamespace(
+                    method="POST",
+                    url=SimpleNamespace(path=path),
+                    headers={"authorization": "Bearer project-key"},
+                    query_params={},
+                    app=SimpleNamespace(state=SimpleNamespace(control=control)),
+                )
+                await main.require_desktop_token(request, call_next)
+        self.assertFalse(control.acquire.await_args_list[0].kwargs["concurrency"])
+        self.assertTrue(control.acquire.await_args_list[1].kwargs["concurrency"])
+        control.release.assert_awaited_once_with("project")
+
     async def test_admin_schedule_delete_releases_stored_owner_quota(self):
         schedule_id = "00000000-0000-0000-0000-000000000001"
         control = SimpleNamespace(owner=Mock(return_value="project"), disown=Mock())
@@ -221,6 +268,55 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 204)
         control.disown.assert_called_once_with(
             "schedule", schedule_id, "project"
+        )
+
+    async def test_admin_schedule_update_resizes_stored_owner_quota(self):
+        schedule_id = "00000000-0000-0000-0000-000000000002"
+        now = datetime.now(timezone.utc)
+        record = ScheduleRecord(
+            id=schedule_id,
+            name="Admin update",
+            cron="0 * * * *",
+            timezone="UTC",
+            enabled=True,
+            payload=b"old",
+            next_run_at=now,
+            created_at=now,
+            updated_at=now,
+            project_id="project",
+        )
+        updated = main.replace(record, payload=b"new", updated_at=now + timedelta(seconds=1))
+        control = SimpleNamespace(
+            owner=Mock(return_value="project"), resize_schedule=Mock()
+        )
+        service = SimpleNamespace(
+            store=SimpleNamespace(get=AsyncMock(return_value=record)),
+            payload_size=Mock(return_value=10),
+            update=AsyncMock(return_value=updated),
+        )
+        original_control = getattr(main.app.state, "control", None)
+        original_schedules = getattr(main.app.state, "schedules", None)
+        main.app.state.control = control
+        main.app.state.schedules = service
+        request = SimpleNamespace(
+            app=main.app,
+            state=SimpleNamespace(
+                is_admin=True, trusted_local=False, project_id=None
+            ),
+        )
+        try:
+            with patch("main.CONTROL_ENABLED", True):
+                response = await main.update_schedule(
+                    schedule_id,
+                    main.ScheduleUpdate(render=RenderRequest(html="new")),
+                    request,
+                )
+        finally:
+            main.app.state.control = original_control
+            main.app.state.schedules = original_schedules
+        self.assertEqual(response.status_code, 200)
+        control.resize_schedule.assert_called_once_with(
+            schedule_id, "project", 10
         )
 
     async def test_cached_render_bypasses_saturated_chromium_slots(self):
