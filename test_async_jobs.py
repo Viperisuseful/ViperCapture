@@ -30,6 +30,7 @@ from async_jobs import (
     RenderedArtifact,
     StoredArtifact,
     load_providers,
+    public_job_document,
     settings_from_environment,
 )
 from render_contract import RenderRequest
@@ -146,6 +147,22 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
                 base_dir=self.root, allow_zero_workers=True
             )
         self.assertEqual(settings.worker_count, 0)
+
+    def test_public_job_document_hides_project_namespace(self):
+        now = datetime.now(UTC)
+        job = JobRecord(
+            id=str(uuid4()),
+            request_id=f"_project-{'a' * 24}:caller-visible",
+            status="queued",
+            payload=b"encrypted",
+            attempt_count=0,
+            available_at=now,
+            queue_expires_at=now + timedelta(minutes=1),
+            created_at=now,
+        )
+        self.assertEqual(
+            public_job_document(job)["request_id"], "caller-visible"
+        )
 
     async def test_deferred_claim_does_not_spend_a_render_attempt(self):
         calls = 0

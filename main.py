@@ -950,8 +950,8 @@ async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
     project_id = None
     if CONTROL_ENABLED and job is not None:
         candidate = job.request_id.partition(":")[0]
-        if re.fullmatch(r"[0-9a-f]{24}", candidate):
-            project_id = candidate
+        if re.fullmatch(r"_project-[0-9a-f]{24}", candidate):
+            project_id = candidate.removeprefix("_project-")
     control = getattr(app.state, "control", None)
     project_acquired = False
     if project_id is not None and control is not None:
@@ -1396,7 +1396,7 @@ def _async_job_service() -> AsyncJobService:
 
 def _project_request_id(request: Request, request_id: str) -> str:
     project_id = getattr(request.state, "project_id", None)
-    return f"{project_id}:{request_id}" if project_id else request_id
+    return f"_project-{project_id}:{request_id}" if project_id else request_id
 
 
 async def _validate_profile_access(payload: RenderRequest, request: Request) -> None:

@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import secrets
 import sqlite3
+import stat
 import threading
 import time
 from collections import defaultdict, deque
@@ -14,6 +16,8 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+from async_jobs import _ensure_private_directory
 
 MAX_BASELINES_PER_PROJECT = 100
 MAX_BASELINE_BYTES_PER_PROJECT = 512 * 1024 * 1024
@@ -72,7 +76,11 @@ class ControlPlane:
         self._limit_lock = asyncio.Lock()
 
     def initialize(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if os.name == "nt":
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            _ensure_private_directory(self.path.parent)
+            self._secure_file(self.path, create=True)
         with self._connect() as db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS projects (
@@ -122,8 +130,44 @@ class ControlPlane:
                     "ALTER TABLE api_keys ADD COLUMN scopes TEXT NOT NULL DEFAULT '[\"render\",\"jobs\",\"schedules\",\"profiles\",\"baselines\"]'"
                 )
 
+    @staticmethod
+    def _secure_file(path: Path, *, create: bool = False) -> None:
+        if os.name == "nt":
+            return
+        flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        if create:
+            flags |= os.O_CREAT
+        try:
+            descriptor = os.open(path, flags, 0o600)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise RuntimeError(
+                "control database files must be owner-controlled regular files"
+            ) from exc
+        try:
+            information = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(information.st_mode)
+                or information.st_uid != os.getuid()
+            ):
+                raise RuntimeError(
+                    "control database files must be owner-controlled regular files"
+                )
+            os.fchmod(descriptor, 0o600)
+            if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o600:
+                raise RuntimeError("control database files must be owner-only")
+        finally:
+            os.close(descriptor)
+
+    def _secure_files(self) -> None:
+        self._secure_file(self.path, create=True)
+        self._secure_file(Path(f"{self.path}-wal"))
+        self._secure_file(Path(f"{self.path}-shm"))
+
     @contextmanager
     def _connect(self):
+        self._secure_files()
         connection = sqlite3.connect(self.path, timeout=10)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
@@ -135,7 +179,10 @@ class ControlPlane:
             connection.rollback()
             raise
         finally:
-            connection.close()
+            try:
+                self._secure_files()
+            finally:
+                connection.close()
 
     def create_project(self, name: str, rpm: int, concurrency: int) -> dict[str, object]:
         project_id = secrets.token_hex(12)
@@ -300,24 +347,28 @@ class ControlPlane:
                 "DELETE FROM profiles WHERE project_id=? AND expires_at IS NOT NULL AND expires_at<=?",
                 (project_id, now),
             )
-            usage = db.execute(
-                "SELECT count(*) count, coalesce(sum(length(payload)),0) bytes "
-                "FROM profiles WHERE project_id=?",
-                (project_id,),
-            ).fetchone()
-            existing = db.execute(
-                "SELECT length(payload) bytes FROM profiles WHERE project_id=? AND id=?",
-                (project_id, profile_id),
-            ).fetchone()
-            count = int(usage["count"]) + (0 if existing else 1)
-            total = (
-                int(usage["bytes"])
-                - (int(existing["bytes"]) if existing else 0)
-                + len(payload)
-            )
-            if count > MAX_PROFILES_PER_PROJECT or total > MAX_PROFILE_BYTES_PER_PROJECT:
-                raise ProfileQuotaError
+            self._check_profile_quota(db, project_id, profile_id, payload)
             db.execute("INSERT OR REPLACE INTO profiles VALUES (?, ?, ?, ?, ?)", (profile_id, project_id, payload, now, expires))
+
+    @staticmethod
+    def _check_profile_quota(db, project_id: str, profile_id: str, payload: bytes) -> None:
+        usage = db.execute(
+            "SELECT count(*) count, coalesce(sum(length(payload)),0) bytes "
+            "FROM profiles WHERE project_id=?",
+            (project_id,),
+        ).fetchone()
+        existing = db.execute(
+            "SELECT length(payload) bytes FROM profiles WHERE project_id=? AND id=?",
+            (project_id, profile_id),
+        ).fetchone()
+        count = int(usage["count"]) + (0 if existing else 1)
+        total = (
+            int(usage["bytes"])
+            - (int(existing["bytes"]) if existing else 0)
+            + len(payload)
+        )
+        if count > MAX_PROFILES_PER_PROJECT or total > MAX_PROFILE_BYTES_PER_PROJECT:
+            raise ProfileQuotaError
 
     def get_profile(self, project_id: str, profile_id: str) -> dict[str, object] | None:
         with self._connect() as db:
@@ -337,22 +388,33 @@ class ControlPlane:
         return self.get_profile(str(row["project_id"]), profile_id) if row else None
 
     def put_profile_any(self, profile_id: str, state: dict[str, object]) -> bool:
+        now = int(time.time())
         with self._connect() as db:
-            row = db.execute("SELECT project_id, expires_at FROM profiles WHERE id=?", (profile_id,)).fetchone()
-        if row is None:
-            return False
-        expires_at = int(row["expires_at"]) if row["expires_at"] else None
-        if expires_at is not None and expires_at <= int(time.time()):
-            self.delete_profile(str(row["project_id"]), profile_id)
-            return False
-        self.put_profile(
-            str(row["project_id"]),
-            profile_id,
-            state,
-            None,
-            expires_at=expires_at,
-        )
-        return True
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "DELETE FROM profiles WHERE expires_at IS NOT NULL AND expires_at<=?",
+                (now,),
+            )
+            row = db.execute(
+                "SELECT project_id, expires_at FROM profiles WHERE id=?",
+                (profile_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            project_id = str(row["project_id"])
+            nonce = secrets.token_bytes(12)
+            payload = nonce + self._cipher.encrypt(
+                nonce,
+                json.dumps(state, separators=(",", ":")).encode(),
+                f"{project_id}:{profile_id}".encode(),
+            )
+            self._check_profile_quota(db, project_id, profile_id, payload)
+            updated = db.execute(
+                "UPDATE profiles SET payload=?,updated_at=? "
+                "WHERE id=? AND project_id=?",
+                (payload, now, profile_id, project_id),
+            )
+            return updated.rowcount == 1
 
     def delete_profile(self, project_id: str, profile_id: str) -> bool:
         with self._connect() as db:

@@ -715,7 +715,7 @@ class ScheduleService:
                     if self.project_for_schedule is not None:
                         project_id = await self.project_for_schedule(record.id)
                         if project_id is not None:
-                            request_id = f"{project_id}:{request_id}"
+                            request_id = f"_project-{project_id}:{request_id}"
                     job = await self.jobs.submit(
                         render,
                         request_id=request_id,

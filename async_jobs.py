@@ -1368,6 +1368,14 @@ class AsyncJobService:
             self._wake_workers()
 
 def public_job_document(job: JobRecord) -> dict[str, object]:
+    prefix, separator, request_id = job.request_id.partition(":")
+    if not (
+        separator
+        and prefix.startswith("_project-")
+        and len(prefix) == 33
+        and all(character in "0123456789abcdef" for character in prefix[9:])
+    ):
+        request_id = job.request_id
     result = None
     if job.status == "succeeded":
         result = {
@@ -1384,7 +1392,7 @@ def public_job_document(job: JobRecord) -> dict[str, object]:
         }
     return {
         "id": job.id,
-        "request_id": job.request_id,
+        "request_id": request_id,
         "status": job.status,
         "status_url": f"/v1/jobs/{job.id}",
         "result_url": (

@@ -242,7 +242,7 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
         await self.service.run_due(datetime.now(UTC) + timedelta(minutes=2))
         self.assertTrue(
             self.jobs.calls[0][1].startswith(
-                f"{project_id}:_schedule-{record.id}-"
+                f"_project-{project_id}:_schedule-{record.id}-"
             )
         )
 

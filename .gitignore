@@ -24,6 +24,8 @@ captures/
 .venv/.deps_stamp
 .venv/.playwright_stamp
 frontend/node_modules/
+sdk/typescript/node_modules/
+sdk/typescript/dist/
 
 # OS
 .DS_Store

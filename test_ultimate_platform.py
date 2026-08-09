@@ -1,3 +1,4 @@
+import asyncio
 import io
 import json
 import os
@@ -5,6 +6,7 @@ import base64
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import zipfile
 from pathlib import Path
@@ -106,6 +108,52 @@ class ControlPlaneTests(unittest.IsolatedAsyncioTestCase):
             self.control.put_baseline(project_id, "one", b"1")
             with self.assertRaises(BaselineQuotaError):
                 self.control.put_baseline(project_id, "two", b"2")
+
+    async def test_profile_delete_wins_a_concurrent_save(self):
+        project = self.control.create_project("tests", 10, 1)
+        project_id = str(project["id"])
+        self.control.put_profile(project_id, "profile", {}, None)
+        entered = threading.Event()
+        release = threading.Event()
+        original = self.control._check_profile_quota
+
+        def pause_save(*args):
+            entered.set()
+            release.wait(timeout=2)
+            return original(*args)
+
+        with patch.object(self.control, "_check_profile_quota", pause_save):
+            save = asyncio.create_task(
+                asyncio.to_thread(
+                    self.control.put_profile_any, "profile", {"cookies": []}
+                )
+            )
+            await asyncio.to_thread(entered.wait)
+            delete = asyncio.create_task(
+                asyncio.to_thread(
+                    self.control.delete_profile, project_id, "profile"
+                )
+            )
+            await asyncio.sleep(0.02)
+            release.set()
+            self.assertTrue(await save)
+            self.assertTrue(await delete)
+        self.assertIsNone(self.control.get_profile(project_id, "profile"))
+
+    async def test_control_database_files_are_owner_only(self):
+        with self.control._connect() as database:
+            database.execute(
+                "INSERT INTO audit_events(project_id,actor,action,resource,created_at) "
+                "VALUES (NULL,'test','permissions',NULL,0)"
+            )
+            paths = [
+                Path(self.directory.name) / "control.sqlite3",
+                Path(self.directory.name) / "control.sqlite3-wal",
+                Path(self.directory.name) / "control.sqlite3-shm",
+            ]
+            for path in paths:
+                if path.exists():
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
 
 class CompatibilityTests(unittest.TestCase):
