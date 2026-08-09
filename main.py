@@ -1174,6 +1174,14 @@ def _record_render_metrics(
 async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
     started = time.perf_counter()
     job = current_job()
+    durable_queue_ms = (
+        max(
+            0,
+            round((job.started_at - job.created_at).total_seconds() * 1000),
+        )
+        if job is not None and job.started_at is not None
+        else None
+    )
     project_id = (
         _internal_project_id(job.request_id)
         if CONTROL_ENABLED and job is not None
@@ -1191,7 +1199,10 @@ async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
             cached = await cache.get(payload, project_id)
             if cached is not None:
                 _record_render_metrics(
-                    payload, cache_hit=True, render_ms=0, queue_ms=0
+                    payload,
+                    cache_hit=True,
+                    render_ms=0,
+                    queue_ms=durable_queue_ms or 0,
                 )
                 return RenderedArtifact(
                     body=cached.body,
@@ -1201,7 +1212,12 @@ async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
                 )
         queue_started = time.perf_counter()
         await app.state.capture_slots.acquire()
-        queue_ms = round((time.perf_counter() - queue_started) * 1000)
+        slot_queue_ms = round((time.perf_counter() - queue_started) * 1000)
+        queue_ms = (
+            durable_queue_ms
+            if durable_queue_ms is not None
+            else slot_queue_ms
+        )
         browser: Browser = app.state.browser
         engine = _render_engine()
         render_started = time.perf_counter()

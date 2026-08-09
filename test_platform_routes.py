@@ -669,9 +669,16 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         main.app.state.browser = SimpleNamespace(is_connected=Mock(return_value=True))
         metrics = SimpleNamespace(inc=Mock())
         artifact = RenderArtifact(b"rendered", "image/png", "capture.png")
+        created_at = datetime.now(timezone.utc)
+        job = SimpleNamespace(
+            request_id="metrics-job",
+            created_at=created_at,
+            started_at=created_at + timedelta(seconds=7),
+        )
         try:
             with (
                 patch("main.METRICS", metrics),
+                patch("main.current_job", return_value=job),
                 patch("main._render_with_cache", AsyncMock(return_value=(artifact, False))),
             ):
                 result = await main._render_async_image(
@@ -685,6 +692,7 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metrics.inc.call_args_list[0].args[0], "renders_total")
         self.assertEqual(metrics.inc.call_args_list[1].args[0], "render_seconds_sum")
         self.assertEqual(metrics.inc.call_args_list[2].args[0], "queue_seconds_sum")
+        self.assertEqual(metrics.inc.call_args_list[2].args[1], 7)
 
     async def test_visual_diff_queue_is_bounded(self):
         original_slots = getattr(main.app.state, "diff_slots", None)
