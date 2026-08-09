@@ -26,6 +26,10 @@ and run the [reproducible benchmark](benchmarks/README.md) on your workload.
   geolocation, cookies, user agent, proxy, resource blocking, and cleanup
 - Ad, tracker, chat, newsletter, and consent-banner cleanup backed by the
   vendored, license-preserved AutoConsent rule set
+- Cleanup and deterministic advanced controls in both the browser UI and
+  desktop app
+- High local defaults: 500 megapixels, 16,384-pixel viewports, and 100,000-pixel
+  full-page height, all configurable for remote hosting
 - Durable encrypted async jobs, idempotency, retries, polling, cancellation,
   bulk submission, cron schedules, and signed webhook callbacks
 - Private local result storage or built-in S3-compatible storage for AWS S3,

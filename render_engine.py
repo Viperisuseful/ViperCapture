@@ -612,14 +612,14 @@ async def diagnostic_bundle(
 
 @dataclass(frozen=True)
 class RenderLimits:
-    max_width: int = 7680
-    max_height: int = 4320
-    max_pixels: int = 50_000_000
-    max_full_page_height: int = 20_000
+    max_width: int = 16_384
+    max_height: int = 16_384
+    max_pixels: int = 500_000_000
+    max_full_page_height: int = 100_000
     wait_timeout_ms: int = 30_000
     delay_ms: int = 15_000
     deadline_seconds: int = 75
-    output_bytes: int = 50 * 1024 * 1024
+    output_bytes: int = 1024 * 1024 * 1024
 
 
 @dataclass(frozen=True)

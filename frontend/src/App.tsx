@@ -50,6 +50,7 @@ import { Switch } from "@/components/ui/switch"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 
 type Output = "png" | "jpeg" | "webp" | "avif" | "pdf" | "html" | "markdown" | "metadata" | "webm" | "mp4" | "gif"
+type Device = "desktop" | "iphone_14" | "pixel_7" | "ipad"
 type Capture = {
   name: string
   url: string
@@ -63,6 +64,9 @@ type Capture = {
 type ActiveRun = { waitConditions: string; waitTimeout: number }
 type AppConfig = {
   max_screenshot_pixels?: number
+  max_viewport_width?: number
+  max_viewport_height?: number
+  max_full_page_height?: number
   control_plane?: boolean
   gpu?: { mode?: "off" | "auto" | "required"; hardware_active?: boolean; mutable?: boolean }
 }
@@ -75,6 +79,7 @@ const presets = [
   ["Full HD", 1920, 1080],
   ["2K", 2560, 1440],
   ["4K", 3840, 2160],
+  ["8K", 7680, 4320],
 ] as const
 
 const providerNames: Record<string, string> = {
@@ -219,6 +224,28 @@ export default function App() {
   const [waitText, setWaitText] = useState("")
   const [waitTimeout, setWaitTimeout] = useState(15)
   const [headers, setHeaders] = useState("")
+  const [consent, setConsent] = useState("reject")
+  const [blockAds, setBlockAds] = useState(true)
+  const [blockTrackers, setBlockTrackers] = useState(true)
+  const [blockChats, setBlockChats] = useState(true)
+  const [blockNewsletters, setBlockNewsletters] = useState(true)
+  const [device, setDevice] = useState<Device>("desktop")
+  const [colorScheme, setColorScheme] = useState("system")
+  const [reducedMotion, setReducedMotion] = useState("system")
+  const [locale, setLocale] = useState("")
+  const [timezone, setTimezone] = useState("")
+  const [customCss, setCustomCss] = useState("")
+  const [failStatuses, setFailStatuses] = useState("")
+  const [clipEnabled, setClipEnabled] = useState(false)
+  const [clipX, setClipX] = useState(0)
+  const [clipY, setClipY] = useState(0)
+  const [clipWidth, setClipWidth] = useState(640)
+  const [clipHeight, setClipHeight] = useState(480)
+  const [extractMode, setExtractMode] = useState("document")
+  const [pdfMode, setPdfMode] = useState("print")
+  const [paperSize, setPaperSize] = useState("A4")
+  const [orientation, setOrientation] = useState("portrait")
+  const [pdfMargin, setPdfMargin] = useState(0.4)
   const [config, setConfig] = useState<AppConfig | null>(null)
   const [gpuBusy, setGpuBusy] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -257,7 +284,9 @@ export default function App() {
     return () => window.clearInterval(timer)
   }, [busy])
 
-  const maxPixels = config?.max_screenshot_pixels ?? 50_000_000
+  const maxPixels = config?.max_screenshot_pixels ?? 500_000_000
+  const maxWidth = config?.max_viewport_width ?? 16_384
+  const maxHeight = config?.max_viewport_height ?? 16_384
   const imageOutput = output === "png" || output === "jpeg" || output === "webp" || output === "avif"
   const videoOutput = output === "webm" || output === "mp4" || output === "gif"
   const gpuEnabled = config?.gpu?.mode !== "off"
@@ -319,6 +348,28 @@ export default function App() {
     setWaitText("")
     setWaitTimeout(15)
     setHeaders("")
+    setConsent("reject")
+    setBlockAds(true)
+    setBlockTrackers(true)
+    setBlockChats(true)
+    setBlockNewsletters(true)
+    setDevice("desktop")
+    setColorScheme("system")
+    setReducedMotion("system")
+    setLocale("")
+    setTimezone("")
+    setCustomCss("")
+    setFailStatuses("")
+    setClipEnabled(false)
+    setClipX(0)
+    setClipY(0)
+    setClipWidth(640)
+    setClipHeight(480)
+    setExtractMode("document")
+    setPdfMode("print")
+    setPaperSize("A4")
+    setOrientation("portrait")
+    setPdfMargin(0.4)
     setHeadersTouched(false)
     setSelectorTouched(false)
     setWaitSelectorTouched(false)
@@ -359,23 +410,55 @@ export default function App() {
       setHeadersTouched(true)
       return toast.error("Fix the highlighted advanced settings before capturing.")
     }
+    if (new TextEncoder().encode(customCss).length > 64 * 1024) {
+      return toast.error("Custom CSS may use at most 64 KiB.")
+    }
+    const parsedStatuses = failStatuses.trim()
+      ? failStatuses.split(",").map((value) => Number(value.trim()))
+      : []
+    if (
+      parsedStatuses.some((value) => !Number.isInteger(value) || value < 100 || value > 599) ||
+      new Set(parsedStatuses).size !== parsedStatuses.length
+    ) {
+      return toast.error("Failure statuses must be unique HTTP codes from 100 through 599.")
+    }
     const customHeaders = headersValidation.headers
     const normalized = /^https?:\/\//i.test(url.trim()) ? url.trim() : `https://${url.trim()}`
     const payload = {
       url: normalized,
       output,
       viewport: { width, height, device_scale_factor: density },
-      full_page: imageOutput && selector ? false : fullPage,
-      preserve_viewport_width: imageOutput && !selector && fullPage && preserveViewportWidth,
+      environment: {
+        device,
+        color_scheme: colorScheme === "system" ? null : colorScheme,
+        reduced_motion: reducedMotion === "system" ? null : reducedMotion,
+        locale: locale.trim() || null,
+        timezone: timezone.trim() || null,
+      },
+      full_page: imageOutput && (selector || clipEnabled) ? false : fullPage,
+      preserve_viewport_width: imageOutput && !selector && !clipEnabled && fullPage && preserveViewportWidth,
       lazy_load: lazyLoad,
-      selector: imageOutput ? selector || null : null,
+      selector: imageOutput && !clipEnabled ? selector || null : null,
+      clip: imageOutput && clipEnabled
+        ? { x: clipX, y: clipY, width: clipWidth, height: clipHeight }
+        : null,
+      custom_css: customCss || null,
+      fail_on_status: parsedStatuses,
       image: {
         quality: output === "jpeg" || output === "webp" || output === "avif" ? quality : null,
         transparent_background: (output === "png" || output === "webp" || output === "avif") && transparent,
-        optimize_for_speed: output === "png" && optimizePng,
+        optimize_for_speed: (output === "png" || output === "webp") && optimizePng,
       },
       diagnostics: { bundle: diagnostics },
       video: videoOutput ? { duration_ms: videoDuration * 1000, scroll: videoScroll } : null,
+      pdf: output === "pdf" ? {
+        mode: pdfMode,
+        paper_size: paperSize,
+        orientation,
+        print_background: true,
+        margins: { top: pdfMargin, right: pdfMargin, bottom: pdfMargin, left: pdfMargin },
+      } : null,
+      extract_mode: output === "html" || output === "markdown" ? extractMode : "document",
       headers: customHeaders,
       wait_for: {
         event: waitEvent,
@@ -383,6 +466,13 @@ export default function App() {
         text: waitText || null,
         delay_ms: waitDelay * 1000,
         timeout_ms: waitTimeout * 1000,
+      },
+      cleanup: {
+        consent_mode: consent,
+        block_ads: blockAds,
+        block_trackers: blockTrackers,
+        block_chats: blockChats,
+        block_newsletters: blockNewsletters,
       },
       proceed_on_captcha: proceedOnCaptcha,
     }
@@ -558,9 +648,9 @@ export default function App() {
                 <FieldSet>
                   <FieldLegend>Viewport</FieldLegend>
                   <div className="grid grid-cols-3 gap-3">
-                    <Field><FieldLabel htmlFor="width">Width</FieldLabel><Input id="width" type="number" min={1} max={7680} value={width} onChange={(event) => setWidth(Number(event.target.value))} /></Field>
-                    <Field><FieldLabel htmlFor="height">Height</FieldLabel><Input id="height" type="number" min={1} max={4320} value={height} onChange={(event) => setHeight(Number(event.target.value))} /></Field>
-                    <Field><FieldLabel htmlFor="density">Density</FieldLabel><Input id="density" type="number" min={0.1} max={4} step={0.25} value={density} onChange={(event) => setDensity(Number(event.target.value))} /></Field>
+                    <Field><FieldLabel htmlFor="width">Width</FieldLabel><Input id="width" type="number" min={1} max={maxWidth} value={width} onChange={(event) => setWidth(Number(event.target.value))} /></Field>
+                    <Field><FieldLabel htmlFor="height">Height</FieldLabel><Input id="height" type="number" min={1} max={maxHeight} value={height} onChange={(event) => setHeight(Number(event.target.value))} /></Field>
+                    <Field><FieldLabel htmlFor="density">Density</FieldLabel><Input id="density" type="number" min={0.1} max={8} step={0.25} value={density} onChange={(event) => setDensity(Number(event.target.value))} /></Field>
                   </div>
                   <ToggleGroup type="single" variant="outline" value={`${width}x${height}`} onValueChange={(value) => {
                     const preset = presets.find((item) => `${item[1]}x${item[2]}` === value)
@@ -574,9 +664,9 @@ export default function App() {
                   </ToggleGroup>
                   <Field orientation="horizontal">
                     <FieldLabel htmlFor="full-page"><span><span className="block">Full page</span><FieldDescription>Scroll and capture the document.</FieldDescription></span></FieldLabel>
-                    <Switch id="full-page" checked={fullPage} onCheckedChange={(checked: boolean) => setFullPage(checked)} disabled={Boolean(selector)} />
+                    <Switch id="full-page" checked={fullPage} onCheckedChange={(checked: boolean) => setFullPage(checked)} disabled={Boolean(selector) || clipEnabled} />
                   </Field>
-                  {fullPage && !selector && (
+                  {fullPage && !selector && !clipEnabled && (
                     <Field orientation="horizontal">
                       <FieldLabel htmlFor="preserve-width"><span><span className="block">Preserve viewport width</span><FieldDescription>Clip horizontal overflow while keeping the full page height.</FieldDescription></span></FieldLabel>
                       <Switch id="preserve-width" checked={preserveViewportWidth} onCheckedChange={setPreserveViewportWidth} />
@@ -597,17 +687,61 @@ export default function App() {
                   </Field>
                 </FieldSet>
 
+                <FieldSet>
+                  <FieldLegend>Page cleanup</FieldLegend>
+                  <Field>
+                    <FieldLabel>Cookie consent</FieldLabel>
+                    <Select value={consent} onValueChange={setConsent}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup>
+                      <SelectItem value="reject">Reject non-essential</SelectItem><SelectItem value="accept">Accept</SelectItem><SelectItem value="hide">Hide banner</SelectItem><SelectItem value="none">Leave unchanged</SelectItem>
+                    </SelectGroup></SelectContent></Select>
+                  </Field>
+                  {[
+                    ["cleanup-ads", "Ads", blockAds, setBlockAds],
+                    ["cleanup-trackers", "Trackers", blockTrackers, setBlockTrackers],
+                    ["cleanup-chats", "Chat widgets", blockChats, setBlockChats],
+                    ["cleanup-newsletters", "Newsletters", blockNewsletters, setBlockNewsletters],
+                  ].map(([id, label, checked, setter]) => (
+                    <Field key={String(id)} orientation="horizontal">
+                      <FieldLabel htmlFor={String(id)}>{String(label)}</FieldLabel>
+                      <Switch id={String(id)} checked={checked as boolean} onCheckedChange={setter as (value: boolean) => void} />
+                    </Field>
+                  ))}
+                </FieldSet>
+
                 <Collapsible>
                   <CollapsibleTrigger asChild>
                     <Button variant="outline" className="w-full justify-between"><span className="flex items-center gap-2"><SlidersHorizontal />Advanced controls</span><ChevronDown /></Button>
                   </CollapsibleTrigger>
                   <CollapsibleContent className="pt-4">
                     <FieldGroup>
+                      <FieldSet>
+                        <FieldLegend>Deterministic environment</FieldLegend>
+                        <Field><FieldLabel>Device signals</FieldLabel><Select value={device} onValueChange={(value) => setDevice(value as Device)}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup>
+                          <SelectItem value="desktop">Desktop Chromium</SelectItem><SelectItem value="iphone_14">iPhone 14</SelectItem><SelectItem value="pixel_7">Pixel 7</SelectItem><SelectItem value="ipad">iPad</SelectItem>
+                        </SelectGroup></SelectContent></Select><FieldDescription>Applies user-agent, touch, and mobile signals without changing the explicit viewport.</FieldDescription></Field>
+                        <div className="grid grid-cols-2 gap-3">
+                          <Field><FieldLabel>Color scheme</FieldLabel><Select value={colorScheme} onValueChange={setColorScheme}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="system">Browser default</SelectItem><SelectItem value="light">Light</SelectItem><SelectItem value="dark">Dark</SelectItem><SelectItem value="no-preference">No preference</SelectItem></SelectGroup></SelectContent></Select></Field>
+                          <Field><FieldLabel>Reduced motion</FieldLabel><Select value={reducedMotion} onValueChange={setReducedMotion}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="system">Browser default</SelectItem><SelectItem value="reduce">Reduce</SelectItem><SelectItem value="no-preference">No preference</SelectItem></SelectGroup></SelectContent></Select></Field>
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                          <Field><FieldLabel htmlFor="locale">Locale</FieldLabel><Input id="locale" value={locale} onChange={(event) => setLocale(event.target.value)} placeholder="en-US" /></Field>
+                          <Field><FieldLabel htmlFor="timezone">IANA timezone</FieldLabel><Input id="timezone" value={timezone} onChange={(event) => setTimezone(event.target.value)} placeholder="America/New_York" /></Field>
+                        </div>
+                      </FieldSet>
                       <Field data-invalid={selectorTouched && Boolean(selectorError)}>
                         <FieldLabel htmlFor="selector">Element selector · <a href={`${docsUrl}#selectors-and-waits`} target="_blank" rel="noreferrer">Docs</a></FieldLabel>
-                        <Input id="selector" value={selector} onChange={(event) => setSelector(event.target.value)} onBlur={() => setSelectorTouched(true)} placeholder="main, #invoice" aria-invalid={selectorTouched && Boolean(selectorError)} />
+                        <Input id="selector" value={selector} onChange={(event) => { setSelector(event.target.value); if (event.target.value) setClipEnabled(false) }} onBlur={() => setSelectorTouched(true)} placeholder="main, #invoice" aria-invalid={selectorTouched && Boolean(selectorError)} />
                         {selectorTouched && <FieldError>{selectorError}</FieldError>}
                       </Field>
+                      <Field orientation="horizontal"><FieldLabel htmlFor="clip-enabled"><span><span className="block">Rectangular crop</span><FieldDescription>Crop CSS-pixel coordinates from the final document.</FieldDescription></span></FieldLabel><Switch id="clip-enabled" checked={clipEnabled} onCheckedChange={(checked) => { setClipEnabled(checked); if (checked) setSelector("") }} disabled={!imageOutput} /></Field>
+                      {clipEnabled && imageOutput && <div className="grid grid-cols-4 gap-2">
+                        <Field><FieldLabel htmlFor="clip-x">X</FieldLabel><Input id="clip-x" type="number" min={0} max={100000} value={clipX} onChange={(event) => setClipX(Number(event.target.value))} /></Field>
+                        <Field><FieldLabel htmlFor="clip-y">Y</FieldLabel><Input id="clip-y" type="number" min={0} max={100000} value={clipY} onChange={(event) => setClipY(Number(event.target.value))} /></Field>
+                        <Field><FieldLabel htmlFor="clip-width">Width</FieldLabel><Input id="clip-width" type="number" min={1} max={100000} value={clipWidth} onChange={(event) => setClipWidth(Number(event.target.value))} /></Field>
+                        <Field><FieldLabel htmlFor="clip-height">Height</FieldLabel><Input id="clip-height" type="number" min={1} max={100000} value={clipHeight} onChange={(event) => setClipHeight(Number(event.target.value))} /></Field>
+                      </div>}
+                      <Field><FieldLabel htmlFor="custom-css">Custom CSS</FieldLabel><InputGroup><InputGroupTextarea id="custom-css" rows={4} value={customCss} onChange={(event) => setCustomCss(event.target.value)} placeholder="header, .cookie-banner { display: none !important; }" /></InputGroup><FieldDescription>Applied to the main document for this render; maximum 64 KiB.</FieldDescription></Field>
+                      <Field><FieldLabel htmlFor="fail-statuses">Fail on HTTP status</FieldLabel><Input id="fail-statuses" value={failStatuses} onChange={(event) => setFailStatuses(event.target.value)} placeholder="404,429,500,502,503" /><FieldDescription>Comma-separated exact status codes.</FieldDescription></Field>
                       <Field><FieldLabel>Lazy content loading</FieldLabel><Select value={lazyLoad} onValueChange={setLazyLoad}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="thorough">Thorough (default)</SelectItem><SelectItem value="adaptive">Adaptive (faster)</SelectItem><SelectItem value="none">None (fastest)</SelectItem></SelectGroup></SelectContent></Select></Field>
                       <div className="grid grid-cols-3 gap-3">
                         <Field><FieldLabel>Load event</FieldLabel><Select value={waitEvent} onValueChange={setWaitEvent}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="load">Load</SelectItem><SelectItem value="domcontentloaded">DOM ready</SelectItem><SelectItem value="networkidle">Network idle</SelectItem></SelectGroup></SelectContent></Select></Field>
@@ -624,7 +758,16 @@ export default function App() {
                       </div>
                       {(output === "jpeg" || output === "webp" || output === "avif") && <Field><FieldLabel htmlFor="quality">Image quality</FieldLabel><Input id="quality" type="number" min={1} max={100} value={quality} onChange={(event) => setQuality(Number(event.target.value))} /></Field>}
                       {(output === "png" || output === "webp" || output === "avif") && <Field orientation="horizontal"><FieldLabel htmlFor="transparent">Transparent background</FieldLabel><Switch id="transparent" checked={transparent} onCheckedChange={setTransparent} /></Field>}
-                      {output === "png" && <Field orientation="horizontal"><FieldLabel htmlFor="optimize-png"><span><span className="block">Fast PNG encoding</span><FieldDescription>Uses less encoding work, with a larger file.</FieldDescription></span></FieldLabel><Switch id="optimize-png" checked={optimizePng} onCheckedChange={setOptimizePng} /></Field>}
+                      {(output === "png" || output === "webp") && <Field orientation="horizontal"><FieldLabel htmlFor="optimize-image"><span><span className="block">Fast {output.toUpperCase()} encoding</span><FieldDescription>Prioritizes render speed over the smallest file size.</FieldDescription></span></FieldLabel><Switch id="optimize-image" checked={optimizePng} onCheckedChange={setOptimizePng} /></Field>}
+                      {(output === "html" || output === "markdown") && <Field><FieldLabel>Extraction</FieldLabel><Select value={extractMode} onValueChange={setExtractMode}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="document">Full document</SelectItem><SelectItem value="article">Main article</SelectItem></SelectGroup></SelectContent></Select></Field>}
+                      {output === "pdf" && <>
+                        <div className="grid grid-cols-3 gap-3">
+                          <Field><FieldLabel>PDF mode</FieldLabel><Select value={pdfMode} onValueChange={setPdfMode}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="print">Print pages</SelectItem><SelectItem value="single_page">Single page</SelectItem></SelectGroup></SelectContent></Select></Field>
+                          <Field><FieldLabel>Paper</FieldLabel><Select value={paperSize} onValueChange={setPaperSize}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="A4">A4</SelectItem><SelectItem value="Letter">Letter</SelectItem></SelectGroup></SelectContent></Select></Field>
+                          <Field><FieldLabel>Orientation</FieldLabel><Select value={orientation} onValueChange={setOrientation}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="portrait">Portrait</SelectItem><SelectItem value="landscape">Landscape</SelectItem></SelectGroup></SelectContent></Select></Field>
+                        </div>
+                        <Field><FieldLabel htmlFor="pdf-margin">PDF margins (inches)</FieldLabel><Input id="pdf-margin" type="number" min={0} max={4} step={0.1} value={pdfMargin} onChange={(event) => setPdfMargin(Number(event.target.value))} /></Field>
+                      </>}
                       {videoOutput && <><Field><FieldLabel htmlFor="video-duration">Video duration (seconds)</FieldLabel><Input id="video-duration" type="number" min={1} max={30} value={videoDuration} onChange={(event) => setVideoDuration(Number(event.target.value))} /></Field><Field orientation="horizontal"><FieldLabel htmlFor="video-scroll">Scroll while recording</FieldLabel><Switch id="video-scroll" checked={videoScroll} onCheckedChange={setVideoScroll} /></Field></>}
                       <Field orientation="horizontal"><FieldLabel htmlFor="diagnostics"><span><span className="block">Diagnostic bundle</span><FieldDescription>ZIP the artifact with console and network reports.</FieldDescription></span></FieldLabel><Switch id="diagnostics" checked={diagnostics} onCheckedChange={setDiagnostics} /></Field>
                       <Field data-invalid={headersTouched && Boolean(headersValidation.error)}>
