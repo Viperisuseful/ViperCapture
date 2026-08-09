@@ -1841,12 +1841,15 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             "image/png": "png",
             "image/jpeg": "jpg",
             "image/webp": "webp",
+            "image/avif": "avif",
+            "image/gif": "gif",
             "application/pdf": "pdf",
             "text/html; charset=utf-8": "html",
             "text/markdown; charset=utf-8": "md",
             "application/json": "json",
             "application/zip": "zip",
             "video/webm": "webm",
+            "video/mp4": "mp4",
         }
         try:
             for media_type, extension in media.items():

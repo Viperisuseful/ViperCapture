@@ -103,6 +103,23 @@ class RenderCacheTests(unittest.IsolatedAsyncioTestCase):
             second = RenderRequest(html="two", cache=True)
             self.assertNotEqual(cache.key(first), cache.key(second))
 
+    async def test_certification_key_rotation_changes_cache_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = RenderCache(Path(directory))
+            await cache.start()
+            request = RenderRequest(
+                html="certified", cache=True, certification={"enabled": True}
+            )
+            with patch.dict(
+                os.environ, {"VIPERCAPTURE_CERTIFICATION_SECRET": "a" * 32}
+            ):
+                first = cache.key(request)
+            with patch.dict(
+                os.environ, {"VIPERCAPTURE_CERTIFICATION_SECRET": "b" * 32}
+            ):
+                second = cache.key(request)
+            self.assertNotEqual(first, second)
+
     async def test_project_namespace_changes_key_and_visibility(self):
         with tempfile.TemporaryDirectory() as directory:
             cache = RenderCache(Path(directory))

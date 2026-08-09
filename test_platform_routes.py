@@ -33,6 +33,7 @@ class PlatformRouteTests(unittest.TestCase):
 
     def test_desktop_cors_allows_schedule_updates(self):
         self.assertIn("PATCH", main.DESKTOP_ALLOW_METHODS)
+        self.assertIn("PUT", main.DESKTOP_ALLOW_METHODS)
 
 
 class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):

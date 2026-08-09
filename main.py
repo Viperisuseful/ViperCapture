@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Annotated, Awaitable, Literal, TypeVar
 from types import SimpleNamespace
 from urllib.parse import urlencode
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,6 +43,7 @@ from control_plane import (
     ControlPlane,
     Metrics,
     ProfileQuotaError,
+    ScheduleQuotaError,
 )
 from page_cleanup import (
     CleanupOptions,
@@ -100,7 +101,7 @@ DESKTOP_ALLOW_HEADERS = [
     "Content-Type",
     "X-Request-Id",
 ]
-DESKTOP_ALLOW_METHODS = ["GET", "POST", "PATCH", "DELETE"]
+DESKTOP_ALLOW_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"]
 
 
 def _load_local_env() -> None:
@@ -1672,7 +1673,42 @@ async def _submit_job(
 async def create_schedule(payload: ScheduleCreate, request: Request) -> JSONResponse:
     await _validate_profile_access(payload.render, request)
     await _validate_webhook(payload.render)
-    record = await _schedule_service().create(payload)
+    service = _schedule_service()
+    schedule_id = str(uuid4())
+    control = getattr(request.app.state, "control", None)
+    project_id = request.state.project_id
+    reserved = CONTROL_ENABLED and control is not None and project_id is not None
+    if reserved:
+        try:
+            size_bytes = await _settled_thread(
+                service.payload_size, schedule_id, payload.render
+            )
+            await _settled_thread(
+                control.reserve_schedule,
+                schedule_id,
+                project_id,
+                size_bytes,
+            )
+        except asyncio.CancelledError:
+            await _settled_thread(
+                control.disown, "schedule", schedule_id, project_id
+            )
+            raise
+        except ScheduleQuotaError as exc:
+            raise RenderError(
+                "schedule_quota_exceeded",
+                "The project schedule storage quota was reached.",
+                413,
+                False,
+            ) from exc
+    try:
+        record = await service.create(payload, schedule_id=schedule_id)
+    except BaseException:
+        if reserved and await service.store.get(schedule_id) is None:
+            await _settled_thread(
+                control.disown, "schedule", schedule_id, project_id
+            )
+        raise
     await _own_resource(request, "schedule", record.id)
     return JSONResponse(
         public_schedule_document(record),
@@ -1741,7 +1777,53 @@ async def update_schedule(schedule_id: UUID, payload: ScheduleUpdate, request: R
     if payload.render is not None:
         await _validate_profile_access(payload.render, request)
         await _validate_webhook(payload.render)
-    updated = await service.update(record, payload)
+    control = getattr(request.app.state, "control", None)
+    project_id = request.state.project_id
+    resized = (
+        payload.render is not None
+        and CONTROL_ENABLED
+        and control is not None
+        and project_id is not None
+    )
+    if resized:
+        try:
+            size_bytes = await _settled_thread(
+                service.payload_size, str(schedule_id), payload.render
+            )
+            await _settled_thread(
+                control.resize_schedule,
+                str(schedule_id),
+                project_id,
+                size_bytes,
+            )
+        except asyncio.CancelledError:
+            await _settled_thread(
+                control.resize_schedule,
+                str(schedule_id),
+                project_id,
+                len(record.payload),
+            )
+            raise
+        except ScheduleQuotaError as exc:
+            raise RenderError(
+                "schedule_quota_exceeded",
+                "The project schedule storage quota was reached.",
+                413,
+                False,
+            ) from exc
+    try:
+        updated = await service.update(record, payload)
+    except BaseException:
+        if resized:
+            current = await service.store.get(str(schedule_id))
+            if current is None or current.updated_at == record.updated_at:
+                await _settled_thread(
+                    control.resize_schedule,
+                    str(schedule_id),
+                    project_id,
+                    len(record.payload),
+                )
+        raise
     return JSONResponse(public_schedule_document(updated), headers={"Cache-Control": "private, no-store"})
 
 

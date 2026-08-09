@@ -1239,18 +1239,21 @@ class SQLiteJobStore:
 
 
 _SAFE_KEY = re.compile(
-    r"^[0-9a-f-]{36}\.(png|jpg|webp|pdf|html|md|json|zip|webm)$"
+    r"^[0-9a-f-]{36}\.(png|jpg|webp|avif|gif|pdf|html|md|json|zip|webm|mp4)$"
 )
 _ARTIFACT_EXTENSIONS = {
     "image/png": "png",
     "image/jpeg": "jpg",
     "image/webp": "webp",
+    "image/avif": "avif",
+    "image/gif": "gif",
     "application/pdf": "pdf",
     "text/html; charset=utf-8": "html",
     "text/markdown; charset=utf-8": "md",
     "application/json": "json",
     "application/zip": "zip",
     "video/webm": "webm",
+    "video/mp4": "mp4",
 }
 
 

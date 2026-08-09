@@ -12,7 +12,7 @@ import stat
 import threading
 import time
 from collections import defaultdict, deque
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -23,6 +23,8 @@ MAX_BASELINES_PER_PROJECT = 100
 MAX_BASELINE_BYTES_PER_PROJECT = 512 * 1024 * 1024
 MAX_PROFILES_PER_PROJECT = 100
 MAX_PROFILE_BYTES_PER_PROJECT = 512 * 1024 * 1024
+MAX_SCHEDULES_PER_PROJECT = 100
+MAX_SCHEDULE_BYTES_PER_PROJECT = 512 * 1024 * 1024
 MAX_AUDIT_EVENTS = 100_000
 LIMIT_LEASE_SECONDS = 15 * 60
 
@@ -33,6 +35,20 @@ class BaselineQuotaError(RuntimeError):
 
 class ProfileQuotaError(RuntimeError):
     pass
+
+
+class ScheduleQuotaError(RuntimeError):
+    pass
+
+
+async def _settled_thread(operation, *args):
+    task = asyncio.create_task(asyncio.to_thread(operation, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        with suppress(Exception):
+            await asyncio.shield(task)
+        raise
 
 
 def _metric_label(value: object) -> str:
@@ -76,6 +92,17 @@ class ControlPlane:
         self._leases: dict[str, deque[str]] = defaultdict(deque)
         self._limit_lock = asyncio.Lock()
 
+    async def _settled_acquisition(self, operation, *args):
+        task = asyncio.create_task(asyncio.to_thread(operation, *args))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            result = await asyncio.shield(task)
+            lease_id = result[1]
+            if lease_id is not None:
+                await _settled_thread(self._release, lease_id)
+            raise
+
     def initialize(self) -> None:
         if os.name == "nt":
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -97,6 +124,7 @@ class ControlPlane:
                 CREATE TABLE IF NOT EXISTS resources (
                     kind TEXT NOT NULL, id TEXT NOT NULL, project_id TEXT NOT NULL,
                     created_at INTEGER NOT NULL DEFAULT 0, expires_at INTEGER,
+                    size_bytes INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY(kind, id)
                 );
                 CREATE TABLE IF NOT EXISTS audit_events (
@@ -140,6 +168,10 @@ class ControlPlane:
                 )
             if "expires_at" not in resource_columns:
                 db.execute("ALTER TABLE resources ADD COLUMN expires_at INTEGER")
+            if "size_bytes" not in resource_columns:
+                db.execute(
+                    "ALTER TABLE resources ADD COLUMN size_bytes INTEGER NOT NULL DEFAULT 0"
+                )
 
     @staticmethod
     def _secure_file(path: Path, *, create: bool = False) -> None:
@@ -255,68 +287,85 @@ class ControlPlane:
     async def acquire(self, identity: dict[str, object]) -> tuple[bool, str | None]:
         project_id = str(identity["project_id"])
         async with self._limit_lock:
-            now = time.time()
-            lease_id = secrets.token_hex(16)
-            with self._connect() as db:
-                db.execute("BEGIN IMMEDIATE")
-                db.execute("DELETE FROM rate_events WHERE created_at<=?", (now - 60,))
-                db.execute("DELETE FROM active_leases WHERE expires_at<=?", (now,))
-                rpm = db.execute(
-                    "SELECT count(*) FROM rate_events WHERE project_id=?",
-                    (project_id,),
-                ).fetchone()[0]
-                if int(rpm) >= int(identity["rpm"]):
-                    return False, "rate_limit_exceeded"
-                active = db.execute(
-                    "SELECT count(*) FROM active_leases WHERE project_id=?",
-                    (project_id,),
-                ).fetchone()[0]
-                if int(active) >= int(identity["concurrency"]):
-                    return False, "concurrency_limit_exceeded"
-                db.execute(
-                    "INSERT INTO rate_events VALUES (?, ?, ?)",
-                    (secrets.token_hex(16), project_id, now),
-                )
-                db.execute(
-                    "INSERT INTO active_leases VALUES (?, ?, ?)",
-                    (lease_id, project_id, now + LIMIT_LEASE_SECONDS),
-                )
+            result, lease_id = await self._settled_acquisition(
+                self._acquire, identity, project_id
+            )
+            if result[0] is False:
+                return result
             self._leases[project_id].append(lease_id)
-        return True, None
+            return result
+
+    def _acquire(
+        self, identity: dict[str, object], project_id: str
+    ) -> tuple[tuple[bool, str | None], str | None]:
+        now = time.time()
+        lease_id = secrets.token_hex(16)
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("DELETE FROM rate_events WHERE created_at<=?", (now - 60,))
+            db.execute("DELETE FROM active_leases WHERE expires_at<=?", (now,))
+            rpm = db.execute(
+                "SELECT count(*) FROM rate_events WHERE project_id=?", (project_id,)
+            ).fetchone()[0]
+            if int(rpm) >= int(identity["rpm"]):
+                return (False, "rate_limit_exceeded"), None
+            active = db.execute(
+                "SELECT count(*) FROM active_leases WHERE project_id=?", (project_id,)
+            ).fetchone()[0]
+            if int(active) >= int(identity["concurrency"]):
+                return (False, "concurrency_limit_exceeded"), None
+            db.execute(
+                "INSERT INTO rate_events VALUES (?, ?, ?)",
+                (secrets.token_hex(16), project_id, now),
+            )
+            db.execute(
+                "INSERT INTO active_leases VALUES (?, ?, ?)",
+                (lease_id, project_id, now + LIMIT_LEASE_SECONDS),
+            )
+        return (True, None), lease_id
 
     async def release(self, project_id: str) -> None:
         async with self._limit_lock:
             if not self._leases[project_id]:
                 return
             lease_id = self._leases[project_id].popleft()
-            with self._connect() as db:
-                db.execute("DELETE FROM active_leases WHERE id=?", (lease_id,))
+            await _settled_thread(self._release, lease_id)
+
+    def _release(self, lease_id: str) -> None:
+        with self._connect() as db:
+            db.execute("DELETE FROM active_leases WHERE id=?", (lease_id,))
 
     async def acquire_worker(self, project_id: str) -> bool:
+        async with self._limit_lock:
+            acquired, lease_id = await self._settled_acquisition(
+                self._acquire_worker, project_id
+            )
+            if not acquired:
+                return False
+            self._leases[project_id].append(lease_id)
+            return True
+
+    def _acquire_worker(self, project_id: str) -> tuple[bool, str | None]:
+        now = time.time()
+        lease_id = secrets.token_hex(16)
         with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("DELETE FROM active_leases WHERE expires_at<=?", (now,))
             row = db.execute(
                 "SELECT concurrency FROM projects WHERE id=?", (project_id,)
             ).fetchone()
-        if row is None:
-            return False
-        async with self._limit_lock:
-            now = time.time()
-            lease_id = secrets.token_hex(16)
-            with self._connect() as db:
-                db.execute("BEGIN IMMEDIATE")
-                db.execute("DELETE FROM active_leases WHERE expires_at<=?", (now,))
-                active = db.execute(
-                    "SELECT count(*) FROM active_leases WHERE project_id=?",
-                    (project_id,),
-                ).fetchone()[0]
-                if int(active) >= int(row["concurrency"]):
-                    return False
-                db.execute(
-                    "INSERT INTO active_leases VALUES (?, ?, ?)",
-                    (lease_id, project_id, now + LIMIT_LEASE_SECONDS),
-                )
-            self._leases[project_id].append(lease_id)
-        return True
+            if row is None:
+                return False, None
+            active = db.execute(
+                "SELECT count(*) FROM active_leases WHERE project_id=?", (project_id,)
+            ).fetchone()[0]
+            if int(active) >= int(row["concurrency"]):
+                return False, None
+            db.execute(
+                "INSERT INTO active_leases VALUES (?, ?, ?)",
+                (lease_id, project_id, now + LIMIT_LEASE_SECONDS),
+            )
+        return True, lease_id
 
     def own(
         self,
@@ -329,9 +378,56 @@ class ControlPlane:
         expires_at = now + ttl_seconds if ttl_seconds is not None else None
         with self._connect() as db:
             db.execute(
-                "INSERT OR IGNORE INTO resources(kind,id,project_id,created_at,expires_at) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO resources(kind,id,project_id,created_at,expires_at,size_bytes) "
+                "VALUES (?, ?, ?, ?, ?, 0)",
                 (kind, resource_id, project_id, now, expires_at),
+            )
+
+    def reserve_schedule(
+        self, resource_id: str, project_id: str, size_bytes: int
+    ) -> None:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            usage = db.execute(
+                "SELECT count(*) count, coalesce(sum(size_bytes),0) bytes "
+                "FROM resources WHERE kind='schedule' AND project_id=?",
+                (project_id,),
+            ).fetchone()
+            if (
+                int(usage["count"]) + 1 > MAX_SCHEDULES_PER_PROJECT
+                or int(usage["bytes"]) + size_bytes
+                > MAX_SCHEDULE_BYTES_PER_PROJECT
+            ):
+                raise ScheduleQuotaError
+            db.execute(
+                "INSERT INTO resources(kind,id,project_id,created_at,expires_at,size_bytes) "
+                "VALUES ('schedule', ?, ?, ?, NULL, ?)",
+                (resource_id, project_id, int(time.time()), size_bytes),
+            )
+
+    def resize_schedule(
+        self, resource_id: str, project_id: str, size_bytes: int
+    ) -> None:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            existing = db.execute(
+                "SELECT size_bytes FROM resources "
+                "WHERE kind='schedule' AND id=? AND project_id=?",
+                (resource_id, project_id),
+            ).fetchone()
+            if existing is None:
+                raise KeyError(resource_id)
+            other_bytes = db.execute(
+                "SELECT coalesce(sum(size_bytes),0) FROM resources "
+                "WHERE kind='schedule' AND project_id=? AND id<>?",
+                (project_id, resource_id),
+            ).fetchone()[0]
+            if int(other_bytes) + size_bytes > MAX_SCHEDULE_BYTES_PER_PROJECT:
+                raise ScheduleQuotaError
+            db.execute(
+                "UPDATE resources SET size_bytes=? "
+                "WHERE kind='schedule' AND id=? AND project_id=?",
+                (size_bytes, resource_id, project_id),
             )
 
     def disown(

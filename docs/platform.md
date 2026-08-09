@@ -33,6 +33,9 @@ AES-GCM encrypted at rest; profile IDs are unguessable and can be supplied as
 RPM events and active-render leases are transactionally recorded in the
 control database. Processes using that same database therefore share project
 limits; abandoned concurrency leases expire after 15 minutes.
+Each project may retain at most 100 schedules and 512 MiB of encrypted schedule
+payloads. Creation reserves quota before the durable schedule row is written;
+updates resize that reservation and deletion releases it.
 
 ## Deterministic, diagnostic, and certified artifacts
 
@@ -55,8 +58,9 @@ The built-in SQLite control plane is intentionally restricted to `role=all`;
 split deployments must enforce shared authentication and quotas at their
 gateway. Schedules in split mode require a shared
 `VIPERCAPTURE_SCHEDULE_STORE_FACTORY`; disable them explicitly otherwise.
-Running-job recovery is performed only by the exclusive `all` role so starting
-a distributed replica cannot steal a live worker's claim.
+The combined `all` role recovers its own interrupted claims on restart. Split
+workers require an external job store with lease-based `recover_stale()` so a
+replica can recover only expired claims and cannot steal live work.
 
 `GET /metrics` exports Prometheus text, `GET /ready` reports role and browser
 readiness, and `/v1/admin/status` exposes authenticated operator state. Set

@@ -599,9 +599,14 @@ class ScheduleService:
     def _decrypt(self, record: ScheduleRecord) -> RenderRequest:
         return self.cipher.decrypt(SimpleNamespace(id=record.id, payload=record.payload))
 
-    async def create(self, request: ScheduleCreate) -> ScheduleRecord:
+    def payload_size(self, schedule_id: str, request: RenderRequest) -> int:
+        return len(self._encrypt(schedule_id, request))
+
+    async def create(
+        self, request: ScheduleCreate, *, schedule_id: str | None = None
+    ) -> ScheduleRecord:
         now = datetime.now(UTC)
-        schedule_id = str(uuid4())
+        schedule_id = schedule_id or str(uuid4())
         record = ScheduleRecord(
             id=schedule_id,
             name=request.name,

@@ -22,6 +22,7 @@ from control_plane import (
     ControlPlane,
     Metrics,
     ProfileQuotaError,
+    ScheduleQuotaError,
 )
 from render_contract import OutputFormat, RenderRequest
 from render_engine import RenderArtifact, RenderLimits, diagnostic_bundle
@@ -90,6 +91,73 @@ class ControlPlaneTests(unittest.IsolatedAsyncioTestCase):
             [event["action"] for event in reversed(self.control.audits(10))],
             ["event-2", "event-3", "event-4"],
         )
+
+    async def test_schedule_reservations_are_bounded_and_recoverable(self):
+        project = self.control.create_project("tests", 10, 1)
+        project_id = str(project["id"])
+        with patch("control_plane.MAX_SCHEDULES_PER_PROJECT", 1):
+            self.control.reserve_schedule("one", project_id, 2)
+            with self.assertRaises(ScheduleQuotaError):
+                self.control.reserve_schedule("two", project_id, 1)
+            self.assertTrue(
+                self.control.disown("schedule", "one", project_id)
+            )
+            self.control.reserve_schedule("two", project_id, 1)
+        with patch("control_plane.MAX_SCHEDULE_BYTES_PER_PROJECT", 2):
+            with self.assertRaises(ScheduleQuotaError):
+                self.control.resize_schedule("two", project_id, 3)
+
+    async def test_quota_database_wait_does_not_block_event_loop(self):
+        project = self.control.create_project("tests", 10, 1)
+        key = self.control.create_key(str(project["id"]), "ci")
+        identity = self.control.authenticate(key["api_key"])
+        entered = threading.Event()
+        release = threading.Event()
+        original = self.control._acquire
+
+        def slow_acquire(*args):
+            entered.set()
+            release.wait(timeout=1)
+            return original(*args)
+
+        with patch.object(self.control, "_acquire", slow_acquire):
+            task = asyncio.create_task(self.control.acquire(identity))
+            await asyncio.to_thread(entered.wait)
+            started = asyncio.get_running_loop().time()
+            await asyncio.sleep(0.02)
+            elapsed = asyncio.get_running_loop().time() - started
+            release.set()
+            self.assertLess(elapsed, 0.1)
+            self.assertTrue((await task)[0])
+        await self.control.release(str(project["id"]))
+
+    async def test_cancelled_quota_acquisition_releases_committed_lease(self):
+        project = self.control.create_project("tests", 10, 1)
+        project_id = str(project["id"])
+        key = self.control.create_key(project_id, "ci")
+        identity = self.control.authenticate(key["api_key"])
+        entered = threading.Event()
+        release = threading.Event()
+        original = self.control._acquire
+
+        def slow_acquire(*args):
+            entered.set()
+            release.wait(timeout=1)
+            return original(*args)
+
+        with patch.object(self.control, "_acquire", slow_acquire):
+            task = asyncio.create_task(self.control.acquire(identity))
+            await asyncio.to_thread(entered.wait)
+            task.cancel()
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        with self.control._connect() as database:
+            active = database.execute(
+                "SELECT count(*) FROM active_leases WHERE project_id=?",
+                (project_id,),
+            ).fetchone()[0]
+        self.assertEqual(active, 0)
 
     async def test_baseline_store(self):
         project = self.control.create_project("tests", 10, 1)
