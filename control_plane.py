@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -280,9 +281,7 @@ class ControlPlane:
         return result
 
     def _key_digest(self, raw: str) -> bytes:
-        return hashlib.blake2b(
-            raw.encode(), key=self._key_hash_secret, digest_size=32
-        ).digest()
+        return hmac.digest(self._key_hash_secret, raw.encode(), "sha256")
 
     async def acquire(
         self, identity: dict[str, object], *, concurrency: bool = True
