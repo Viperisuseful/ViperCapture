@@ -448,7 +448,7 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
         slots = asyncio.Semaphore(1)
         with (
             patch("vipercapture.render_engine.PUBLIC_DNS_SLOTS", slots),
-            patch("vipercapture.render_engine.DNS_RESOLUTION_TIMEOUT_SECONDS", 0.01),
+            patch("vipercapture.render_engine.DNS_RESOLUTION_TIMEOUT_SECONDS", 0.5),
             patch("vipercapture.render_engine.socket.getaddrinfo", side_effect=resolve),
         ):
             self.assertFalse(
@@ -457,10 +457,10 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
             second = asyncio.create_task(
                 _resolve_public_origin("second.example", 443)
             )
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(0)
             self.assertFalse(second.done())
             release.set()
-            self.assertTrue(await second)
+            self.assertTrue(await asyncio.wait_for(second, timeout=1))
 
     async def test_default_self_hosted_render_skips_request_routing(self):
         context = FakeContext()

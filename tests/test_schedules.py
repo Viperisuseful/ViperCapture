@@ -1,4 +1,5 @@
 import asyncio
+import os
 import tempfile
 import unittest
 from dataclasses import replace
@@ -58,6 +59,16 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, datetime(2026, 1, 1, 12, 5, tzinfo=UTC))
 
     async def asyncSetUp(self):
+        if os.name == "nt" and self._testMethodName in {
+            "test_bundled_store_refuses_windows",
+            "test_cron_and_timezone_validation",
+            "test_next_run_is_utc",
+        }:
+            return
+        if os.name == "nt":
+            self.skipTest(
+                "bundled schedule store requires POSIX owner-only permissions"
+            )
         self.temporary = tempfile.TemporaryDirectory()
         self.store = ScheduleStore(Path(self.temporary.name) / "vipercapture.schedules.sqlite3")
         self.jobs = FakeJobs()
@@ -70,6 +81,8 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
         await self.store.start()
 
     async def asyncTearDown(self):
+        if not hasattr(self, "store"):
+            return
         await self.store.close()
         self.temporary.cleanup()
 

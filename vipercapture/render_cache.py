@@ -53,7 +53,11 @@ class RenderCache:
 
     def _load_key(self) -> bytes:
         path = self.directory / ".fingerprint-key"
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_BINARY", 0)
+        )
         try:
             descriptor = os.open(path, flags)
         except FileNotFoundError:
@@ -86,7 +90,15 @@ class RenderCache:
                 os.name != "nt" and information.st_mode & 0o077
             ):
                 raise RuntimeError("render cache key must be an owner-only regular file")
-            material = os.read(descriptor, 33)
+            chunks = []
+            remaining = 33
+            while remaining:
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            material = b"".join(chunks)
         finally:
             os.close(descriptor)
         if len(material) != 32:
