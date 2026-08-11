@@ -31,27 +31,75 @@ jobs:
         run: |
           python -m pip install -r requirements.txt
           python -m playwright install --with-deps chromium
-      - name: Start renderer
-        run: |
-          VIPERCAPTURE_ASYNC_JOBS=1 VIPERCAPTURE_SCHEDULES=0 \
-            VIPERCAPTURE_MAX_CONCURRENCY=2 \
-            uvicorn vipercapture.main:app --host 127.0.0.1 --port 8000 \
-            > /tmp/vipercapture-operational.log 2>&1 &
-          echo $! > /tmp/vipercapture-operational.pid
-          for attempt in $(seq 1 120); do
-            curl --fail --silent http://127.0.0.1:8000/ready >/dev/null && exit 0
-            sleep 0.25
-          done
-          cat /tmp/vipercapture-operational.log
-          exit 1
       - name: Concurrency saturation matrix
         run: |
           mkdir -p operational-results
           for concurrency in 1 2 4 8; do
+            if test -f /tmp/vipercapture-operational.pid; then
+              old_pid="$(cat /tmp/vipercapture-operational.pid)"
+              kill "$old_pid" || true
+              for attempt in $(seq 1 40); do
+                kill -0 "$old_pid" 2>/dev/null || break
+                sleep 0.25
+              done
+              if kill -0 "$old_pid" 2>/dev/null; then
+                kill -9 "$old_pid" || true
+              fi
+              wait "$old_pid" 2>/dev/null || true
+            fi
+            log="operational-results/renderer-concurrency-${concurrency}.log"
+            VIPERCAPTURE_ASYNC_JOBS=1 VIPERCAPTURE_SCHEDULES=0 \
+              VIPERCAPTURE_MAX_CONCURRENCY="$concurrency" \
+              uvicorn vipercapture.main:app --host 127.0.0.1 --port 8000 \
+              > "$log" 2>&1 &
+            echo $! > /tmp/vipercapture-operational.pid
+            renderer_pid="$(cat /tmp/vipercapture-operational.pid)"
+            ready=false
+            for attempt in $(seq 1 120); do
+              if kill -0 "$renderer_pid" 2>/dev/null && \
+                curl --fail --silent http://127.0.0.1:8000/ready >/dev/null; then
+                ready=true
+                break
+              fi
+              sleep 0.25
+            done
+            if test "$ready" != true; then
+              cat "$log"
+              exit 1
+            fi
             python -m benchmarks.production_gate load \
               --requests 40 --concurrency "$concurrency" --max-p95-ms 20000 \
               --output "operational-results/concurrency-${concurrency}.json"
           done
+      - name: Start sustained-load renderer at capacity four
+        run: |
+          if test -f /tmp/vipercapture-operational.pid; then
+            old_pid="$(cat /tmp/vipercapture-operational.pid)"
+            kill "$old_pid" || true
+            for attempt in $(seq 1 40); do
+              kill -0 "$old_pid" 2>/dev/null || break
+              sleep 0.25
+            done
+            if kill -0 "$old_pid" 2>/dev/null; then
+              kill -9 "$old_pid" || true
+            fi
+            wait "$old_pid" 2>/dev/null || true
+          fi
+          VIPERCAPTURE_ASYNC_JOBS=1 VIPERCAPTURE_SCHEDULES=0 \
+            VIPERCAPTURE_MAX_CONCURRENCY=4 \
+            uvicorn vipercapture.main:app --host 127.0.0.1 --port 8000 \
+            > /tmp/vipercapture-operational.log 2>&1 &
+          echo $! > /tmp/vipercapture-operational.pid
+          renderer_pid="$(cat /tmp/vipercapture-operational.pid)"
+          for attempt in $(seq 1 120); do
+            if kill -0 "$renderer_pid" 2>/dev/null && \
+              curl --fail --silent http://127.0.0.1:8000/ready >/dev/null; then
+              exit 0
+            fi
+            sleep 0.25
+          done
+          cat /tmp/vipercapture-operational.log
+          exit 1
       - name: Five-minute sustained-load gate
         run: >-
           python -m benchmarks.production_gate load
@@ -62,7 +110,13 @@ jobs:
         if: always()
         run: |
           if test -f /tmp/vipercapture-operational.pid; then
-            kill "$(cat /tmp/vipercapture-operational.pid)" || true
+            renderer_pid="$(cat /tmp/vipercapture-operational.pid)"
+            kill "$renderer_pid" || true
+            for attempt in $(seq 1 40); do
+              kill -0 "$renderer_pid" 2>/dev/null || exit 0
+              sleep 0.25
+            done
+            kill -9 "$renderer_pid" || true
           fi
       - name: Crash and restart recovery gate
         run: >-

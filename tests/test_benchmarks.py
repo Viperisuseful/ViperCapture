@@ -113,6 +113,28 @@ class BrowserlessAdapterTests(unittest.IsolatedAsyncioTestCase):
             {"selector": "main", "timeout": 12000, "visible": True},
         )
 
+    async def test_non_viper_provider_rejects_unequal_lazy_loading(self):
+        scenario = {
+            "url": "https://example.com",
+            "viewport": {"width": 1280, "height": 720},
+            "lazy_load": "adaptive",
+        }
+        async with httpx.AsyncClient() as client:
+            with self.assertRaisesRegex(ValueError, "cannot preserve lazy_load=adaptive"):
+                await render(
+                    client, "browserless", "http://127.0.0.1:3000", scenario
+                )
+
+    def test_published_comparison_scenarios_disable_lazy_loading(self):
+        scenarios = json.loads(
+            (Path(__file__).parents[1] / "benchmarks" / "scenarios-real-sites.json").read_text(
+                "utf-8"
+            )
+        )
+        self.assertTrue(
+            all(case["request"]["lazy_load"] == "none" for case in scenarios)
+        )
+
 
 class ManagedProviderAdapterTests(unittest.IsolatedAsyncioTestCase):
     scenario = {

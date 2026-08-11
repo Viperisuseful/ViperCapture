@@ -9,9 +9,9 @@ groups:
           summary: ViperCapture has not been scrapeable for two minutes
       - alert: ViperCaptureHighServerErrorRate
         expr: >-
-          sum(rate(vipercapture_http_requests_total{status=~"5.."}[5m]))
+          sum(rate(vipercapture_http_requests_total{status=~"5..",route!~"/(health|ready|metrics)"}[5m]))
           /
-          clamp_min(sum(rate(vipercapture_http_requests_total[5m])), 0.001)
+          clamp_min(sum(rate(vipercapture_http_requests_total{route!~"/(health|ready|metrics)"}[5m])), 0.001)
           > 0.05
         for: 10m
         labels: {severity: warning}

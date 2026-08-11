@@ -130,12 +130,29 @@ class OperationalPackagingTests(unittest.TestCase):
         self.assertIn("sum(rate(vipercapture_queue_seconds_sum[10m]))", alerts)
         self.assertIn("sum(rate(vipercapture_renders_total[10m]))", alerts)
 
+    def test_error_rate_alert_excludes_probe_routes_from_both_operands(self):
+        alerts = (ROOT / "deploy" / "public-api" / "alerts.yml").read_text(
+            "utf-8"
+        )
+        route_filter = 'route!~"/(health|ready|metrics)"'
+        self.assertEqual(alerts.count(route_filter), 2)
+
+    def test_operational_matrix_varies_renderer_and_client_concurrency(self):
+        workflow = (
+            ROOT / ".github" / "workflows" / "operational-readiness.yml"
+        ).read_text("utf-8")
+        matrix = workflow[workflow.index("Concurrency saturation matrix") :]
+        self.assertIn('VIPERCAPTURE_MAX_CONCURRENCY="$concurrency"', matrix)
+        self.assertIn('--concurrency "$concurrency"', matrix)
+        self.assertIn("VIPERCAPTURE_MAX_CONCURRENCY=4", matrix)
+
     def test_container_waits_for_validated_packages_and_go_tag_is_prefixed(self):
         workflow = (ROOT / ".github" / "workflows" / "oss-release.yml").read_text(
             "utf-8"
         )
         self.assertIn("container:\n    needs: package", workflow)
         self.assertIn('go_tag="sdk/go/v${version}"', workflow)
+        self.assertIn("npm publish dist/typescript/*.tgz --access public --tag beta", workflow)
 
 
 if __name__ == "__main__":

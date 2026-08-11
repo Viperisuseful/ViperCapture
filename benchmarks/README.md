@@ -62,7 +62,9 @@ the raw JSON, Markdown summary, container metadata, and logs as one Actions
 artifact. ScreenshotOne and Urlbox can be added to the same run after adding
 `SCREENSHOTONE_ACCESS_KEY` and `URLBOX_SECRET` repository secrets. A run fails
 instead of silently omitting a requested managed provider when either secret is
-missing.
+missing. Cross-provider scenarios disable ViperCapture-specific lazy-loading
+scroll behavior; the harness rejects non-Viper providers when a scenario tries
+to enable it, rather than publishing unequal work as a comparison.
 
 ## Operational gates
 

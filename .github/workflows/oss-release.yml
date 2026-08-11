@@ -80,7 +80,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish dist/typescript/*.tgz --access public
+        run: npm publish dist/typescript/*.tgz --access public --tag beta
       - name: Publish GitHub prerelease
         if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
         env:

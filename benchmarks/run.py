@@ -36,6 +36,11 @@ def percentile(values: list[float], fraction: float) -> float:
 
 
 async def render(client: httpx.AsyncClient, provider: str, endpoint: str, scenario: dict) -> bytes:
+    lazy_load = scenario.get("lazy_load", "none")
+    if provider != "viper" and lazy_load != "none":
+        raise ValueError(
+            f"{provider} benchmark adapter cannot preserve lazy_load={lazy_load}"
+        )
     if provider == "viper":
         response = await client.post(endpoint.rstrip("/") + "/v1/render", json=scenario)
         response.raise_for_status()
