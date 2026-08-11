@@ -48,7 +48,7 @@ jobs:
         run: |
           docker run --detach --name browserless-benchmark \
             --shm-size=1g --publish 127.0.0.1:3000:3000 \
-            --env TOKEN=benchmark-token ghcr.io/browserless/chromium:2.55.1
+            --env TOKEN=benchmark-token ghcr.io/browserless/chromium:2.26.1
           echo 'BROWSERLESS_TOKEN=benchmark-token' >> "$GITHUB_ENV"
       - name: Wait for both providers
         run: |
