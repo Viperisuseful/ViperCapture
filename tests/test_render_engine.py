@@ -1131,7 +1131,9 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
         document = json.loads(artifact.body)
         self.assertEqual(document["title"], "Example")
         self.assertEqual(document["images"]["total"], 1)
-        self.assertIn("for (const form of document.forms)", page.script)
+        self.assertIn("for (const item of items)", page.script)
+        self.assertNotIn("[...document.querySelectorAll", page.script)
+        self.assertNotIn("[...document.images]", page.script)
         self.assertNotIn("[...document.forms]", page.script)
 
     async def test_markdown_input_conversion_is_off_thread_and_bounded(self):

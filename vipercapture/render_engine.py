@@ -1067,9 +1067,18 @@ async def render_metadata(page: Page) -> RenderArtifact:
                 typeof value === "string" ? value.trim().slice(0, limit) : null;
             const attr = (selector, name = "content") =>
                 clean(document.querySelector(selector)?.getAttribute(name));
+            const sample = (items, limit, transform) => {
+                const result = [];
+                for (const item of items) {
+                    const value = transform(item);
+                    if (value) result.push(value);
+                    if (result.length >= limit) break;
+                }
+                return result;
+            };
             const pairs = (attribute, keyPrefix) => {
                 const result = {};
-                for (const element of [...document.querySelectorAll(`meta[${attribute}]`)]) {
+                for (const element of document.querySelectorAll(`meta[${attribute}]`)) {
                     const key = clean(element.getAttribute(attribute), 128);
                     const value = clean(element.getAttribute("content"));
                     if (key && key.startsWith(keyPrefix) && value && !(key in result)) result[key] = value;
@@ -1077,8 +1086,8 @@ async def render_metadata(page: Page) -> RenderArtifact:
                 }
                 return result;
             };
-            const links = [...document.querySelectorAll("a[href]")];
-            const images = [...document.images];
+            const links = document.querySelectorAll("a[href]");
+            const images = document.images;
             return {
                 title: clean(document.title),
                 description: attr('meta[name="description"]'),
@@ -1088,66 +1097,59 @@ async def render_metadata(page: Page) -> RenderArtifact:
                 theme_color: attr('meta[name="theme-color"]'),
                 open_graph: pairs("property", "og:"),
                 twitter: pairs("name", "twitter:"),
-                fonts: (() => {
-                    const fonts = [];
-                    for (const font of document.fonts || []) {
-                        fonts.push({
+                fonts: sample(document.fonts || [], maxItems, (font) => ({
                             family: clean(font.family, 256),
                             style: clean(font.style, 64),
                             weight: clean(font.weight, 64),
                             status: clean(font.status, 32)
-                        });
-                        if (fonts.length >= maxItems) break;
-                    }
-                    return fonts;
-                })(),
-                icons: [...document.querySelectorAll('link[rel~="icon"][href]')]
-                    .slice(0, 16)
-                    .map((element) => ({
+                        })),
+                icons: sample(
+                    document.querySelectorAll('link[rel~="icon"][href]'),
+                    16,
+                    (element) => ({
                         rel: clean(element.getAttribute("rel"), 64),
                         href: clean(element.href),
                         sizes: clean(element.getAttribute("sizes"), 64),
                         type: clean(element.getAttribute("type"), 128)
-                    })),
-                headings: [...document.querySelectorAll("h1,h2,h3,h4,h5,h6")]
-                    .slice(0, maxItems)
-                    .map((element) => ({
+                    })
+                ),
+                headings: sample(
+                    document.querySelectorAll("h1,h2,h3,h4,h5,h6"),
+                    maxItems,
+                    (element) => {
+                        const text = clean(element.textContent);
+                        return text ? {
                         level: Number(element.tagName.slice(1)),
-                        text: clean(element.textContent)
-                    }))
-                    .filter((item) => item.text),
+                            text
+                        } : null;
+                    }
+                ),
                 links: {
                     total: links.length,
-                    sample: links.slice(0, maxItems).map((element) => ({
+                    sample: sample(links, maxItems, (element) => ({
                         text: clean(element.textContent, 512),
                         href: clean(element.href)
                     }))
                 },
                 images: {
                     total: images.length,
-                    sample: images.slice(0, maxItems).map((element) => ({
+                    sample: sample(images, maxItems, (element) => ({
                         src: clean(element.currentSrc || element.src),
                         alt: clean(element.alt, 512),
                         width: Number(element.naturalWidth || element.width || 0),
                         height: Number(element.naturalHeight || element.height || 0)
                     }))
                 },
-                forms: (() => {
-                    const forms = [];
-                    for (const form of document.forms) {
-                        forms.push({
-                            action: clean(form.action),
-                            method: clean(form.method, 16),
-                            controls: form.elements.length
-                        });
-                        if (forms.length >= maxItems) break;
-                    }
-                    return forms;
-                })(),
-                structured_data: [...document.querySelectorAll('script[type="application/ld+json"]')]
-                    .slice(0, 16)
-                    .map((element) => clean(element.textContent))
-                    .filter(Boolean)
+                forms: sample(document.forms, maxItems, (form) => ({
+                    action: clean(form.action),
+                    method: clean(form.method, 16),
+                    controls: form.elements.length
+                })),
+                structured_data: sample(
+                    document.querySelectorAll('script[type="application/ld+json"]'),
+                    16,
+                    (element) => clean(element.textContent)
+                )
             };
         }""",
         {"maxItems": MAX_METADATA_ITEMS, "maxChars": MAX_METADATA_VALUE_CHARS},
