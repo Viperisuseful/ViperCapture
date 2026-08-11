@@ -147,6 +147,14 @@ class OperationalPackagingTests(unittest.TestCase):
         self.assertIn('--concurrency "$concurrency"', matrix)
         self.assertIn("VIPERCAPTURE_MAX_CONCURRENCY=4", matrix)
 
+    def test_constrained_memory_report_is_copied_before_failure_propagates(self):
+        workflow = (
+            ROOT / ".github" / "workflows" / "operational-readiness.yml"
+        ).read_text("utf-8")
+        gate = workflow[workflow.index("Constrained-memory render gate") :]
+        self.assertIn("|| gate_status=$?", gate)
+        self.assertLess(gate.index("docker cp"), gate.index('test "$gate_status" -eq 0'))
+
     def test_container_waits_for_validated_packages_and_go_tag_is_prefixed(self):
         workflow = (ROOT / ".github" / "workflows" / "oss-release.yml").read_text(
             "utf-8"
@@ -171,6 +179,13 @@ class OperationalPackagingTests(unittest.TestCase):
         nginx = (ROOT / "deploy" / "public-api" / "nginx.conf").read_text("utf-8")
         self.assertIn("proxy_request_buffering off;", nginx)
         self.assertNotIn("proxy_request_buffering on;", nginx)
+
+    def test_gateway_preserves_caller_request_id_with_generated_fallback(self):
+        nginx = (ROOT / "deploy" / "public-api" / "nginx.conf").read_text("utf-8")
+        self.assertIn("map $http_x_request_id $upstream_request_id", nginx)
+        self.assertIn('"" $request_id;', nginx)
+        self.assertIn("default $http_x_request_id;", nginx)
+        self.assertIn("proxy_set_header X-Request-Id $upstream_request_id;", nginx)
 
 
 if __name__ == "__main__":

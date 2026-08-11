@@ -153,14 +153,19 @@ jobs:
           exit 1
       - name: Constrained-memory render gate
         run: |
+          gate_status=0
           docker exec vipercapture-memory python -m benchmarks.production_gate load \
             --api-url http://127.0.0.1:8000 --requests 40 --concurrency 1 \
             --max-p95-ms 20000 --require-memory-limit \
-            --output /tmp/constrained-memory.json
+            --output /tmp/constrained-memory.json || gate_status=$?
           mkdir -p operational-results
-          docker cp vipercapture-memory:/tmp/constrained-memory.json \
-            operational-results/constrained-memory.json
-          test "$(docker inspect --format '{{.State.OOMKilled}}' vipercapture-memory)" = false
+          if docker exec vipercapture-memory test -f /tmp/constrained-memory.json; then
+            docker cp vipercapture-memory:/tmp/constrained-memory.json \
+              operational-results/constrained-memory.json
+          fi
+          oom_killed="$(docker inspect --format '{{.State.OOMKilled}}' vipercapture-memory)"
+          test "$gate_status" -eq 0
+          test "$oom_killed" = false
       - name: Container diagnostics
         if: always()
         run: |
