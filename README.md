@@ -56,6 +56,8 @@ and run the [reproducible benchmark](benchmarks/README.md) on your workload.
   cancellation, consistent error envelopes, and hosted-mode SSRF defenses
 - Browser UI, Tauri desktop app, native Android app, Docker Compose, and a
   portable agent skill
+- Reproducible sustained-load, forced restart-recovery, constrained-memory,
+  same-host competitor, and longer real-site benchmark workflows
 
 ## Start in one command
 
@@ -120,8 +122,9 @@ callback by setting `delivery.webhook_url`. Related orchestration endpoints:
 | `POST /compat/urlbox/v1/render/{sync,async}` | Urlbox-compatible adapters |
 
 See the [API and workflows guide](docs/api.md), [async provider guide](docs/async-jobs.md),
-[platform/operator guide](docs/platform.md), and
-[migration guide](docs/migration-screenshotone-urlbox.md). If a site you
+[platform/operator guide](docs/platform.md),
+[public API deployment](deploy/public-api), [stable-v1 gates](docs/v1-readiness.md),
+[release guide](docs/releasing.md), and [migration guide](docs/migration-screenshotone-urlbox.md). If a site you
 administer challenges the renderer, follow the least-privilege
 [Cloudflare/WAF authorization guide](docs/site-access.md).
 

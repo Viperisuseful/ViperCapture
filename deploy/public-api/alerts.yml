@@ -1,0 +1,29 @@
+groups:
+  - name: vipercapture
+    rules:
+      - alert: ViperCaptureDown
+        expr: up{job="vipercapture"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: ViperCapture has not been scrapeable for two minutes
+      - alert: ViperCaptureHighServerErrorRate
+        expr: >-
+          sum(rate(vipercapture_http_requests_total{status=~"5.."}[5m]))
+          /
+          clamp_min(sum(rate(vipercapture_http_requests_total[5m])), 0.001)
+          > 0.05
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: More than five percent of ViperCapture requests are failing
+      - alert: ViperCaptureQueueLatencyGrowing
+        expr: >-
+          rate(vipercapture_queue_seconds_sum[10m])
+          /
+          clamp_min(rate(vipercapture_renders_total[10m]), 0.001)
+          > 10
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: Average render queue time has exceeded ten seconds

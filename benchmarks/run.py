@@ -72,6 +72,25 @@ async def render(client: httpx.AsyncClient, provider: str, endpoint: str, scenar
         download = await client.get(result["renderUrl"])
         download.raise_for_status()
         return download.content
+    if provider == "browserless":
+        payload = {
+            "url": scenario["url"],
+            "viewport": {
+                "width": scenario["viewport"]["width"],
+                "height": scenario["viewport"]["height"],
+            },
+            "options": {
+                "type": "jpeg" if scenario.get("output") == "jpeg" else scenario.get("output", "png"),
+                "fullPage": scenario.get("full_page", True),
+            },
+        }
+        token = os.environ.get("BROWSERLESS_TOKEN")
+        target = endpoint.rstrip("/") + "/chromium/screenshot"
+        if token:
+            target += "?token=" + token
+        response = await client.post(target, json=payload)
+        response.raise_for_status()
+        return response.content
     raise ValueError(f"unknown provider: {provider}")
 
 
@@ -82,7 +101,7 @@ async def main() -> int:
         action="append",
         required=True,
         metavar="TYPE=URL",
-        help="viper, screenshotone, or urlbox endpoint; repeat to compare",
+        help="viper, browserless, screenshotone, or urlbox endpoint; repeat to compare",
     )
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--warmups", type=int, default=1)
@@ -95,7 +114,7 @@ async def main() -> int:
     providers = []
     for specification in args.provider:
         kind, separator, endpoint = specification.partition("=")
-        if not separator or kind not in {"viper", "screenshotone", "urlbox"}:
+        if not separator or kind not in {"viper", "browserless", "screenshotone", "urlbox"}:
             parser.error("provider must be TYPE=URL")
         providers.append((kind, endpoint))
 

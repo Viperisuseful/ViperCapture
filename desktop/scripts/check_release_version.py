@@ -27,7 +27,7 @@ def main() -> None:
     android_config = json.loads(
         (src_tauri / "tauri.android.conf.json").read_text(encoding="utf-8")
     )
-    versions = {
+    desktop_versions = {
         "package.json": json.loads((root / "package.json").read_text(encoding="utf-8"))["version"],
         "package-lock.json": package_lock["version"],
         'package-lock.json packages[""]': package_lock["packages"][""]["version"],
@@ -36,21 +36,32 @@ def main() -> None:
         "tauri.conf.json": json.loads(
             (src_tauri / "tauri.conf.json").read_text(encoding="utf-8")
         )["version"],
-        "tauri.android.conf.json": android_config["version"],
     }
-    version = versions["tauri.conf.json"]
-    mismatches = [name for name, candidate in versions.items() if candidate != version]
+    version = (
+        desktop_versions["tauri.conf.json"]
+        if app == "desktop"
+        else android_config["version"]
+    )
+    compared_versions = desktop_versions if app == "desktop" else {
+        "tauri.android.conf.json": android_config["version"]
+    }
+    mismatches = [
+        name for name, candidate in compared_versions.items() if candidate != version
+    ]
     if mismatches:
-        details = ", ".join(f"{name}={versions[name]}" for name in mismatches)
-        raise SystemExit(f"app versions do not match tauri.conf.json={version}: {details}")
-
-    major, minor, patch = (int(part) for part in version.split("."))
-    expected_version_code = major * 1_000_000 + minor * 1_000 + patch
-    version_code = android_config["bundle"]["android"].get("versionCode")
-    if version_code != expected_version_code:
-        raise SystemExit(
-            f"Android versionCode {version_code!r} must be {expected_version_code} for {version}"
+        details = ", ".join(
+            f"{name}={compared_versions[name]}" for name in mismatches
         )
+        raise SystemExit(f"app versions do not match release version {version}: {details}")
+
+    if app == "android":
+        major, minor, patch = (int(part) for part in version.split("."))
+        expected_version_code = major * 1_000_000 + minor * 1_000 + patch
+        version_code = android_config["bundle"]["android"].get("versionCode")
+        if version_code != expected_version_code:
+            raise SystemExit(
+                f"Android versionCode {version_code!r} must be {expected_version_code} for {version}"
+            )
 
     expected = f"{app}-v{version}"
     if tag != expected:
