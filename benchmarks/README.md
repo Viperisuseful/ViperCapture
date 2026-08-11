@@ -85,6 +85,7 @@ on the intended production host for the stable-v1 evidence set.
 
 ## Published results
 
+- [ViperCapture and Browserless, same host, 2026-08-11](results/2026-08-11-viper-browserless-same-host.md)
 - [ViperCapture and ScreenshotOne, 2026-08-11](results/2026-08-11-screenshotone.md)
 
 Results are engineering snapshots, not universal vendor rankings. Read the

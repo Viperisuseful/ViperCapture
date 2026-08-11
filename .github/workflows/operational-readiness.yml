@@ -8,6 +8,7 @@ on:
       - "Dockerfile"
       - "requirements.txt"
       - ".github/workflows/operational-readiness.yml"
+      - "!benchmarks/results/**"
   workflow_dispatch:
   schedule:
     - cron: "23 4 * * 1"
