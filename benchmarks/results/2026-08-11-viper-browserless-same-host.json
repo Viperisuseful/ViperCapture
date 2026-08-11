@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-08-11T19:21:57.390754+00:00",
+  "generated_at": "2026-08-11T20:31:59.440564+00:00",
   "environment": {
     "python": "3.11.15",
     "platform": "Linux-6.8.0-1062-azure-x86_64-with-glibc2.35",
@@ -38,7 +38,7 @@
             "device_scale_factor": 1
           },
           "full_page": true,
-          "lazy_load": "adaptive",
+          "lazy_load": "none",
           "wait_for": {
             "event": "load"
           }
@@ -55,7 +55,7 @@
             "device_scale_factor": 1
           },
           "full_page": true,
-          "lazy_load": "adaptive",
+          "lazy_load": "none",
           "wait_for": {
             "event": "load"
           }
@@ -108,7 +108,7 @@
             "device_scale_factor": 1
           },
           "full_page": true,
-          "lazy_load": "adaptive",
+          "lazy_load": "none",
           "wait_for": {
             "event": "load"
           }
@@ -128,19 +128,19 @@
           "success_rate": 1.0,
           "latency_ms": {
             "samples": [
-              550.24,
-              490.89,
-              506.94,
-              468.89,
-              495.2,
-              413.85,
-              449.82,
-              415.28,
-              437.18,
-              398.38
+              421.19,
+              437.27,
+              445.91,
+              451.78,
+              437.56,
+              450.29,
+              460.32,
+              450.57,
+              436.37,
+              424.3
             ],
-            "median": 459.36,
-            "p95": 550.24
+            "median": 441.74,
+            "p95": 460.32
           },
           "artifacts": [
             {
@@ -232,96 +232,96 @@
           "success_rate": 1.0,
           "latency_ms": {
             "samples": [
-              1174.12,
-              1163.5,
-              1166.94,
-              1265.39,
-              1163.84,
-              1222.19,
-              1241.61,
-              1167.96,
-              1181.1,
-              1248.64
+              832.22,
+              609.18,
+              629.96,
+              658.69,
+              639.33,
+              605.33,
+              640.95,
+              617.56,
+              622.01,
+              611.79
             ],
-            "median": 1177.61,
-            "p95": 1265.39
+            "median": 625.99,
+            "p95": 832.22
           },
           "artifacts": [
             {
-              "bytes": 442962,
-              "sha256": "7be08ace98fff7b3ea4db863a4e5ee1b1947fc461dd1e348057a3f018ba76727",
+              "bytes": 429323,
+              "sha256": "eb91a59d46bd231c4333c1ebc1c6b2c37f5fc690fdc47f481ca729378db4b903",
               "dimensions": [
                 1365,
                 2497
               ]
             },
             {
-              "bytes": 442983,
-              "sha256": "121b5bd401164007d476ce8f3b6f5d86fba9625db91116198aa2a1103bd42aa8",
+              "bytes": 428570,
+              "sha256": "8c3ae80098bf3d7751557f27f8a29ebfd8cb9e6a6ac6fe8c3cb4ae1d2405844b",
               "dimensions": [
                 1365,
                 2497
               ]
             },
             {
-              "bytes": 442962,
-              "sha256": "7be08ace98fff7b3ea4db863a4e5ee1b1947fc461dd1e348057a3f018ba76727",
+              "bytes": 428177,
+              "sha256": "4b45006aff293b9050cd007cbc5034e33593977a5e744da287a546271f42fca0",
               "dimensions": [
                 1365,
                 2497
               ]
             },
             {
-              "bytes": 442962,
-              "sha256": "7be08ace98fff7b3ea4db863a4e5ee1b1947fc461dd1e348057a3f018ba76727",
+              "bytes": 430043,
+              "sha256": "9a7210b49d8dea80096310593d48465f861f125b47f5bfa5c1fd283c4d0edb8e",
               "dimensions": [
                 1365,
                 2497
               ]
             },
             {
-              "bytes": 442962,
-              "sha256": "7be08ace98fff7b3ea4db863a4e5ee1b1947fc461dd1e348057a3f018ba76727",
+              "bytes": 428588,
+              "sha256": "5da187b8104a5fb1409f7d4f5fe09f18d2bcb3a143817a90227da1938c5760eb",
               "dimensions": [
                 1365,
                 2497
               ]
             },
             {
-              "bytes": 442939,
-              "sha256": "0913118371fdb4d0397223732541d36099975f4ba7aae8601569e41b18530074",
+              "bytes": 428702,
+              "sha256": "5c2c844cacbc7b51defd1ef918895de8b36c3089dc8a0fe74485b9321efe5839",
               "dimensions": [
                 1365,
                 2497
               ]
             },
             {
-              "bytes": 442977,
-              "sha256": "3e39cc91c69aa29623874d524600a5c43f9c06dba0c6590b3ae16f2c65e19c18",
+              "bytes": 428177,
+              "sha256": "4b45006aff293b9050cd007cbc5034e33593977a5e744da287a546271f42fca0",
               "dimensions": [
                 1365,
                 2497
               ]
             },
             {
-              "bytes": 442889,
-              "sha256": "8e58002a6e31ad74547a7414d544146e47cd934755a9e8c0ba6a549d8c37a77d",
+              "bytes": 429146,
+              "sha256": "8f0b757cc8dd13ba9b5a122205e38f673a3fb04f3d820fdf667fed5498b8a2d2",
               "dimensions": [
                 1365,
                 2497
               ]
             },
             {
-              "bytes": 442983,
-              "sha256": "121b5bd401164007d476ce8f3b6f5d86fba9625db91116198aa2a1103bd42aa8",
+              "bytes": 428846,
+              "sha256": "11bf8954faa70287be17733cf1716720ef83506c6c2a7dc7c578e6f687451015",
               "dimensions": [
                 1365,
                 2497
               ]
             },
             {
-              "bytes": 442939,
-              "sha256": "0913118371fdb4d0397223732541d36099975f4ba7aae8601569e41b18530074",
+              "bytes": 428155,
+              "sha256": "292ad9951195f9ab9aa25598e46fdd63de10bfc97c6d08153a603d1a10a7cfac",
               "dimensions": [
                 1365,
                 2497
@@ -336,19 +336,19 @@
           "success_rate": 1.0,
           "latency_ms": {
             "samples": [
-              1175.41,
-              1134.54,
-              1067.1,
-              1047.23,
-              1065.9,
-              1084.96,
-              1045.83,
-              1066.32,
-              1083.22,
-              1080.2
+              496.48,
+              800.41,
+              498.79,
+              507.56,
+              539.68,
+              478.98,
+              482.12,
+              481.88,
+              498.35,
+              481.66
             ],
-            "median": 1073.65,
-            "p95": 1175.41
+            "median": 497.42,
+            "p95": 800.41
           },
           "artifacts": [
             {
@@ -440,96 +440,96 @@
           "success_rate": 1.0,
           "latency_ms": {
             "samples": [
-              2535.61,
-              2640.71,
-              2654.0,
-              2672.2,
-              2559.73,
-              2751.85,
-              2910.31,
-              2927.03,
-              2972.19,
-              2760.32
+              2596.22,
+              2498.44,
+              2863.37,
+              2647.18,
+              2578.71,
+              2598.73,
+              2547.39,
+              2574.72,
+              2625.91,
+              2727.54
             ],
-            "median": 2712.02,
-            "p95": 2972.19
+            "median": 2597.47,
+            "p95": 2863.37
           },
           "artifacts": [
             {
-              "bytes": 150787,
-              "sha256": "25b0cac40627a176ae1baaec0760c4a58123c1fd3762ccf722975c3de9e133b7",
+              "bytes": 155252,
+              "sha256": "aca472c96e1665dec09c4728c377dace5fc8b394244080fbc23605cfcaba063b",
               "dimensions": [
                 1280,
                 800
               ]
             },
             {
-              "bytes": 156534,
-              "sha256": "2dc2555bce37e23a02b2d587749d17f5ba53c42baaac443c05852c22ee48548b",
+              "bytes": 151879,
+              "sha256": "9e359d824a0cf416e2a031089e9cbbee138b0838164c2212e11b7315cd6cae95",
               "dimensions": [
                 1280,
                 800
               ]
             },
             {
-              "bytes": 155542,
-              "sha256": "75a720b1ea20a0e9ba92e2fb78eb6c9034a533e1b665da0e8e8dc37e4fc8bbed",
+              "bytes": 159217,
+              "sha256": "836ea7db48daa5ef5ad6dc001fff92a3245412f04a2dca549f587d17736e28c2",
               "dimensions": [
                 1280,
                 800
               ]
             },
             {
-              "bytes": 163685,
-              "sha256": "ef07da42a4e3fd5ca58198558def767eef1c49ab609ca9c20380abbf364894e9",
+              "bytes": 164174,
+              "sha256": "15b12cfc9a3340017464dbb08729f4edf345bfb1207ff797cd184b17b9a7586e",
               "dimensions": [
                 1280,
                 800
               ]
             },
             {
-              "bytes": 157217,
-              "sha256": "3c5a8b75747c828cdacb609501ab89a8cf770ed19db6d38cd8098f9f27ee8402",
+              "bytes": 158133,
+              "sha256": "5507e7492b7b37863b602006f83804def172b107fe665d66864bf4ba904cd665",
               "dimensions": [
                 1280,
                 800
               ]
             },
             {
-              "bytes": 174132,
-              "sha256": "782cbf38faebd07deac2e4dcf11dca8400cff535d0aeb74eb4626c5270862b99",
+              "bytes": 159485,
+              "sha256": "f68d47eed148ab23242b118811f3894308f718b5e2d0830fca79be4127bcc627",
               "dimensions": [
                 1280,
                 800
               ]
             },
             {
-              "bytes": 167332,
-              "sha256": "2a1b68a46785510c3b9ac8cb168384667a78a2011e416cabc46536eff916b60d",
+              "bytes": 158628,
+              "sha256": "1ac89e22306a54c542f4caed3f5e2cdeba99c01cc440c720b5b6521431762406",
               "dimensions": [
                 1280,
                 800
               ]
             },
             {
-              "bytes": 176241,
-              "sha256": "bdfd5849ac6c25587ec2db0982e915894dab673bf800b45e82bb27728037ff8d",
+              "bytes": 150738,
+              "sha256": "dc5bdb9b010109c71502049f43c6e9905737f7a17f3223196b23824a222b1323",
               "dimensions": [
                 1280,
                 800
               ]
             },
             {
-              "bytes": 174036,
-              "sha256": "3f41ae9771255c2672b69372475760d703140f03d54c421bd2c6bf40fcb5502b",
+              "bytes": 158243,
+              "sha256": "ead1231e1a3e2df045f73685462b46382f4cda1f86d1163dc7541951bb50c1cf",
               "dimensions": [
                 1280,
                 800
               ]
             },
             {
-              "bytes": 148690,
-              "sha256": "42e4a3a78f05d8a163ccaf7664016e6c47115bc88688adc213f1d64d48501cb5",
+              "bytes": 150879,
+              "sha256": "95544908e99e08766d0879abd4ecfca44fabae1db67b5ad0d2a4821637530464",
               "dimensions": [
                 1280,
                 800
@@ -544,72 +544,64 @@
           "success_rate": 1.0,
           "latency_ms": {
             "samples": [
-              1333.3,
-              1339.2,
-              1358.81,
-              1354.23,
-              1327.95,
-              1351.26,
-              1337.9,
-              1325.56,
-              1317.66,
-              1339.25
+              1293.31,
+              1335.35,
+              1323.64,
+              1291.09,
+              1332.2,
+              1332.46,
+              1299.3,
+              1285.86,
+              1296.13,
+              1304.76
             ],
-            "median": 1338.55,
-            "p95": 1358.81
+            "median": 1302.03,
+            "p95": 1335.35
           },
           "artifacts": [
             {
-              "bytes": 113803,
-              "sha256": "3553c8d8ed2e3f5e219d64a84c1152ba914c47b3319d092a68ff918004aa6969",
+              "bytes": 113802,
+              "sha256": "63553573317bbaeaf7531a0277106cb5a4575cc1a8ef3b01417f1730288492b9",
               "dimensions": [
                 1280,
                 800
               ]
             },
             {
-              "bytes": 113803,
-              "sha256": "3553c8d8ed2e3f5e219d64a84c1152ba914c47b3319d092a68ff918004aa6969",
+              "bytes": 113802,
+              "sha256": "63553573317bbaeaf7531a0277106cb5a4575cc1a8ef3b01417f1730288492b9",
               "dimensions": [
                 1280,
                 800
               ]
             },
             {
-              "bytes": 113803,
-              "sha256": "3553c8d8ed2e3f5e219d64a84c1152ba914c47b3319d092a68ff918004aa6969",
+              "bytes": 113802,
+              "sha256": "63553573317bbaeaf7531a0277106cb5a4575cc1a8ef3b01417f1730288492b9",
               "dimensions": [
                 1280,
                 800
               ]
             },
             {
-              "bytes": 113803,
-              "sha256": "3553c8d8ed2e3f5e219d64a84c1152ba914c47b3319d092a68ff918004aa6969",
+              "bytes": 113802,
+              "sha256": "63553573317bbaeaf7531a0277106cb5a4575cc1a8ef3b01417f1730288492b9",
               "dimensions": [
                 1280,
                 800
               ]
             },
             {
-              "bytes": 113803,
-              "sha256": "3553c8d8ed2e3f5e219d64a84c1152ba914c47b3319d092a68ff918004aa6969",
+              "bytes": 113802,
+              "sha256": "63553573317bbaeaf7531a0277106cb5a4575cc1a8ef3b01417f1730288492b9",
               "dimensions": [
                 1280,
                 800
               ]
             },
             {
-              "bytes": 113803,
-              "sha256": "3553c8d8ed2e3f5e219d64a84c1152ba914c47b3319d092a68ff918004aa6969",
-              "dimensions": [
-                1280,
-                800
-              ]
-            },
-            {
-              "bytes": 113803,
-              "sha256": "3553c8d8ed2e3f5e219d64a84c1152ba914c47b3319d092a68ff918004aa6969",
+              "bytes": 113802,
+              "sha256": "63553573317bbaeaf7531a0277106cb5a4575cc1a8ef3b01417f1730288492b9",
               "dimensions": [
                 1280,
                 800
@@ -634,6 +626,14 @@
             {
               "bytes": 113803,
               "sha256": "3553c8d8ed2e3f5e219d64a84c1152ba914c47b3319d092a68ff918004aa6969",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 113802,
+              "sha256": "63553573317bbaeaf7531a0277106cb5a4575cc1a8ef3b01417f1730288492b9",
               "dimensions": [
                 1280,
                 800
@@ -648,99 +648,99 @@
           "success_rate": 1.0,
           "latency_ms": {
             "samples": [
-              2901.96,
-              2916.5,
-              2856.58,
-              2881.88,
-              2963.14,
-              2906.05,
-              2896.31,
-              2986.76,
-              2858.13,
-              2917.62
+              1468.49,
+              1764.15,
+              1751.2,
+              1684.93,
+              1727.08,
+              1695.95,
+              1694.38,
+              1713.26,
+              1678.44,
+              1686.16
             ],
-            "median": 2904.01,
-            "p95": 2986.76
+            "median": 1695.16,
+            "p95": 1764.15
           },
           "artifacts": [
             {
-              "bytes": 3041799,
-              "sha256": "1ae66d89748652b90e0c926c7f9847fb395cd0be1ea0d98c7c8455a12f8214e1",
+              "bytes": 1899637,
+              "sha256": "8c35329f5cbeb1ddd0c4ea40b2499927bdf3548c42cb14b82e221edb4069d4d7",
               "dimensions": [
                 1440,
-                8120
+                6973
               ]
             },
             {
-              "bytes": 3044504,
-              "sha256": "78e72b39e78fae32a6d59764eefa55b48e9774d75994de045d275d3aad1975ab",
+              "bytes": 2883788,
+              "sha256": "4bf62e0884dc377b68ad0653776f3994f63bfecd842acc65ea29f93ee649ba53",
               "dimensions": [
                 1440,
-                8120
+                7973
               ]
             },
             {
-              "bytes": 3046473,
-              "sha256": "78302174f5bffca3b07d2985b604415b2fcb3b38b7f147345114c1b30db38d3e",
+              "bytes": 2881566,
+              "sha256": "a071fe81b4fd8f8dba38661e6cd9fe3a7c09437e4fd12bb9d4f53c0073db4284",
               "dimensions": [
                 1440,
-                8120
+                7973
               ]
             },
             {
-              "bytes": 3045695,
-              "sha256": "80eb8e445bd8c809b5b6b34f9e55177eb8383b7e6c7b65de713c707633ca6ad3",
+              "bytes": 2879263,
+              "sha256": "0847aefbf753128dcf55bdac6893960410ff19d141eccfc691d1ffe589d990ec",
               "dimensions": [
                 1440,
-                8120
+                7972
               ]
             },
             {
-              "bytes": 3039888,
-              "sha256": "8dbdd30a78d6104e65c421ee5c439417d69b45ae6630a35bc39421ec4f84a08e",
+              "bytes": 2883789,
+              "sha256": "0178a0926323da34d7fdb81e7a282e3f8a7b76dd014c544661332e2ce83d71f8",
               "dimensions": [
                 1440,
-                8120
+                7972
               ]
             },
             {
-              "bytes": 3039814,
-              "sha256": "8706b9ab7ce50c734ca636e28de9f4b2b15455d0a97af4b7a388ab9081ae99f0",
+              "bytes": 2881581,
+              "sha256": "eb02fb84a55768811612693cd389f22b159a081fddf4bfc7cd8e450dc728245f",
               "dimensions": [
                 1440,
-                8120
+                7972
               ]
             },
             {
-              "bytes": 3038289,
-              "sha256": "46c9c1eb45160faac282a84f73a6375e656da922bd9d11d12b22ebff8c03e45f",
+              "bytes": 2883821,
+              "sha256": "a0eebf826e44411a8391a5d980178d27d64caa873ff7bfd4c6b1b17065b262b5",
               "dimensions": [
                 1440,
-                8120
+                7972
               ]
             },
             {
-              "bytes": 3045679,
-              "sha256": "9f1c65b435c489c0648c8055cca41f5a9d13e16e0a0c8df4027bc780e8b69224",
+              "bytes": 2881578,
+              "sha256": "138e92fdb65793bed2b260a013134006c864b7bf8855f356cde42a08b7839a69",
               "dimensions": [
                 1440,
-                8120
+                7972
               ]
             },
             {
-              "bytes": 3044619,
-              "sha256": "b439de4c4504139a1c7fba3c79a1931154356554019d3249997fc52bc045385e",
+              "bytes": 2875980,
+              "sha256": "2d748c2a24f30b756ef88653922b85b0fe683f9925857db3656a12f5fcfa2e8e",
               "dimensions": [
                 1440,
-                8120
+                7972
               ]
             },
             {
-              "bytes": 3040400,
-              "sha256": "3dabca3840f442d67c7df6c14ece9b21abce98eb521ef97e17a779e5551f7b52",
+              "bytes": 2883768,
+              "sha256": "960b5dbe2273a43690706995a8ea08a6875210d9102a3ed715fe741a9f7e7cbe",
               "dimensions": [
                 1440,
-                8120
+                7972
               ]
             }
           ]
@@ -758,19 +758,19 @@
           "success_rate": 1.0,
           "latency_ms": {
             "samples": [
-              1065.54,
-              1048.32,
-              1084.77,
-              1115.78,
-              1032.16,
-              1065.98,
-              1066.64,
-              1015.27,
-              1067.65,
-              1031.48
+              999.7,
+              997.29,
+              1000.89,
+              999.16,
+              989.61,
+              1009.36,
+              1014.87,
+              966.26,
+              1099.9,
+              1001.16
             ],
-            "median": 1065.76,
-            "p95": 1115.78
+            "median": 1000.3,
+            "p95": 1099.9
           },
           "artifacts": [
             {
@@ -862,96 +862,96 @@
           "success_rate": 1.0,
           "latency_ms": {
             "samples": [
-              981.02,
-              998.94,
-              1047.41,
-              1014.2,
-              1013.95,
-              1033.81,
-              1019.13,
-              1028.23,
-              1012.91,
-              999.01
+              1133.61,
+              934.86,
+              945.06,
+              1033.54,
+              945.81,
+              946.82,
+              1014.84,
+              1016.51,
+              980.44,
+              1098.88
             ],
-            "median": 1014.08,
-            "p95": 1047.41
+            "median": 997.64,
+            "p95": 1133.61
           },
           "artifacts": [
             {
-              "bytes": 475134,
-              "sha256": "64023bfe49c138c5be7a40d42032c005fa23b6bd0d6dea39db61d41cdf9f353f",
+              "bytes": 467373,
+              "sha256": "61bce0af766ff3bd788138bc4877f8bd206380a989bb44a87c5d4b462050e6a0",
               "dimensions": [
                 1365,
                 2497
               ]
             },
             {
-              "bytes": 473991,
-              "sha256": "07fc5929a2ce9849516b5d543bf86278a397d2498b908e960e7083a6b73e6bb3",
+              "bytes": 469526,
+              "sha256": "7b28b7fc4652c4fb4b58d389638ea0da3d34913980628deb8ab9e8581cfdf8e3",
               "dimensions": [
                 1365,
                 2497
               ]
             },
             {
-              "bytes": 480541,
-              "sha256": "3e725e7d282b612ec5bc8c5a47bb16a109d25c90b625f0f65c3487cb693d6dc1",
+              "bytes": 474056,
+              "sha256": "54060654bab4933d5996dd1072086353e6c4a9d8b22e6cc2aafa3d6ab42fad47",
               "dimensions": [
                 1365,
                 2497
               ]
             },
             {
-              "bytes": 479381,
-              "sha256": "72efadef9169750f45a40237f068fb0b013da740dddc12217eac786f50be5403",
+              "bytes": 468443,
+              "sha256": "cf55d93eca1c04e7a12e9b1252b5afcaff22e68524dc3b73d03bad408079d11f",
               "dimensions": [
                 1365,
                 2497
               ]
             },
             {
-              "bytes": 472783,
-              "sha256": "019f45aeb8f252445caa566ae3846bb1e7c7fd5647c741f8056b5d4a3fa5cf95",
+              "bytes": 474060,
+              "sha256": "f536dee8ef657b9c40f62440c36ac828c96dc92c3cccfb6b04a01d98a5adafd7",
               "dimensions": [
                 1365,
                 2497
               ]
             },
             {
-              "bytes": 472781,
-              "sha256": "bce4798a8f38d435bc26761af2b506ad60bb558ea318171752dc8bf9ca2ec7b4",
+              "bytes": 476046,
+              "sha256": "1fd8f67548f0e3ef7a6168645ffeb8b6e3e616c0d0ad3a04a4f1b8d3ae889c40",
               "dimensions": [
                 1365,
                 2497
               ]
             },
             {
-              "bytes": 476054,
-              "sha256": "689593f9f40995972bc75099dd52ad3ac4ea8ccbd3bcb0dd6e32df9ff968374c",
+              "bytes": 475777,
+              "sha256": "f633395fea15845e42dd5851c2312a87f155a515062934504d98e1e87df4255c",
               "dimensions": [
                 1365,
                 2497
               ]
             },
             {
-              "bytes": 479128,
-              "sha256": "16ed449b42385d53bcff30aac1f0e5a183935714144004a2501e5f8bbaec81fd",
+              "bytes": 474056,
+              "sha256": "54060654bab4933d5996dd1072086353e6c4a9d8b22e6cc2aafa3d6ab42fad47",
               "dimensions": [
                 1365,
                 2497
               ]
             },
             {
-              "bytes": 476043,
-              "sha256": "52628e3c2820156d20873363e1590738b6dd639bd727740feae9789fe14fbba0",
+              "bytes": 476563,
+              "sha256": "fb04392274e93f73f37d7c964672c86a96784b932f7a0037ee1c2e9079f61e28",
               "dimensions": [
                 1365,
                 2497
               ]
             },
             {
-              "bytes": 472781,
-              "sha256": "bce4798a8f38d435bc26761af2b506ad60bb558ea318171752dc8bf9ca2ec7b4",
+              "bytes": 470844,
+              "sha256": "a600d478158afdc23ee219ed170005a896dcaef362dc66d317d4bf60166d208b",
               "dimensions": [
                 1365,
                 2497
@@ -966,19 +966,19 @@
           "success_rate": 1.0,
           "latency_ms": {
             "samples": [
-              940.4,
-              916.73,
-              916.3,
-              888.21,
-              892.53,
-              896.52,
-              866.96,
-              883.04,
-              899.79,
-              885.53
+              828.84,
+              831.06,
+              907.09,
+              837.75,
+              850.94,
+              839.54,
+              828.51,
+              848.61,
+              888.57,
+              885.38
             ],
-            "median": 894.52,
-            "p95": 940.4
+            "median": 844.08,
+            "p95": 907.09
           },
           "artifacts": [
             {
@@ -1070,96 +1070,96 @@
           "success_rate": 1.0,
           "latency_ms": {
             "samples": [
-              2831.93,
-              2898.82,
-              2790.55,
-              2561.11,
-              2546.13,
-              2485.98,
-              2593.35,
-              2570.45,
-              2498.79,
-              2658.24
+              2913.16,
+              2830.55,
+              2877.63,
+              2701.31,
+              2552.34,
+              2669.06,
+              2448.25,
+              2486.51,
+              2513.09,
+              2459.43
             ],
-            "median": 2581.9,
-            "p95": 2898.82
+            "median": 2610.7,
+            "p95": 2913.16
           },
           "artifacts": [
             {
-              "bytes": 117231,
-              "sha256": "5c0679f44edc649969811b56b3e914d5fb4b7509ae4093a8e03369d3a56760da",
+              "bytes": 122300,
+              "sha256": "130985a1a52649d507a4eb780e717e0ae0b08ec96fe6ee1cc976ff667988c05f",
               "dimensions": [
                 1280,
                 800
               ]
             },
             {
-              "bytes": 123408,
-              "sha256": "ce6b25c24bfa9e06bee74c79cae8c1a849a6190cffe8078d17c927a378208cea",
+              "bytes": 119735,
+              "sha256": "25c324d2db4e34df9605310b200ee650d9b756ad8b93025983739d6001592b82",
               "dimensions": [
                 1280,
                 800
               ]
             },
             {
-              "bytes": 119406,
-              "sha256": "14827e9751b0a45e49090ae1780fdbaedea2451698d5a3196e9782321ffab708",
+              "bytes": 120273,
+              "sha256": "82c587443441bfbdf1a4314ba45310903be75bfc89e5835ac5c3c3d25aa7fe38",
               "dimensions": [
                 1280,
                 800
               ]
             },
             {
-              "bytes": 124032,
-              "sha256": "86fbf4221a81bd59b9a52ff0ff59e473eaa421715a969c90d0ed81399acc76f7",
+              "bytes": 122542,
+              "sha256": "0222816cb8830641ba6f7028eb8890642edad825fdbd6779b7967725c6271fe6",
               "dimensions": [
                 1280,
                 800
               ]
             },
             {
-              "bytes": 123911,
-              "sha256": "2bf2eb3d0bdcfddff537ca09411c681ac24b3df53dde013d0ea3a285b3259bdc",
+              "bytes": 112433,
+              "sha256": "7edb2f23b9a6ff089d2602713be948d1d46721f35187785361870179965c0466",
               "dimensions": [
                 1280,
                 800
               ]
             },
             {
-              "bytes": 119773,
-              "sha256": "f5fb0c4db6c5c3ead1789acbfd24b8ae5286f504acb59ce013cb53d6d64f179d",
+              "bytes": 121727,
+              "sha256": "2d244dea8773b45a37a9cb6f9415cbe14b24f3808f412347d50733c882cb4431",
               "dimensions": [
                 1280,
                 800
               ]
             },
             {
-              "bytes": 117926,
-              "sha256": "92b9a465a847c00a8ac82fcaa165a7bdb3ab46a2e357bc8fe5686e8292082db9",
+              "bytes": 121338,
+              "sha256": "43690bcf965509008b58d9426fb28a9ce8fded42bd239231be7377a5b9025fa4",
               "dimensions": [
                 1280,
                 800
               ]
             },
             {
-              "bytes": 121487,
-              "sha256": "69d07b7e880a7b7502c4d56219d8fd6515bd8c601c237ff29cc052aa18b68a28",
+              "bytes": 121570,
+              "sha256": "426f375cdedd8790e588277c9e8ff4e27d89c4fc4b89212d5a79ec7a9519401e",
               "dimensions": [
                 1280,
                 800
               ]
             },
             {
-              "bytes": 112057,
-              "sha256": "c0c27d6c11a3b1671c63e0a6871758e9b1f318751b4b1230624fefde69026ca1",
+              "bytes": 120410,
+              "sha256": "7d5cf86f1c92f30b91a7d698242d6273575cb4af19e52b5209e39b246d8666cb",
               "dimensions": [
                 1280,
                 800
               ]
             },
             {
-              "bytes": 116350,
-              "sha256": "27e811a9d691d04da33e0a619973161fbecf6988e7bd9975885f72518ecbfbfc",
+              "bytes": 117538,
+              "sha256": "74179e7fb7ee5e5c50950c1d47db007eeb276879107d47d9250b14f8b7a6229b",
               "dimensions": [
                 1280,
                 800
@@ -1174,24 +1174,24 @@
           "success_rate": 1.0,
           "latency_ms": {
             "samples": [
-              1647.16,
-              1664.91,
-              1634.21,
-              1663.62,
-              1632.12,
-              1732.8,
-              1631.75,
-              1616.73,
-              1732.69,
-              1633.4
+              1600.05,
+              1615.61,
+              1583.63,
+              1565.79,
+              1582.89,
+              1649.47,
+              1649.5,
+              1583.4,
+              1566.02,
+              1581.69
             ],
-            "median": 1640.68,
-            "p95": 1732.8
+            "median": 1583.52,
+            "p95": 1649.5
           },
           "artifacts": [
             {
-              "bytes": 118990,
-              "sha256": "8d11202aac3912e8ed12558d47633c9f0ffe3c6944f67f1159f4739089bf3560",
+              "bytes": 118989,
+              "sha256": "5a112163b89041ed97c6268ead9735c33dc05898affe258ebebbaee1f06f1afd",
               "dimensions": [
                 1280,
                 800
@@ -1208,14 +1208,6 @@
             {
               "bytes": 118990,
               "sha256": "8d11202aac3912e8ed12558d47633c9f0ffe3c6944f67f1159f4739089bf3560",
-              "dimensions": [
-                1280,
-                800
-              ]
-            },
-            {
-              "bytes": 116032,
-              "sha256": "3123b7b3d223694d45bacac099a4f4463a89e5785698d820c5ebdb1645aba71a",
               "dimensions": [
                 1280,
                 800
@@ -1246,8 +1238,16 @@
               ]
             },
             {
-              "bytes": 118990,
-              "sha256": "8d11202aac3912e8ed12558d47633c9f0ffe3c6944f67f1159f4739089bf3560",
+              "bytes": 118989,
+              "sha256": "5a112163b89041ed97c6268ead9735c33dc05898affe258ebebbaee1f06f1afd",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 118989,
+              "sha256": "5a112163b89041ed97c6268ead9735c33dc05898affe258ebebbaee1f06f1afd",
               "dimensions": [
                 1280,
                 800
@@ -1278,96 +1278,96 @@
           "success_rate": 1.0,
           "latency_ms": {
             "samples": [
-              1798.82,
-              1934.44,
-              1872.79,
-              1818.57,
-              2026.66,
-              1836.75,
-              1895.27,
-              1959.83,
-              1917.2,
-              1927.29
+              1792.43,
+              1676.76,
+              1608.5,
+              1666.77,
+              1640.85,
+              1616.39,
+              1753.94,
+              1557.22,
+              1674.48,
+              1632.44
             ],
-            "median": 1906.24,
-            "p95": 2026.66
+            "median": 1653.81,
+            "p95": 1792.43
           },
           "artifacts": [
             {
-              "bytes": 2781364,
-              "sha256": "3772b591ea14bf583c03cae66b3be04f80280dc2937661483bfc9b64bf9aba0e",
+              "bytes": 2781330,
+              "sha256": "3a3c359c632ed73405b77696974a130b113d11187291b4c93ccaa913b6cf8f26",
               "dimensions": [
                 1440,
                 6973
               ]
             },
             {
-              "bytes": 2781385,
-              "sha256": "25f85bc7bc9bcbf72e8ec10a267f14822e7ca7c52a2a462fa64dc5949e942d2e",
+              "bytes": 1806176,
+              "sha256": "1ae044917d19f7498093205dba640ae8e41780071e48076c9a1cfe9882575365",
               "dimensions": [
                 1440,
                 6973
               ]
             },
             {
-              "bytes": 2781385,
-              "sha256": "25f85bc7bc9bcbf72e8ec10a267f14822e7ca7c52a2a462fa64dc5949e942d2e",
+              "bytes": 2781370,
+              "sha256": "b4287db8b63067b507e453f13ec51a695ce1c08949b70f733230e2901fc4fbb0",
               "dimensions": [
                 1440,
                 6973
               ]
             },
             {
-              "bytes": 2781368,
-              "sha256": "718d1d753e588fd7a5779146a73b65a5f27f214da1202cb8647cdb4093454866",
+              "bytes": 2781327,
+              "sha256": "0bcd90e97b863ef90038df348ad9fed1e8c444d11cda02010f718181a3a69d40",
               "dimensions": [
                 1440,
                 6973
               ]
             },
             {
-              "bytes": 2781377,
-              "sha256": "123b781631c3fc2514a87d9ed7dbbb68f6abf86e91377976f1c0b91fbf28278d",
+              "bytes": 1806187,
+              "sha256": "dab0d87da6ff9aa4b54c328b52766b6d2dcb78261e9f7b5ae98116c452150201",
               "dimensions": [
                 1440,
                 6973
               ]
             },
             {
-              "bytes": 2781385,
-              "sha256": "25f85bc7bc9bcbf72e8ec10a267f14822e7ca7c52a2a462fa64dc5949e942d2e",
+              "bytes": 2781327,
+              "sha256": "0bcd90e97b863ef90038df348ad9fed1e8c444d11cda02010f718181a3a69d40",
               "dimensions": [
                 1440,
                 6973
               ]
             },
             {
-              "bytes": 2781377,
-              "sha256": "3751031f0f1ed3c838b84562718c45832c79f0fe3ca0cbeab26f83e6226d05c6",
+              "bytes": 1867095,
+              "sha256": "c0791570cd6536d97484c4a79e2b955470d17b5111971421c5b2451c141a386d",
               "dimensions": [
                 1440,
                 6973
               ]
             },
             {
-              "bytes": 2781385,
-              "sha256": "25f85bc7bc9bcbf72e8ec10a267f14822e7ca7c52a2a462fa64dc5949e942d2e",
+              "bytes": 1806190,
+              "sha256": "64178291bc2b26a2745a5ebf727a095dd1461cd2dd0408ea7b413f0b9c858c78",
               "dimensions": [
                 1440,
                 6973
               ]
             },
             {
-              "bytes": 2781385,
-              "sha256": "25f85bc7bc9bcbf72e8ec10a267f14822e7ca7c52a2a462fa64dc5949e942d2e",
+              "bytes": 1806151,
+              "sha256": "17bf24224aa12378254f4d6cddf4abdf255a1d6d43323f77d175602c06debfa5",
               "dimensions": [
                 1440,
                 6973
               ]
             },
             {
-              "bytes": 2781385,
-              "sha256": "25f85bc7bc9bcbf72e8ec10a267f14822e7ca7c52a2a462fa64dc5949e942d2e",
+              "bytes": 2781338,
+              "sha256": "1e10dfec84ffbc665f3973124c8a9ac9c34d533536eeae63c89e71322fa522dc",
               "dimensions": [
                 1440,
                 6973

@@ -2,13 +2,15 @@
 
 ## Evidence
 
-- GitHub Actions run: [31527269371](https://github.com/Viperisuseful/ViperCapture/actions/runs/31527269371)
-- ViperCapture commit: `9decf73c9ec517a9c595db9d0b36f559edd21908`
+- GitHub Actions run: [31533142388](https://github.com/Viperisuseful/ViperCapture/actions/runs/31533142388)
+- ViperCapture commit: `9f25fcb5fff5a0a8a9d8ac666e9436ecb171073c`
 - Runner: GitHub-hosted `ubuntu-22.04`, with both containers and the benchmark
   client on that one runner
-- ViperCapture image ID: `sha256:e64de458a1d14721bdb21d19ccd1708516b08ebf9a26b49f3de2bdc06369c97e`
+- ViperCapture image ID: `sha256:7d27b520e23b01b0be7b56eb9b0bdc11e40ba15b87418aa930c440f5852b4521`
 - Browserless: `v2.55.1`, OCI index
   `sha256:611b88859cb367a0bfd8d34fbd510d9783b7cede6729cfa8e7f6e19677084fbf`
+- All cross-provider scenarios use `lazy_load: none`; provider-specific scrolling
+  is excluded so both engines perform comparable work.
 - Raw samples, output hashes, dimensions, inputs, and failures:
   [JSON](2026-08-11-viper-browserless-same-host.json)
 
@@ -16,22 +18,22 @@
 
 | Scenario | Provider | Success | Median | p95 | Median bytes |
 | --- | --- | ---: | ---: | ---: | ---: |
-| wikipedia-home-viewport | viper | 10/10 | 459.36 ms | 550.24 ms | 103,137 |
-| python-home-full-page | viper | 10/10 | 1,177.61 ms | 1,265.39 ms | 442,962 |
-| rust-home-full-page | viper | 10/10 | 1,073.65 ms | 1,175.41 ms | 416,288 |
-| github-home-viewport | viper | 10/10 | 2,712.02 ms | 2,972.19 ms | 163,685 |
-| mdn-web-docs-viewport | viper | 10/10 | 1,338.55 ms | 1,358.81 ms | 113,803 |
-| vite-home-full-page | viper | 10/10 | 2,904.01 ms | 2,986.76 ms | 3,044,504 |
-| wikipedia-home-viewport | browserless | 10/10 | 1,065.76 ms | 1,115.78 ms | 102,380 |
-| python-home-full-page | browserless | 10/10 | 1,014.08 ms | 1,047.41 ms | 476,043 |
-| rust-home-full-page | browserless | 10/10 | 894.52 ms | 940.40 ms | 443,727 |
-| github-home-viewport | browserless | 10/10 | 2,581.90 ms | 2,898.82 ms | 119,773 |
-| mdn-web-docs-viewport | browserless | 10/10 | 1,640.68 ms | 1,732.80 ms | 118,990 |
-| vite-home-full-page | browserless | 10/10 | 1,906.24 ms | 2,026.66 ms | 2,781,385 |
+| wikipedia-home-viewport | viper | 10/10 | 441.74 ms | 460.32 ms | 103,137 |
+| python-home-full-page | viper | 10/10 | 625.99 ms | 832.22 ms | 428,702 |
+| rust-home-full-page | viper | 10/10 | 497.42 ms | 800.41 ms | 416,288 |
+| github-home-viewport | viper | 10/10 | 2,597.47 ms | 2,863.37 ms | 158,243 |
+| mdn-web-docs-viewport | viper | 10/10 | 1,302.03 ms | 1,335.35 ms | 113,802 |
+| vite-home-full-page | viper | 10/10 | 1,695.16 ms | 1,764.15 ms | 2,881,581 |
+| wikipedia-home-viewport | browserless | 10/10 | 1,000.30 ms | 1,099.90 ms | 102,380 |
+| python-home-full-page | browserless | 10/10 | 997.64 ms | 1,133.61 ms | 474,056 |
+| rust-home-full-page | browserless | 10/10 | 844.08 ms | 907.09 ms | 443,727 |
+| github-home-viewport | browserless | 10/10 | 2,610.70 ms | 2,913.16 ms | 121,338 |
+| mdn-web-docs-viewport | browserless | 10/10 | 1,583.52 ms | 1,649.50 ms | 118,989 |
+| vite-home-full-page | browserless | 10/10 | 1,653.81 ms | 1,792.43 ms | 2,781,327 |
 
 ## Method
 
-- Generated at `2026-08-11T19:21:57.390754+00:00`.
+- Generated at `2026-08-11T20:31:59.440564+00:00`.
 - Python `3.11.15` on `Linux-6.8.0-1062-azure-x86_64-with-glibc2.35` (`x86_64`).
 - `10` measured runs after `2` warm-up run(s) for every provider and scenario.
 - Providers were invoked sequentially from the same benchmark process and host.
