@@ -11,6 +11,12 @@ or Markdown into screenshots, PDFs, AVIF images, WebM/MP4/GIF video, hydrated HT
 structured metadata—through a strict JSON API you can run on your own machines
 and storage.
 
+> [!IMPORTANT]
+> ViperCapture OSS v0.1 is beta software. The engine and API are ready for
+> developer self-hosting and evaluation, but the public API may still change
+> before v1. The desktop and Android applications are also beta releases;
+> desktop packages are not yet code-signed.
+
 This project aims for practical workflow parity, not misleading one-for-one
 option naming. See the dated, source-linked [compatibility matrix](docs/compatibility.md)
 and run the [reproducible benchmark](benchmarks/README.md) on your workload.
@@ -158,8 +164,10 @@ artifacts accordingly.
 
 ## Native apps and agent skill
 
-The Tauri 2 desktop app lives in [`desktop/`](desktop) and the Android WebView
-renderer is documented in [docs/android.md](docs/android.md). The portable
+The beta Tauri 2 desktop app lives in [`desktop/`](desktop) and the beta Android
+WebView renderer is documented in [docs/android.md](docs/android.md). Download
+them from [GitHub Releases](https://github.com/Viperisuseful/ViperCapture/releases).
+The portable
 [`skills/vipercapture`](skills/vipercapture) skill works with Codex, Claude Code,
 and Cursor and includes a dependency-free client.
 

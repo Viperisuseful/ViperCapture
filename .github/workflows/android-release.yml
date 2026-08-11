@@ -143,6 +143,7 @@ jobs:
           gh release create "$RELEASE_TAG" artifacts/* \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
-            --title "ViperCapture Android ${RELEASE_TAG#android-v}" \
+            --prerelease \
+            --title "ViperCapture Android ${RELEASE_TAG#android-v} Beta" \
             --generate-notes \
-            --notes "Android 10 or newer. The APK is signed and ready for direct installation; the AAB is included for store distribution."
+            --notes "Beta release for Android 10 or newer. The APK is signed and ready for direct installation; the AAB is included for store distribution."

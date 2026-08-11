@@ -1,7 +1,8 @@
 # Android app
 
-ViperCapture Android is part of the isolated Tauri 2 project under `desktop/`.
-It does not change the hosted or self-hosted web application.
+ViperCapture Android is beta software. It is part of the isolated Tauri 2
+project under `desktop/`. It does not change the hosted or self-hosted web
+application.
 
 Android cannot run the packaged Python/Playwright desktop sidecar. The app
 therefore uses a private Tauri mobile plugin with an offscreen Android WebView.
