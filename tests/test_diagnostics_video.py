@@ -30,6 +30,7 @@ class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
         process = AsyncMock(return_value=(0, b""))
         with (
             patch("vipercapture.render_engine._ffmpeg_executable", return_value=Path("ffmpeg")),
+            patch("vipercapture.render_engine.ffmpeg_has_encoder", return_value=True),
             patch("vipercapture.render_engine._run_process", process),
         ):
             await _transcode_video(
@@ -37,6 +38,18 @@ class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
             )
         command = process.await_args.args[0]
         self.assertIn("pad=ceil(iw/2)*2:ceil(ih/2)*2", command)
+
+    async def test_mp4_requires_libx264(self):
+        with (
+            patch("vipercapture.render_engine._ffmpeg_executable", return_value=Path("ffmpeg")),
+            patch("vipercapture.render_engine.ffmpeg_has_encoder", return_value=False),
+            self.assertRaises(RenderError) as raised,
+        ):
+            await _transcode_video(
+                Path("capture.webm"), Path("capture.mp4"), OutputFormat.MP4
+            )
+        self.assertEqual(raised.exception.code, "video_encoder_unavailable")
+        self.assertFalse(raised.exception.retryable)
 
     def test_ffmpeg_discovery_checks_native_playwright_caches(self):
         with tempfile.TemporaryDirectory() as directory:

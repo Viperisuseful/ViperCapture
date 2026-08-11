@@ -3,6 +3,7 @@ import unittest
 from pydantic import ValidationError
 
 from vipercapture.render_contract import (
+    BrowserEngine,
     DevicePreset,
     LazyLoadMode,
     OutputFormat,
@@ -45,6 +46,74 @@ class RenderContractTest(unittest.TestCase):
         self.assertEqual(request.lazy_load, LazyLoadMode.THOROUGH)
         self.assertFalse(request.image.optimize_for_speed)
         self.assertFalse(request.cache)
+
+    def test_cross_browser_and_parity_options_are_validated(self):
+        request = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "engine": "firefox",
+                "output": "webp",
+                "image": {"width": 800, "height": 600, "quality": 82},
+            }
+        )
+        self.assertEqual(request.engine, BrowserEngine.FIREFOX)
+        self.assertEqual(request.image.width, 800)
+
+        shadow = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "output": "html",
+                "include_shadow_dom": True,
+            }
+        )
+        self.assertTrue(shadow.include_shadow_dom)
+
+        for payload in (
+            {"url": "https://example.com", "engine": "webkit", "output": "pdf"},
+            {
+                "url": "https://example.com",
+                "engine": "firefox",
+                "image": {"optimize_for_speed": True},
+            },
+            {"url": "https://example.com", "include_shadow_dom": True},
+        ):
+            with self.subTest(payload=payload), self.assertRaises(ValidationError):
+                RenderRequest.model_validate(payload)
+
+        for pdf in (
+            {"page_ranges": "1-51"},
+            {"page_ranges": "5-2"},
+            {
+                "paper_size": "A6",
+                "margins": {"top": 0, "right": 3, "bottom": 0, "left": 3},
+            },
+        ):
+            with self.subTest(pdf=pdf), self.assertRaises(ValidationError):
+                RenderRequest.model_validate(
+                    {"url": "https://example.com", "output": "pdf", "pdf": pdf}
+                )
+
+        bounded_ranges = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "output": "pdf",
+                "pdf": {"page_ranges": "1-25,20-50"},
+            }
+        )
+        self.assertEqual(bounded_ranges.pdf.page_ranges, "1-25,20-50")
+
+        single_page = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "output": "pdf",
+                "pdf": {
+                    "mode": "single_page",
+                    "paper_size": "A6",
+                    "margins": {"top": 0, "right": 3, "bottom": 0, "left": 3},
+                },
+            }
+        )
+        self.assertEqual(single_page.pdf.paper_size.value, "A6")
 
     def test_viewport_width_can_be_preserved_for_full_page_images(self):
         request = RenderRequest.model_validate(

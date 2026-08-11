@@ -84,6 +84,14 @@ class PlatformRouteTests(unittest.TestCase):
 
 
 class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_app_config_hides_mp4_without_libx264(self):
+        with (
+            patch("vipercapture.main.ffmpeg_has_encoder", return_value=False),
+            patch("vipercapture.main._gpu_config", AsyncMock(return_value={})),
+        ):
+            config = await main.app_config()
+        self.assertNotIn("mp4", config["output_formats"])
+
     async def test_invalid_baseline_is_rejected_before_persistence(self):
         control = SimpleNamespace(put_baseline=Mock(), audit=Mock())
         request = SimpleNamespace(
@@ -397,6 +405,29 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.headers["x-vipercapture-cache"], "hit")
         self.assertEqual(cache.get.await_count, 2)
         engine.render_image.assert_not_awaited()
+
+    async def test_browser_start_failure_releases_capture_slots(self):
+        original_slots = getattr(main.app.state, "capture_slots", None)
+        main.app.state.capture_slots = asyncio.Semaphore(1)
+        unavailable = RenderError(
+            "browser_unavailable", "Browser could not start.", 503, False
+        )
+        request = SimpleNamespace(is_disconnected=AsyncMock(return_value=False))
+        try:
+            with patch(
+                "vipercapture.main._browser_for",
+                AsyncMock(side_effect=unavailable),
+            ):
+                with self.assertRaises(RenderError):
+                    await main._render_response(RenderRequest(html="sync"), request)
+                await asyncio.wait_for(main.app.state.capture_slots.acquire(), 0.1)
+                main.app.state.capture_slots.release()
+                with self.assertRaises(RenderError):
+                    await main._render_async_image(RenderRequest(html="async"))
+                await asyncio.wait_for(main.app.state.capture_slots.acquire(), 0.1)
+                main.app.state.capture_slots.release()
+        finally:
+            main.app.state.capture_slots = original_slots
 
     async def test_signed_url_rejects_webhook_delivery(self):
         payload = RenderRequest.model_validate(

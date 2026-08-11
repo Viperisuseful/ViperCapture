@@ -8,9 +8,9 @@ The desktop bundle includes:
 
 - the React interface and Tauri Rust shell;
 - the FastAPI/Playwright renderer packaged with PyInstaller;
-- a platform-native Playwright Chromium headless shell;
+- platform-native Playwright Chromium, Firefox, and WebKit runtimes;
 - a random loopback port and per-launch bearer secret;
-- app-data capture storage and clean sidecar/Chromium shutdown.
+- app-data capture storage and clean sidecar/browser shutdown.
 
 The renderer listens only on `127.0.0.1`. Desktop API requests require the
 ephemeral secret passed directly from Rust, and the webview CSP permits only
@@ -41,7 +41,7 @@ npm run sidecar:build
 npm run tauri:dev
 ```
 
-`sidecar:build` downloads the current Playwright headless Chromium into the
+`sidecar:build` downloads the current Playwright Chromium, Firefox, and WebKit builds into the
 Tauri resources directory and creates the target-triple sidecar binary expected
 by Tauri.
 
@@ -68,8 +68,15 @@ The `Desktop Release` GitHub Actions workflow builds on each native runner:
 - Windows x64: NSIS setup executable and MSI
 - macOS Apple Silicon: DMG
 - macOS Intel: DMG
-- Linux x64: AppImage, Debian package, and RPM
+- Linux x64: Debian package with declared Chromium, Firefox, WebKit, and FFmpeg runtime dependencies
 
 The first release artifacts are unsigned. Windows SmartScreen and macOS
 Gatekeeper may warn until repository secrets for platform code-signing
 certificates are configured. Linux packages are also not repository-signed.
+The desktop workspace exposes every output family, browser selection, URL/HTML/
+Markdown input, resizing, extraction, PDF, video, diagnostics, deterministic
+rendering, slices, and the cleanup/network controls. Expert JSON overrides are
+deep-merged into the generated strict request for actions, assertions, cookies,
+proxies, profiles, viewport packs, certification, and newly added API fields.
+MP4 is shown only when the installed or packaged FFmpeg exposes the required
+libx264 encoder; WebM and GIF remain available through Playwright's runtime.

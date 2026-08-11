@@ -45,12 +45,9 @@ jobs:
             paths: desktop/src-tauri/target/release/bundle/dmg/*.dmg
           - name: Linux x64
             os: ubuntu-22.04
-            bundles: deb,rpm,appimage
+            bundles: deb
             artifact: linux-x64
-            paths: |
-              desktop/src-tauri/target/release/bundle/deb/*.deb
-              desktop/src-tauri/target/release/bundle/rpm/*.rpm
-              desktop/src-tauri/target/release/bundle/appimage/*.AppImage
+            paths: desktop/src-tauri/target/release/bundle/deb/*.deb
 
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -101,7 +98,7 @@ jobs:
 
       - name: Install Playwright system dependencies
         if: runner.os == 'Linux'
-        run: python -m playwright install-deps chromium
+        run: python -m playwright install-deps chromium firefox webkit
 
       - name: Build and test packaged renderer
         run: |

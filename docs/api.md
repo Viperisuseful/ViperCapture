@@ -9,12 +9,12 @@ All request models reject unknown fields. Exactly one of `url`, `html`, or
 
 | `output` | Response | Notes |
 | --- | --- | --- |
-| `png`, `jpeg`, `webp` | image | Full page, viewport, selector, clip, or multi-viewport |
+| `png`, `jpeg`, `webp`, `avif` | image | Full page, viewport, selector, clip, resize, slices, or multi-viewport |
 | `pdf` | PDF | Print or single-page mode, paper/orientation/margins |
 | `html` | UTF-8 HTML | Fully rendered document or article extraction |
 | `markdown` | UTF-8 Markdown | Document or readability-based article extraction |
 | `metadata` | JSON | Title, description, canonical URL, headings, links, images |
-| `webm` | video | 1–30 second post-preparation window, stationary or stepped scrolling |
+| `webm`, `mp4`, `gif` | video | 1–30 second post-preparation window, stationary or stepped scrolling |
 
 `viewports` accepts two or three named image viewports and returns a ZIP with a
 manifest. `diagnostics.bundle` returns a ZIP containing the normal artifact,
@@ -22,6 +22,18 @@ manifest, and optionally bounded console and network event files.
 WebM setup/navigation frames are trimmed from the recording with Playwright's
 FFmpeg runtime, and `duration_ms` reports the verified encoded duration rather
 than merely echoing the request.
+
+Set `engine` to `chromium` (default), `firefox`, or `webkit`. Browsers start on
+first use and each request still receives a fresh isolated context. PDF and
+`image.optimize_for_speed` are Chromium-only; unsupported combinations fail
+validation instead of silently changing engines. WebP and AVIF on Firefox or
+WebKit are captured losslessly and converted by the bounded image pipeline.
+
+`image.width` and `image.height` constrain the final image while preserving its
+aspect ratio. HTML and Markdown requests may set `include_shadow_dom` to embed
+open shadow roots as declarative shadow DOM. PDF options include A0–A6, Legal,
+Letter, and Tabloid paper, optional page ranges, and bounded header/footer
+templates. Metadata includes icons, loaded fonts, forms, and JSON-LD samples.
 
 ## Browser preparation
 

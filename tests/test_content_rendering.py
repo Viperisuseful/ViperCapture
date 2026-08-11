@@ -133,6 +133,56 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(markdown.media_type, "text/markdown; charset=utf-8")
         self.assertIn(b"Hello document", markdown.body)
 
+    async def test_open_shadow_dom_is_serialized(self):
+        page = FakePage()
+        page.content = AsyncMock(side_effect=AssertionError("content must not load"))
+        page.evaluate = AsyncMock(
+            side_effect=[
+                len(page.html.encode("utf-8")),
+                len(page.html.encode("utf-8")) + 100,
+                '<html><body><x-card><template shadowrootmode="open"><p>Inside</p></template></x-card></body></html>',
+            ]
+        )
+        artifact = await render_document_output(
+            page,
+            RenderRequest.model_validate(
+                {
+                    "url": "https://example.com",
+                    "output": "html",
+                    "include_shadow_dom": True,
+                }
+            ),
+            LIMITS,
+        )
+        self.assertIn(b'template shadowrootmode="open"', artifact.body)
+        self.assertTrue(
+            all(
+                "new XMLSerializer().serializeToString(document.doctype)" in call.args[0]
+                for call in (page.evaluate.await_args_list[0], page.evaluate.await_args_list[2])
+            )
+        )
+        page.content.assert_not_awaited()
+
+    async def test_open_shadow_dom_is_bounded_before_serialization(self):
+        page = FakePage()
+        page.content = AsyncMock(side_effect=AssertionError("content must not load"))
+        page.evaluate = AsyncMock(side_effect=[50, 101])
+        with self.assertRaises(RenderError) as raised:
+            await render_document_output(
+                page,
+                RenderRequest.model_validate(
+                    {
+                        "url": "https://example.com",
+                        "output": "html",
+                        "include_shadow_dom": True,
+                    }
+                ),
+                RenderLimits(output_bytes=100),
+            )
+        self.assertEqual(raised.exception.code, "output_too_large")
+        self.assertEqual(page.evaluate.await_count, 2)
+        page.content.assert_not_awaited()
+
     async def test_markdown_hydrated_dom_size_is_bounded(self):
         page = FakePage(html="x" * (5 * 1024 * 1024 + 1))
         with self.assertRaises(RenderError) as raised:
@@ -200,6 +250,26 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(print_page.pdf_options["format"], "A4")
         self.assertEqual(print_page.pdf_options["page_ranges"], "1-51")
         self.assertEqual(print_page.emulated_media, "print")
+
+        custom_print = FakePage()
+        await render_document_output(
+            custom_print,
+            RenderRequest.model_validate(
+                {
+                    "url": "https://example.com",
+                    "output": "pdf",
+                    "pdf": {
+                        "paper_size": "Legal",
+                        "page_ranges": "2-3",
+                        "header_template": '<span class="title"></span>',
+                    },
+                }
+            ),
+            LIMITS,
+        )
+        self.assertEqual(custom_print.pdf_options["format"], "Legal")
+        self.assertEqual(custom_print.pdf_options["page_ranges"], "2-3")
+        self.assertTrue(custom_print.pdf_options["display_header_footer"])
 
         single_page = FakePage()
         single = await render_document_output(
@@ -319,6 +389,28 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
             LIMITS,
         )
         self.assertEqual(fragmented.metadata["pages"], MAX_PRINT_PAGES)
+
+    async def test_pdf_range_beyond_document_is_non_retryable(self):
+        page = FakePage()
+        page.pdf = AsyncMock(
+            side_effect=PlaywrightError(
+                "Page.pdf: Protocol error (Page.printToPDF): Page range exceeds page count"
+            )
+        )
+        with self.assertRaises(RenderError) as raised:
+            await render_document_output(
+                page,
+                RenderRequest.model_validate(
+                    {
+                        "url": "https://example.com",
+                        "output": "pdf",
+                        "pdf": {"page_ranges": "10"},
+                    }
+                ),
+                LIMITS,
+            )
+        self.assertEqual(raised.exception.code, "pdf_page_range_invalid")
+        self.assertFalse(raised.exception.retryable)
 
     def test_pdf_costs_two_credits(self):
         request = RenderRequest.model_validate({"html": "Hello", "output": "pdf"})

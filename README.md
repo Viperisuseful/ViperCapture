@@ -17,6 +17,7 @@ and run the [reproducible benchmark](benchmarks/README.md) on your workload.
 
 ## What ships
 
+- Chromium, Firefox, and WebKit rendering with lazy browser startup
 - PNG, JPEG, WebP, AVIF, PDF, HTML, Markdown, metadata, and WebM/MP4/GIF output
 - URL, raw HTML, and Markdown input; full-page, viewport, element, clip, and
   multi-viewport ZIP captures
@@ -60,7 +61,7 @@ cd ViperCapture
 python launch.py
 ```
 
-The launcher creates a virtual environment, installs Chromium, starts the API,
+The launcher creates a virtual environment, installs Chromium, Firefox, and WebKit, starts the API,
 and opens `http://127.0.0.1:8000`.
 
 Or use Docker:
@@ -166,7 +167,7 @@ and Cursor and includes a dependency-free client.
 
 ```bash
 python -m pip install -r requirements.txt
-python -m playwright install chromium
+python -m playwright install chromium firefox webkit
 python -m unittest -v
 npm ci --prefix frontend && npm run lint --prefix frontend && npm run build --prefix frontend
 ```

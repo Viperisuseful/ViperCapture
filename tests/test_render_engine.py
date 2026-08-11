@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from playwright.async_api import Error as PlaywrightError
+from PIL import Image
 
 from vipercapture.render_contract import LazyLoadMode, OutputFormat, RenderRequest
 from vipercapture.render_engine import (
@@ -19,6 +20,7 @@ from vipercapture.render_engine import (
     RenderEngine,
     RenderLimits,
     _encode_avif,
+    _postprocess_image,
     _resolve_public_origin,
     _run_process,
     capture_clipped_image,
@@ -31,6 +33,17 @@ from vipercapture.render_engine import (
     routed_headers,
 )
 from vipercapture.render_errors import RenderError
+
+
+class ImageParityTest(unittest.TestCase):
+    def test_resize_preserves_aspect_ratio_and_converts_format(self):
+        source = io.BytesIO()
+        Image.new("RGBA", (400, 200), (255, 0, 0, 128)).save(source, format="PNG")
+        body, width, height = _postprocess_image(
+            source.getvalue(), OutputFormat.JPEG, 80, 100, 100
+        )
+        self.assertEqual((width, height), (100, 50))
+        self.assertTrue(body.startswith(b"\xff\xd8"))
 
 
 class FakeNavigation:
@@ -207,6 +220,35 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
                     max_pixels=2_073_600,
                 ),
             )
+        self.assertEqual(
+            events,
+            ["stabilize", "measure", "stabilize", "measure", "capture"],
+        )
+
+    async def test_firefox_animations_stabilize_before_full_page_measurement(self):
+        events = []
+
+        class AnimatedPage(FakePage):
+            async def evaluate(self, script, *_args):
+                if "document.getAnimations" in script:
+                    events.append("stabilize")
+                    return None
+                if "width:" in script and "height:" in script:
+                    events.append("measure")
+                    return {"width": 640, "height": 480}
+                return 480
+
+            async def screenshot(self, **_options):
+                events.append("capture")
+                return b"image"
+
+        await RenderEngine(hosted=False).render_image(
+            FakeBrowser(FakeContext(AnimatedPage())),
+            RenderRequest(
+                url="https://example.com", engine="firefox", full_page=True
+            ),
+            RenderLimits(max_width=1920, max_height=1080, max_pixels=2_073_600),
+        )
         self.assertEqual(
             events,
             ["stabilize", "measure", "stabilize", "measure", "capture"],
@@ -833,6 +875,7 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
         request = RenderRequest.model_validate(
             {
                 "url": "https://example.com",
+                "engine": "firefox",
                 "full_page": False,
                 "environment": {
                     "device": "pixel_7",
@@ -866,11 +909,94 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(page.styles, ["nav { display: none }"])
         self.assertEqual(browser.context_options["user_agent"], "Pixel Test")
+        self.assertNotIn("is_mobile", browser.context_options)
+        self.assertTrue(browser.context_options["has_touch"])
         self.assertEqual(browser.context_options["color_scheme"], "dark")
         self.assertEqual(browser.context_options["timezone_id"], "Europe/Paris")
         self.assertIn("Linux armv8l", browser.context.init_scripts[0])
         self.assertEqual(clipped.await_args.kwargs["clip"]["x"], 5)
         self.assertEqual(artifact.metadata["width"], 320)
+
+    async def test_resize_rejects_sources_above_pillow_pixel_ceiling(self):
+        page = FakePage()
+        request = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "full_page": False,
+                "viewport": {"width": 5, "height": 5},
+                "image": {"width": 1},
+            }
+        )
+        with patch.object(Image, "MAX_IMAGE_PIXELS", 10):
+            with self.assertRaises(RenderError) as raised:
+                await RenderEngine(hosted=False).render(
+                    FakeBrowser(FakeContext(page)),
+                    request,
+                    RenderLimits(max_width=100, max_height=100, max_pixels=100),
+                )
+        self.assertEqual(raised.exception.code, "image_resize_source_too_large")
+
+    async def test_converted_webp_rejects_sources_above_pillow_pixel_ceiling(self):
+        payloads = [
+            {
+                "url": "https://example.com",
+                "engine": "firefox",
+                "output": "webp",
+                "full_page": False,
+                "lazy_load": "none",
+                "viewport": {"width": 5, "height": 5},
+            },
+            {
+                "url": "https://example.com",
+                "engine": "firefox",
+                "output": "webp",
+                "full_page": True,
+                "lazy_load": "none",
+                "viewport": {"width": 5, "height": 5},
+                "slices": {"height": 100},
+            },
+        ]
+        for payload in payloads:
+            with self.subTest(sliced="slices" in payload):
+                page = FakePage()
+                request = RenderRequest.model_validate(payload)
+                with patch.object(Image, "MAX_IMAGE_PIXELS", 10):
+                    with self.assertRaises(RenderError) as raised:
+                        await RenderEngine(hosted=False).render(
+                            FakeBrowser(FakeContext(page)),
+                            request,
+                            RenderLimits(
+                                max_width=1_000,
+                                max_height=1_000,
+                                max_pixels=1_000_000,
+                            ),
+                        )
+                self.assertEqual(
+                    raised.exception.code, "image_conversion_source_too_large"
+                )
+
+    async def test_resize_uses_a_lossless_screenshot_intermediate(self):
+        page = FakePage()
+        request = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "output": "jpeg",
+                "full_page": False,
+                "viewport": {"width": 320, "height": 180},
+                "image": {"width": 160, "quality": 40},
+            }
+        )
+        with patch(
+            "vipercapture.render_engine._postprocess_image",
+            return_value=(b"jpeg", 160, 90),
+        ):
+            await RenderEngine(hosted=False).render(
+                FakeBrowser(FakeContext(page)),
+                request,
+                RenderLimits(max_width=1000, max_height=1000, max_pixels=1_000_000),
+            )
+        self.assertEqual(page.screenshot_options["type"], "png")
+        self.assertNotIn("quality", page.screenshot_options)
 
     async def test_empty_live_request_match_set_is_preserved(self):
         matched: set[str] = set()
@@ -977,7 +1103,10 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_metadata_output_is_bounded_json(self):
         class MetadataPage:
-            async def evaluate(self, _script, _options):
+            script = ""
+
+            async def evaluate(self, script, _options):
+                self.script = script
                 return {
                     "title": "Example",
                     "description": "Description",
@@ -996,11 +1125,16 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
                     },
                 }
 
-        artifact = await render_metadata(MetadataPage())
+        page = MetadataPage()
+        artifact = await render_metadata(page)
         self.assertEqual(artifact.media_type, "application/json")
         document = json.loads(artifact.body)
         self.assertEqual(document["title"], "Example")
         self.assertEqual(document["images"]["total"], 1)
+        self.assertIn("for (const item of items)", page.script)
+        self.assertNotIn("[...document.querySelectorAll", page.script)
+        self.assertNotIn("[...document.images]", page.script)
+        self.assertNotIn("[...document.forms]", page.script)
 
     async def test_markdown_input_conversion_is_off_thread_and_bounded(self):
         request = RenderRequest.model_validate(

@@ -10,12 +10,13 @@ remain separate.
 
 Use Python 3.11 or newer, then run `python launch.py`. This is the supported
 setup and startup method. The launcher creates a virtual environment, installs
-Playwright Chromium, starts the application, and opens the local interface.
+Playwright Chromium, Firefox, and WebKit, starts the application, and opens the local interface.
 
 ## Production boundaries
 
 - Put hosted mode behind a rate-limited reverse proxy.
-- Run one application process; every process owns a Chromium process tree.
+- Run one application process; every process owns one Chromium process tree and
+  starts Firefox or WebKit lazily when requested.
 - Keep `VIPERCAPTURE_MAX_CONCURRENCY=1` until memory and swap pressure are measured.
 - Apply container or systemd memory, PID, and CPU limits.
 - Enforce network egress rules that block private ranges and cloud metadata endpoints.

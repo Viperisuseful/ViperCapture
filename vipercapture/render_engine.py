@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import socket
+import subprocess
 import tempfile
 import time
 import zipfile
@@ -21,6 +22,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from fnmatch import fnmatchcase
+from functools import lru_cache
 from pathlib import Path
 from typing import Awaitable, Callable
 from urllib.parse import urlsplit, urlunsplit
@@ -34,6 +36,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from PIL import Image
 
 from .render_contract import (
+    BrowserEngine,
     ActionType,
     DevicePreset,
     LazyLoadMode,
@@ -155,6 +158,20 @@ def _ffmpeg_executable() -> Path:
     )
 
 
+@lru_cache(maxsize=8)
+def ffmpeg_has_encoder(name: str) -> bool:
+    try:
+        result = subprocess.run(
+            [str(_ffmpeg_executable()), "-hide_banner", "-encoders"],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, RenderError):
+        return False
+    return result.returncode == 0 and name.encode() in result.stdout
+
+
 def _timestamp_ms(value: str) -> int:
     hours, minutes, seconds = value.split(":")
     return round(
@@ -254,6 +271,13 @@ async def _trim_webm(
 async def _transcode_video(source: Path, destination: Path, output: OutputFormat) -> None:
     ffmpeg = _ffmpeg_executable()
     if output is OutputFormat.MP4:
+        if not await _settled_thread(ffmpeg_has_encoder, "libx264"):
+            raise RenderError(
+                "video_encoder_unavailable",
+                "This FFmpeg build cannot encode MP4 with libx264.",
+                503,
+                False,
+            )
         encoding = [
             "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-c:v", "libx264",
             "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
@@ -292,8 +316,29 @@ def _write_diagnostic_zip(entries: list[tuple[str, bytes]]) -> bytes:
 def _convert_image(body: bytes, output: OutputFormat, quality: int | None) -> bytes:
     destination = io.BytesIO()
     with Image.open(io.BytesIO(body)) as image:
+        if output is OutputFormat.JPEG and image.mode not in {"RGB", "L"}:
+            image = image.convert("RGB")
         image.save(destination, format=output.value.upper(), quality=quality or 80)
     return destination.getvalue()
+
+
+def _postprocess_image(
+    body: bytes,
+    output: OutputFormat,
+    quality: int | None,
+    width: int | None,
+    height: int | None,
+) -> tuple[bytes, int, int]:
+    destination = io.BytesIO()
+    with Image.open(io.BytesIO(body)) as image:
+        if width is not None or height is not None:
+            target_width = width or max(1, round(image.width * (height or image.height) / image.height))
+            target_height = height or max(1, round(image.height * (width or image.width) / image.width))
+            image.thumbnail((target_width, target_height), Image.Resampling.LANCZOS)
+        if output is OutputFormat.JPEG and image.mode not in {"RGB", "L"}:
+            image = image.convert("RGB")
+        image.save(destination, format=output.value.upper(), quality=quality or 80)
+        return destination.getvalue(), image.width, image.height
 
 
 async def _encode_avif(body: bytes, quality: int | None) -> bytes:
@@ -972,8 +1017,19 @@ async def capture_clipped_image(
     clip: dict[str, float],
     quality: int | None,
     transparent: bool,
+    use_cdp: bool = True,
 ) -> bytes:
     """Capture a tall explicit clip beyond the visible viewport."""
+    if not use_cdp:
+        options: dict[str, object] = {
+            "type": output.value,
+            "clip": {key: value for key, value in clip.items() if key != "scale"},
+            "animations": "disabled",
+            "omit_background": transparent,
+        }
+        if output is OutputFormat.JPEG:
+            options["quality"] = quality if quality is not None else 80
+        return await page.screenshot(**options)
     session = await page.context.new_cdp_session(page)
     try:
         with suppress(Exception):
@@ -1011,9 +1067,18 @@ async def render_metadata(page: Page) -> RenderArtifact:
                 typeof value === "string" ? value.trim().slice(0, limit) : null;
             const attr = (selector, name = "content") =>
                 clean(document.querySelector(selector)?.getAttribute(name));
+            const sample = (items, limit, transform) => {
+                const result = [];
+                for (const item of items) {
+                    const value = transform(item);
+                    if (value) result.push(value);
+                    if (result.length >= limit) break;
+                }
+                return result;
+            };
             const pairs = (attribute, keyPrefix) => {
                 const result = {};
-                for (const element of [...document.querySelectorAll(`meta[${attribute}]`)]) {
+                for (const element of document.querySelectorAll(`meta[${attribute}]`)) {
                     const key = clean(element.getAttribute(attribute), 128);
                     const value = clean(element.getAttribute("content"));
                     if (key && key.startsWith(keyPrefix) && value && !(key in result)) result[key] = value;
@@ -1021,8 +1086,8 @@ async def render_metadata(page: Page) -> RenderArtifact:
                 }
                 return result;
             };
-            const links = [...document.querySelectorAll("a[href]")];
-            const images = [...document.images];
+            const links = document.querySelectorAll("a[href]");
+            const images = document.images;
             return {
                 title: clean(document.title),
                 description: attr('meta[name="description"]'),
@@ -1032,37 +1097,59 @@ async def render_metadata(page: Page) -> RenderArtifact:
                 theme_color: attr('meta[name="theme-color"]'),
                 open_graph: pairs("property", "og:"),
                 twitter: pairs("name", "twitter:"),
-                icons: [...document.querySelectorAll('link[rel~="icon"][href]')]
-                    .slice(0, 16)
-                    .map((element) => ({
+                fonts: sample(document.fonts || [], maxItems, (font) => ({
+                            family: clean(font.family, 256),
+                            style: clean(font.style, 64),
+                            weight: clean(font.weight, 64),
+                            status: clean(font.status, 32)
+                        })),
+                icons: sample(
+                    document.querySelectorAll('link[rel~="icon"][href]'),
+                    16,
+                    (element) => ({
                         rel: clean(element.getAttribute("rel"), 64),
                         href: clean(element.href),
                         sizes: clean(element.getAttribute("sizes"), 64),
                         type: clean(element.getAttribute("type"), 128)
-                    })),
-                headings: [...document.querySelectorAll("h1,h2,h3,h4,h5,h6")]
-                    .slice(0, maxItems)
-                    .map((element) => ({
+                    })
+                ),
+                headings: sample(
+                    document.querySelectorAll("h1,h2,h3,h4,h5,h6"),
+                    maxItems,
+                    (element) => {
+                        const text = clean(element.textContent);
+                        return text ? {
                         level: Number(element.tagName.slice(1)),
-                        text: clean(element.textContent)
-                    }))
-                    .filter((item) => item.text),
+                            text
+                        } : null;
+                    }
+                ),
                 links: {
                     total: links.length,
-                    sample: links.slice(0, maxItems).map((element) => ({
+                    sample: sample(links, maxItems, (element) => ({
                         text: clean(element.textContent, 512),
                         href: clean(element.href)
                     }))
                 },
                 images: {
                     total: images.length,
-                    sample: images.slice(0, maxItems).map((element) => ({
+                    sample: sample(images, maxItems, (element) => ({
                         src: clean(element.currentSrc || element.src),
                         alt: clean(element.alt, 512),
                         width: Number(element.naturalWidth || element.width || 0),
                         height: Number(element.naturalHeight || element.height || 0)
                     }))
-                }
+                },
+                forms: sample(document.forms, maxItems, (form) => ({
+                    action: clean(form.action),
+                    method: clean(form.method, 16),
+                    controls: form.elements.length
+                })),
+                structured_data: sample(
+                    document.querySelectorAll('script[type="application/ld+json"]'),
+                    16,
+                    (element) => clean(element.textContent)
+                )
             };
         }""",
         {"maxItems": MAX_METADATA_ITEMS, "maxChars": MAX_METADATA_VALUE_CHARS},
@@ -1476,6 +1563,8 @@ class RenderEngine:
                 if descriptor_name:
                     context_options.update(self.device_descriptors.get(descriptor_name, {}))
                     context_options.pop("default_browser_type", None)
+                    if request.engine.value == BrowserEngine.FIREFOX.value:
+                        context_options.pop("is_mobile", None)
                 context_options.update(
                     {
                         "viewport": {
@@ -1829,16 +1918,22 @@ class RenderEngine:
                     await self.cleanup_hooks.apply(page, request.cleanup)
                 if self.challenge_checker:
                     await self.challenge_checker(page, request.proceed_on_captcha, navigation_status)
-                uses_cdp_capture = (
-                    request.output is OutputFormat.WEBP
+                resizing_image = (
+                    request.image.width is not None
+                    or request.image.height is not None
+                )
+                uses_cdp_capture = request.engine.value == BrowserEngine.CHROMIUM.value and (
+                    (request.output is OutputFormat.WEBP and not resizing_image)
                     or (
                         request.output is OutputFormat.PNG
                         and request.image.optimize_for_speed
                     )
-                    or request.clip is not None
-                    or (request.full_page and request.selector is None)
                 )
-                if uses_cdp_capture and request.full_page:
+                stabilizes_full_page = (
+                    request.full_page
+                    and request.selector is None
+                )
+                if stabilizes_full_page:
                     with suppress(Exception):
                         await page.evaluate(STABILIZE_ANIMATIONS_SCRIPT)
                 if request.full_page:
@@ -2007,17 +2102,24 @@ class RenderEngine:
                     return finalized
 
                 screenshot_output = (
-                    OutputFormat.PNG if request.output is OutputFormat.AVIF else request.output
+                    OutputFormat.PNG
+                    if resizing_image
+                    or request.output is OutputFormat.AVIF
+                    or (
+                        request.engine.value != BrowserEngine.CHROMIUM.value
+                        and request.output is OutputFormat.WEBP
+                    )
+                    else request.output
                 )
                 screenshot_options: dict[str, object] = {
                     "type": screenshot_output.value,
                     "animations": "disabled",
                     "omit_background": request.image.transparent_background,
                 }
-                if request.image.quality is not None and request.output is not OutputFormat.AVIF:
+                if request.image.quality is not None and screenshot_output is OutputFormat.JPEG:
                     screenshot_options["quality"] = request.image.quality
 
-                if uses_cdp_capture:
+                if uses_cdp_capture or stabilizes_full_page:
                     with suppress(Exception):
                         await page.evaluate(STABILIZE_ANIMATIONS_SCRIPT)
 
@@ -2113,6 +2215,39 @@ class RenderEngine:
                             )
                     else:
                         width, height = request.viewport.width, request.viewport.height
+                pillow_pixel_limit = (
+                    int(Image.MAX_IMAGE_PIXELS * 2)
+                    if Image.MAX_IMAGE_PIXELS is not None
+                    else None
+                )
+                pillow_source_height = (
+                    min(height, request.slices.height)
+                    if request.slices is not None
+                    else height
+                )
+                uses_pillow_conversion = (
+                    resizing_image or screenshot_output is not request.output
+                )
+                if (
+                    uses_pillow_conversion
+                    and pillow_pixel_limit is not None
+                    and math.ceil(width * request.viewport.device_scale_factor)
+                    * math.ceil(
+                        pillow_source_height * request.viewport.device_scale_factor
+                    )
+                    > pillow_pixel_limit
+                ):
+                    raise RenderError(
+                        (
+                            "image_resize_source_too_large"
+                            if resizing_image
+                            else "image_conversion_source_too_large"
+                        ),
+                        "The source image is too large for safe image processing.",
+                        413,
+                        False,
+                        {"max_source_pixels": pillow_pixel_limit},
+                    )
                 if request.slices is not None:
                     slice_entries: list[tuple[str, bytes]] = []
                     slice_manifest = []
@@ -2132,11 +2267,23 @@ class RenderEngine:
                             },
                             quality=request.image.quality,
                             transparent=request.image.transparent_background,
+                            use_cdp=request.engine.value == BrowserEngine.CHROMIUM.value,
                         )
-                        if request.output is OutputFormat.AVIF:
-                            part = await _encode_avif(
-                                part, request.image.quality
-                            )
+                        if request.output in {OutputFormat.AVIF, OutputFormat.WEBP} and screenshot_output is OutputFormat.PNG:
+                            try:
+                                part = await _settled_thread(
+                                    _convert_image,
+                                    part,
+                                    request.output,
+                                    request.image.quality,
+                                )
+                            except Exception as exc:
+                                raise RenderError(
+                                    "image_encoder_unavailable",
+                                    f"This Pillow build cannot encode {request.output.value.upper()}.",
+                                    503,
+                                    False,
+                                ) from exc
                         total_bytes += len(part)
                         if total_bytes > limits.output_bytes:
                             raise RenderError("output_too_large", "The rendered slices exceed the output limit.", 413, False)
@@ -2194,10 +2341,7 @@ class RenderEngine:
                     )
                     await self._persist_profile(request, context)
                     return finalized
-                if request.output is OutputFormat.WEBP or (
-                    request.output is OutputFormat.PNG
-                    and request.image.optimize_for_speed
-                ):
+                if uses_cdp_capture:
                     scroll = {"x": 0, "y": 0}
                     if not request.full_page and not request.clip:
                         measured_scroll = await page.evaluate(
@@ -2260,6 +2404,7 @@ class RenderEngine:
                         },
                         quality=request.image.quality,
                         transparent=request.image.transparent_background,
+                        use_cdp=request.engine.value == BrowserEngine.CHROMIUM.value,
                     )
                 elif request.full_page and request.preserve_viewport_width:
                     image = await capture_clipped_image(
@@ -2274,8 +2419,9 @@ class RenderEngine:
                         },
                         quality=request.image.quality,
                         transparent=request.image.transparent_background,
+                        use_cdp=request.engine.value == BrowserEngine.CHROMIUM.value,
                     )
-                elif request.full_page:
+                elif request.full_page and request.engine.value == BrowserEngine.CHROMIUM.value:
                     image = await capture_clipped_image(
                         page,
                         output=screenshot_output,
@@ -2297,8 +2443,34 @@ class RenderEngine:
 
                 if not image:
                     raise RenderError("empty_output", "The renderer produced an empty image.", 502, True)
-                if request.output is OutputFormat.AVIF:
-                    image = await _encode_avif(image, request.image.quality)
+                if (
+                    request.output is OutputFormat.AVIF
+                    or request.image.width is not None
+                    or request.image.height is not None
+                    or (
+                        request.output is OutputFormat.WEBP
+                        and screenshot_output is OutputFormat.PNG
+                    )
+                ):
+                    try:
+                        image, pixel_width, pixel_height = await _settled_thread(
+                            _postprocess_image,
+                            image,
+                            request.output,
+                            request.image.quality,
+                            request.image.width,
+                            request.image.height,
+                        )
+                    except Exception as exc:
+                        raise RenderError(
+                            "image_encoder_unavailable",
+                            f"This Pillow build cannot encode {request.output.value.upper()}.",
+                            503,
+                            False,
+                        ) from exc
+                    ensure_dimensions(pixel_width, pixel_height, 1, limits)
+                    width = pixel_width / request.viewport.device_scale_factor
+                    height = pixel_height / request.viewport.device_scale_factor
                 if len(image) > limits.output_bytes:
                     raise RenderError("output_too_large", "The rendered image exceeds the output limit.", 413, False)
                 artifact = RenderArtifact(
