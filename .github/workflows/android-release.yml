@@ -6,7 +6,7 @@ on:
       tag:
         description: Release tag
         required: true
-        default: android-v0.1.6
+        default: android-v0.1.8
       publish:
         description: Publish a GitHub release after the build passes
         required: true
@@ -27,6 +27,15 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Validate release version
+        env:
+          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.tag }}
+        run: python desktop/scripts/check_release_version.py android
 
       - uses: actions/setup-node@v4
         with:
