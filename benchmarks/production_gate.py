@@ -305,6 +305,40 @@ def _write(report: dict[str, Any], output: Path | None) -> None:
     sys.stdout.write(serialized)
 
 
+async def _restart_recovery_gate(
+    port: int,
+    data_dir: Path,
+    output: Path | None,
+    generated_at: str,
+) -> int:
+    diagnostics = {
+        "data_dir": str(data_dir),
+        "server_log": str(data_dir / "operational-server.log"),
+    }
+    try:
+        result = await restart_recovery(port, data_dir)
+    except Exception as exc:
+        report = {
+            "schema_version": 1,
+            "generated_at": generated_at,
+            "gate": "restart-recovery",
+            "result": None,
+            "error": {"type": type(exc).__name__, "message": str(exc)},
+            "diagnostics": diagnostics,
+        }
+        _write(report, output)
+        return 1
+    report = {
+        "schema_version": 1,
+        "generated_at": generated_at,
+        "gate": "restart-recovery",
+        "result": result,
+        "diagnostics": diagnostics,
+    }
+    _write(report, output)
+    return 0
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -355,13 +389,20 @@ async def main() -> int:
 
     if args.data_dir:
         args.data_dir.mkdir(parents=True, exist_ok=True)
-        result = await restart_recovery(args.port, args.data_dir)
+        return await _restart_recovery_gate(
+            args.port, args.data_dir, args.output, generated_at
+        )
+    if args.output:
+        data_dir = args.output.parent / f"{args.output.stem}-data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        return await _restart_recovery_gate(
+            args.port, data_dir, args.output, generated_at
+        )
     else:
         with tempfile.TemporaryDirectory(prefix="vipercapture-recovery-") as directory:
-            result = await restart_recovery(args.port, Path(directory))
-    report = {"schema_version": 1, "generated_at": generated_at, "gate": "restart-recovery", "result": result}
-    _write(report, args.output)
-    return 0
+            return await _restart_recovery_gate(
+                args.port, Path(directory), args.output, generated_at
+            )
 
 
 if __name__ == "__main__":

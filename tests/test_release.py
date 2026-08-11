@@ -42,7 +42,7 @@ class ReleaseVersionTests(unittest.TestCase):
 
 
 class ChecksumTests(unittest.TestCase):
-    def test_checksum_script_covers_nested_artifacts_but_not_itself(self):
+    def test_checksum_script_uses_flat_published_asset_names(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "nested").mkdir()
@@ -56,8 +56,23 @@ class ChecksumTests(unittest.TestCase):
             checksum = (root / "SHA256SUMS.txt").read_text("ascii")
             self.assertEqual(
                 checksum,
-                f"{hashlib.sha256(artifact.read_bytes()).hexdigest()}  nested/artifact.bin\n",
+                f"{hashlib.sha256(artifact.read_bytes()).hexdigest()}  artifact.bin\n",
             )
+
+    def test_checksum_script_rejects_duplicate_published_asset_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for nested in ("one", "two"):
+                (root / nested).mkdir()
+                (root / nested / "artifact.bin").write_bytes(nested.encode("ascii"))
+            completed = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "write_checksums.py"), str(root)],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("duplicate release asset name", completed.stderr)
 
     def test_repository_bundles_are_reproducible(self):
         with tempfile.TemporaryDirectory() as directory:

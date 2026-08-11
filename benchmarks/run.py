@@ -44,14 +44,34 @@ async def render(client: httpx.AsyncClient, provider: str, endpoint: str, scenar
         key = os.environ.get("SCREENSHOTONE_ACCESS_KEY")
         if not key:
             raise RuntimeError("SCREENSHOTONE_ACCESS_KEY is required")
+        wait = scenario.get("wait_for", {})
+        if wait.get("text"):
+            raise ValueError(
+                "ScreenshotOne benchmark adapter cannot preserve wait_for.text"
+            )
+        wait_event = {
+            "domcontentloaded": "domcontentloaded",
+            "load": "load",
+            "networkidle": "networkidle0",
+        }.get(wait.get("event", "load"))
+        if wait_event is None:
+            raise ValueError(f"unsupported wait_for.event: {wait.get('event')}")
         payload = {
             "access_key": key,
             "url": scenario["url"],
             "format": scenario.get("output", "png"),
             "viewport_width": scenario["viewport"]["width"],
             "viewport_height": scenario["viewport"]["height"],
+            "device_scale_factor": scenario["viewport"].get("device_scale_factor", 1),
             "full_page": scenario.get("full_page", True),
+            "wait_until": wait_event,
+            "timeout": wait.get("timeout_ms", 15_000) / 1_000,
         }
+        if wait.get("delay_ms"):
+            payload["delay"] = wait["delay_ms"] / 1_000
+        if wait.get("selector"):
+            payload["wait_for_selector"] = wait["selector"]
+            payload["error_on_selector_not_found"] = True
         response = await client.post(endpoint, json=payload)
         response.raise_for_status()
         return response.content
@@ -59,13 +79,38 @@ async def render(client: httpx.AsyncClient, provider: str, endpoint: str, scenar
         key = os.environ.get("URLBOX_SECRET")
         if not key:
             raise RuntimeError("URLBOX_SECRET is required")
+        device_scale_factor = scenario["viewport"].get("device_scale_factor", 1)
+        if device_scale_factor not in {1, 2}:
+            raise ValueError(
+                "Urlbox benchmark adapter supports device_scale_factor 1 or 2"
+            )
+        wait = scenario.get("wait_for", {})
+        if wait.get("text"):
+            raise ValueError("Urlbox benchmark adapter cannot preserve wait_for.text")
+        wait_event = {
+            "domcontentloaded": "domloaded",
+            "load": "loaded",
+            "networkidle": "requestsfinished",
+        }.get(wait.get("event", "load"))
+        if wait_event is None:
+            raise ValueError(f"unsupported wait_for.event: {wait.get('event')}")
         payload = {
             "url": scenario["url"],
             "format": scenario.get("output", "png"),
             "width": scenario["viewport"]["width"],
             "height": scenario["viewport"]["height"],
+            "retina": device_scale_factor == 2,
             "full_page": scenario.get("full_page", True),
+            "wait_until": wait_event,
+            "timeout": wait.get("timeout_ms", 15_000),
         }
+        if wait.get("delay_ms"):
+            payload["delay"] = wait["delay_ms"]
+        if wait.get("selector"):
+            payload["wait_for"] = wait["selector"]
+            payload["wait_for_state"] = "visible"
+            payload["wait_timeout"] = wait.get("timeout_ms", 15_000)
+            payload["fail_if_selector_missing"] = True
         response = await client.post(endpoint, json=payload, headers={"Authorization": f"Bearer {key}"})
         response.raise_for_status()
         result = response.json()
@@ -91,6 +136,9 @@ async def render(client: httpx.AsyncClient, provider: str, endpoint: str, scenar
             "viewport": {
                 "width": scenario["viewport"]["width"],
                 "height": scenario["viewport"]["height"],
+                "deviceScaleFactor": scenario["viewport"].get(
+                    "device_scale_factor", 1
+                ),
             },
             "gotoOptions": {
                 "waitUntil": browserless_event,

@@ -8,6 +8,7 @@ from unittest.mock import patch
 import httpx
 from PIL import Image
 
+from benchmarks import production_gate
 from benchmarks.production_gate import percentile, sustained_load
 from benchmarks.report import markdown
 from benchmarks.run import render
@@ -79,7 +80,7 @@ class BrowserlessAdapterTests(unittest.IsolatedAsyncioTestCase):
         scenario = {
             "url": "https://example.com",
             "output": "png",
-            "viewport": {"width": 1280, "height": 720},
+            "viewport": {"width": 1280, "height": 720, "device_scale_factor": 2},
             "full_page": True,
             "wait_for": {
                 "event": "domcontentloaded",
@@ -97,7 +98,10 @@ class BrowserlessAdapterTests(unittest.IsolatedAsyncioTestCase):
             captured["url"],
             "http://127.0.0.1:3000/chromium/screenshot?token=local-token",
         )
-        self.assertEqual(captured["json"]["viewport"], {"width": 1280, "height": 720})
+        self.assertEqual(
+            captured["json"]["viewport"],
+            {"width": 1280, "height": 720, "deviceScaleFactor": 2},
+        )
         self.assertTrue(captured["json"]["options"]["fullPage"])
         self.assertEqual(
             captured["json"]["gotoOptions"],
@@ -108,6 +112,101 @@ class BrowserlessAdapterTests(unittest.IsolatedAsyncioTestCase):
             captured["json"]["waitForSelector"],
             {"selector": "main", "timeout": 12000, "visible": True},
         )
+
+
+class ManagedProviderAdapterTests(unittest.IsolatedAsyncioTestCase):
+    scenario = {
+        "url": "https://example.com",
+        "output": "png",
+        "viewport": {"width": 1280, "height": 720, "device_scale_factor": 2},
+        "full_page": False,
+        "wait_for": {
+            "event": "domcontentloaded",
+            "delay_ms": 1000,
+            "selector": "main",
+            "timeout_ms": 12000,
+        },
+    }
+
+    async def test_screenshotone_preserves_wait_contract(self):
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["json"] = json.loads(request.content)
+            return httpx.Response(200, content=b"image")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with patch.dict("os.environ", {"SCREENSHOTONE_ACCESS_KEY": "key"}):
+                await render(client, "screenshotone", "https://api.example/take", self.scenario)
+
+        self.assertEqual(captured["json"]["wait_until"], "domcontentloaded")
+        self.assertEqual(captured["json"]["delay"], 1)
+        self.assertEqual(captured["json"]["timeout"], 12)
+        self.assertEqual(captured["json"]["wait_for_selector"], "main")
+        self.assertTrue(captured["json"]["error_on_selector_not_found"])
+        self.assertEqual(captured["json"]["device_scale_factor"], 2)
+
+    async def test_urlbox_preserves_wait_contract(self):
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                captured["json"] = json.loads(request.content)
+                return httpx.Response(
+                    200, json={"renderUrl": "https://renders.example/image.png"}
+                )
+            return httpx.Response(200, content=b"image")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with patch.dict("os.environ", {"URLBOX_SECRET": "secret"}):
+                await render(client, "urlbox", "https://api.example/render", self.scenario)
+
+        self.assertEqual(captured["json"]["wait_until"], "domloaded")
+        self.assertEqual(captured["json"]["delay"], 1000)
+        self.assertEqual(captured["json"]["timeout"], 12000)
+        self.assertEqual(captured["json"]["wait_for"], "main")
+        self.assertEqual(captured["json"]["wait_for_state"], "visible")
+        self.assertEqual(captured["json"]["wait_timeout"], 12000)
+        self.assertTrue(captured["json"]["fail_if_selector_missing"])
+        self.assertTrue(captured["json"]["retina"])
+
+    async def test_urlbox_rejects_unrepresentable_device_scale(self):
+        scenario = {
+            **self.scenario,
+            "viewport": {**self.scenario["viewport"], "device_scale_factor": 1.5},
+        }
+        async with httpx.AsyncClient() as client:
+            with patch.dict("os.environ", {"URLBOX_SECRET": "secret"}):
+                with self.assertRaisesRegex(ValueError, "supports device_scale_factor"):
+                    await render(
+                        client, "urlbox", "https://api.example/render", scenario
+                    )
+
+
+class RecoveryDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failure_keeps_log_and_writes_machine_readable_error(self):
+        async def fail_recovery(_port: int, data_dir: Path):
+            data_dir.mkdir(parents=True, exist_ok=True)
+            (data_dir / "operational-server.log").write_text("startup failed", "utf-8")
+            raise RuntimeError("recovery failed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "operational-results" / "restart-recovery.json"
+            argv = ["production_gate", "restart-recovery", "--output", str(output)]
+            with patch.object(production_gate, "restart_recovery", new=fail_recovery), patch(
+                "sys.argv", argv
+            ):
+                exit_code = await production_gate.main()
+
+            data_dir = output.parent / "restart-recovery-data"
+            report = json.loads(output.read_text("utf-8"))
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(report["error"]["type"], "RuntimeError")
+            self.assertEqual(report["error"]["message"], "recovery failed")
+            self.assertEqual(
+                (data_dir / "operational-server.log").read_text("utf-8"),
+                "startup failed",
+            )
 
 
 if __name__ == "__main__":
