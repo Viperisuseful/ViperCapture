@@ -15,7 +15,8 @@
     "externalBin": [],
     "resources": {},
     "android": {
-      "minSdkVersion": 29
+      "minSdkVersion": 29,
+      "versionCode": 1008
     }
   }
 }
