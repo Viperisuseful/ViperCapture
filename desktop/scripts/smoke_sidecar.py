@@ -37,6 +37,7 @@ def request(
     token: str | None,
     path: str,
     payload: dict[str, object] | None = None,
+    timeout: float = 45,
 ) -> bytes:
     headers = {}
     body = None
@@ -45,7 +46,9 @@ def request(
     if payload is not None:
         headers["Content-Type"] = "application/json"
         body = json.dumps(payload).encode()
-    with urlopen(Request(f"{base_url}{path}", data=body, headers=headers), timeout=45) as response:
+    with urlopen(
+        Request(f"{base_url}{path}", data=body, headers=headers), timeout=timeout
+    ) as response:
         return response.read()
 
 
@@ -82,8 +85,14 @@ def main() -> None:
         )
         try:
             for _ in range(120):
+                if process.poll() is not None:
+                    output.seek(0)
+                    raise RuntimeError(
+                        "Sidecar exited before becoming ready:\n"
+                        + output.read().decode(errors="replace")
+                    )
                 try:
-                    if json.loads(request(base_url, token, "/health"))["ready"]:
+                    if json.loads(request(base_url, token, "/health", timeout=1))["ready"]:
                         break
                 except (HTTPError, URLError, TimeoutError, ConnectionError):
                     time.sleep(0.25)
@@ -106,6 +115,7 @@ def main() -> None:
 
             capture_bytes = {}
             for engine in ("chromium", "firefox", "webkit"):
+                print(f"Capturing with {engine}...", flush=True)
                 image = request(
                     base_url,
                     token,
