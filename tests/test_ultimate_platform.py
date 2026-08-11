@@ -256,6 +256,7 @@ class ControlPlaneTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await delete)
         self.assertIsNone(self.control.get_profile(project_id, "profile"))
 
+    @unittest.skipIf(os.name == "nt", "requires POSIX file mode semantics")
     async def test_control_database_files_are_owner_only(self):
         with self.control._connect() as database:
             database.execute(

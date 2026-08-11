@@ -12,6 +12,36 @@ from vipercapture.render_engine import RenderArtifact
 
 
 class RenderCacheTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fingerprint_key_allows_short_file_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            key = root / ".fingerprint-key"
+            key.write_bytes(b"k" * 32)
+            key.chmod(0o600)
+            original_read = os.read
+
+            def short_read(descriptor, size):
+                return original_read(descriptor, min(size, 7))
+
+            with patch("vipercapture.render_cache.os.read", side_effect=short_read):
+                cache = RenderCache(root)
+                await cache.start()
+
+            self.assertEqual(cache._fingerprint_key, b"k" * 32)
+
+    @unittest.skipUnless(hasattr(os, "O_BINARY"), "Windows binary mode only")
+    async def test_fingerprint_key_uses_binary_mode_on_windows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key = root / ".fingerprint-key"
+            key.write_bytes(b"\x1a" * 32)
+
+            cache = RenderCache(root)
+            await cache.start()
+
+            self.assertEqual(cache._fingerprint_key, b"\x1a" * 32)
+
     async def test_interrupted_key_creation_does_not_publish_partial_key(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

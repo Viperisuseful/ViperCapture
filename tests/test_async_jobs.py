@@ -39,6 +39,10 @@ from vipercapture.render_errors import RenderError
 from vipercapture.webhooks import WebhookDeliveryError
 
 UTC = timezone.utc
+POSIX_PERMISSIONS_ONLY = unittest.skipIf(
+    os.name == "nt",
+    "requires POSIX owner-only permission semantics",
+)
 
 
 def _settings(path: Path, **changes) -> JobSettings:
@@ -92,8 +96,29 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             clear=False,
         )
         self.secret.start()
+        self.platform_start_patches = []
+        if (
+            os.name == "nt"
+            and self._testMethodName
+            != "test_bundled_stores_refuse_unprotected_windows_data"
+        ):
+            async def require_posix_permissions(*_args, **_kwargs):
+                self.skipTest(
+                    "bundled local stores require POSIX owner-only permissions"
+                )
+
+            for provider in (SQLiteJobStore, LocalArtifactStore):
+                start_patch = patch.object(
+                    provider,
+                    "start",
+                    new=require_posix_permissions,
+                )
+                start_patch.start()
+                self.platform_start_patches.append(start_patch)
 
     async def asyncTearDown(self):
+        for start_patch in reversed(self.platform_start_patches):
+            start_patch.stop()
         self.secret.stop()
         self.temporary.cleanup()
 
@@ -3462,6 +3487,7 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.store.close()
 
+    @POSIX_PERMISSIONS_ONLY
     async def test_symlinked_sqlite_database_is_rejected(self):
         data_dir = self.root / "symlinked-sqlite"
         data_dir.mkdir()
@@ -3478,6 +3504,7 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(target.read_bytes(), b"not a database")
 
+    @POSIX_PERMISSIONS_ONLY
     async def test_unsafe_sqlite_sidecars_are_rejected_before_recovery(self):
         symlink_data = self.root / "symlinked-wal"
         symlink_data.mkdir(mode=0o700)
@@ -3521,6 +3548,7 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "owner-only"):
             await journal_store.start()
 
+    @POSIX_PERMISSIONS_ONLY
     async def test_symlinked_local_state_directories_are_rejected(self):
         redirected_data = self.root / "redirected-data"
         redirected_data.mkdir()
@@ -3696,6 +3724,8 @@ class ProviderLoadingTests(unittest.TestCase):
                 text=True,
             )
         self.assertEqual(result.stdout.strip(), str(Path(directory) / "cache"))
+
+    @POSIX_PERMISSIONS_ONLY
     def test_generated_local_key_is_private_and_restart_stable(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ,
@@ -3733,6 +3763,7 @@ class ProviderLoadingTests(unittest.TestCase):
             mode = (root / "async-jobs.key").stat().st_mode & 0o777
             self.assertEqual(mode & 0o077, 0)
 
+    @POSIX_PERMISSIONS_ONLY
     def test_new_key_data_directory_entry_is_synced(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ,
@@ -3753,6 +3784,7 @@ class ProviderLoadingTests(unittest.TestCase):
             sync.assert_any_call(base / "first" / "second")
             sync.assert_any_call(root)
 
+    @POSIX_PERMISSIONS_ONLY
     def test_insecure_existing_key_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ,
@@ -3768,6 +3800,7 @@ class ProviderLoadingTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "owner-only"):
                 PayloadCipher.for_data_dir(root)
 
+    @POSIX_PERMISSIONS_ONLY
     def test_symlinked_existing_key_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ,
@@ -3819,6 +3852,20 @@ class ProviderLoadingTests(unittest.TestCase):
 
             _sync_directory(directory)
         open_file.assert_not_called()
+
+    def test_windows_key_generation_requires_configured_secret(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {},
+            clear=False,
+        ):
+            os.environ.pop("VIPERCAPTURE_JOB_SECRET", None)
+            root = Path(directory)
+            with (
+                patch("vipercapture.async_jobs.os.name", "nt"),
+                self.assertRaisesRegex(RuntimeError, "required.*Windows"),
+            ):
+                PayloadCipher.for_data_dir(root)
 
     def test_documented_provider_contract_import_remains_compatible(self):
         import async_jobs as provider_contract
