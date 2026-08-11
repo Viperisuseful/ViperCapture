@@ -11,7 +11,7 @@ from PIL import Image
 from benchmarks import production_gate
 from benchmarks.production_gate import percentile, sustained_load
 from benchmarks.report import markdown
-from benchmarks.run import render
+from benchmarks.run import render, rotated_provider_indexes, run_benchmark
 
 
 class BenchmarkReportTests(unittest.TestCase):
@@ -37,11 +37,37 @@ class BenchmarkReportTests(unittest.TestCase):
         }
         document = markdown(report, "Evidence")
         self.assertIn("| fixture | viper | 2/2 | 12.50 ms | 14.00 ms | 110 |", document)
-        self.assertIn("Providers were invoked sequentially from the same benchmark process and host", document)
+        self.assertIn("Provider order was rotated for every attempt from the same benchmark process and host", document)
 
     def test_percentile_is_bounded_and_deterministic(self):
         self.assertEqual(percentile([40, 10, 20, 30], 0.95), 40)
         self.assertEqual(percentile([], 0.95), 0.0)
+
+    def test_provider_order_rotates_deterministically_between_attempts(self):
+        self.assertEqual(rotated_provider_indexes(2, 0), [0, 1])
+        self.assertEqual(rotated_provider_indexes(2, 1), [1, 0])
+        self.assertEqual(rotated_provider_indexes(3, 4), [1, 2, 0])
+        self.assertEqual(rotated_provider_indexes(0, 2), [])
+
+
+class BenchmarkInterleaveTests(unittest.IsolatedAsyncioTestCase):
+    async def test_benchmark_interleaves_provider_calls_between_attempts(self):
+        calls = []
+        output = io.BytesIO()
+        Image.new("RGB", (8, 8)).save(output, "PNG")
+
+        async def fake_render(_client, provider, _endpoint, _scenario):
+            calls.append(provider)
+            return output.getvalue()
+
+        providers = [("viper", "http://viper"), ("browserless", "http://browserless")]
+        scenarios = [{"name": "fixture", "request": {}}]
+        async with httpx.AsyncClient() as client:
+            with patch("benchmarks.run.render", side_effect=fake_render):
+                results = await run_benchmark(client, providers, scenarios, 2, 0)
+
+        self.assertEqual(calls, ["viper", "browserless", "browserless", "viper"])
+        self.assertEqual([item["cases"][0]["successes"] for item in results], [2, 2])
 
 
 class SustainedLoadTests(unittest.IsolatedAsyncioTestCase):

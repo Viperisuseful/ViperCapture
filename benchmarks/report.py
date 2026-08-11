@@ -46,7 +46,7 @@ def markdown(report: dict, title: str) -> str:
             f'(`{environment["machine"]}`).',
             f'- `{configuration["runs"]}` measured runs after '
             f'`{configuration["warmups"]}` warm-up run(s) for every provider and scenario.',
-            "- Providers were invoked sequentially from the same benchmark process and host.",
+            "- Provider order was rotated for every attempt from the same benchmark process and host.",
             "- Caches must be disabled or cold-equivalent; provider credentials are read from the environment.",
             "",
             "## Limitations",

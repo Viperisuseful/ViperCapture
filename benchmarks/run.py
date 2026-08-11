@@ -35,6 +35,14 @@ def percentile(values: list[float], fraction: float) -> float:
     return ordered[index]
 
 
+def rotated_provider_indexes(provider_count: int, offset: int) -> list[int]:
+    """Return a deterministic rotation so no provider always runs first."""
+    if provider_count < 1:
+        return []
+    start = offset % provider_count
+    return list(range(start, provider_count)) + list(range(0, start))
+
+
 async def render(client: httpx.AsyncClient, provider: str, endpoint: str, scenario: dict) -> bytes:
     lazy_load = scenario.get("lazy_load", "none")
     if provider != "viper" and lazy_load != "none":
@@ -172,6 +180,60 @@ async def render(client: httpx.AsyncClient, provider: str, endpoint: str, scenar
     raise ValueError(f"unknown provider: {provider}")
 
 
+async def run_benchmark(
+    client: httpx.AsyncClient,
+    providers: list[tuple[str, str]],
+    scenarios: list[dict],
+    runs: int,
+    warmups: int,
+) -> list[dict]:
+    provider_results = [
+        {"type": kind, "endpoint": endpoint, "cases": []}
+        for kind, endpoint in providers
+    ]
+    for scenario_index, scenario in enumerate(scenarios):
+        cases = [
+            {"samples": [], "failures": [], "artifacts": []}
+            for _ in providers
+        ]
+        for index in range(warmups + runs):
+            order = rotated_provider_indexes(
+                len(providers), scenario_index + index
+            )
+            for provider_index in order:
+                kind, endpoint = providers[provider_index]
+                case = cases[provider_index]
+                started = time.perf_counter()
+                try:
+                    body = await render(client, kind, endpoint, scenario["request"])
+                    elapsed = (time.perf_counter() - started) * 1_000
+                    with Image.open(io.BytesIO(body)) as image:
+                        dimensions = list(image.size)
+                        image.verify()
+                    if index >= warmups:
+                        case["samples"].append(round(elapsed, 2))
+                        case["artifacts"].append({"bytes": len(body), "sha256": sha256(body).hexdigest(), "dimensions": dimensions})
+                except Exception as exc:
+                    if index >= warmups:
+                        case["failures"].append(type(exc).__name__)
+        for provider_index, case in enumerate(cases):
+            samples = case["samples"]
+            failures = case["failures"]
+            provider_results[provider_index]["cases"].append({
+                "name": scenario["name"],
+                "successes": len(samples),
+                "failures": failures,
+                "success_rate": len(samples) / runs,
+                "latency_ms": {
+                    "samples": samples,
+                    "median": round(statistics.median(samples), 2) if samples else None,
+                    "p95": round(percentile(samples, 0.95), 2) if samples else None,
+                },
+                "artifacts": case["artifacts"],
+            })
+    return provider_results
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -208,39 +270,9 @@ async def main() -> int:
         "providers": [],
     }
     async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
-        for kind, endpoint in providers:
-            provider_result = {"type": kind, "endpoint": endpoint, "cases": []}
-            for scenario in scenarios:
-                samples = []
-                failures = []
-                artifacts = []
-                for index in range(args.warmups + args.runs):
-                    started = time.perf_counter()
-                    try:
-                        body = await render(client, kind, endpoint, scenario["request"])
-                        elapsed = (time.perf_counter() - started) * 1_000
-                        with Image.open(io.BytesIO(body)) as image:
-                            dimensions = list(image.size)
-                            image.verify()
-                        if index >= args.warmups:
-                            samples.append(round(elapsed, 2))
-                            artifacts.append({"bytes": len(body), "sha256": sha256(body).hexdigest(), "dimensions": dimensions})
-                    except Exception as exc:
-                        if index >= args.warmups:
-                            failures.append(type(exc).__name__)
-                provider_result["cases"].append({
-                    "name": scenario["name"],
-                    "successes": len(samples),
-                    "failures": failures,
-                    "success_rate": len(samples) / args.runs,
-                    "latency_ms": {
-                        "samples": samples,
-                        "median": round(statistics.median(samples), 2) if samples else None,
-                        "p95": round(percentile(samples, 0.95), 2) if samples else None,
-                    },
-                    "artifacts": artifacts,
-                })
-            report["providers"].append(provider_result)
+        report["providers"] = await run_benchmark(
+            client, providers, scenarios, args.runs, args.warmups
+        )
     serialized = json.dumps(report, indent=2) + "\n"
     if args.output:
         args.output.write_text(serialized, "utf-8")
