@@ -1,6 +1,6 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "version": "0.1.6",
+  "version": "0.1.8",
   "app": {
     "windows": [
       {
@@ -15,7 +15,8 @@
     "externalBin": [],
     "resources": {},
     "android": {
-      "minSdkVersion": 29
+      "minSdkVersion": 29,
+      "versionCode": 1008
     }
   }
 }

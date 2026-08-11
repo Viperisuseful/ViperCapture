@@ -41,3 +41,10 @@ simple and stable; copy `scenarios.json` and add representative pages owned by
 your organization before making a purchasing or capacity decision. Provider
 credentials are read only from the process environment and never written to
 the report.
+
+## Published results
+
+- [ViperCapture and ScreenshotOne, 2026-08-11](results/2026-08-11-screenshotone.md)
+
+Results are engineering snapshots, not universal vendor rankings. Read the
+methodology and limitations before citing a latency ratio.
