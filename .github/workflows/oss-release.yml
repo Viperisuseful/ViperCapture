@@ -82,22 +82,47 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: dist/python/
+          packages_dir: dist/python/
+          skip_existing: true
       - name: Publish TypeScript SDK
         if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish dist/typescript/*.tgz --access public --tag beta
+        run: |
+          package="$(node -p "require('./sdk/typescript/package.json').name")"
+          version="$(node -p "require('./sdk/typescript/package.json').version")"
+          if npm view "${package}@${version}" version --json >/dev/null 2>&1; then
+            echo "${package}@${version} is already published"
+          else
+            npm publish dist/typescript/*.tgz --access public --tag beta
+          fi
       - name: Publish GitHub prerelease
         if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v0.1.0-beta.2' }}
         run: |
-          gh release create "$RELEASE_TAG" $(find dist -type f -print) \
-            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
-            --title "ViperCapture OSS ${RELEASE_TAG#v} Developer Beta" \
-            --notes-file docs/releases/v0.1.0-beta.2.md
+          mapfile -t assets < <(find dist -type f -print)
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            existing_assets="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --json assets --jq '.assets[].name')"
+            for asset in "${assets[@]}"; do
+              asset_name="$(basename "$asset")"
+              if grep -Fxq -- "$asset_name" <<< "$existing_assets"; then
+                echo "${asset_name} is already attached"
+              else
+                gh release upload "$RELEASE_TAG" "$asset" --repo "$GITHUB_REPOSITORY"
+              fi
+            done
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --prerelease \
+              --title "ViperCapture OSS ${RELEASE_TAG#v} Developer Beta" \
+              --notes-file docs/releases/v0.1.0-beta.2.md
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+              --title "ViperCapture OSS ${RELEASE_TAG#v} Developer Beta" \
+              --notes-file docs/releases/v0.1.0-beta.2.md
+          fi
 
   container:
     needs: package

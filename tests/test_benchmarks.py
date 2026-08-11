@@ -93,6 +93,41 @@ class SustainedLoadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["requests"], calls)
         self.assertEqual(result["success_rate"], 1)
 
+    async def test_memory_is_sampled_during_render_and_uses_cgroup_peak(self):
+        state = {"in_flight": False, "observed": False}
+        output = io.BytesIO()
+        Image.new("RGB", (8, 8)).save(output, "PNG")
+
+        class SlowTransport(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                state["in_flight"] = True
+                await production_gate.asyncio.sleep(0.04)
+                state["in_flight"] = False
+                return httpx.Response(200, content=output.getvalue())
+
+        def cgroup_number(name):
+            if name == "memory.current":
+                state["observed"] = state["observed"] or state["in_flight"]
+                return 200 if state["in_flight"] else 100
+            if name == "memory.peak":
+                return 250
+            if name == "memory.max":
+                return 1024
+            return None
+
+        client = httpx.AsyncClient(transport=SlowTransport())
+        with patch("benchmarks.production_gate.httpx.AsyncClient") as client_type, patch(
+            "benchmarks.production_gate._cgroup_number", side_effect=cgroup_number
+        ):
+            client_type.return_value.__aenter__.return_value = client
+            result = await sustained_load(
+                "http://local", requests=1, concurrency=1, timeout=1
+            )
+        await client.aclose()
+
+        self.assertTrue(state["observed"])
+        self.assertEqual(result["memory"]["peak_cgroup_bytes"], 250)
+
 
 class BrowserlessAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_browserless_uses_same_viewport_and_full_page_contract(self):

@@ -174,38 +174,61 @@ async def sustained_load(
     started = time.perf_counter()
     deadline = started + duration_seconds
     peak_memory = _cgroup_number("memory.current")
+    stop_memory_sampling = asyncio.Event()
     issued = 0
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        async def one(index: int) -> None:
-            nonlocal peak_memory
-            async with semaphore:
-                request_started = time.perf_counter()
-                try:
-                    response = await client.post(
-                        endpoint.rstrip("/") + "/v1/render", json=payload
-                    )
-                    response.raise_for_status()
-                    with Image.open(io.BytesIO(response.content)) as image:
-                        current_dimensions = list(image.size)
-                        image.verify()
-                    latencies.append((time.perf_counter() - request_started) * 1000)
-                    sizes.append(len(response.content))
-                    dimensions.append(current_dimensions)
-                except Exception as exc:
-                    failures.append({"index": index, "error": type(exc).__name__, "message": str(exc)[:500]})
-                current = _cgroup_number("memory.current")
-                if current is not None:
-                    peak_memory = max(peak_memory or 0, current)
+    async def sample_memory() -> None:
+        nonlocal peak_memory
+        while not stop_memory_sampling.is_set():
+            current = _cgroup_number("memory.current")
+            if current is not None:
+                peak_memory = max(peak_memory or 0, current)
+            try:
+                await asyncio.wait_for(stop_memory_sampling.wait(), timeout=0.01)
+            except TimeoutError:
+                pass
 
-        async def worker() -> None:
-            nonlocal issued
-            while issued < requests or time.perf_counter() < deadline:
-                index = issued
-                issued += 1
-                await one(index)
+    memory_sampler = asyncio.create_task(sample_memory())
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async def one(index: int) -> None:
+                async with semaphore:
+                    request_started = time.perf_counter()
+                    try:
+                        response = await client.post(
+                            endpoint.rstrip("/") + "/v1/render", json=payload
+                        )
+                        response.raise_for_status()
+                        with Image.open(io.BytesIO(response.content)) as image:
+                            current_dimensions = list(image.size)
+                            image.verify()
+                        latencies.append((time.perf_counter() - request_started) * 1000)
+                        sizes.append(len(response.content))
+                        dimensions.append(current_dimensions)
+                    except Exception as exc:
+                        failures.append(
+                            {
+                                "index": index,
+                                "error": type(exc).__name__,
+                                "message": str(exc)[:500],
+                            }
+                        )
 
-        await asyncio.gather(*(worker() for _ in range(concurrency)))
+            async def worker() -> None:
+                nonlocal issued
+                while issued < requests or time.perf_counter() < deadline:
+                    index = issued
+                    issued += 1
+                    await one(index)
+
+            await asyncio.gather(*(worker() for _ in range(concurrency)))
+    finally:
+        stop_memory_sampling.set()
+        await memory_sampler
+
+    cgroup_peak = _cgroup_number("memory.peak")
+    if cgroup_peak is not None:
+        peak_memory = max(peak_memory or 0, cgroup_peak)
 
     elapsed = time.perf_counter() - started
     completed = len(latencies) + len(failures)

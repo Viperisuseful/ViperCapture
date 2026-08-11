@@ -153,13 +153,24 @@ class OperationalPackagingTests(unittest.TestCase):
         )
         self.assertIn("container:\n    needs: package", workflow)
         self.assertIn('go_tag="sdk/go/v${version}"', workflow)
+        self.assertIn("packages_dir: dist/python/", workflow)
+        self.assertIn("skip_existing: true", workflow)
+        self.assertIn('npm view "${package}@${version}" version', workflow)
         self.assertIn("npm publish dist/typescript/*.tgz --access public --tag beta", workflow)
+        self.assertIn('gh release view "$RELEASE_TAG"', workflow)
+        self.assertIn("--json assets --jq '.assets[].name'", workflow)
+        self.assertIn('gh release upload "$RELEASE_TAG" "$asset"', workflow)
         self.assertIn("MANUAL_PUBLISH:", workflow)
         self.assertIn(
             'git ls-remote origin "refs/tags/${expected}" "refs/tags/${expected}^{}"',
             workflow,
         )
         self.assertIn('test "$tagged_commit" = "$GITHUB_SHA"', workflow)
+
+    def test_gateway_streams_admitted_request_bodies(self):
+        nginx = (ROOT / "deploy" / "public-api" / "nginx.conf").read_text("utf-8")
+        self.assertIn("proxy_request_buffering off;", nginx)
+        self.assertNotIn("proxy_request_buffering on;", nginx)
 
 
 if __name__ == "__main__":
