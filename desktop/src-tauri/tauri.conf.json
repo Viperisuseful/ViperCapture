@@ -72,7 +72,7 @@
           "libepoxy0",
           "libevent-2.1-7",
           "libevdev2",
-          "libffi7",
+          "libffi8",
           "libfontconfig1",
           "libfreetype6",
           "libgbm1",
