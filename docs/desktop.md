@@ -1,6 +1,7 @@
 # Desktop app
 
-ViperCapture Desktop is a Tauri 2 application under `desktop/`. The existing
+ViperCapture Desktop is beta software. It is a Tauri 2 application under
+`desktop/`. The existing
 web application remains under `frontend/`; neither project writes into the
 other project's source or build directory.
 
