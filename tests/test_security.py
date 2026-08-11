@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import socket
+import sys
 import threading
 import unittest
 import zipfile
@@ -16,12 +17,19 @@ from pydantic import ValidationError
 from starlette.requests import Request
 
 from vipercapture.main import (
+    STEALTH,
+    _launch_browser,
     _await_while_connected,
     _is_local_control_request,
     gpu_launch_args,
     hardware_gpu_active,
 )
-from vipercapture.render_contract import LazyLoadMode, OutputFormat, RenderRequest
+from vipercapture.render_contract import (
+    BrowserEngine,
+    LazyLoadMode,
+    OutputFormat,
+    RenderRequest,
+)
 from vipercapture.render_engine import (
     PublicUrlValidator,
     RenderEngine,
@@ -631,9 +639,52 @@ class CaptureCancellationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(operation_cancelled.is_set())
 
 
+class BrowserLaunchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_chromium_uses_full_headless_browser_and_writable_paths(self):
+        browser = object()
+        launch = AsyncMock(return_value=browser)
+        playwright = SimpleNamespace(chromium=SimpleNamespace(launch=launch))
+
+        self.assertIs(
+            await _launch_browser(playwright, "off", BrowserEngine.CHROMIUM),
+            browser,
+        )
+
+        options = launch.await_args.kwargs
+        self.assertEqual(options["channel"], "chromium")
+        self.assertTrue(options["headless"])
+        self.assertEqual(options["args"], [])
+        self.assertEqual(options["env"]["XDG_CACHE_HOME"], "/tmp/chromium-cache")
+        self.assertEqual(options["env"]["XDG_CONFIG_HOME"], "/tmp/chromium-config")
+
+    async def test_non_chromium_launch_does_not_receive_chromium_options(self):
+        browser = object()
+        launch = AsyncMock(return_value=browser)
+        playwright = SimpleNamespace(firefox=SimpleNamespace(launch=launch))
+
+        self.assertIs(
+            await _launch_browser(playwright, "off", BrowserEngine.FIREFOX),
+            browser,
+        )
+
+        self.assertEqual(launch.await_args.kwargs, {"headless": True, "args": []})
+
+
 class GpuConfigurationTests(unittest.TestCase):
     def test_gpu_is_off_by_default(self):
         self.assertEqual(gpu_launch_args("off", "default", "linux"), [])
+
+    def test_stealth_preserves_runtime_browser_signals(self):
+        expected_platform = (
+            "Win32"
+            if sys.platform.startswith("win")
+            else "MacIntel"
+            if sys.platform == "darwin"
+            else "Linux x86_64"
+        )
+        self.assertEqual(STEALTH.navigator_platform_override, expected_platform)
+        self.assertFalse(STEALTH.sec_ch_ua)
+        self.assertFalse(STEALTH.webgl_vendor)
 
     def test_linux_vulkan_mode_sets_explicit_backend(self):
         self.assertEqual(

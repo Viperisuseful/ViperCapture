@@ -18,6 +18,7 @@ class LauncherTest(unittest.TestCase):
             ):
                 launch.ensure_playwright()
             run.assert_called_once()
+            self.assertIn("--no-shell", run.call_args.args)
             self.assertEqual(
                 stamp.read_text(), "1.2.3:chromium,firefox,webkit"
             )

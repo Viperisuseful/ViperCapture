@@ -10,7 +10,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir -r requirements.txt \
-    && python -m playwright install --with-deps chromium firefox webkit \
+    && python -m playwright install --with-deps --no-shell chromium firefox webkit \
     && useradd --create-home --uid 10001 vipercapture \
     && mkdir -p /data /app/captures \
     && chown -R vipercapture:vipercapture /data /app/captures /ms-playwright

@@ -4320,10 +4320,12 @@ class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
         playwright = SimpleNamespace(stop=AsyncMock())
         manager = SimpleNamespace(start=AsyncMock(return_value=playwright))
         test_app = SimpleNamespace(state=SimpleNamespace())
+        hook_stealth = Mock()
 
         with tempfile.TemporaryDirectory() as directory:
             with (
                 patch("vipercapture.main.async_playwright", return_value=manager),
+                patch.object(main.STEALTH, "hook_playwright_context", hook_stealth),
                 patch("vipercapture.main._launch_browser", AsyncMock(return_value=browser)),
                 patch("vipercapture.main._detect_hardware_gpu", AsyncMock(return_value=False)),
                 patch("vipercapture.main.ASYNC_JOBS_ENABLED", True),
@@ -4337,6 +4339,7 @@ class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
                         pass
 
         service.close.assert_awaited_once()
+        hook_stealth.assert_called_once_with(playwright)
         browser.close.assert_awaited_once()
         playwright.stop.assert_awaited_once()
 
