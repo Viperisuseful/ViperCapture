@@ -36,7 +36,7 @@ class BenchmarkReportTests(unittest.TestCase):
             ],
         }
         document = markdown(report, "Evidence")
-        self.assertIn("| fixture | viper | 2/2 | 12.50 ms | 14.00 ms | 120 |", document)
+        self.assertIn("| fixture | viper | 2/2 | 12.50 ms | 14.00 ms | 110 |", document)
         self.assertIn("Providers were invoked sequentially from the same benchmark process and host", document)
 
     def test_percentile_is_bounded_and_deterministic(self):

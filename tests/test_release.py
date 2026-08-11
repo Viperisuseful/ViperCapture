@@ -142,6 +142,7 @@ class OperationalPackagingTests(unittest.TestCase):
             ROOT / ".github" / "workflows" / "operational-readiness.yml"
         ).read_text("utf-8")
         matrix = workflow[workflow.index("Concurrency saturation matrix") :]
+        self.assertIn("timeout-minutes: 45", workflow)
         self.assertIn('VIPERCAPTURE_MAX_CONCURRENCY="$concurrency"', matrix)
         self.assertIn('--concurrency "$concurrency"', matrix)
         self.assertIn("VIPERCAPTURE_MAX_CONCURRENCY=4", matrix)
@@ -153,6 +154,12 @@ class OperationalPackagingTests(unittest.TestCase):
         self.assertIn("container:\n    needs: package", workflow)
         self.assertIn('go_tag="sdk/go/v${version}"', workflow)
         self.assertIn("npm publish dist/typescript/*.tgz --access public --tag beta", workflow)
+        self.assertIn("MANUAL_PUBLISH:", workflow)
+        self.assertIn(
+            'git ls-remote origin "refs/tags/${expected}" "refs/tags/${expected}^{}"',
+            workflow,
+        )
+        self.assertIn('test "$tagged_commit" = "$GITHUB_SHA"', workflow)
 
 
 if __name__ == "__main__":

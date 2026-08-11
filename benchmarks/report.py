@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import statistics
 
 
 def markdown(report: dict, title: str) -> str:
@@ -21,8 +22,10 @@ def markdown(report: dict, title: str) -> str:
             artifacts = case.get("artifacts", [])
             median_bytes = "—"
             if artifacts:
-                sizes = sorted(item["bytes"] for item in artifacts)
-                median_bytes = f"{sizes[len(sizes) // 2]:,}"
+                size_median = statistics.median(
+                    item["bytes"] for item in artifacts
+                )
+                median_bytes = f"{size_median:,.1f}".removesuffix(".0")
             latency = case["latency_ms"]
             median = "—" if latency["median"] is None else f'{latency["median"]:,.2f} ms'
             p95 = "—" if latency["p95"] is None else f'{latency["p95"]:,.2f} ms'

@@ -35,9 +35,16 @@ jobs:
       - name: Validate release tag
         env:
           RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+          MANUAL_PUBLISH: ${{ github.event_name == 'workflow_dispatch' && inputs.publish && 'true' || 'false' }}
         run: |
           expected="v$(python -c 'import json; print(json.load(open("release/versions.json"))["oss"])')"
           test -z "$RELEASE_TAG" || test "$RELEASE_TAG" = "$expected"
+          if test "$RELEASE_TAG" = "$expected" || test "$MANUAL_PUBLISH" = true; then
+            remote_lines="$(git ls-remote origin "refs/tags/${expected}" "refs/tags/${expected}^{}")"
+            tagged_commit="$(printf '%s\n' "$remote_lines" | awk '/\^\{\}$/ {print $1}')"
+            test -n "$tagged_commit"
+            test "$tagged_commit" = "$GITHUB_SHA"
+          fi
       - name: Build repository bundles
         run: python scripts/build_release.py --output-dir dist
       - name: Build Python SDK
