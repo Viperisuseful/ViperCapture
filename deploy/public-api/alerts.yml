@@ -19,9 +19,9 @@ groups:
           summary: More than five percent of ViperCapture requests are failing
       - alert: ViperCaptureQueueLatencyGrowing
         expr: >-
-          rate(vipercapture_queue_seconds_sum[10m])
+          sum(rate(vipercapture_queue_seconds_sum[10m]))
           /
-          clamp_min(rate(vipercapture_renders_total[10m]), 0.001)
+          clamp_min(sum(rate(vipercapture_renders_total[10m])), 0.001)
           > 10
         for: 15m
         labels: {severity: warning}

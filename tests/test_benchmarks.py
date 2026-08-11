@@ -81,6 +81,12 @@ class BrowserlessAdapterTests(unittest.IsolatedAsyncioTestCase):
             "output": "png",
             "viewport": {"width": 1280, "height": 720},
             "full_page": True,
+            "wait_for": {
+                "event": "domcontentloaded",
+                "delay_ms": 1000,
+                "selector": "main",
+                "timeout_ms": 12000,
+            },
         }
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             with patch.dict("os.environ", {"BROWSERLESS_TOKEN": "local-token"}):
@@ -93,6 +99,15 @@ class BrowserlessAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(captured["json"]["viewport"], {"width": 1280, "height": 720})
         self.assertTrue(captured["json"]["options"]["fullPage"])
+        self.assertEqual(
+            captured["json"]["gotoOptions"],
+            {"waitUntil": "domcontentloaded", "timeout": 12000},
+        )
+        self.assertEqual(captured["json"]["waitForTimeout"], 1000)
+        self.assertEqual(
+            captured["json"]["waitForSelector"],
+            {"selector": "main", "timeout": 12000, "visible": True},
+        )
 
 
 if __name__ == "__main__":

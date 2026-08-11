@@ -73,17 +73,42 @@ async def render(client: httpx.AsyncClient, provider: str, endpoint: str, scenar
         download.raise_for_status()
         return download.content
     if provider == "browserless":
+        wait = scenario.get("wait_for", {})
+        if wait.get("text"):
+            raise ValueError(
+                "Browserless benchmark adapter cannot preserve wait_for.text"
+            )
+        wait_event = wait.get("event", "load")
+        browserless_event = {
+            "domcontentloaded": "domcontentloaded",
+            "load": "load",
+            "networkidle": "networkidle0",
+        }.get(wait_event)
+        if browserless_event is None:
+            raise ValueError(f"unsupported wait_for.event: {wait_event}")
         payload = {
             "url": scenario["url"],
             "viewport": {
                 "width": scenario["viewport"]["width"],
                 "height": scenario["viewport"]["height"],
             },
+            "gotoOptions": {
+                "waitUntil": browserless_event,
+                "timeout": wait.get("timeout_ms", 15_000),
+            },
             "options": {
                 "type": "jpeg" if scenario.get("output") == "jpeg" else scenario.get("output", "png"),
                 "fullPage": scenario.get("full_page", True),
             },
         }
+        if wait.get("delay_ms"):
+            payload["waitForTimeout"] = wait["delay_ms"]
+        if wait.get("selector"):
+            payload["waitForSelector"] = {
+                "selector": wait["selector"],
+                "timeout": wait.get("timeout_ms", 15_000),
+                "visible": True,
+            }
         token = os.environ.get("BROWSERLESS_TOKEN")
         target = endpoint.rstrip("/") + "/chromium/screenshot"
         if token:

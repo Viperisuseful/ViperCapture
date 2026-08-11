@@ -11,7 +11,7 @@
 | n8n/Terraform integrations | 0.1.0-beta.2 | GitHub Release asset | import/extract `vipercapture-integrations-*.zip` |
 | Python SDK | 0.1.0b2 | PyPI | `pip install vipercapture==0.1.0b2` |
 | TypeScript SDK | 0.1.0-beta.2 | npm | `npm install @vipercapture/sdk@0.1.0-beta.2` |
-| Go SDK | 0.1.0-beta.2 source | GitHub | import the tagged module source |
+| Go SDK | 0.1.0-beta.2 source | GitHub | `go get github.com/Viperisuseful/ViperCapture/sdk/go@v0.1.0-beta.2` |
 | Desktop beta | 0.1.9 | GitHub Releases | MSI/NSIS, Apple/Intel DMGs, Debian package |
 | Android beta | 0.1.8 | GitHub Releases, then Play Console internal testing | signed universal APK/AAB |
 
@@ -54,7 +54,9 @@ packages in clean temporary environments, and test the source archive with
 2. Run Validate, CodeQL, Operational readiness, and Same-host benchmark.
 3. Run OSS release with `publish=false`; inspect and smoke-test its artifacts.
 4. Create and push annotated tag `v0.1.0-beta.2`. The OSS workflow publishes
-   GitHub assets, GHCR, PyPI, npm, Action tag, skill, and integrations.
+   GitHub assets, GHCR, PyPI, npm, Action tag, skill, integrations, and the
+   required `sdk/go/v0.1.0-beta.2` Go submodule tag. It refuses to overwrite a
+   Go tag that points at another commit.
 5. Create and push annotated tag `desktop-v0.1.9`. The Desktop workflow builds
    four native packages and smoke-tests each packaged renderer before release.
 6. Keep `android-v0.1.8` as the existing Android beta. Upload its AAB to Play

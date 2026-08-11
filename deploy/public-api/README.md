@@ -19,9 +19,11 @@ object-store durability, or an incident-response owner.
    sudo ./egress-firewall.sh
    ```
 
-   This inserts one isolated chain into `DOCKER-USER`; it does not flush other
-   firewall rules. Re-run it after Docker/firewall replacement and verify it
-   with `sudo iptables -S VIPERCAPTURE_EGRESS`.
+   This inserts one isolated chain into `DOCKER-USER` for only the renderer's
+   fixed `172.30.0.10/32` address; established replies to the gateway and
+   Prometheus remain allowed. It does not flush other firewall rules. Re-run it
+   after Docker/firewall replacement and verify it with
+   `sudo iptables -S VIPERCAPTURE_EGRESS`.
 3. Start and probe the pinned deployment:
 
    ```bash
@@ -30,7 +32,10 @@ object-store durability, or an incident-response owner.
    curl --fail http://127.0.0.1:8080/ready
    ```
 4. Terminate HTTPS in a host reverse proxy, load balancer, or tunnel that sends
-   traffic only to `127.0.0.1:8080`. Do not expose the container port directly.
+   traffic only to `127.0.0.1:8080`. The front proxy must overwrite, not append,
+   `X-Forwarded-For` with the connecting client address. Nginx trusts only the
+   pinned Docker host gateway at `172.31.0.1` for that header. Do not expose the
+   container port directly.
 5. Create one project/key per customer or internal workload through an
    authenticated maintenance connection. Never give callers the admin token.
 

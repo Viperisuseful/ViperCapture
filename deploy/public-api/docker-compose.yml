@@ -92,6 +92,12 @@ services:
 
 networks:
   frontend:
+    driver: bridge
+    enable_ipv6: false
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
+          gateway: 172.31.0.1
   backend:
     driver: bridge
     enable_ipv6: false

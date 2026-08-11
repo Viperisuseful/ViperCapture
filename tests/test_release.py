@@ -59,6 +59,69 @@ class ChecksumTests(unittest.TestCase):
                 f"{hashlib.sha256(artifact.read_bytes()).hexdigest()}  nested/artifact.bin\n",
             )
 
+    def test_repository_bundles_are_reproducible(self):
+        with tempfile.TemporaryDirectory() as directory:
+            roots = [Path(directory) / name for name in ("first", "second")]
+            environment = os.environ.copy()
+            environment.pop("SOURCE_DATE_EPOCH", None)
+            for root in roots:
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(ROOT / "scripts" / "build_release.py"),
+                        "--output-dir",
+                        str(root),
+                    ],
+                    check=True,
+                    cwd=ROOT,
+                    env=environment,
+                )
+            first = {
+                path.relative_to(roots[0]): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in roots[0].rglob("*")
+                if path.is_file()
+            }
+            second = {
+                path.relative_to(roots[1]): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in roots[1].rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual(first, second)
+
+
+class OperationalPackagingTests(unittest.TestCase):
+    def test_egress_policy_targets_only_renderer_and_allows_replies(self):
+        policy = (ROOT / "deploy" / "public-api" / "egress-firewall.sh").read_text(
+            "utf-8"
+        )
+        self.assertIn("RENDERER_CIDR=${VIPERCAPTURE_RENDERER_CIDR:-172.30.0.10/32}", policy)
+        self.assertIn('--ctstate ESTABLISHED,RELATED -j RETURN', policy)
+        self.assertIn('-s "$RENDERER_CIDR" -j "$CHAIN"', policy)
+        self.assertLess(policy.index("ESTABLISHED,RELATED"), policy.index("10.0.0.0/8"))
+
+    def test_gateway_trust_and_rate_limit_share_one_fixed_network(self):
+        compose = (ROOT / "deploy" / "public-api" / "docker-compose.yml").read_text(
+            "utf-8"
+        )
+        nginx = (ROOT / "deploy" / "public-api" / "nginx.conf").read_text("utf-8")
+        self.assertIn("gateway: 172.31.0.1", compose)
+        self.assertIn("set_real_ip_from 127.0.0.1;", nginx)
+        self.assertIn("set_real_ip_from 172.31.0.1;", nginx)
+        self.assertIn("real_ip_header X-Forwarded-For;", nginx)
+        self.assertIn("limit_req_zone $binary_remote_addr", nginx)
+
+    def test_queue_alert_aggregates_both_metric_families(self):
+        alerts = (ROOT / "deploy" / "public-api" / "alerts.yml").read_text("utf-8")
+        self.assertIn("sum(rate(vipercapture_queue_seconds_sum[10m]))", alerts)
+        self.assertIn("sum(rate(vipercapture_renders_total[10m]))", alerts)
+
+    def test_container_waits_for_validated_packages_and_go_tag_is_prefixed(self):
+        workflow = (ROOT / ".github" / "workflows" / "oss-release.yml").read_text(
+            "utf-8"
+        )
+        self.assertIn("container:\n    needs: package", workflow)
+        self.assertIn('go_tag="sdk/go/v${version}"', workflow)
+
 
 if __name__ == "__main__":
     unittest.main()

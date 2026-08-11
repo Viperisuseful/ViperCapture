@@ -1,6 +1,8 @@
 # ViperCapture TypeScript SDK
 
-Typed beta client for browser and Node.js runtimes with `fetch`.
+Typed beta client for Node.js and same-origin browser applications with `fetch`.
+Cross-origin browser use requires the deployment's trusted gateway to provide a
+restricted CORS policy; the public-beta Compose stack does not enable CORS.
 
 ```ts
 import {ViperCapture} from "@vipercapture/sdk";

@@ -7,6 +7,7 @@ import argparse
 from datetime import datetime, timezone
 import io
 import json
+import os
 from pathlib import Path, PurePosixPath
 import subprocess
 import tarfile
@@ -15,6 +16,27 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSIONS = ROOT / "release" / "versions.json"
+
+
+def source_identity() -> tuple[str, str]:
+    commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+    ).strip()
+    epoch_text = os.environ.get("SOURCE_DATE_EPOCH")
+    if epoch_text is None:
+        epoch_text = subprocess.check_output(
+            ["git", "show", "-s", "--format=%ct", "HEAD"], cwd=ROOT, text=True
+        ).strip()
+    try:
+        epoch = int(epoch_text)
+    except ValueError as exc:
+        raise SystemExit("SOURCE_DATE_EPOCH must be an integer") from exc
+    if epoch < 0:
+        raise SystemExit("SOURCE_DATE_EPOCH must not be negative")
+    generated_at = datetime.fromtimestamp(epoch, timezone.utc).isoformat().replace(
+        "+00:00", "Z"
+    )
+    return commit, generated_at
 
 
 def tracked_files(*prefixes: str) -> list[Path]:
@@ -53,6 +75,10 @@ def go_bundle(target: Path, version: str) -> None:
             name = PurePosixPath(f"vipercapture-go-{version}") / path.relative_to(ROOT).as_posix()
             info = archive.gettarinfo(str(path), arcname=str(name))
             info.mtime = 0
+            info.uid = 0
+            info.gid = 0
+            info.uname = ""
+            info.gname = ""
             with path.open("rb") as source:
                 archive.addfile(info, source)
     import gzip
@@ -67,6 +93,7 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, default=ROOT / "dist")
     args = parser.parse_args()
     versions = json.loads(VERSIONS.read_text("utf-8"))
+    source_commit, generated_at = source_identity()
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
     (output / "python").mkdir(exist_ok=True)
@@ -89,7 +116,8 @@ def main() -> int:
     go_bundle(output / f"vipercapture-go-{version}.tar.gz", version)
     manifest = {
         "schema_version": 1,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": generated_at,
+        "source_commit": source_commit,
         "versions": versions,
         "destinations": {
             "source_action_skill_integrations": "GitHub Releases",

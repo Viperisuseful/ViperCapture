@@ -55,6 +55,22 @@ jobs:
           name: oss-release-packages
           path: dist/
           if-no-files-found: error
+      - name: Publish Go module tag
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+        run: |
+          version="$(python -c 'import json; print(json.load(open("release/versions.json"))["oss"])')"
+          go_tag="sdk/go/v${version}"
+          remote_lines="$(git ls-remote origin "refs/tags/${go_tag}" "refs/tags/${go_tag}^{}")"
+          if test -n "$remote_lines"; then
+            remote_commit="$(printf '%s\n' "$remote_lines" | awk '/\^\{\}$/ {print $1}')"
+            test -n "$remote_commit" || remote_commit="$(printf '%s\n' "$remote_lines" | head -n 1 | cut -f 1)"
+            test "$remote_commit" = "$GITHUB_SHA"
+          else
+            git config user.name github-actions[bot]
+            git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+            git tag --annotate "$go_tag" "$GITHUB_SHA" --message "ViperCapture Go SDK ${version}"
+            git push origin "refs/tags/${go_tag}"
+          fi
       - name: Publish Python SDK with trusted publishing
         if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
         uses: pypa/gh-action-pypi-publish@release/v1
@@ -77,6 +93,7 @@ jobs:
             --notes-file docs/releases/v0.1.0-beta.2.md
 
   container:
+    needs: package
     runs-on: ubuntu-22.04
     timeout-minutes: 35
     steps:
