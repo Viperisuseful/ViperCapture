@@ -936,6 +936,45 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
                 )
         self.assertEqual(raised.exception.code, "image_resize_source_too_large")
 
+    async def test_converted_webp_rejects_sources_above_pillow_pixel_ceiling(self):
+        payloads = [
+            {
+                "url": "https://example.com",
+                "engine": "firefox",
+                "output": "webp",
+                "full_page": False,
+                "lazy_load": "none",
+                "viewport": {"width": 5, "height": 5},
+            },
+            {
+                "url": "https://example.com",
+                "engine": "firefox",
+                "output": "webp",
+                "full_page": True,
+                "lazy_load": "none",
+                "viewport": {"width": 5, "height": 5},
+                "slices": {"height": 100},
+            },
+        ]
+        for payload in payloads:
+            with self.subTest(sliced="slices" in payload):
+                page = FakePage()
+                request = RenderRequest.model_validate(payload)
+                with patch.object(Image, "MAX_IMAGE_PIXELS", 10):
+                    with self.assertRaises(RenderError) as raised:
+                        await RenderEngine(hosted=False).render(
+                            FakeBrowser(FakeContext(page)),
+                            request,
+                            RenderLimits(
+                                max_width=1_000,
+                                max_height=1_000,
+                                max_pixels=1_000_000,
+                            ),
+                        )
+                self.assertEqual(
+                    raised.exception.code, "image_conversion_source_too_large"
+                )
+
     async def test_resize_uses_a_lossless_screenshot_intermediate(self):
         page = FakePage()
         request = RenderRequest.model_validate(

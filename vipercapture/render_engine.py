@@ -2218,16 +2218,30 @@ class RenderEngine:
                     if Image.MAX_IMAGE_PIXELS is not None
                     else None
                 )
+                pillow_source_height = (
+                    min(height, request.slices.height)
+                    if request.slices is not None
+                    else height
+                )
+                uses_pillow_conversion = (
+                    resizing_image or screenshot_output is not request.output
+                )
                 if (
-                    (request.image.width is not None or request.image.height is not None)
+                    uses_pillow_conversion
                     and pillow_pixel_limit is not None
                     and math.ceil(width * request.viewport.device_scale_factor)
-                    * math.ceil(height * request.viewport.device_scale_factor)
+                    * math.ceil(
+                        pillow_source_height * request.viewport.device_scale_factor
+                    )
                     > pillow_pixel_limit
                 ):
                     raise RenderError(
-                        "image_resize_source_too_large",
-                        "The source image is too large for safe resizing.",
+                        (
+                            "image_resize_source_too_large"
+                            if resizing_image
+                            else "image_conversion_source_too_large"
+                        ),
+                        "The source image is too large for safe image processing.",
                         413,
                         False,
                         {"max_source_pixels": pillow_pixel_limit},

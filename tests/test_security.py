@@ -728,6 +728,11 @@ class FrontendTests(unittest.TestCase):
         self.assertIn("Fast {output.toUpperCase()} encoding", desktop_source)
         self.assertIn('output === "png" || output === "webp"', desktop_source)
         self.assertIn("<FieldLegend>Page cleanup</FieldLegend>", desktop_source)
+        self.assertIn('pdfMode === "print" && <Field><FieldLabel>Paper', desktop_source)
+        self.assertIn(
+            'pdfMode === "print" && <Field><FieldLabel>Orientation',
+            desktop_source,
+        )
         self.assertIn('"style": "radix-nova"', components)
 
 

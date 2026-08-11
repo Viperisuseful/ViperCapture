@@ -502,10 +502,12 @@ export default function App() {
         : null,
       pdf: output === "pdf" ? {
         mode: pdfMode,
-        paper_size: paperSize,
-        orientation,
+        ...(pdfMode === "print" ? {
+          paper_size: paperSize,
+          orientation,
+          page_ranges: pdfPageRanges.trim() || null,
+        } : {}),
         margins: { top: pdfMargin, right: pdfMargin, bottom: pdfMargin, left: pdfMargin },
-        page_ranges: pdfMode === "print" ? pdfPageRanges.trim() || null : null,
         header_template: pdfHeader.trim() || null,
         footer_template: pdfFooter.trim() || null,
       } : null,
@@ -818,8 +820,8 @@ export default function App() {
                         <Field orientation="horizontal"><FieldLabel htmlFor="shadow-dom"><span><span className="block">Include open shadow DOM</span><FieldDescription>Serializes open component roots as declarative shadow DOM.</FieldDescription></span></FieldLabel><Switch id="shadow-dom" checked={includeShadowDom} onCheckedChange={setIncludeShadowDom} /></Field>
                       </FieldSet>}
                       {!isAndroid && output === "pdf" && <FieldSet><FieldLegend>PDF</FieldLegend>
-                        <FieldGroup className="grid grid-cols-2 gap-3"><Field><FieldLabel>Mode</FieldLabel><Select value={pdfMode} onValueChange={setPdfMode}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="print">Print pages</SelectItem><SelectItem value="single_page">Single page</SelectItem></SelectGroup></SelectContent></Select></Field><Field><FieldLabel>Paper</FieldLabel><Select value={paperSize} onValueChange={setPaperSize}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup>{["A0", "A1", "A2", "A3", "A4", "A5", "A6", "Legal", "Letter", "Tabloid"].map((size) => <SelectItem key={size} value={size}>{size}</SelectItem>)}</SelectGroup></SelectContent></Select></Field></FieldGroup>
-                        <FieldGroup className="grid grid-cols-2 gap-3"><Field><FieldLabel>Orientation</FieldLabel><Select value={orientation} onValueChange={setOrientation}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="portrait">Portrait</SelectItem><SelectItem value="landscape">Landscape</SelectItem></SelectGroup></SelectContent></Select></Field><Field><FieldLabel htmlFor="pdf-margin">Margins (in)</FieldLabel><Input id="pdf-margin" type="number" min={0} max={4} step={0.1} value={pdfMargin} onChange={(event) => setPdfMargin(Number(event.target.value))} /></Field></FieldGroup>
+                        <FieldGroup className="grid grid-cols-2 gap-3"><Field><FieldLabel>Mode</FieldLabel><Select value={pdfMode} onValueChange={setPdfMode}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="print">Print pages</SelectItem><SelectItem value="single_page">Single page</SelectItem></SelectGroup></SelectContent></Select></Field>{pdfMode === "print" && <Field><FieldLabel>Paper</FieldLabel><Select value={paperSize} onValueChange={setPaperSize}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup>{["A0", "A1", "A2", "A3", "A4", "A5", "A6", "Legal", "Letter", "Tabloid"].map((size) => <SelectItem key={size} value={size}>{size}</SelectItem>)}</SelectGroup></SelectContent></Select></Field>}</FieldGroup>
+                        <FieldGroup className="grid grid-cols-2 gap-3">{pdfMode === "print" && <Field><FieldLabel>Orientation</FieldLabel><Select value={orientation} onValueChange={setOrientation}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="portrait">Portrait</SelectItem><SelectItem value="landscape">Landscape</SelectItem></SelectGroup></SelectContent></Select></Field>}<Field><FieldLabel htmlFor="pdf-margin">Margins (in)</FieldLabel><Input id="pdf-margin" type="number" min={0} max={4} step={0.1} value={pdfMargin} onChange={(event) => setPdfMargin(Number(event.target.value))} /></Field></FieldGroup>
                         {pdfMode === "print" && <Field><FieldLabel htmlFor="page-ranges">Page ranges</FieldLabel><Input id="page-ranges" value={pdfPageRanges} onChange={(event) => setPdfPageRanges(event.target.value)} placeholder="1-3, 5" /></Field>}
                         <Field><FieldLabel htmlFor="pdf-header">Header template</FieldLabel><InputGroup><InputGroupTextarea id="pdf-header" rows={2} value={pdfHeader} onChange={(event) => setPdfHeader(event.target.value)} placeholder={'<span class="title"></span>'} /></InputGroup></Field>
                         <Field><FieldLabel htmlFor="pdf-footer">Footer template</FieldLabel><InputGroup><InputGroupTextarea id="pdf-footer" rows={2} value={pdfFooter} onChange={(event) => setPdfFooter(event.target.value)} placeholder={'<span class="pageNumber"></span>'} /></InputGroup></Field>
