@@ -1132,11 +1132,18 @@ async def render_metadata(page: Page) -> RenderArtifact:
                         height: Number(element.naturalHeight || element.height || 0)
                     }))
                 },
-                forms: [...document.forms].slice(0, maxItems).map((form) => ({
-                    action: clean(form.action),
-                    method: clean(form.method, 16),
-                    controls: form.elements.length
-                })),
+                forms: (() => {
+                    const forms = [];
+                    for (const form of document.forms) {
+                        forms.push({
+                            action: clean(form.action),
+                            method: clean(form.method, 16),
+                            controls: form.elements.length
+                        });
+                        if (forms.length >= maxItems) break;
+                    }
+                    return forms;
+                })(),
                 structured_data: [...document.querySelectorAll('script[type="application/ld+json"]')]
                     .slice(0, 16)
                     .map((element) => clean(element.textContent))

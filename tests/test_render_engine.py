@@ -1064,7 +1064,10 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_metadata_output_is_bounded_json(self):
         class MetadataPage:
-            async def evaluate(self, _script, _options):
+            script = ""
+
+            async def evaluate(self, script, _options):
+                self.script = script
                 return {
                     "title": "Example",
                     "description": "Description",
@@ -1083,11 +1086,14 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
                     },
                 }
 
-        artifact = await render_metadata(MetadataPage())
+        page = MetadataPage()
+        artifact = await render_metadata(page)
         self.assertEqual(artifact.media_type, "application/json")
         document = json.loads(artifact.body)
         self.assertEqual(document["title"], "Example")
         self.assertEqual(document["images"]["total"], 1)
+        self.assertIn("for (const form of document.forms)", page.script)
+        self.assertNotIn("[...document.forms]", page.script)
 
     async def test_markdown_input_conversion_is_off_thread_and_bounded(self):
         request = RenderRequest.model_validate(

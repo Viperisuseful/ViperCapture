@@ -244,7 +244,9 @@ async def render_document_output(
         )
         serialized_bytes = await page.evaluate(
             """() => {
-                const doctype = document.doctype ? `<!DOCTYPE ${document.doctype.name}>` : "";
+                const doctype = document.doctype
+                    ? new XMLSerializer().serializeToString(document.doctype)
+                    : "";
                 const html = document.documentElement?.outerHTML || "";
                 return new TextEncoder().encode(doctype + html).byteLength;
             }"""
@@ -333,7 +335,9 @@ async def render_document_output(
                     };
                     const clone = document.documentElement.cloneNode(true);
                     visit(document.documentElement, clone);
-                    const doctype = document.doctype ? `<!DOCTYPE ${document.doctype.name}>` : "";
+                    const doctype = document.doctype
+                        ? new XMLSerializer().serializeToString(document.doctype)
+                        : "";
                     return doctype + clone.outerHTML;
                 }"""
             )

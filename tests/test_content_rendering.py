@@ -155,6 +155,12 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
             LIMITS,
         )
         self.assertIn(b'template shadowrootmode="open"', artifact.body)
+        self.assertTrue(
+            all(
+                "new XMLSerializer().serializeToString(document.doctype)" in call.args[0]
+                for call in (page.evaluate.await_args_list[0], page.evaluate.await_args_list[2])
+            )
+        )
         page.content.assert_not_awaited()
 
     async def test_open_shadow_dom_is_bounded_before_serialization(self):
