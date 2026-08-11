@@ -20,14 +20,14 @@ def main() -> None:
     src_tauri = root / "src-tauri"
     cargo = tomllib.loads((src_tauri / "Cargo.toml").read_text(encoding="utf-8"))
     cargo_lock = tomllib.loads((src_tauri / "Cargo.lock").read_text(encoding="utf-8"))
+    package_lock = json.loads((root / "package-lock.json").read_text(encoding="utf-8"))
     locked_app = next(
         package for package in cargo_lock["package"] if package["name"] == "vipercapture-desktop"
     )
     versions = {
         "package.json": json.loads((root / "package.json").read_text(encoding="utf-8"))["version"],
-        "package-lock.json": json.loads(
-            (root / "package-lock.json").read_text(encoding="utf-8")
-        )["version"],
+        "package-lock.json": package_lock["version"],
+        'package-lock.json packages[""]': package_lock["packages"][""]["version"],
         "Cargo.toml": cargo["package"]["version"],
         "Cargo.lock": locked_app["version"],
         "tauri.conf.json": json.loads(
