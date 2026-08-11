@@ -46,9 +46,26 @@ host; neither layer replaces network-level abuse protection.
 ## Backups and restore drills
 
 Enable bucket versioning and retention in S3/R2. The Docker volume contains
-control-plane state, encrypted queued inputs, encryption keys, schedules, and
-cache metadata. Take an offline volume backup so the SQLite files and keys are
-from the same instant:
+control-plane state, encrypted queued inputs, schedules, and cache metadata. It
+does **not** contain the secrets needed to decrypt that state or the credentials
+needed to retrieve S3/R2 artifacts. Keep a separately encrypted recovery copy of
+the complete `.env`, including `VIPERCAPTURE_CONTROL_SECRET`,
+`VIPERCAPTURE_JOB_SECRET`, `VIPERCAPTURE_SIGNING_SECRET`, admin and webhook
+tokens, and every `VIPERCAPTURE_S3_*`/`AWS_*` value. For example, encrypt it to
+an offline recovery key with [age](https://age-encryption.org/) and never store
+the plaintext copy beside the volume archive:
+
+```bash
+umask 077
+mkdir -p backups
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+age --encrypt --recipient "$VIPERCAPTURE_BACKUP_AGE_RECIPIENT" \
+  --output "backups/vipercapture-env-${stamp}.age" .env
+```
+
+Store that encrypted file and the age identity in separate access-controlled
+locations, and test that the object-store credentials still reach the retained
+bucket. Then take an offline volume backup so its encrypted state is consistent:
 
 ```bash
 mkdir -p backups
@@ -61,10 +78,27 @@ docker compose --env-file .env start vipercapture
 curl --fail http://127.0.0.1:8080/ready
 ```
 
-At least monthly, restore into a new named volume on a non-production host,
-start the same pinned image, authenticate an admin status request, and verify a
-retained job/profile/baseline. A backup that has not passed a restore drill is
-not release evidence.
+At least monthly, restore the matching pair on a non-production host (replace
+the timestamp and identity path):
+
+```bash
+umask 077
+age --decrypt --identity /secure/offline-recovery-key.txt \
+  --output .env backups/vipercapture-env-TIMESTAMP.age
+chmod 600 .env
+export COMPOSE_PROJECT_NAME=vipercapture-restore
+docker volume create "${COMPOSE_PROJECT_NAME}_vipercapture-data"
+docker run --rm \
+  -v "${COMPOSE_PROJECT_NAME}_vipercapture-data:/data" \
+  -v "$PWD/backups:/backup:ro" alpine:3.22.1 \
+  tar -C /data -xzf /backup/vipercapture-data-TIMESTAMP.tar.gz
+docker compose --project-name "$COMPOSE_PROJECT_NAME" --env-file .env up -d
+```
+
+Authenticate an admin status request and verify a retained
+job/profile/baseline plus an S3-backed artifact. Delete the recovered plaintext
+`.env` when the isolated drill is complete. A backup that has not passed this
+full state, secret, and object-store restore drill is not release evidence.
 
 ## Upgrade and rollback
 

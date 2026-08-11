@@ -168,12 +168,17 @@ class OperationalPackagingTests(unittest.TestCase):
         self.assertIn('gh release view "$RELEASE_TAG"', workflow)
         self.assertIn("--json assets --jq '.assets[].name'", workflow)
         self.assertIn('gh release upload "$RELEASE_TAG" "$asset"', workflow)
+        self.assertIn('cmp -s "$asset" "$download_dir/$asset_name"', workflow)
+        self.assertIn("--repo \"$GITHUB_REPOSITORY\" --clobber", workflow)
         self.assertIn("MANUAL_PUBLISH:", workflow)
         self.assertIn(
             'git ls-remote origin "refs/tags/${expected}" "refs/tags/${expected}^{}"',
             workflow,
         )
         self.assertIn('test "$tagged_commit" = "$GITHUB_SHA"', workflow)
+        publish_condition = "(github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish)"
+        self.assertEqual(workflow.count(publish_condition), 6)
+        self.assertNotIn("if: startsWith(github.ref, 'refs/tags/v') || inputs.publish", workflow)
 
     def test_gateway_streams_admitted_request_bodies(self):
         nginx = (ROOT / "deploy" / "public-api" / "nginx.conf").read_text("utf-8")
@@ -186,6 +191,19 @@ class OperationalPackagingTests(unittest.TestCase):
         self.assertIn('"" $request_id;', nginx)
         self.assertIn("default $http_x_request_id;", nginx)
         self.assertIn("proxy_set_header X-Request-Id $upstream_request_id;", nginx)
+
+    def test_backup_guide_includes_external_secrets_and_object_store_restore(self):
+        guide = (ROOT / "deploy" / "public-api" / "README.md").read_text("utf-8")
+        for name in (
+            "VIPERCAPTURE_CONTROL_SECRET",
+            "VIPERCAPTURE_JOB_SECRET",
+            "VIPERCAPTURE_SIGNING_SECRET",
+            "VIPERCAPTURE_S3_*",
+            "AWS_*",
+        ):
+            self.assertIn(name, guide)
+        self.assertIn("age --encrypt", guide)
+        self.assertIn("S3-backed artifact", guide)
 
 
 if __name__ == "__main__":
