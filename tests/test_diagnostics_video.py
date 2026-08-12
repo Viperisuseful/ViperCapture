@@ -242,6 +242,35 @@ class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
             ):
                 self.assertEqual(_ffmpeg_executable(), candidates[1])
 
+    def test_ffmpeg_discovery_uses_explicit_and_bundled_executables(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            explicit = root / "explicit-ffmpeg"
+            bundled = root / "bundled-ffmpeg"
+            for candidate in (explicit, bundled):
+                candidate.write_bytes(b"ffmpeg")
+                candidate.chmod(0o700)
+
+            with patch.dict(
+                os.environ,
+                {
+                    "VIPERCAPTURE_FFMPEG": str(explicit),
+                    "VIPERCAPTURE_BUNDLED_FFMPEG": str(bundled),
+                },
+                clear=True,
+            ):
+                self.assertEqual(_ffmpeg_executable(), explicit)
+
+            with (
+                patch("vipercapture.render_engine.shutil.which", return_value=None),
+                patch.dict(
+                    os.environ,
+                    {"VIPERCAPTURE_BUNDLED_FFMPEG": str(bundled)},
+                    clear=True,
+                ),
+            ):
+                self.assertEqual(_ffmpeg_executable(), bundled)
+
     def test_diagnostic_urls_drop_secrets(self):
         sanitized = diagnostic_url("https://user:pass@example.com/path?token=secret#fragment")
         self.assertEqual(sanitized, "https://example.com/path")

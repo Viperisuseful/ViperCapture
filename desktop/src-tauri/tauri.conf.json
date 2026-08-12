@@ -46,7 +46,8 @@
       "binaries/vipercapture-sidecar"
     ],
     "resources": {
-      "resources/playwright/": "playwright/"
+      "resources/playwright/": "playwright/",
+      "resources/ffmpeg/": "ffmpeg/"
     },
     "linux": {
       "deb": {

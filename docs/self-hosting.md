@@ -8,9 +8,13 @@ remain separate.
 
 ## Local install
 
-Use Python 3.11 or newer, then run `python launch.py`. This is the supported
-setup and startup method. The launcher creates a virtual environment, installs
-Playwright Chromium, Firefox, and WebKit, starts the application, and opens the local interface.
+Use Python 3.11 or newer and install a full FFmpeg build through the operating
+system package manager. Confirm `ffmpeg -encoders` lists `libvpx`, `libvpx-vp9`,
+and `libx264`; GPU video additionally requires the vendor encoder and driver.
+Then run `python launch.py`. This is the supported setup and startup method.
+The launcher creates a virtual environment, installs Playwright Chromium,
+Firefox, and WebKit, starts the application, and opens the local interface.
+The Docker image and released desktop installers already include FFmpeg.
 
 ## Production boundaries
 

@@ -10,6 +10,7 @@ The desktop bundle includes:
 - the React interface and Tauri Rust shell;
 - the FastAPI/Playwright renderer packaged with PyInstaller;
 - platform-native Playwright Chromium, Firefox, and WebKit runtimes;
+- a pinned, checksum-verified FFmpeg executable and its license materials;
 - a random loopback port and per-launch bearer secret;
 - app-data capture storage and clean sidecar/browser shutdown.
 
@@ -26,6 +27,10 @@ for each operating system. Windows development requires:
 - Microsoft Edge WebView2
 - Rust using the MSVC toolchain
 - Node.js and npm
+
+Release installers need no separate FFmpeg installation. Development builds
+download the pinned native FFmpeg asset during `sidecar:build`; a system
+FFmpeg remains preferred when present so newer vendor GPU encoders can be used.
 
 Install the Python build dependencies from the repository root:
 
@@ -69,7 +74,7 @@ The `Desktop Release` GitHub Actions workflow builds on each native runner:
 - Windows x64: NSIS setup executable and MSI
 - macOS Apple Silicon: DMG
 - macOS Intel: DMG
-- Linux x64: Debian package with declared Chromium, Firefox, WebKit, and FFmpeg runtime dependencies
+- Linux x64: Debian package with bundled FFmpeg plus declared browser and system dependencies
 
 The first release artifacts are unsigned. Windows SmartScreen and macOS
 Gatekeeper may warn until repository secrets for platform code-signing
@@ -79,5 +84,7 @@ Markdown input, resizing, extraction, PDF, video, diagnostics, deterministic
 rendering, slices, and the cleanup/network controls. Expert JSON overrides are
 deep-merged into the generated strict request for actions, assertions, cookies,
 proxies, profiles, viewport packs, certification, and newly added API fields.
-MP4 is shown only when the installed or packaged FFmpeg exposes the required
-libx264 encoder; WebM and GIF remain available through Playwright's runtime.
+MP4, WebM, and GIF use the bundled FFmpeg when a compatible system FFmpeg is
+not installed. The build smoke test renders MP4 through that exact packaged
+binary. FFmpeg and the bundled codecs retain their upstream licenses; the
+corresponding `LICENSE` and build `README` ship beside the executable.

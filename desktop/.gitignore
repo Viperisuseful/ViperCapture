@@ -17,6 +17,8 @@ src-tauri/binaries/*
 !src-tauri/binaries/.gitkeep
 src-tauri/resources/playwright/*
 !src-tauri/resources/playwright/.gitkeep
+src-tauri/resources/ffmpeg/*
+!src-tauri/resources/ffmpeg/.gitkeep
 
 # Editor directories and files
 .vscode/*

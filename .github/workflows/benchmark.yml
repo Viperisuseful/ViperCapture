@@ -31,8 +31,8 @@ jobs:
       SCREENSHOTONE_ACCESS_KEY: ${{ secrets.SCREENSHOTONE_ACCESS_KEY }}
       URLBOX_SECRET: ${{ secrets.URLBOX_SECRET }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
@@ -103,7 +103,7 @@ jobs:
             > benchmark-results/container-inspect.json || true
           docker logs vipercapture-benchmark > benchmark-results/vipercapture.log 2>&1 || true
           docker logs browserless-benchmark > benchmark-results/browserless.log 2>&1 || true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: same-host-real-sites

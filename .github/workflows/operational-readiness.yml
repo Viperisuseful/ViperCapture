@@ -21,8 +21,8 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
@@ -122,7 +122,7 @@ jobs:
         run: >-
           python -m benchmarks.production_gate restart-recovery
           --output operational-results/restart-recovery.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: operational-readiness
@@ -130,12 +130,11 @@ jobs:
             operational-results/
             /tmp/vipercapture-operational.log
           if-no-files-found: warn
-
   constrained-memory:
     runs-on: ubuntu-22.04
     timeout-minutes: 35
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build image
         run: docker build --tag vipercapture:operational .
       - name: Start under a 1 GiB hard limit
@@ -173,7 +172,7 @@ jobs:
           docker stats --no-stream vipercapture-memory || true
           docker inspect vipercapture-memory > operational-results/container-inspect.json || true
           docker logs vipercapture-memory > operational-results/container.log 2>&1 || true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: constrained-memory

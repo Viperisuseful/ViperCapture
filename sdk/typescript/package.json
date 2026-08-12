@@ -11,14 +11,23 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist"],
-  "scripts": {"build": "tsc -p tsconfig.json", "prepack": "npm run build"},
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepack": "npm run build"
+  },
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Viperisuseful/ViperCapture.git",
     "directory": "sdk/typescript"
   },
-  "publishConfig": {"access": "public"},
-  "devDependencies": {"typescript": "^5.7.0"}
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3"
+  }
 }

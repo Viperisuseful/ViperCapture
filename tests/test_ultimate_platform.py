@@ -401,7 +401,7 @@ class ArtifactFeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("n8n-nodes-base.manualTrigger", node_types)
         self.assertIn("n8n-nodes-base.set", node_types)
         self.assertTrue(workflow["connections"])
-        self.assertIn("Pillow>=11.3.0", (root / "requirements.txt").read_text())
+        self.assertIn("Pillow>=12.3.0", (root / "requirements.txt").read_text())
         self.assertIn("ffmpeg", (root / "Dockerfile").read_text())
 
     def test_worker_role_requires_async_jobs(self):

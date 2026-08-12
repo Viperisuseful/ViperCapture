@@ -61,7 +61,14 @@ and run the [reproducible benchmark](benchmarks/README.md) on your workload.
 
 ## Start in one command
 
-With Python 3.11 or newer:
+Direct installs require Python 3.11 or newer and a full FFmpeg build on
+`PATH`. Video output needs the `libvpx`, `libvpx-vp9`, and `libx264` encoders;
+GPU video also needs the matching hardware encoder and driver. Use your OS
+package manager or the [FFmpeg download page](https://ffmpeg.org/download.html),
+then verify with `ffmpeg -encoders`. The Docker image already includes FFmpeg,
+and desktop installers bundle it.
+
+Then run:
 
 ```bash
 git clone https://github.com/Viperisuseful/ViperCapture.git

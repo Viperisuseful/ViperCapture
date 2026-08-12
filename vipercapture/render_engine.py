@@ -188,9 +188,25 @@ BOUNDED_CONSOLE_SCRIPT = """(() => {
 
 
 def _ffmpeg_executable() -> Path:
+    configured = os.getenv("VIPERCAPTURE_FFMPEG")
+    if configured:
+        candidate = Path(configured)
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+        raise RenderError(
+            "video_encoder_unavailable",
+            "VIPERCAPTURE_FFMPEG does not point to an executable file.",
+            503,
+            False,
+        )
     installed = shutil.which("ffmpeg")
     if installed:
         return Path(installed)
+    bundled = os.getenv("VIPERCAPTURE_BUNDLED_FFMPEG")
+    if bundled:
+        candidate = Path(bundled)
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
     roots = []
     configured = os.getenv("PLAYWRIGHT_BROWSERS_PATH")
     if configured:
@@ -210,7 +226,7 @@ def _ffmpeg_executable() -> Path:
                 return candidate
     raise RenderError(
         "video_encoder_unavailable",
-        "The Playwright FFmpeg runtime is unavailable.",
+        "An FFmpeg executable is unavailable.",
         503,
         False,
     )

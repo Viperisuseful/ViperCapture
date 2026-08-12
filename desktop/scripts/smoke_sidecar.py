@@ -66,6 +66,11 @@ def main() -> None:
     token = "vipercapture-desktop-smoke"
     base_url = f"http://127.0.0.1:{port}"
     env = os.environ.copy()
+    ffmpeg = TAURI_DIR / "resources" / "ffmpeg" / (
+        "ffmpeg.exe" if sys.platform.startswith("win") else "ffmpeg"
+    )
+    if not ffmpeg.is_file():
+        raise SystemExit(f"Bundled FFmpeg is missing: {ffmpeg}")
     env.update(
         {
             "VIPERCAPTURE_PORT": str(port),
@@ -73,6 +78,7 @@ def main() -> None:
             "VIPERCAPTURE_PARENT_PID": str(os.getpid()),
             "VIPERCAPTURE_CAPTURES_DIR": str(DESKTOP_DIR / ".sidecar-build" / "captures"),
             "PLAYWRIGHT_BROWSERS_PATH": str(TAURI_DIR / "resources" / "playwright"),
+            "VIPERCAPTURE_FFMPEG": str(ffmpeg),
         }
     )
 

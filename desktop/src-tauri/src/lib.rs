@@ -85,6 +85,33 @@ fn playwright_dir(app: &tauri::App) -> Result<PathBuf, String> {
 }
 
 #[cfg(desktop)]
+fn ffmpeg_path(app: &tauri::App) -> Result<PathBuf, String> {
+    let name = if cfg!(target_os = "windows") {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    };
+    let bundled = app
+        .path()
+        .resource_dir()
+        .map_err(|error| format!("Could not locate bundled resources: {error}"))?
+        .join("ffmpeg")
+        .join(name);
+    if bundled.is_file() {
+        return Ok(bundled);
+    }
+
+    let development = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("resources")
+        .join("ffmpeg")
+        .join(name);
+    if development.is_file() {
+        return Ok(development);
+    }
+    Err("The bundled FFmpeg executable is missing".to_string())
+}
+
+#[cfg(desktop)]
 fn stop_backend(app: &tauri::AppHandle) {
     let state = app.state::<BackendState>();
     if let Ok(mut guard) = state.child.lock() {
@@ -124,6 +151,7 @@ pub fn run() {
             let captures_dir = data_dir.join("captures");
             std::fs::create_dir_all(&captures_dir)?;
             let browser_dir = playwright_dir(app)?;
+            let ffmpeg = ffmpeg_path(app)?;
 
             let mut sidecar = app
                 .shell()
@@ -143,6 +171,7 @@ pub fn run() {
             }
             let (mut events, child) = sidecar
                 .env("PLAYWRIGHT_BROWSERS_PATH", browser_dir.as_os_str())
+                .env("VIPERCAPTURE_BUNDLED_FFMPEG", ffmpeg.as_os_str())
                 .spawn()?;
 
             let config = BackendConfig {
