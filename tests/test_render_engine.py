@@ -1355,7 +1355,7 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
             async def close(self):
                 return None
 
-        async def trim(_source, target, *, duration_ms):
+        async def trim(_source, target, *, duration_ms, **_options):
             target.write_bytes(b"webm")
             return duration_ms
 
