@@ -71,7 +71,7 @@ readiness, and `/v1/admin/status` exposes authenticated operator state. Set
 
 ## Clients and integrations
 
-The dependency-free Python CLI is under `skills/vipercapture/scripts`, typed
+The dependency-free Python client is under `skills/vipercapture/scripts`, typed
 TypeScript and Go clients are under `sdk/`, and the repository includes a
 composite GitHub Action, an importable n8n workflow, and a minimal Terraform
 Docker module. Compatibility adapters intentionally reject unknown vendor

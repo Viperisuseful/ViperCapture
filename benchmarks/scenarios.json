@@ -17,7 +17,7 @@
       "output": "png",
       "viewport": {"width": 1440, "height": 900, "device_scale_factor": 1},
       "full_page": true,
-      "lazy_load": "adaptive",
+      "lazy_load": "none",
       "wait_for": {"event": "load"}
     }
   }

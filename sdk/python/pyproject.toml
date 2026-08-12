@@ -4,7 +4,21 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vipercapture"
-version = "0.1.0"
+version = "0.1.0b2"
 description = "Dependency-free Python client for ViperCapture"
 requires-python = ">=3.11"
 license = "MIT"
+readme = "README.md"
+authors = [{name = "ViperCapture contributors"}]
+keywords = ["screenshot", "playwright", "rendering", "pdf"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only"
+]
+
+[project.urls]
+Homepage = "https://github.com/Viperisuseful/ViperCapture"
+Documentation = "https://github.com/Viperisuseful/ViperCapture/blob/master/docs/api.md"
+Issues = "https://github.com/Viperisuseful/ViperCapture/issues"

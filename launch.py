@@ -114,7 +114,7 @@ def ensure_playwright() -> None:
         return
 
     print("  [3/3] Installing Playwright browsers...")
-    command = [sys.executable, "-m", "playwright", "install"]
+    command = [sys.executable, "-m", "playwright", "install", "--no-shell"]
     if sys.platform.startswith("linux"):
         command.append("--with-deps")
     run(*command, "chromium", "firefox", "webkit", label="playwright install")

@@ -64,6 +64,8 @@ def main() -> None:
             raw_name,
             "--paths",
             str(REPO_DIR),
+            "--collect-data",
+            "playwright_stealth",
             "--distpath",
             str(BUILD_DIR / "dist"),
             "--workpath",

@@ -25,6 +25,7 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 from playwright.async_api import Browser, Playwright, async_playwright
+from playwright_stealth import Stealth
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .async_jobs import (
@@ -255,6 +256,17 @@ CONTROL_DATABASE = Path(
     os.getenv("VIPERCAPTURE_CONTROL_DATABASE", str(CACHE_DIRECTORY.parent / "control.sqlite3"))
 ).expanduser()
 METRICS = Metrics()
+STEALTH = Stealth(
+    navigator_platform_override=(
+        "Win32"
+        if sys.platform.startswith("win")
+        else "MacIntel"
+        if sys.platform == "darwin"
+        else "Linux x86_64"
+    ),
+    sec_ch_ua=False,
+    webgl_vendor=False,
+)
 
 
 class _SlotStreamingResponse(StreamingResponse):
@@ -331,9 +343,25 @@ async def _launch_browser(
 ) -> Browser:
     selected_mode = gpu_mode or GPU_MODE
     browser_type = getattr(playwright, engine.value)
+    launch_options = {
+        "headless": True,
+        "args": (
+            gpu_launch_args(selected_mode)
+            if engine.value == BrowserEngine.CHROMIUM.value
+            else []
+        ),
+    }
+    if engine.value == BrowserEngine.CHROMIUM.value:
+        launch_options.update(
+            channel="chromium",
+            env={
+                **os.environ,
+                "XDG_CACHE_HOME": "/tmp/chromium-cache",
+                "XDG_CONFIG_HOME": "/tmp/chromium-config",
+            },
+        )
     browser = await browser_type.launch(
-        headless=True,
-        args=gpu_launch_args(selected_mode) if engine.value == BrowserEngine.CHROMIUM.value else [],
+        **launch_options,
     )
     if selected_mode == "required" and engine.value == BrowserEngine.CHROMIUM.value:
         try:
@@ -440,6 +468,7 @@ async def lifespan(app: FastAPI):
                 "split api/worker roles require VIPERCAPTURE_SCHEDULE_STORE_FACTORY or VIPERCAPTURE_SCHEDULES=0"
             )
     playwright: Playwright = await async_playwright().start()
+    STEALTH.hook_playwright_context(playwright)
     browser = await _launch_browser(playwright)
     app.state.playwright = playwright
     app.state.browser = browser

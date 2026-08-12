@@ -1,0 +1,110 @@
+name: vipercapture-public
+
+services:
+  gateway:
+    image: nginx:1.29.0-alpine
+    depends_on:
+      vipercapture:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${VIPERCAPTURE_GATEWAY_PORT:-8080}:8080"
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:size=64m,mode=0755
+      - /var/run:size=1m,mode=0755
+      - /tmp:size=16m,mode=1777
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - frontend
+      - backend
+    cap_drop: [ALL]
+    cap_add: [CHOWN, NET_BIND_SERVICE, SETGID, SETUID]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+
+  vipercapture:
+    image: ghcr.io/viperisuseful/vipercapture:${VIPERCAPTURE_VERSION:?set VIPERCAPTURE_VERSION}
+    environment:
+      VIPERCAPTURE_HOSTED: "1"
+      VIPERCAPTURE_PUBLIC_URL: ${VIPERCAPTURE_PUBLIC_URL:?set VIPERCAPTURE_PUBLIC_URL}
+      VIPERCAPTURE_ADMIN_TOKEN: ${VIPERCAPTURE_ADMIN_TOKEN:?set VIPERCAPTURE_ADMIN_TOKEN}
+      VIPERCAPTURE_CONTROL_SECRET: ${VIPERCAPTURE_CONTROL_SECRET:?set VIPERCAPTURE_CONTROL_SECRET}
+      VIPERCAPTURE_JOB_SECRET: ${VIPERCAPTURE_JOB_SECRET:?set VIPERCAPTURE_JOB_SECRET}
+      VIPERCAPTURE_SIGNING_SECRET: ${VIPERCAPTURE_SIGNING_SECRET:?set VIPERCAPTURE_SIGNING_SECRET}
+      VIPERCAPTURE_SIGNING_ADMIN_TOKEN: ${VIPERCAPTURE_SIGNING_ADMIN_TOKEN:?set VIPERCAPTURE_SIGNING_ADMIN_TOKEN}
+      VIPERCAPTURE_WEBHOOK_SECRET: ${VIPERCAPTURE_WEBHOOK_SECRET:?set VIPERCAPTURE_WEBHOOK_SECRET}
+      VIPERCAPTURE_ASYNC_JOBS: "1"
+      VIPERCAPTURE_SCHEDULES: "1"
+      VIPERCAPTURE_MAX_CONCURRENCY: ${VIPERCAPTURE_MAX_CONCURRENCY:-2}
+      VIPERCAPTURE_JOB_WORKERS: ${VIPERCAPTURE_JOB_WORKERS:-2}
+      VIPERCAPTURE_JOB_QUEUE_LIMIT: ${VIPERCAPTURE_JOB_QUEUE_LIMIT:-100}
+      VIPERCAPTURE_MAX_PIXELS: ${VIPERCAPTURE_MAX_PIXELS:-50000000}
+      VIPERCAPTURE_MAX_WIDTH: ${VIPERCAPTURE_MAX_WIDTH:-7680}
+      VIPERCAPTURE_MAX_HEIGHT: ${VIPERCAPTURE_MAX_HEIGHT:-4320}
+      VIPERCAPTURE_MAX_FULL_PAGE_HEIGHT: ${VIPERCAPTURE_MAX_FULL_PAGE_HEIGHT:-20000}
+      VIPERCAPTURE_MAX_OUTPUT_BYTES: ${VIPERCAPTURE_MAX_OUTPUT_BYTES:-52428800}
+      VIPERCAPTURE_S3_BUCKET: ${VIPERCAPTURE_S3_BUCKET:?set VIPERCAPTURE_S3_BUCKET}
+      VIPERCAPTURE_S3_REGION: ${VIPERCAPTURE_S3_REGION:-auto}
+      VIPERCAPTURE_S3_ENDPOINT_URL: ${VIPERCAPTURE_S3_ENDPOINT_URL:-}
+      VIPERCAPTURE_S3_ADDRESSING_STYLE: ${VIPERCAPTURE_S3_ADDRESSING_STYLE:-auto}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?set AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?set AWS_SECRET_ACCESS_KEY}
+    volumes:
+      - vipercapture-data:/data
+    shm_size: 512m
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+      - /app/captures:size=64m,uid=10001,gid=10001,mode=0700
+      - /home/vipercapture/.cache:size=64m,uid=10001,gid=10001,mode=0700
+    pids_limit: 512
+    mem_limit: 2g
+    cpus: 2
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks:
+      backend:
+        ipv4_address: 172.30.0.10
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=2)"]
+      interval: 15s
+      timeout: 3s
+      retries: 4
+      start_period: 45s
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    networks: [backend]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+
+networks:
+  frontend:
+    driver: bridge
+    enable_ipv6: false
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
+          gateway: 172.31.0.1
+  backend:
+    driver: bridge
+    enable_ipv6: false
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  vipercapture-data:
+  prometheus-data:

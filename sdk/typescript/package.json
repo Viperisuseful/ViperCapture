@@ -1,10 +1,24 @@
 {
   "name": "@vipercapture/sdk",
-  "version": "0.1.0",
+  "version": "0.1.0-beta.2",
+  "description": "Typed beta client for the ViperCapture rendering API",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
   "files": ["dist"],
   "scripts": {"build": "tsc -p tsconfig.json", "prepack": "npm run build"},
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Viperisuseful/ViperCapture.git",
+    "directory": "sdk/typescript"
+  },
+  "publishConfig": {"access": "public"},
   "devDependencies": {"typescript": "^5.7.0"}
 }

@@ -1,0 +1,1381 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-08-11T20:57:56.039272+00:00",
+  "environment": {
+    "python": "3.11.15",
+    "platform": "Linux-6.8.0-1062-azure-x86_64-with-glibc2.35",
+    "machine": "x86_64"
+  },
+  "configuration": {
+    "runs": 10,
+    "warmups": 2,
+    "scenarios": [
+      {
+        "name": "wikipedia-home-viewport",
+        "request": {
+          "url": "https://www.wikipedia.org/",
+          "output": "png",
+          "viewport": {
+            "width": 1280,
+            "height": 720,
+            "device_scale_factor": 1
+          },
+          "full_page": false,
+          "lazy_load": "none",
+          "wait_for": {
+            "event": "load"
+          }
+        }
+      },
+      {
+        "name": "python-home-full-page",
+        "request": {
+          "url": "https://www.python.org/",
+          "output": "png",
+          "viewport": {
+            "width": 1365,
+            "height": 768,
+            "device_scale_factor": 1
+          },
+          "full_page": true,
+          "lazy_load": "none",
+          "wait_for": {
+            "event": "load"
+          }
+        }
+      },
+      {
+        "name": "rust-home-full-page",
+        "request": {
+          "url": "https://www.rust-lang.org/",
+          "output": "png",
+          "viewport": {
+            "width": 1440,
+            "height": 900,
+            "device_scale_factor": 1
+          },
+          "full_page": true,
+          "lazy_load": "none",
+          "wait_for": {
+            "event": "load"
+          }
+        }
+      },
+      {
+        "name": "github-home-viewport",
+        "request": {
+          "url": "https://github.com/",
+          "output": "png",
+          "viewport": {
+            "width": 1280,
+            "height": 800,
+            "device_scale_factor": 1
+          },
+          "full_page": false,
+          "lazy_load": "none",
+          "wait_for": {
+            "event": "domcontentloaded",
+            "delay_ms": 1000
+          }
+        }
+      },
+      {
+        "name": "mdn-web-docs-viewport",
+        "request": {
+          "url": "https://developer.mozilla.org/en-US/",
+          "output": "png",
+          "viewport": {
+            "width": 1280,
+            "height": 800,
+            "device_scale_factor": 1
+          },
+          "full_page": false,
+          "lazy_load": "none",
+          "wait_for": {
+            "event": "domcontentloaded",
+            "delay_ms": 1000
+          }
+        }
+      },
+      {
+        "name": "vite-home-full-page",
+        "request": {
+          "url": "https://vite.dev/",
+          "output": "png",
+          "viewport": {
+            "width": 1440,
+            "height": 900,
+            "device_scale_factor": 1
+          },
+          "full_page": true,
+          "lazy_load": "none",
+          "wait_for": {
+            "event": "load"
+          }
+        }
+      }
+    ]
+  },
+  "providers": [
+    {
+      "type": "viper",
+      "endpoint": "http://127.0.0.1:8000",
+      "cases": [
+        {
+          "name": "wikipedia-home-viewport",
+          "successes": 10,
+          "failures": [],
+          "success_rate": 1.0,
+          "latency_ms": {
+            "samples": [
+              398.87,
+              427.78,
+              397.65,
+              411.06,
+              368.78,
+              394.76,
+              406.4,
+              393.1,
+              383.42,
+              410.03
+            ],
+            "median": 398.26,
+            "p95": 427.78
+          },
+          "artifacts": [
+            {
+              "bytes": 103137,
+              "sha256": "2f4e331b91aa746a13a5181d18ae50c405d4e6940b01901268f863981507fd58",
+              "dimensions": [
+                1280,
+                720
+              ]
+            },
+            {
+              "bytes": 103137,
+              "sha256": "2f4e331b91aa746a13a5181d18ae50c405d4e6940b01901268f863981507fd58",
+              "dimensions": [
+                1280,
+                720
+              ]
+            },
+            {
+              "bytes": 103137,
+              "sha256": "2f4e331b91aa746a13a5181d18ae50c405d4e6940b01901268f863981507fd58",
+              "dimensions": [
+                1280,
+                720
+              ]
+            },
+            {
+              "bytes": 103137,
+              "sha256": "2f4e331b91aa746a13a5181d18ae50c405d4e6940b01901268f863981507fd58",
+              "dimensions": [
+                1280,
+                720
+              ]
+            },
+            {
+              "bytes": 103137,
+              "sha256": "2f4e331b91aa746a13a5181d18ae50c405d4e6940b01901268f863981507fd58",
+              "dimensions": [
+                1280,
+                720
+              ]
+            },
+            {
+              "bytes": 103137,
+              "sha256": "2f4e331b91aa746a13a5181d18ae50c405d4e6940b01901268f863981507fd58",
+              "dimensions": [
+                1280,
+                720
+              ]
+            },
+            {
+              "bytes": 103137,
+              "sha256": "2f4e331b91aa746a13a5181d18ae50c405d4e6940b01901268f863981507fd58",
+              "dimensions": [
+                1280,
+                720
+              ]
+            },
+            {
+              "bytes": 103137,
+              "sha256": "2f4e331b91aa746a13a5181d18ae50c405d4e6940b01901268f863981507fd58",
+              "dimensions": [
+                1280,
+                720
+              ]
+            },
+            {
+              "bytes": 103137,
+              "sha256": "2f4e331b91aa746a13a5181d18ae50c405d4e6940b01901268f863981507fd58",
+              "dimensions": [
+                1280,
+                720
+              ]
+            },
+            {
+              "bytes": 103137,
+              "sha256": "2f4e331b91aa746a13a5181d18ae50c405d4e6940b01901268f863981507fd58",
+              "dimensions": [
+                1280,
+                720
+              ]
+            }
+          ]
+        },
+        {
+          "name": "python-home-full-page",
+          "successes": 10,
+          "failures": [],
+          "success_rate": 1.0,
+          "latency_ms": {
+            "samples": [
+              641.19,
+              630.01,
+              639.07,
+              626.43,
+              655.97,
+              647.87,
+              677.85,
+              628.17,
+              642.55,
+              665.6
+            ],
+            "median": 641.87,
+            "p95": 677.85
+          },
+          "artifacts": [
+            {
+              "bytes": 420727,
+              "sha256": "f09b24d76fddadd43f1273a267aad85837ffa9e91445a928ae2b0d6328b619c9",
+              "dimensions": [
+                1365,
+                2497
+              ]
+            },
+            {
+              "bytes": 421671,
+              "sha256": "5bd120da17dc4faa2dc2d65f03eaf9a5e14110afa340c3be009b4dee87a2cba2",
+              "dimensions": [
+                1365,
+                2497
+              ]
+            },
+            {
+              "bytes": 416539,
+              "sha256": "c122d914d43d0639717459b7ed3c1135ce042e82a413ad12137138135f79ee25",
+              "dimensions": [
+                1365,
+                2497
+              ]
+            },
+            {
+              "bytes": 421351,
+              "sha256": "919b735b9a9dd432bf29b0e0ba7716c891b33604eb20681ed054cfa99714dfd2",
+              "dimensions": [
+                1365,
+                2497
+              ]
+            },
+            {
+              "bytes": 421703,
+              "sha256": "5e886a42b3dd16ea73763291d3bf6ec6528e20d6682bf230f4cd50d12a4c0230",
+              "dimensions": [
+                1365,
+                2497
+              ]
+            },
+            {
+              "bytes": 421722,
+              "sha256": "dca4512d3ff9f4a2a06ded39b3584bcecea2a3beb7b7071f76bef6837195d6f9",
+              "dimensions": [
+                1365,
+                2497
+              ]
+            },
+            {
+              "bytes": 420727,
+              "sha256": "f09b24d76fddadd43f1273a267aad85837ffa9e91445a928ae2b0d6328b619c9",
+              "dimensions": [
+                1365,
+                2497
+              ]
+            },
+            {
+              "bytes": 420715,
+              "sha256": "9a0e5dc1bda8b00b1fb7c7f3e0f9682b2b6ee7a5dd36df74cd303119660431e2",
+              "dimensions": [
+                1365,
+                2497
+              ]
+            },
+            {
+              "bytes": 420216,
+              "sha256": "4a45a041c06c8758a8385275d43a28a9b932bd87371de3081e07b41fa2fad1a7",
+              "dimensions": [
+                1365,
+                2497
+              ]
+            },
+            {
+              "bytes": 421315,
+              "sha256": "4c015472b76af782f44666a4064254bc8c8627e1e885ed1bcae92a8d56e89081",
+              "dimensions": [
+                1365,
+                2497
+              ]
+            }
+          ]
+        },
+        {
+          "name": "rust-home-full-page",
+          "successes": 10,
+          "failures": [],
+          "success_rate": 1.0,
+          "latency_ms": {
+            "samples": [
+              734.79,
+              608.59,
+              549.41,
+              609.84,
+              581.1,
+              543.23,
+              581.05,
+              510.46,
+              532.03,
+              541.07
+            ],
+            "median": 565.23,
+            "p95": 734.79
+          },
+          "artifacts": [
+            {
+              "bytes": 416288,
+              "sha256": "4e068e848bed2910e567a06779af6c2520e8bc59837b4fc132a651992f52a598",
+              "dimensions": [
+                1440,
+                3490
+              ]
+            },
+            {
+              "bytes": 416288,
+              "sha256": "4e068e848bed2910e567a06779af6c2520e8bc59837b4fc132a651992f52a598",
+              "dimensions": [
+                1440,
+                3490
+              ]
+            },
+            {
+              "bytes": 416288,
+              "sha256": "4e068e848bed2910e567a06779af6c2520e8bc59837b4fc132a651992f52a598",
+              "dimensions": [
+                1440,
+                3490
+              ]
+            },
+            {
+              "bytes": 416288,
+              "sha256": "4e068e848bed2910e567a06779af6c2520e8bc59837b4fc132a651992f52a598",
+              "dimensions": [
+                1440,
+                3490
+              ]
+            },
+            {
+              "bytes": 416288,
+              "sha256": "4e068e848bed2910e567a06779af6c2520e8bc59837b4fc132a651992f52a598",
+              "dimensions": [
+                1440,
+                3490
+              ]
+            },
+            {
+              "bytes": 416288,
+              "sha256": "4e068e848bed2910e567a06779af6c2520e8bc59837b4fc132a651992f52a598",
+              "dimensions": [
+                1440,
+                3490
+              ]
+            },
+            {
+              "bytes": 416288,
+              "sha256": "4e068e848bed2910e567a06779af6c2520e8bc59837b4fc132a651992f52a598",
+              "dimensions": [
+                1440,
+                3490
+              ]
+            },
+            {
+              "bytes": 416288,
+              "sha256": "4e068e848bed2910e567a06779af6c2520e8bc59837b4fc132a651992f52a598",
+              "dimensions": [
+                1440,
+                3490
+              ]
+            },
+            {
+              "bytes": 416288,
+              "sha256": "4e068e848bed2910e567a06779af6c2520e8bc59837b4fc132a651992f52a598",
+              "dimensions": [
+                1440,
+                3490
+              ]
+            },
+            {
+              "bytes": 416288,
+              "sha256": "4e068e848bed2910e567a06779af6c2520e8bc59837b4fc132a651992f52a598",
+              "dimensions": [
+                1440,
+                3490
+              ]
+            }
+          ]
+        },
+        {
+          "name": "github-home-viewport",
+          "successes": 10,
+          "failures": [],
+          "success_rate": 1.0,
+          "latency_ms": {
+            "samples": [
+              2530.64,
+              2563.42,
+              2619.59,
+              2621.38,
+              2531.5,
+              2504.52,
+              2493.75,
+              2570.02,
+              2566.63,
+              2650.23
+            ],
+            "median": 2565.03,
+            "p95": 2650.23
+          },
+          "artifacts": [
+            {
+              "bytes": 155731,
+              "sha256": "f4ba930907db82575131c6bd49ae50e4a772dc369366fde322c9abaf2b726293",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 160634,
+              "sha256": "edc2ce05795cf1066c1f6572e2f0e26f09a90030f4cd0282050c716f579dee45",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 160208,
+              "sha256": "551b27c3dedf07539fc5b1ea0510ec4671b549b6e3a21a984d64716cb7ce5535",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 157232,
+              "sha256": "3322deb7a43c80c63d072a93773b46b78ad1f30b712a2c64d2a00e4ca95be1db",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 159261,
+              "sha256": "c311bfa2eebe55e2ca0ebbdc92d9dba996d966eb8edad90a78d273f9540257c0",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 153216,
+              "sha256": "1a250f36d4b9dae96ccfb95afbeb5ae524752e33ea6f9d9cfe2f362c60239a5c",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 153894,
+              "sha256": "c36cb1f97e4c64c0937703b92f3891983103eab82fad54423f331cdb312d76c8",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 155870,
+              "sha256": "a531b2ee209d89b2b4853b12cd90abfdc6a444638c366cd4ee693a82d1b3fc43",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 154334,
+              "sha256": "89f02bc128ffaaaa3da9ebe43ffdaf456244e44b10d6c6986eab5bc984c31709",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 159658,
+              "sha256": "317939b1a50a9926dc3b1463bcc85dce1a709a9c9c807e852eed6a97d5faac8b",
+              "dimensions": [
+                1280,
+                800
+              ]
+            }
+          ]
+        },
+        {
+          "name": "mdn-web-docs-viewport",
+          "successes": 10,
+          "failures": [],
+          "success_rate": 1.0,
+          "latency_ms": {
+            "samples": [
+              1300.91,
+              1308.73,
+              1297.78,
+              1382.87,
+              1370.28,
+              1351.91,
+              1276.24,
+              1377.65,
+              1287.48,
+              1297.48
+            ],
+            "median": 1304.82,
+            "p95": 1382.87
+          },
+          "artifacts": [
+            {
+              "bytes": 113802,
+              "sha256": "63553573317bbaeaf7531a0277106cb5a4575cc1a8ef3b01417f1730288492b9",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 113802,
+              "sha256": "63553573317bbaeaf7531a0277106cb5a4575cc1a8ef3b01417f1730288492b9",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 113802,
+              "sha256": "63553573317bbaeaf7531a0277106cb5a4575cc1a8ef3b01417f1730288492b9",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 113806,
+              "sha256": "042074561d1db9d464d7e5e5d50ea5a733a092dbdb0dd1a2247c0db9913e4a26",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 113802,
+              "sha256": "63553573317bbaeaf7531a0277106cb5a4575cc1a8ef3b01417f1730288492b9",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 113802,
+              "sha256": "63553573317bbaeaf7531a0277106cb5a4575cc1a8ef3b01417f1730288492b9",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 113802,
+              "sha256": "63553573317bbaeaf7531a0277106cb5a4575cc1a8ef3b01417f1730288492b9",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 108680,
+              "sha256": "d874f29ebd6f12c666d35b965d46832c4cde942fe02a46bff057264a8bd3fc34",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 113802,
+              "sha256": "63553573317bbaeaf7531a0277106cb5a4575cc1a8ef3b01417f1730288492b9",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 113802,
+              "sha256": "63553573317bbaeaf7531a0277106cb5a4575cc1a8ef3b01417f1730288492b9",
+              "dimensions": [
+                1280,
+                800
+              ]
+            }
+          ]
+        },
+        {
+          "name": "vite-home-full-page",
+          "successes": 10,
+          "failures": [],
+          "success_rate": 1.0,
+          "latency_ms": {
+            "samples": [
+              1792.48,
+              1747.88,
+              1797.98,
+              1681.47,
+              1722.55,
+              1776.1,
+              1794.04,
+              1495.53,
+              1720.15,
+              1710.4
+            ],
+            "median": 1735.22,
+            "p95": 1797.98
+          },
+          "artifacts": [
+            {
+              "bytes": 2885603,
+              "sha256": "961e90b3f3e2589e5df1a251e2603a2019ecf3df0dee27a5b0b4127986d27a4c",
+              "dimensions": [
+                1440,
+                7972
+              ]
+            },
+            {
+              "bytes": 2885583,
+              "sha256": "48350e98b3dedcfd2eaec6153683335e7a075691554a201ff3a6ba39c99256aa",
+              "dimensions": [
+                1440,
+                7972
+              ]
+            },
+            {
+              "bytes": 2883786,
+              "sha256": "9ac76716d2c939cb273554b31b57ac3c1bcbabbc42c89e409f38349df8a6d655",
+              "dimensions": [
+                1440,
+                7973
+              ]
+            },
+            {
+              "bytes": 2881607,
+              "sha256": "d71fa740a08e4fcae612ca3445e87cbdc0e1523072938600f567016402d11483",
+              "dimensions": [
+                1440,
+                7973
+              ]
+            },
+            {
+              "bytes": 2883839,
+              "sha256": "2cdf732588f17f54cb78faa832d238c3b8ee6b8ec65e9595714f40473a6a64f3",
+              "dimensions": [
+                1440,
+                7973
+              ]
+            },
+            {
+              "bytes": 2885596,
+              "sha256": "af98c593912bd03ab7870353f57ce9a7373d30351a3270e42a1119e4cb93b127",
+              "dimensions": [
+                1440,
+                7972
+              ]
+            },
+            {
+              "bytes": 2883804,
+              "sha256": "863ccb83f5fa075661932e84d06bce19ef175b71fda70b5b559703c9351d9a62",
+              "dimensions": [
+                1440,
+                7973
+              ]
+            },
+            {
+              "bytes": 1890442,
+              "sha256": "b68b65cebee17efaf54cb557f1906128999a55ee7f36b2cc4dffd5d68b9275dd",
+              "dimensions": [
+                1440,
+                6972
+              ]
+            },
+            {
+              "bytes": 2881542,
+              "sha256": "a315ff2cf94e2be971b97cca2bdcc23293c93c6b4c16d5ced3ebfc757b8e4d6b",
+              "dimensions": [
+                1440,
+                7972
+              ]
+            },
+            {
+              "bytes": 2881595,
+              "sha256": "efb9f4ec6a6b90fc946fbed698ee7cdce7b875ef759ef9efaff14fafaa6c2da0",
+              "dimensions": [
+                1440,
+                7973
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "browserless",
+      "endpoint": "http://127.0.0.1:3000",
+      "cases": [
+        {
+          "name": "wikipedia-home-viewport",
+          "successes": 10,
+          "failures": [],
+          "success_rate": 1.0,
+          "latency_ms": {
+            "samples": [
+              967.3,
+              998.13,
+              956.31,
+              1132.06,
+              969.86,
+              981.4,
+              980.4,
+              984.81,
+              987.14,
+              1449.45
+            ],
+            "median": 983.11,
+            "p95": 1449.45
+          },
+          "artifacts": [
+            {
+              "bytes": 102380,
+              "sha256": "871e1998b5cc2d89991274f63171a446a70592fbf74ee8f9a8fe30765fc28a25",
+              "dimensions": [
+                1280,
+                720
+              ]
+            },
+            {
+              "bytes": 102380,
+              "sha256": "871e1998b5cc2d89991274f63171a446a70592fbf74ee8f9a8fe30765fc28a25",
+              "dimensions": [
+                1280,
+                720
+              ]
+            },
+            {
+              "bytes": 102380,
+              "sha256": "871e1998b5cc2d89991274f63171a446a70592fbf74ee8f9a8fe30765fc28a25",
+              "dimensions": [
+                1280,
+                720
+              ]
+            },
+            {
+              "bytes": 102380,
+              "sha256": "871e1998b5cc2d89991274f63171a446a70592fbf74ee8f9a8fe30765fc28a25",
+              "dimensions": [
+                1280,
+                720
+              ]
+            },
+            {
+              "bytes": 102380,
+              "sha256": "871e1998b5cc2d89991274f63171a446a70592fbf74ee8f9a8fe30765fc28a25",
+              "dimensions": [
+                1280,
+                720
+              ]
+            },
+            {
+              "bytes": 102380,
+              "sha256": "871e1998b5cc2d89991274f63171a446a70592fbf74ee8f9a8fe30765fc28a25",
+              "dimensions": [
+                1280,
+                720
+              ]
+            },
+            {
+              "bytes": 102380,
+              "sha256": "871e1998b5cc2d89991274f63171a446a70592fbf74ee8f9a8fe30765fc28a25",
+              "dimensions": [
+                1280,
+                720
+              ]
+            },
+            {
+              "bytes": 102380,
+              "sha256": "871e1998b5cc2d89991274f63171a446a70592fbf74ee8f9a8fe30765fc28a25",
+              "dimensions": [
+                1280,
+                720
+              ]
+            },
+            {
+              "bytes": 102380,
+              "sha256": "871e1998b5cc2d89991274f63171a446a70592fbf74ee8f9a8fe30765fc28a25",
+              "dimensions": [
+                1280,
+                720
+              ]
+            },
+            {
+              "bytes": 102380,
+              "sha256": "871e1998b5cc2d89991274f63171a446a70592fbf74ee8f9a8fe30765fc28a25",
+              "dimensions": [
+                1280,
+                720
+              ]
+            }
+          ]
+        },
+        {
+          "name": "python-home-full-page",
+          "successes": 10,
+          "failures": [],
+          "success_rate": 1.0,
+          "latency_ms": {
+            "samples": [
+              992.06,
+              1045.33,
+              994.46,
+              947.12,
+              949.66,
+              924.16,
+              965.35,
+              1044.87,
+              959.07,
+              953.01
+            ],
+            "median": 962.21,
+            "p95": 1045.33
+          },
+          "artifacts": [
+            {
+              "bytes": 459947,
+              "sha256": "2050976917495172d638024312e9a806cffa54c7e663868831c4acc8b8056636",
+              "dimensions": [
+                1365,
+                2497
+              ]
+            },
+            {
+              "bytes": 459942,
+              "sha256": "13f7f007a8aab573b84e48ed04656349cc43ccc6fdbb183628dc2f7c5ad28990",
+              "dimensions": [
+                1365,
+                2497
+              ]
+            },
+            {
+              "bytes": 462094,
+              "sha256": "3c1a29f8d6a11772d6dc6f7e75445f1cd1829069f834b26b007c9d69f63aa6c6",
+              "dimensions": [
+                1365,
+                2497
+              ]
+            },
+            {
+              "bytes": 464284,
+              "sha256": "a963cdec3a8d71f07c781694398709d94f92b83ba023ba678c9193434e000423",
+              "dimensions": [
+                1365,
+                2497
+              ]
+            },
+            {
+              "bytes": 462094,
+              "sha256": "3c1a29f8d6a11772d6dc6f7e75445f1cd1829069f834b26b007c9d69f63aa6c6",
+              "dimensions": [
+                1365,
+                2497
+              ]
+            },
+            {
+              "bytes": 457773,
+              "sha256": "66f47e6f11b7211bd4f095f347f6109da543cebd3eab759bb83e3151b1af7ac2",
+              "dimensions": [
+                1365,
+                2497
+              ]
+            },
+            {
+              "bytes": 462094,
+              "sha256": "3c1a29f8d6a11772d6dc6f7e75445f1cd1829069f834b26b007c9d69f63aa6c6",
+              "dimensions": [
+                1365,
+                2497
+              ]
+            },
+            {
+              "bytes": 463240,
+              "sha256": "8547679a54e5cc373703879aeb5a35b73ee946b08d259e55439a1f846db9aa5d",
+              "dimensions": [
+                1365,
+                2497
+              ]
+            },
+            {
+              "bytes": 465802,
+              "sha256": "8bd56b23a0987084ed6d908dc339c8831ec868db9e81e73eaaca70af46fefb5f",
+              "dimensions": [
+                1365,
+                2497
+              ]
+            },
+            {
+              "bytes": 457781,
+              "sha256": "d1746b48beae21677821394e1c112bfe5e61d73d2e78b3a709fc34bd42038278",
+              "dimensions": [
+                1365,
+                2497
+              ]
+            }
+          ]
+        },
+        {
+          "name": "rust-home-full-page",
+          "successes": 10,
+          "failures": [],
+          "success_rate": 1.0,
+          "latency_ms": {
+            "samples": [
+              906.71,
+              916.85,
+              951.44,
+              899.68,
+              920.84,
+              932.33,
+              906.26,
+              928.63,
+              871.47,
+              1015.26
+            ],
+            "median": 918.85,
+            "p95": 1015.26
+          },
+          "artifacts": [
+            {
+              "bytes": 443727,
+              "sha256": "ef3de9a6f8381229c1774b1376cf519b8d4de9009c36bc8b7a1931b3699e2695",
+              "dimensions": [
+                1440,
+                3490
+              ]
+            },
+            {
+              "bytes": 443727,
+              "sha256": "ef3de9a6f8381229c1774b1376cf519b8d4de9009c36bc8b7a1931b3699e2695",
+              "dimensions": [
+                1440,
+                3490
+              ]
+            },
+            {
+              "bytes": 443727,
+              "sha256": "ef3de9a6f8381229c1774b1376cf519b8d4de9009c36bc8b7a1931b3699e2695",
+              "dimensions": [
+                1440,
+                3490
+              ]
+            },
+            {
+              "bytes": 443727,
+              "sha256": "ef3de9a6f8381229c1774b1376cf519b8d4de9009c36bc8b7a1931b3699e2695",
+              "dimensions": [
+                1440,
+                3490
+              ]
+            },
+            {
+              "bytes": 443727,
+              "sha256": "ef3de9a6f8381229c1774b1376cf519b8d4de9009c36bc8b7a1931b3699e2695",
+              "dimensions": [
+                1440,
+                3490
+              ]
+            },
+            {
+              "bytes": 443727,
+              "sha256": "ef3de9a6f8381229c1774b1376cf519b8d4de9009c36bc8b7a1931b3699e2695",
+              "dimensions": [
+                1440,
+                3490
+              ]
+            },
+            {
+              "bytes": 443727,
+              "sha256": "ef3de9a6f8381229c1774b1376cf519b8d4de9009c36bc8b7a1931b3699e2695",
+              "dimensions": [
+                1440,
+                3490
+              ]
+            },
+            {
+              "bytes": 443727,
+              "sha256": "ef3de9a6f8381229c1774b1376cf519b8d4de9009c36bc8b7a1931b3699e2695",
+              "dimensions": [
+                1440,
+                3490
+              ]
+            },
+            {
+              "bytes": 443727,
+              "sha256": "ef3de9a6f8381229c1774b1376cf519b8d4de9009c36bc8b7a1931b3699e2695",
+              "dimensions": [
+                1440,
+                3490
+              ]
+            },
+            {
+              "bytes": 443727,
+              "sha256": "ef3de9a6f8381229c1774b1376cf519b8d4de9009c36bc8b7a1931b3699e2695",
+              "dimensions": [
+                1440,
+                3490
+              ]
+            }
+          ]
+        },
+        {
+          "name": "github-home-viewport",
+          "successes": 10,
+          "failures": [],
+          "success_rate": 1.0,
+          "latency_ms": {
+            "samples": [
+              2416.42,
+              2430.81,
+              2527.39,
+              2439.05,
+              2494.72,
+              2464.91,
+              2494.16,
+              2413.47,
+              2469.37,
+              2439.08
+            ],
+            "median": 2451.99,
+            "p95": 2527.39
+          },
+          "artifacts": [
+            {
+              "bytes": 121442,
+              "sha256": "67e97e4fce4592b3071473ef9dd407eda72ccab3bfeefa6ae9ab0c0594130723",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 121041,
+              "sha256": "6c5155d682050cfa011190866f8f023d7d12e0ada749fb86b83f99091c22e33f",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 120014,
+              "sha256": "3e000f72e0e1c2211c87edb09d6b26785c824e3d53b32d9d5dbe1814a21e8e93",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 114231,
+              "sha256": "effd8bcf3fd5cc12f02468c5b85f5ffd854d60138df866527b3c1fd014325018",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 121221,
+              "sha256": "800725a4ff83a48f1c03e7ba03f7a0630dae00095215bfbb63156573a1cd6df9",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 119896,
+              "sha256": "700567c690e31b836a652e598f7ce088336c2aeaadf37a32434547c1273281a4",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 120230,
+              "sha256": "a9c54a73a8e8b643df938db3d63064b3365df05241292637032278ca8d489e35",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 122620,
+              "sha256": "5a36b277a9d635fb8db357d4f25699849280d49998486f1aff1f3413f2fa89c0",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 118918,
+              "sha256": "1d9fce59d28c1ddbe4f813b5afb7ace4fc970c24a649bc52d17491ba1aef6566",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 121350,
+              "sha256": "67d51ab977dd3f820dc219e3fcc5a8e9d2dd992e629dec808162470be64406ba",
+              "dimensions": [
+                1280,
+                800
+              ]
+            }
+          ]
+        },
+        {
+          "name": "mdn-web-docs-viewport",
+          "successes": 10,
+          "failures": [],
+          "success_rate": 1.0,
+          "latency_ms": {
+            "samples": [
+              1582.92,
+              1617.23,
+              1574.6,
+              1581.34,
+              1595.83,
+              1582.33,
+              1645.06,
+              1625.21,
+              1583.15,
+              1583.19
+            ],
+            "median": 1583.17,
+            "p95": 1645.06
+          },
+          "artifacts": [
+            {
+              "bytes": 118990,
+              "sha256": "8d11202aac3912e8ed12558d47633c9f0ffe3c6944f67f1159f4739089bf3560",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 118989,
+              "sha256": "5a112163b89041ed97c6268ead9735c33dc05898affe258ebebbaee1f06f1afd",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 118990,
+              "sha256": "8d11202aac3912e8ed12558d47633c9f0ffe3c6944f67f1159f4739089bf3560",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 118990,
+              "sha256": "8d11202aac3912e8ed12558d47633c9f0ffe3c6944f67f1159f4739089bf3560",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 118990,
+              "sha256": "8d11202aac3912e8ed12558d47633c9f0ffe3c6944f67f1159f4739089bf3560",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 118989,
+              "sha256": "5a112163b89041ed97c6268ead9735c33dc05898affe258ebebbaee1f06f1afd",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 118989,
+              "sha256": "5a112163b89041ed97c6268ead9735c33dc05898affe258ebebbaee1f06f1afd",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 118989,
+              "sha256": "5a112163b89041ed97c6268ead9735c33dc05898affe258ebebbaee1f06f1afd",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 118989,
+              "sha256": "5a112163b89041ed97c6268ead9735c33dc05898affe258ebebbaee1f06f1afd",
+              "dimensions": [
+                1280,
+                800
+              ]
+            },
+            {
+              "bytes": 118989,
+              "sha256": "5a112163b89041ed97c6268ead9735c33dc05898affe258ebebbaee1f06f1afd",
+              "dimensions": [
+                1280,
+                800
+              ]
+            }
+          ]
+        },
+        {
+          "name": "vite-home-full-page",
+          "successes": 10,
+          "failures": [],
+          "success_rate": 1.0,
+          "latency_ms": {
+            "samples": [
+              1648.57,
+              1649.19,
+              1698.75,
+              1634.28,
+              1744.52,
+              1683.48,
+              1840.9,
+              1615.52,
+              1578.32,
+              1647.41
+            ],
+            "median": 1648.88,
+            "p95": 1840.9
+          },
+          "artifacts": [
+            {
+              "bytes": 2781370,
+              "sha256": "b4287db8b63067b507e453f13ec51a695ce1c08949b70f733230e2901fc4fbb0",
+              "dimensions": [
+                1440,
+                6973
+              ]
+            },
+            {
+              "bytes": 2781338,
+              "sha256": "5df0333775db2c313495835e36ce5d4b36c2a82c94849d3cea7cfc2e925d2acb",
+              "dimensions": [
+                1440,
+                6973
+              ]
+            },
+            {
+              "bytes": 2781327,
+              "sha256": "0bcd90e97b863ef90038df348ad9fed1e8c444d11cda02010f718181a3a69d40",
+              "dimensions": [
+                1440,
+                6973
+              ]
+            },
+            {
+              "bytes": 2781330,
+              "sha256": "2b4380576ac84abaac70b40b1082c6246eed90174e03eee8573c38e506ed9947",
+              "dimensions": [
+                1440,
+                6973
+              ]
+            },
+            {
+              "bytes": 2781338,
+              "sha256": "5df0333775db2c313495835e36ce5d4b36c2a82c94849d3cea7cfc2e925d2acb",
+              "dimensions": [
+                1440,
+                6973
+              ]
+            },
+            {
+              "bytes": 2781366,
+              "sha256": "b9907c1139dd35f3062391c6cd31ec27cad895b49a2209a1bc4ce90cfb7392d9",
+              "dimensions": [
+                1440,
+                6973
+              ]
+            },
+            {
+              "bytes": 2781330,
+              "sha256": "3a3c359c632ed73405b77696974a130b113d11187291b4c93ccaa913b6cf8f26",
+              "dimensions": [
+                1440,
+                6973
+              ]
+            },
+            {
+              "bytes": 1806151,
+              "sha256": "17bf24224aa12378254f4d6cddf4abdf255a1d6d43323f77d175602c06debfa5",
+              "dimensions": [
+                1440,
+                6973
+              ]
+            },
+            {
+              "bytes": 1806174,
+              "sha256": "f2085ce92e1c993711d1a8930e25013ee6dc95fd8753d564b88be2e3de91fe3e",
+              "dimensions": [
+                1440,
+                6973
+              ]
+            },
+            {
+              "bytes": 2781327,
+              "sha256": "0bcd90e97b863ef90038df348ad9fed1e8c444d11cda02010f718181a3a69d40",
+              "dimensions": [
+                1440,
+                6973
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
