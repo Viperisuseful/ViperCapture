@@ -4,14 +4,14 @@
 
 | Deliverable | Version | Ship to | How users consume it |
 | --- | --- | --- | --- |
-| OSS developer beta | 0.2.0-beta.1 | GitHub Releases | source archive or repository tag |
-| Container | 0.2.0-beta.1 | GitHub Container Registry | `docker pull ghcr.io/viperisuseful/vipercapture:v0.2.0-beta.1` |
-| GitHub Action | 0.2.0-beta.1 | Repository tag | `uses: Viperisuseful/ViperCapture@v0.2.0-beta.1` |
-| Agent skill | 0.2.0-beta.1 | GitHub Release asset | extract/install `vipercapture-skill-*.zip` |
-| n8n/Terraform integrations | 0.2.0-beta.1 | GitHub Release asset | import/extract `vipercapture-integrations-*.zip` |
-| Python SDK | 0.2.0b1 | PyPI | `pip install vipercapture==0.2.0b1` |
-| TypeScript SDK | 0.2.0-beta.1 | npm | `npm install @vipercapture/sdk@0.2.0-beta.1` |
-| Go SDK | 0.2.0-beta.1 source | GitHub | `go get github.com/Viperisuseful/ViperCapture/sdk/go@v0.2.0-beta.1` |
+| OSS developer beta | 0.2.0-beta.2 | GitHub Releases | source archive or repository tag |
+| Container | 0.2.0-beta.2 | GitHub Container Registry | `docker pull ghcr.io/viperisuseful/vipercapture:v0.2.0-beta.2` |
+| GitHub Action | 0.2.0-beta.2 | Repository tag | `uses: Viperisuseful/ViperCapture@v0.2.0-beta.2` |
+| Agent skill | 0.2.0-beta.2 | GitHub Release asset | extract/install `vipercapture-skill-*.zip` |
+| n8n/Terraform integrations | 0.2.0-beta.2 | GitHub Release asset | import/extract `vipercapture-integrations-*.zip` |
+| Python SDK | 0.2.0b2 | GitHub Releases; PyPI when enabled | release wheel/sdist or `pip install vipercapture==0.2.0b2` |
+| TypeScript SDK | 0.2.0-beta.2 | GitHub Releases; npm when enabled | release tarball or `npm install @vipercapture/sdk@0.2.0-beta.2` |
+| Go SDK | 0.2.0-beta.2 source | GitHub | `go get github.com/Viperisuseful/ViperCapture/sdk/go@v0.2.0-beta.2` |
 | Desktop beta | 0.2.0 | GitHub Releases | MSI/NSIS, Apple/Intel DMGs, Debian package |
 | Android beta | 0.1.8 | GitHub Releases, then Play Console internal testing | signed universal APK/AAB |
 
@@ -42,8 +42,13 @@ packages in clean temporary environments, and test the source archive with
 
 - Configure PyPI trusted publishing for repository
   `Viperisuseful/ViperCapture` and workflow `oss-release.yml`.
+- Set repository variable `PUBLISH_PYPI=true` after the trusted publisher is
+  configured. Until then, the wheel and source distribution remain available
+  from the GitHub release.
 - Create an npm automation token with publish access to the `@vipercapture`
-  scope and save it as repository secret `NPM_TOKEN`.
+  scope, save it as repository secret `NPM_TOKEN`, and set repository variable
+  `PUBLISH_NPM=true`. Until then, the npm tarball remains available from the
+  GitHub release.
 - GitHub's workflow token publishes the GHCR image and GitHub prerelease.
 - Add `SCREENSHOTONE_ACCESS_KEY` and `URLBOX_SECRET` only if managed-provider
   benchmark evidence is desired. They are not release credentials.
@@ -53,9 +58,10 @@ packages in clean temporary environments, and test the source archive with
 1. Confirm PR #21 is merged, then fast-forward `master`.
 2. Run Validate, CodeQL, Operational readiness, and Same-host benchmark.
 3. Run OSS release with `publish=false`; inspect and smoke-test its artifacts.
-4. Create and push annotated tag `v0.2.0-beta.1`. The OSS workflow publishes
+4. Create and push annotated tag `v0.2.0-beta.2`. The OSS workflow publishes
    GitHub assets, GHCR, PyPI, npm, Action tag, skill, integrations, and the
-   required `sdk/go/v0.2.0-beta.1` Go submodule tag. It refuses to overwrite a
+   required `sdk/go/v0.2.0-beta.2` Go submodule tag. PyPI and npm publish only
+   when their repository variables are enabled. It refuses to overwrite a
    Go tag that points at another commit.
 5. Create and push annotated tag `desktop-v0.2.0`. The Desktop workflow builds
    four native packages and smoke-tests each packaged renderer before release.
