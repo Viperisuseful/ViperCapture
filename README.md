@@ -4,26 +4,27 @@
 
 <h1 align="center">ViperCapture</h1>
 
-<p align="center"><strong>The open-source, self-hosted ScreenshotOne / Urlbox alternative.</strong></p>
+<p align="center"><strong>An open-source, self-hosted alternative to ScreenshotOne and Urlbox.</strong></p>
 
-ViperCapture is an MIT-licensed browser rendering platform. It turns URLs, HTML,
-or Markdown into screenshots, PDFs, AVIF images, WebM/MP4/GIF video, hydrated HTML, Markdown, or
-structured metadata—through a strict JSON API you can run on your own machines
-and storage.
+ViperCapture is an MIT-licensed browser renderer that runs on your own
+infrastructure. Give it a URL, HTML, or Markdown and it can return screenshots,
+PDFs, AVIF images, WebM/MP4/GIF video, hydrated HTML, Markdown, or structured
+metadata through a strict JSON API. You control the machines and storage.
 
 > [!IMPORTANT]
-> ViperCapture OSS v0.1 is beta software. The engine and API are ready for
+> ViperCapture OSS v0.2 is beta software. The engine and API are ready for
 > developer self-hosting and evaluation, but the public API may still change
 > before v1. The desktop and Android applications are also beta releases;
 > desktop packages are not yet code-signed.
 
-This project aims for practical workflow parity, not misleading one-for-one
-option naming. See the dated, source-linked [compatibility matrix](docs/compatibility.md)
-and run the [reproducible benchmark](benchmarks/README.md) on your workload.
+The goal is practical workflow parity, not a renamed copy of every competitor
+option. Check the dated, source-linked [compatibility matrix](docs/compatibility.md),
+then run the [reproducible benchmark](benchmarks/README.md) against your own
+workload.
 
 ## What ships
 
-- Chromium, Firefox, and WebKit rendering with lazy browser startup
+- Chromium, Firefox, and WebKit rendering; browsers start only when needed
 - PNG, JPEG, WebP, AVIF, PDF, HTML, Markdown, metadata, and WebM/MP4/GIF output
 - URL, raw HTML, and Markdown input; full-page, viewport, element, clip, and
   multi-viewport ZIP captures
@@ -33,8 +34,10 @@ and run the [reproducible benchmark](benchmarks/README.md) on your workload.
   geolocation, cookies, user agent, proxy, resource blocking, and cleanup
 - Ad, tracker, chat, newsletter, and consent-banner cleanup backed by the
   vendored, license-preserved AutoConsent rule set
-- Cleanup and deterministic advanced controls in both the browser UI and
-  desktop app
+- Cleanup and deterministic controls in both the browser UI and desktop app
+- Timed, full-page GIF, WebM, and MP4 capture with higher-quality encoding,
+  transparent padding where supported, and optional GPU acceleration with a
+  safe software fallback
 - High local defaults: 500 megapixels, 16,384-pixel viewports, and 100,000-pixel
   full-page height, all configurable for remote hosting
 - Durable encrypted async jobs, idempotency, retries, polling, cancellation,
@@ -56,17 +59,17 @@ and run the [reproducible benchmark](benchmarks/README.md) on your workload.
   cancellation, consistent error envelopes, and hosted-mode SSRF defenses
 - Browser UI, Tauri desktop app, native Android app, Docker Compose, and a
   portable agent skill
-- Reproducible sustained-load, forced restart-recovery, constrained-memory,
-  same-host competitor, and longer real-site benchmark workflows
+- Reproducible workflows for sustained load, forced restart recovery,
+  constrained memory, same-host competitor tests, and longer real-site runs
 
 ## Start in one command
 
-Direct installs require Python 3.11 or newer and a full FFmpeg build on
+Direct installation requires Python 3.11 or newer and a full FFmpeg build on
 `PATH`. Video output needs the `libvpx`, `libvpx-vp9`, and `libx264` encoders;
 GPU video also needs the matching hardware encoder and driver. Use your OS
-package manager or the [FFmpeg download page](https://ffmpeg.org/download.html),
-then verify with `ffmpeg -encoders`. The Docker image already includes FFmpeg,
-and desktop installers bundle it.
+package manager or the [FFmpeg download page](https://ffmpeg.org/download.html).
+Run `ffmpeg -encoders` to confirm the encoders are available. The Docker image
+already includes FFmpeg, and the desktop installers bundle it.
 
 Then run:
 
@@ -76,8 +79,8 @@ cd ViperCapture
 python launch.py
 ```
 
-The launcher creates a virtual environment, installs Chromium, Firefox, and WebKit, starts the API,
-and opens `http://127.0.0.1:8000`.
+The launcher creates a virtual environment, installs Chromium, Firefox, and
+WebKit, starts the API, and opens `http://127.0.0.1:8000`.
 
 Or use Docker:
 
@@ -85,10 +88,10 @@ Or use Docker:
 docker compose up --build
 ```
 
-The Compose default binds only to loopback and stores durable queue state,
+By default, Compose binds only to loopback. It keeps durable queue state,
 encryption keys, schedules, cache entries, and local artifacts in a named
-volume. Read [self-hosting](docs/self-hosting.md) before exposing it to a
-network. Set separate `VIPERCAPTURE_ADMIN_TOKEN` and
+volume. Read [self-hosting](docs/self-hosting.md) before exposing the service to
+a network. Set separate `VIPERCAPTURE_ADMIN_TOKEN` and
 `VIPERCAPTURE_CONTROL_SECRET` values to enable the built-in project control
 plane before exposing API routes to multiple tenants.
 
@@ -108,11 +111,12 @@ curl --fail-with-body http://127.0.0.1:8000/v1/render \
   }' --output example.png
 ```
 
-The synchronous response is the artifact itself. It includes a request ID,
-queue/render timing, dimensions, navigation status, and cache outcome in
-`X-ViperCapture-*` headers.
+A synchronous request returns the artifact directly. The
+`X-ViperCapture-*` headers include the request ID, queue and render timing,
+dimensions, navigation status, and cache outcome.
 
-For durable work, send the same render object to `POST /v1/jobs`. Poll
+For work that must survive a dropped connection, send the same render object to
+`POST /v1/jobs`. Poll
 `GET /v1/jobs/{id}`, download `GET /v1/jobs/{id}/result`, or receive a signed
 callback by setting `delivery.webhook_url`. Related orchestration endpoints:
 
@@ -137,46 +141,48 @@ administer challenges the renderer, follow the least-privilege
 
 ## Storage and webhooks
 
-Set `VIPERCAPTURE_S3_BUCKET` to switch job results from local files to the
-built-in S3 adapter. Standard AWS credential resolution is used. R2 and MinIO
-add an endpoint URL and path-style addressing where appropriate. The
-`docker-compose.s3.yml` overlay provides a complete local MinIO proof:
+Set `VIPERCAPTURE_S3_BUCKET` to store job results through the built-in S3
+adapter instead of local files. It uses standard AWS credential resolution.
+R2 and MinIO also need an endpoint URL and, where appropriate, path-style
+addressing. The `docker-compose.s3.yml` overlay provides a complete local MinIO
+example:
 
 ```bash
 export MINIO_ROOT_PASSWORD='replace-with-at-least-a-long-random-secret'
 docker compose -f docker-compose.yml -f docker-compose.s3.yml up --build
 ```
 
-Set `VIPERCAPTURE_WEBHOOK_SECRET` to enable callbacks. Each body is canonical
-JSON signed with HMAC-SHA256 in `X-ViperCapture-Webhook-Signature`, with timestamp and
-event-ID headers for verification and deduplication. Private callback targets
-are rejected unless the operator explicitly opts in. Public DNS results are
-pinned through the callback connection to prevent rebinding, and the encrypted
-delivery outbox survives process restarts.
+Set `VIPERCAPTURE_WEBHOOK_SECRET` to enable callbacks. Each callback contains
+canonical JSON signed with HMAC-SHA256 in
+`X-ViperCapture-Webhook-Signature`. Timestamp and event-ID headers support
+verification and deduplication. Private callback targets are rejected unless
+the operator explicitly opts in. Public DNS results stay pinned for the life
+of the callback connection to prevent rebinding, and the encrypted delivery
+outbox survives process restarts.
 
 ## Security boundary
 
-Keep the service on loopback, enable `VIPERCAPTURE_ADMIN_TOKEN`, or place every
-route behind the same authenticated, rate-limited reverse proxy. With the
-control plane disabled, job and schedule UUIDs remain locators rather than
-access control. Hosted mode rejects targets and redirects that resolve privately at
-validation time, unsafe subresources, cross-origin credential headers, proxy
-use, and cross-site cookies. Because browser DNS can change after validation,
-deployments must also enforce host/container egress rules to block rebinding.
-Self-host mode intentionally permits operators to reach internal pages and use
-proxies; isolate Chromium accordingly.
+Keep the service on loopback, enable `VIPERCAPTURE_ADMIN_TOKEN`, or put every
+route behind the same authenticated, rate-limited reverse proxy. When the
+control plane is disabled, job and schedule UUIDs identify resources but do
+not provide access control. Hosted mode rejects targets and redirects that
+resolve to private addresses during validation, along with unsafe subresources,
+cross-origin credential headers, proxy use, and cross-site cookies. Browser DNS
+can change after validation, so deployments also need host or container egress
+rules to block rebinding. Self-host mode deliberately allows internal pages and
+proxies; isolate Chromium with that boundary in mind.
 
 JavaScript actions are disabled unless `VIPERCAPTURE_ALLOW_SCRIPTS=1`. Render
 inputs can contain credentials and private page data. Async and scheduled inputs
 are AES-GCM encrypted and erased at terminal job states, but diagnostic console
-output and browser video can still capture sensitive page content—treat their
+output and browser video can still record sensitive page content. Treat those
 artifacts accordingly.
 
 ## Native apps and agent skill
 
-The beta Tauri 2 desktop app lives in [`desktop/`](desktop) and the beta Android
-WebView renderer is documented in [docs/android.md](docs/android.md). Download
-them from [GitHub Releases](https://github.com/Viperisuseful/ViperCapture/releases).
+The beta Tauri 2 desktop app lives in [`desktop/`](desktop). The beta Android
+WebView renderer is documented in [docs/android.md](docs/android.md). Both are
+available from [GitHub Releases](https://github.com/Viperisuseful/ViperCapture/releases).
 The portable
 [`skills/vipercapture`](skills/vipercapture) skill works with Codex, Claude Code,
 and Cursor and includes a dependency-free client.
@@ -190,9 +196,10 @@ python -m unittest -v
 npm ci --prefix frontend && npm run lint --prefix frontend && npm run build --prefix frontend
 ```
 
-CI runs the renderer suite and both web/desktop builds. The benchmark emits raw
-samples and never invents competitor results; use your own provider credentials
-to compare from the same host and scenario file.
+CI runs the renderer suite and builds both web interfaces. Benchmarks write the
+raw samples used in their reports and do not fill in missing competitor data.
+Use your own provider credentials to compare services from the same host with
+the same scenario file.
 
 ## License
 
