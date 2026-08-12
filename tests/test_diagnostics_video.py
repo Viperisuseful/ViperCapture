@@ -113,6 +113,7 @@ class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(hardware_video_encoder(OutputFormat.MP4), second)
         hardware_video_encoder.cache_clear()
         self.assertEqual(run.call_count, 2)
+        self.assertIn("color=size=128x128:rate=1", run.call_args_list[0].args[0])
 
     async def test_mp4_uses_selected_hardware_encoder_and_higher_bitrate(self):
         process = AsyncMock(return_value=(0, b""))

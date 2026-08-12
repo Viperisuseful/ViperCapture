@@ -259,7 +259,7 @@ def hardware_video_encoder(output: OutputFormat) -> HardwareVideoEncoder | None:
         command = [
             str(ffmpeg), "-hide_banner", "-loglevel", "error",
             *encoder.global_args,
-            "-f", "lavfi", "-i", "color=size=64x64:rate=1",
+            "-f", "lavfi", "-i", "color=size=128x128:rate=1",
             "-frames:v", "1", "-vf", encoder.filter,
             "-c:v", encoder.name, *encoder.options, *HARDWARE_VIDEO_BITRATE,
             "-f", "null", "-",
