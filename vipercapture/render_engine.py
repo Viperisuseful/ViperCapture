@@ -76,6 +76,11 @@ MAX_DNS_CONCURRENCY = 8
 MAX_DNS_ORIGINS = 100
 PUBLIC_DNS_SLOTS = asyncio.Semaphore(MAX_DNS_CONCURRENCY)
 MAX_DIAGNOSTIC_EVENTS = 500
+VPX_QUALITY = (
+    "-deadline", "realtime", "-cpu-used", "4", "-crf", "12",
+    "-b:v", "8M", "-maxrate", "12M", "-bufsize", "16M",
+)
+H264_QUALITY = ("-preset", "fast", "-crf", "17")
 STABILIZE_ANIMATIONS_SCRIPT = """() => {
     for (const animation of document.getAnimations()) {
         try {
@@ -250,10 +255,7 @@ async def _trim_webm(
         "-an",
         "-c:v",
         "libvpx",
-        "-deadline",
-        "realtime",
-        "-cpu-used",
-        "8",
+        *VPX_QUALITY,
         "-y",
         str(destination),
     ]
@@ -280,10 +282,15 @@ async def _transcode_video(source: Path, destination: Path, output: OutputFormat
             )
         encoding = [
             "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-c:v", "libx264",
-            "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            *H264_QUALITY, "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         ]
     elif output is OutputFormat.GIF:
-        encoding = ["-vf", "fps=12,scale='min(1280,iw)':-2:flags=lanczos", "-loop", "0"]
+        filters = (
+            "fps=15,split[frames][palette_input];"
+            "[palette_input]palettegen=stats_mode=diff[palette];"
+            "[frames][palette]paletteuse=dither=sierra2_4a"
+        )
+        encoding = ["-filter_complex", filters, "-loop", "0"]
     else:
         return
     returncode, _ = await _run_process(
@@ -310,7 +317,7 @@ async def _encode_scrolling_media(
     frames = (
         f"scale='min(iw,{width})':-2:flags=lanczos,"
         f"pad={width}:'max(ih,{height})':(ow-iw)/2:0:color={background},"
-        f"crop={width}:{height}:0:'(ih-oh)*min(t/{duration:.3f},1)',fps=12,"
+        f"crop={width}:{height}:0:'(ih-oh)*min(t/{duration:.3f},1)',fps=15,"
         f"format={'rgba' if transparent else 'rgb24'}"
     )
     if output is OutputFormat.MP4:
@@ -332,8 +339,8 @@ async def _encode_scrolling_media(
                 False,
             )
         encoding = [
-            "-vf", frames, "-c:v", encoder, "-deadline", "realtime",
-            "-cpu-used", "8", "-pix_fmt", "yuva420p" if transparent else "yuv420p",
+            "-vf", frames, "-c:v", encoder, *VPX_QUALITY,
+            "-pix_fmt", "yuva420p" if transparent else "yuv420p",
         ]
     else:
         if not await _settled_thread(ffmpeg_has_encoder, "libx264"):
@@ -344,7 +351,7 @@ async def _encode_scrolling_media(
                 False,
             )
         encoding = [
-            "-vf", frames, "-c:v", "libx264", "-preset", "veryfast",
+            "-vf", frames, "-c:v", "libx264", *H264_QUALITY,
             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         ]
     returncode, _ = await _run_process(

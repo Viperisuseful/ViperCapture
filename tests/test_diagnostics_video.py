@@ -18,6 +18,7 @@ from vipercapture.render_engine import (
     _ffmpeg_executable,
     _encode_scrolling_media,
     _redact_trace_archive,
+    _trim_webm,
     _transcode_video,
     _warc_document,
     diagnostic_bundle,
@@ -66,7 +67,28 @@ class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
         command = process.await_args.args[0]
         self.assertIn("libvpx-vp9", command)
         self.assertIn("yuva420p", command)
+        self.assertEqual(command[command.index("-crf") + 1], "12")
+        self.assertEqual(command[command.index("-b:v") + 1], "8M")
+        self.assertEqual(command[command.index("-maxrate") + 1], "12M")
+        self.assertEqual(command[command.index("-cpu-used") + 1], "4")
         self.assertIn("color=black@0", command[command.index("-vf") + 1])
+
+    async def test_live_webm_trim_uses_high_bitrate_constrained_quality(self):
+        process = AsyncMock(return_value=(0, b""))
+        duration = AsyncMock(side_effect=[2_000, 1_000])
+        with (
+            patch("vipercapture.render_engine._ffmpeg_executable", return_value=Path("ffmpeg")),
+            patch("vipercapture.render_engine._webm_duration_ms", duration),
+            patch("vipercapture.render_engine._run_process", process),
+        ):
+            await _trim_webm(
+                Path("source.webm"), Path("trimmed.webm"), duration_ms=1_000
+            )
+        command = process.await_args.args[0]
+        self.assertEqual(command[command.index("-crf") + 1], "12")
+        self.assertEqual(command[command.index("-b:v") + 1], "8M")
+        self.assertEqual(command[command.index("-maxrate") + 1], "12M")
+        self.assertEqual(command[command.index("-cpu-used") + 1], "4")
 
     async def test_mp4_transcode_pads_odd_dimensions(self):
         process = AsyncMock(return_value=(0, b""))
@@ -80,6 +102,24 @@ class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
             )
         command = process.await_args.args[0]
         self.assertIn("pad=ceil(iw/2)*2:ceil(ih/2)*2", command)
+        self.assertEqual(command[command.index("-crf") + 1], "17")
+        self.assertEqual(command[command.index("-preset") + 1], "fast")
+
+    async def test_gif_transcode_keeps_source_size_and_uses_generated_palette(self):
+        process = AsyncMock(return_value=(0, b""))
+        with (
+            patch("vipercapture.render_engine._ffmpeg_executable", return_value=Path("ffmpeg")),
+            patch("vipercapture.render_engine._run_process", process),
+        ):
+            await _transcode_video(
+                Path("capture.webm"), Path("capture.gif"), OutputFormat.GIF
+            )
+        command = process.await_args.args[0]
+        filters = command[command.index("-filter_complex") + 1]
+        self.assertIn("fps=15", filters)
+        self.assertIn("palettegen", filters)
+        self.assertIn("paletteuse", filters)
+        self.assertNotIn("scale=", filters)
 
     async def test_mp4_requires_libx264(self):
         with (

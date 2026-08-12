@@ -28,6 +28,9 @@ document over `video.duration_ms`. Set `video.transparent_background=true` to
 keep transparent page and side padding; opaque output uses black padding. MP4
 does not support transparency. With `full_page=false`, video records the live
 viewport and `video.scroll` optionally adds stepped scrolling.
+WebM targets 8 Mbps with a 12 Mbps ceiling, MP4 uses H.264 CRF 17, and GIF
+output keeps the requested viewport size with a generated 15 FPS palette. GPU
+mode affects Chromium page compositing, not these FFmpeg encoding settings.
 
 Set `engine` to `chromium` (default), `firefox`, or `webkit`. Browsers start on
 first use and each request still receives a fresh isolated context. PDF and
