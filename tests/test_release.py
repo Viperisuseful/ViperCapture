@@ -30,7 +30,7 @@ class ReleaseVersionTests(unittest.TestCase):
 
     def test_desktop_and_android_release_tags_are_checked_independently(self):
         script = ROOT / "desktop" / "scripts" / "check_release_version.py"
-        for app, tag in (("desktop", "desktop-v0.2.0"), ("android", "android-v0.1.8")):
+        for app, tag in (("desktop", "desktop-v0.2.1"), ("android", "android-v0.1.8")):
             completed = subprocess.run(
                 [sys.executable, str(script), app],
                 cwd=ROOT,

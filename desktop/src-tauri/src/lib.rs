@@ -1,5 +1,5 @@
 #[cfg(desktop)]
-use rand::{distr::Alphanumeric, Rng};
+use rand::{distr::Alphanumeric, RngExt};
 #[cfg(desktop)]
 use serde::Serialize;
 #[cfg(desktop)]

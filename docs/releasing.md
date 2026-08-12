@@ -12,11 +12,11 @@
 | Python SDK | 0.2.0b2 | GitHub Releases; PyPI when enabled | release wheel/sdist or `pip install vipercapture==0.2.0b2` |
 | TypeScript SDK | 0.2.0-beta.2 | GitHub Releases; npm when enabled | release tarball or `npm install @vipercapture/sdk@0.2.0-beta.2` |
 | Go SDK | 0.2.0-beta.2 source | GitHub | `go get github.com/Viperisuseful/ViperCapture/sdk/go@v0.2.0-beta.2` |
-| Desktop beta | 0.2.0 | GitHub Releases | MSI/NSIS, Apple/Intel DMGs, Debian package |
+| Desktop beta | 0.2.1 | GitHub Releases | MSI/NSIS, Apple/Intel DMGs, Debian package |
 | Android beta | 0.1.8 | GitHub Releases, then Play Console internal testing | signed universal APK/AAB |
 
 Android 0.1.8 is intentionally unchanged and already has a signed APK/AAB with
-checksums. Desktop advances independently to 0.2.0 so PR #21's animated
+checksums. Desktop advances independently to 0.2.1 so PR #21's animated
 full-page output, quality, GPU encoding, and release-tooling changes ship in
 fresh native packages without relabeling the existing Android binary.
 
@@ -63,7 +63,7 @@ packages in clean temporary environments, and test the source archive with
    required `sdk/go/v0.2.0-beta.2` Go submodule tag. PyPI and npm publish only
    when their repository variables are enabled. It refuses to overwrite a
    Go tag that points at another commit.
-5. Create and push annotated tag `desktop-v0.2.0`. The Desktop workflow builds
+5. Create and push annotated tag `desktop-v0.2.1`. The Desktop workflow builds
    four native packages and smoke-tests each packaged renderer before release.
 6. Keep `android-v0.1.8` as the existing Android beta. Upload its AAB to Play
    Console internal testing only after completing store metadata and policy review.
