@@ -1302,6 +1302,43 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(raised.exception.code, "captcha_detected")
 
+    async def test_full_page_video_uses_scrolling_encoder(self):
+        class FullPageVideo(FakePage):
+            async def close(self):
+                return None
+
+        context = FakeContext(FullPageVideo())
+        browser = FakeBrowser(context)
+
+        async def encode(_source, destination, _output, **_options):
+            destination.write_bytes(b"animated-gif")
+
+        with patch(
+            "vipercapture.render_engine._encode_scrolling_media",
+            side_effect=encode,
+        ) as encoder:
+            artifact = await RenderEngine(hosted=False).render_image(
+                browser,
+                RenderRequest(
+                    url="https://example.com",
+                    output="gif",
+                    full_page=True,
+                    lazy_load="none",
+                    video={"duration_ms": 1_000},
+                ),
+                RenderLimits(
+                    max_width=1920,
+                    max_height=1080,
+                    max_pixels=2_073_600,
+                ),
+            )
+        self.assertEqual(artifact.body, b"animated-gif")
+        self.assertTrue(context.page.screenshot_options["full_page"])
+        self.assertTrue(context.page.screenshot_options["omit_background"])
+        self.assertEqual(context.page.screenshot_options["scale"], "css")
+        self.assertNotIn("record_video_dir", browser.context_options)
+        encoder.assert_awaited_once()
+
     async def test_cancelled_video_read_settles_before_cleanup(self):
         started = threading.Event()
         release = threading.Event()

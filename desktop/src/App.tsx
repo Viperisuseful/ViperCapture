@@ -279,6 +279,7 @@ export default function App() {
   const maxPixels = config?.max_screenshot_pixels ?? 500_000_000
   const maxWidth = config?.max_viewport_width ?? 16_384
   const maxHeight = config?.max_viewport_height ?? 16_384
+  const videoOutput = ["webm", "mp4", "gif"].includes(output)
   const gpuEnabled = config?.gpu?.mode !== "off"
   const gpuCopy = useMemo(() => {
     if (!gpuEnabled) return "Uses Chromium's default software-compatible mode."
@@ -483,7 +484,7 @@ export default function App() {
         locale: locale.trim() || null,
         timezone: timezone.trim() || null,
       },
-      full_page: imageOutput ? effectiveFullPage : true,
+      full_page: videoOutput ? fullPage : imageOutput ? effectiveFullPage : true,
       preserve_viewport_width: effectiveFullPage && preserveViewportWidth,
       lazy_load: lazyLoad,
       selector: imageOutput && !clipEnabled ? selector || null : null,
@@ -498,7 +499,11 @@ export default function App() {
         optimize_for_speed: engine === "chromium" && (output === "png" || output === "webp") && optimizePng,
       },
       video: videoOutput
-        ? { duration_ms: videoDuration * 1000, scroll: videoScroll }
+        ? {
+            duration_ms: videoDuration * 1000,
+            scroll: !fullPage && videoScroll,
+            transparent_background: fullPage && output !== "mp4" && transparent,
+          }
         : null,
       pdf: output === "pdf" ? {
         mode: pdfMode,
@@ -766,7 +771,7 @@ export default function App() {
                       </ToggleGroupItem>
                     ))}
                   </ToggleGroup>
-                  {["png", "jpeg", "webp", "avif"].includes(output) && <Field orientation="horizontal">
+                  {(["png", "jpeg", "webp", "avif"].includes(output) || videoOutput) && <Field orientation="horizontal">
                     <FieldLabel htmlFor="full-page"><span><span className="block">Full page</span><FieldDescription>Scroll and capture the document.</FieldDescription></span></FieldLabel>
                     <Switch id="full-page" checked={fullPage} onCheckedChange={(checked: boolean) => setFullPage(checked)} disabled={Boolean(selector) || clipEnabled} />
                   </Field>}
@@ -826,7 +831,7 @@ export default function App() {
                         <Field><FieldLabel htmlFor="pdf-header">Header template</FieldLabel><InputGroup><InputGroupTextarea id="pdf-header" rows={2} value={pdfHeader} onChange={(event) => setPdfHeader(event.target.value)} placeholder={'<span class="title"></span>'} /></InputGroup></Field>
                         <Field><FieldLabel htmlFor="pdf-footer">Footer template</FieldLabel><InputGroup><InputGroupTextarea id="pdf-footer" rows={2} value={pdfFooter} onChange={(event) => setPdfFooter(event.target.value)} placeholder={'<span class="pageNumber"></span>'} /></InputGroup></Field>
                       </FieldSet>}
-                      {!isAndroid && ["webm", "mp4", "gif"].includes(output) && <FieldSet><FieldLegend>Video</FieldLegend><Field><FieldLabel htmlFor="video-duration">Duration (seconds)</FieldLabel><Input id="video-duration" type="number" min={1} max={30} value={videoDuration} onChange={(event) => setVideoDuration(Number(event.target.value))} /></Field><Field orientation="horizontal"><FieldLabel htmlFor="video-scroll">Scroll while recording</FieldLabel><Switch id="video-scroll" checked={videoScroll} onCheckedChange={setVideoScroll} /></Field></FieldSet>}
+                      {!isAndroid && videoOutput && <FieldSet><FieldLegend>Video</FieldLegend><Field><FieldLabel htmlFor="video-duration">Duration (seconds)</FieldLabel><Input id="video-duration" type="number" min={1} max={30} value={videoDuration} onChange={(event) => setVideoDuration(Number(event.target.value))} /></Field>{fullPage ? <FieldDescription>Full-page output scrolls from the top to the bottom over the chosen duration.</FieldDescription> : <Field orientation="horizontal"><FieldLabel htmlFor="video-scroll">Scroll viewport while recording</FieldLabel><Switch id="video-scroll" checked={videoScroll} onCheckedChange={setVideoScroll} /></Field>}{fullPage && output !== "mp4" && <Field orientation="horizontal"><FieldLabel htmlFor="transparent-video">Transparent side padding</FieldLabel><Switch id="transparent-video" checked={transparent} onCheckedChange={setTransparent} /></Field>}</FieldSet>}
                       {!isAndroid && <FieldSet><FieldLegend>Evidence and reproducibility</FieldLegend>
                         <Field orientation="horizontal"><FieldLabel htmlFor="deterministic">Deterministic time, randomness, motion, and fonts</FieldLabel><Switch id="deterministic" checked={deterministic} onCheckedChange={setDeterministic} /></Field>
                         <Field orientation="horizontal"><FieldLabel htmlFor="diagnostics">Diagnostic ZIP</FieldLabel><Switch id="diagnostics" checked={diagnostics} onCheckedChange={setDiagnostics} /></Field>

@@ -14,7 +14,7 @@ All request models reject unknown fields. Exactly one of `url`, `html`, or
 | `html` | UTF-8 HTML | Fully rendered document or article extraction |
 | `markdown` | UTF-8 Markdown | Document or readability-based article extraction |
 | `metadata` | JSON | Title, description, canonical URL, headings, links, images |
-| `webm`, `mp4`, `gif` | video | 1–30 second post-preparation window, stationary or stepped scrolling |
+| `webm`, `mp4`, `gif` | video | Full-page top-to-bottom animation, or a 1–30 second viewport recording |
 
 `viewports` accepts two or three named image viewports and returns a ZIP with a
 manifest. `diagnostics.bundle` returns a ZIP containing the normal artifact,
@@ -22,6 +22,12 @@ manifest, and optionally bounded console and network event files.
 WebM setup/navigation frames are trimmed from the recording with Playwright's
 FFmpeg runtime, and `duration_ms` reports the verified encoded duration rather
 than merely echoing the request.
+
+Full-page GIF and WebM output pans from the top to the bottom of the prepared
+document over `video.duration_ms`. Set `video.transparent_background=true` to
+keep transparent page and side padding; opaque output uses black padding. MP4
+does not support transparency. With `full_page=false`, video records the live
+viewport and `video.scroll` optionally adds stepped scrolling.
 
 Set `engine` to `chromium` (default), `firefox`, or `webkit`. Browsers start on
 first use and each request still receives a fresh isolated context. PDF and

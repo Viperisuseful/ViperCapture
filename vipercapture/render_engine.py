@@ -294,6 +294,76 @@ async def _transcode_video(source: Path, destination: Path, output: OutputFormat
         raise RenderError("video_encode_failed", f"The requested {output.value.upper()} could not be encoded.", 502, True)
 
 
+async def _encode_scrolling_media(
+    source: Path,
+    destination: Path,
+    output: OutputFormat,
+    *,
+    width: int,
+    height: int,
+    duration_ms: int,
+    transparent: bool,
+) -> None:
+    ffmpeg = _ffmpeg_executable()
+    duration = duration_ms / 1000
+    background = "black@0" if transparent else "black"
+    frames = (
+        f"scale='min(iw,{width})':-2:flags=lanczos,"
+        f"pad={width}:'max(ih,{height})':(ow-iw)/2:0:color={background},"
+        f"crop={width}:{height}:0:'(ih-oh)*min(t/{duration:.3f},1)',fps=12,"
+        f"format={'rgba' if transparent else 'rgb24'}"
+    )
+    if output is OutputFormat.MP4:
+        frames += ",pad=ceil(iw/2)*2:ceil(ih/2)*2:color=black"
+    if output is OutputFormat.GIF:
+        filters = (
+            f"{frames},split[frames][palette_input];"
+            f"[palette_input]palettegen=reserve_transparent={int(transparent)}[palette];"
+            "[frames][palette]paletteuse=alpha_threshold=128"
+        )
+        encoding = ["-filter_complex", filters, "-loop", "0"]
+    elif output is OutputFormat.WEBM:
+        encoder = "libvpx-vp9" if transparent else "libvpx"
+        if not await _settled_thread(ffmpeg_has_encoder, encoder):
+            raise RenderError(
+                "video_encoder_unavailable",
+                f"This FFmpeg build cannot encode WebM with {encoder}.",
+                503,
+                False,
+            )
+        encoding = [
+            "-vf", frames, "-c:v", encoder, "-deadline", "realtime",
+            "-cpu-used", "8", "-pix_fmt", "yuva420p" if transparent else "yuv420p",
+        ]
+    else:
+        if not await _settled_thread(ffmpeg_has_encoder, "libx264"):
+            raise RenderError(
+                "video_encoder_unavailable",
+                "This FFmpeg build cannot encode MP4 with libx264.",
+                503,
+                False,
+            )
+        encoding = [
+            "-vf", frames, "-c:v", "libx264", "-preset", "veryfast",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        ]
+    returncode, _ = await _run_process(
+        [
+            str(ffmpeg), "-hide_banner", "-loglevel", "error", "-loop", "1",
+            "-framerate", "12", "-t", f"{duration:.3f}", "-i", str(source),
+            *encoding, "-y", str(destination),
+        ],
+        45,
+    )
+    if returncode != 0:
+        raise RenderError(
+            "video_encode_failed",
+            f"The requested scrolling {output.value.upper()} could not be encoded.",
+            502,
+            True,
+        )
+
+
 def diagnostic_url(value: str) -> str:
     """Retain useful routing context without leaking query strings or credentials."""
     try:
@@ -1552,7 +1622,10 @@ class RenderEngine:
                     if storage_state is None:
                         raise RenderError("profile_not_found", "The browser profile was not found.", 404, False)
                     context_options["storage_state"] = storage_state
-                if request.output in {OutputFormat.WEBM, OutputFormat.MP4, OutputFormat.GIF}:
+                if (
+                    request.output in {OutputFormat.WEBM, OutputFormat.MP4, OutputFormat.GIF}
+                    and not request.full_page
+                ):
                     video_directory = tempfile.TemporaryDirectory(prefix="vipercapture-video-")
                     context_options["record_video_dir"] = video_directory.name
                     context_options["record_video_size"] = {
@@ -1962,29 +2035,44 @@ class RenderEngine:
                 await self._check_assertions(
                     page, request, failed_requests, matched_failure_patterns
                 )
-                is_video = request.output in {
-                    OutputFormat.WEBM,
-                    OutputFormat.MP4,
-                    OutputFormat.GIF,
-                }
                 if request.output in {OutputFormat.WEBM, OutputFormat.MP4, OutputFormat.GIF}:
                     options = request.video
-                    if options is None or page.video is None:
-                        raise RenderError("video_unavailable", "Chromium video recording is unavailable.", 500, True)
-                    if video_directory is None:
-                        raise RenderError("video_unavailable", "Video recording did not start.", 500, True)
-                    if options.scroll:
-                        elapsed = 0
-                        while elapsed < options.duration_ms:
-                            await page.evaluate(
-                                "step => window.scrollBy({top: step, left: 0, behavior: 'smooth'})",
-                                options.scroll_step,
-                            )
-                            delay = min(options.scroll_delay_ms, options.duration_ms - elapsed)
-                            await page.wait_for_timeout(delay)
-                            elapsed += delay
+                    if options is None:
+                        raise RenderError("video_unavailable", "Video options are unavailable.", 500, True)
+                    if request.full_page:
+                        page_width, page_height = await measure_page_dimensions(page)
+                        ensure_full_page_dimensions(
+                            page_width,
+                            page_height,
+                            1,
+                            limits,
+                            viewport_width=request.viewport.width,
+                        )
+                        if video_directory is None:
+                            video_directory = tempfile.TemporaryDirectory(prefix="vipercapture-video-")
+                        source_path = Path(video_directory.name) / "full-page.png"
+                        await page.screenshot(
+                            path=source_path,
+                            type="png",
+                            full_page=True,
+                            omit_background=True,
+                            scale="css",
+                        )
                     else:
-                        await page.wait_for_timeout(options.duration_ms)
+                        if page.video is None or video_directory is None:
+                            raise RenderError("video_unavailable", "Chromium video recording is unavailable.", 500, True)
+                        if options.scroll:
+                            elapsed = 0
+                            while elapsed < options.duration_ms:
+                                await page.evaluate(
+                                    "step => window.scrollBy({top: step, left: 0, behavior: 'smooth'})",
+                                    options.scroll_step,
+                                )
+                                delay = min(options.scroll_delay_ms, options.duration_ms - elapsed)
+                                await page.wait_for_timeout(delay)
+                                elapsed += delay
+                        else:
+                            await page.wait_for_timeout(options.duration_ms)
                     if self.challenge_checker:
                         await self.challenge_checker(
                             page,
@@ -2003,21 +2091,34 @@ class RenderEngine:
                         else None
                     )
                     final_url = page.url
-                    video = page.video
+                    video = None if request.full_page else page.video
                     await page.close()
                     await context.close()
                     context = None
-                    path = await video.path()
-                    trimmed_path = Path(video_directory.name) / "trimmed.webm"
-                    actual_duration_ms = await _trim_webm(
-                        Path(path),
-                        trimmed_path,
-                        duration_ms=options.duration_ms,
-                    )
-                    final_path = trimmed_path
-                    if request.output is not OutputFormat.WEBM:
+                    if request.full_page:
                         final_path = Path(video_directory.name) / f"final.{request.output.value}"
-                        await _transcode_video(trimmed_path, final_path, request.output)
+                        await _encode_scrolling_media(
+                            source_path,
+                            final_path,
+                            request.output,
+                            width=request.viewport.width,
+                            height=request.viewport.height,
+                            duration_ms=options.duration_ms,
+                            transparent=options.transparent_background,
+                        )
+                        actual_duration_ms = options.duration_ms
+                    else:
+                        path = await video.path()
+                        trimmed_path = Path(video_directory.name) / "trimmed.webm"
+                        actual_duration_ms = await _trim_webm(
+                            Path(path),
+                            trimmed_path,
+                            duration_ms=options.duration_ms,
+                        )
+                        final_path = trimmed_path
+                        if request.output is not OutputFormat.WEBM:
+                            final_path = Path(video_directory.name) / f"final.{request.output.value}"
+                            await _transcode_video(trimmed_path, final_path, request.output)
                     size = (await asyncio.to_thread(final_path.stat)).st_size
                     if not size:
                         raise RenderError("empty_output", "The renderer produced an empty video.", 502, True)

@@ -16,6 +16,7 @@ from vipercapture.render_engine import (
     RenderArtifact,
     RenderLimits,
     _ffmpeg_executable,
+    _encode_scrolling_media,
     _redact_trace_archive,
     _transcode_video,
     _warc_document,
@@ -26,6 +27,47 @@ from vipercapture.render_errors import RenderError
 
 
 class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
+    async def test_full_page_gif_scrolls_over_duration_with_opaque_padding(self):
+        process = AsyncMock(return_value=(0, b""))
+        with (
+            patch("vipercapture.render_engine._ffmpeg_executable", return_value=Path("ffmpeg")),
+            patch("vipercapture.render_engine._run_process", process),
+        ):
+            await _encode_scrolling_media(
+                Path("page.png"),
+                Path("capture.gif"),
+                OutputFormat.GIF,
+                width=320,
+                height=240,
+                duration_ms=5_000,
+                transparent=False,
+            )
+        command = process.await_args.args[0]
+        filters = command[command.index("-filter_complex") + 1]
+        self.assertIn("(ih-oh)*min(t/5.000,1)", filters)
+        self.assertIn("color=black", filters)
+
+    async def test_transparent_full_page_webm_uses_alpha_encoder_and_padding(self):
+        process = AsyncMock(return_value=(0, b""))
+        with (
+            patch("vipercapture.render_engine._ffmpeg_executable", return_value=Path("ffmpeg")),
+            patch("vipercapture.render_engine.ffmpeg_has_encoder", return_value=True),
+            patch("vipercapture.render_engine._run_process", process),
+        ):
+            await _encode_scrolling_media(
+                Path("page.png"),
+                Path("capture.webm"),
+                OutputFormat.WEBM,
+                width=320,
+                height=240,
+                duration_ms=1_000,
+                transparent=True,
+            )
+        command = process.await_args.args[0]
+        self.assertIn("libvpx-vp9", command)
+        self.assertIn("yuva420p", command)
+        self.assertIn("color=black@0", command[command.index("-vf") + 1])
+
     async def test_mp4_transcode_pads_odd_dimensions(self):
         process = AsyncMock(return_value=(0, b""))
         with (
@@ -185,6 +227,19 @@ class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
                     {"name": "one", "width": 10, "height": 10},
                     {"name": "two", "width": 10, "height": 10},
                 ],
+            )
+        with self.assertRaises(ValidationError):
+            RenderRequest(
+                url="https://example.com",
+                output="mp4",
+                video={"transparent_background": True},
+            )
+        with self.assertRaises(ValidationError):
+            RenderRequest(
+                url="https://example.com",
+                output="gif",
+                full_page=False,
+                video={"transparent_background": True},
             )
 
 

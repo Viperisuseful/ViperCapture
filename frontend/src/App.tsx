@@ -450,7 +450,11 @@ export default function App() {
         optimize_for_speed: (output === "png" || output === "webp") && optimizePng,
       },
       diagnostics: { bundle: diagnostics },
-      video: videoOutput ? { duration_ms: videoDuration * 1000, scroll: videoScroll } : null,
+      video: videoOutput ? {
+        duration_ms: videoDuration * 1000,
+        scroll: !fullPage && videoScroll,
+        transparent_background: fullPage && output !== "mp4" && transparent,
+      } : null,
       pdf: output === "pdf" ? {
         mode: pdfMode,
         paper_size: paperSize,
@@ -666,7 +670,7 @@ export default function App() {
                     <FieldLabel htmlFor="full-page"><span><span className="block">Full page</span><FieldDescription>Scroll and capture the document.</FieldDescription></span></FieldLabel>
                     <Switch id="full-page" checked={fullPage} onCheckedChange={(checked: boolean) => setFullPage(checked)} disabled={Boolean(selector) || clipEnabled} />
                   </Field>
-                  {fullPage && !selector && !clipEnabled && (
+                  {imageOutput && fullPage && !selector && !clipEnabled && (
                     <Field orientation="horizontal">
                       <FieldLabel htmlFor="preserve-width"><span><span className="block">Preserve viewport width</span><FieldDescription>Clip horizontal overflow while keeping the full page height.</FieldDescription></span></FieldLabel>
                       <Switch id="preserve-width" checked={preserveViewportWidth} onCheckedChange={setPreserveViewportWidth} />
@@ -768,7 +772,7 @@ export default function App() {
                         </div>
                         <Field><FieldLabel htmlFor="pdf-margin">PDF margins (inches)</FieldLabel><Input id="pdf-margin" type="number" min={0} max={4} step={0.1} value={pdfMargin} onChange={(event) => setPdfMargin(Number(event.target.value))} /></Field>
                       </>}
-                      {videoOutput && <><Field><FieldLabel htmlFor="video-duration">Video duration (seconds)</FieldLabel><Input id="video-duration" type="number" min={1} max={30} value={videoDuration} onChange={(event) => setVideoDuration(Number(event.target.value))} /></Field><Field orientation="horizontal"><FieldLabel htmlFor="video-scroll">Scroll while recording</FieldLabel><Switch id="video-scroll" checked={videoScroll} onCheckedChange={setVideoScroll} /></Field></>}
+                      {videoOutput && <><Field><FieldLabel htmlFor="video-duration">Video duration (seconds)</FieldLabel><Input id="video-duration" type="number" min={1} max={30} value={videoDuration} onChange={(event) => setVideoDuration(Number(event.target.value))} /></Field>{fullPage ? <FieldDescription>Full-page output scrolls from the top to the bottom over the chosen duration.</FieldDescription> : <Field orientation="horizontal"><FieldLabel htmlFor="video-scroll">Scroll viewport while recording</FieldLabel><Switch id="video-scroll" checked={videoScroll} onCheckedChange={setVideoScroll} /></Field>}{fullPage && output !== "mp4" && <Field orientation="horizontal"><FieldLabel htmlFor="transparent-video">Transparent side padding</FieldLabel><Switch id="transparent-video" checked={transparent} onCheckedChange={setTransparent} /></Field>}</>}
                       <Field orientation="horizontal"><FieldLabel htmlFor="diagnostics"><span><span className="block">Diagnostic bundle</span><FieldDescription>ZIP the artifact with console and network reports.</FieldDescription></span></FieldLabel><Switch id="diagnostics" checked={diagnostics} onCheckedChange={setDiagnostics} /></Field>
                       <Field data-invalid={headersTouched && Boolean(headersValidation.error)}>
                         <FieldLabel htmlFor="headers">Same-origin headers · <a href={`${docsUrl}#custom-headers`} target="_blank" rel="noreferrer">Docs</a></FieldLabel>

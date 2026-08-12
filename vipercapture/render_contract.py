@@ -394,6 +394,7 @@ class VideoOptions(StrictModel):
     scroll: bool = False
     scroll_step: int = Field(default=500, ge=1, le=4_320)
     scroll_delay_ms: int = Field(default=250, ge=50, le=2_000)
+    transparent_background: bool = False
 
 class ClipOptions(StrictModel):
     x: float = Field(default=0, ge=0, le=100_000)
@@ -656,6 +657,10 @@ class RenderRequest(StrictModel):
                 raise ValueError("video cannot use selector, clip, or multi-viewports")
             if self.diagnostics.include_trace:
                 raise ValueError("video diagnostics support console, network, HAR, and WARC")
+            if self.video.transparent_background and not self.full_page:
+                raise ValueError("transparent video requires full_page=true")
+            if self.video.transparent_background and self.output is OutputFormat.MP4:
+                raise ValueError("MP4 does not support transparent video")
         elif self.video is not None:
             raise ValueError("video settings require WebM, MP4, or GIF output")
         if self.slices is not None and (not is_image or not self.full_page or self.viewports is not None):
