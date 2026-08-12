@@ -177,8 +177,12 @@ class OperationalPackagingTests(unittest.TestCase):
         )
         self.assertIn('test "$tagged_commit" = "$GITHUB_SHA"', workflow)
         publish_condition = "(github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish)"
-        self.assertEqual(workflow.count(publish_condition), 6)
+        self.assertGreaterEqual(workflow.count(publish_condition), 7)
         self.assertNotIn("if: startsWith(github.ref, 'refs/tags/v') || inputs.publish", workflow)
+        self.assertIn("docker buildx imagetools inspect \"$VERSION_IMAGE\"", workflow)
+        self.assertIn("steps.version-image.outputs.exists != 'true'", workflow)
+        self.assertIn("Reuse immutable version image on rerun", workflow)
+        self.assertIn("docker buildx imagetools create", workflow)
 
     def test_gateway_streams_admitted_request_bodies(self):
         nginx = (ROOT / "deploy" / "public-api" / "nginx.conf").read_text("utf-8")
@@ -191,6 +195,20 @@ class OperationalPackagingTests(unittest.TestCase):
         self.assertIn('"" $request_id;', nginx)
         self.assertIn("default $http_x_request_id;", nginx)
         self.assertIn("proxy_set_header X-Request-Id $upstream_request_id;", nginx)
+
+    def test_gateway_timeout_covers_queue_and_render_deadlines(self):
+        nginx = (ROOT / "deploy" / "public-api" / "nginx.conf").read_text("utf-8")
+        engine = (ROOT / "vipercapture" / "render_engine.py").read_text("utf-8")
+        main = (ROOT / "vipercapture" / "main.py").read_text("utf-8")
+        self.assertIn("proxy_read_timeout 120s;", nginx)
+        self.assertIn("deadline_seconds: int = 75", engine)
+        self.assertIn("CAPTURE_QUEUE_TIMEOUT_SECONDS = 30", main)
+
+    def test_terraform_defaults_to_the_released_container(self):
+        terraform = (ROOT / "integrations" / "terraform" / "main.tf").read_text("utf-8")
+        versions = json.loads((ROOT / "release" / "versions.json").read_text("utf-8"))
+        self.assertIn(f'default = "{versions["container"]}"', terraform)
+        self.assertNotIn("vipercapture:latest", terraform)
 
     def test_backup_guide_includes_external_secrets_and_object_store_restore(self):
         guide = (ROOT / "deploy" / "public-api" / "README.md").read_text("utf-8")

@@ -145,11 +145,35 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build or publish versioned image
+      - name: Inspect immutable version image
+        id: version-image
+        if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish)
+        env:
+          VERSION_IMAGE: ghcr.io/viperisuseful/vipercapture:v0.1.0-beta.2
+        run: |
+          if docker buildx imagetools inspect "$VERSION_IMAGE" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build image without publication
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.publish }}
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+          push: false
+          tags: ghcr.io/viperisuseful/vipercapture:v0.1.0-beta.2
+          labels: |
+            org.opencontainers.image.source=https://github.com/Viperisuseful/ViperCapture
+            org.opencontainers.image.version=0.1.0-beta.2
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Publish new immutable version image
+        if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish)) && steps.version-image.outputs.exists != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
           tags: |
             ghcr.io/viperisuseful/vipercapture:v0.1.0-beta.2
             ghcr.io/viperisuseful/vipercapture:beta
@@ -158,3 +182,9 @@ jobs:
             org.opencontainers.image.version=0.1.0-beta.2
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Reuse immutable version image on rerun
+        if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish)) && steps.version-image.outputs.exists == 'true'
+        run: |
+          docker buildx imagetools create \
+            --tag ghcr.io/viperisuseful/vipercapture:beta \
+            ghcr.io/viperisuseful/vipercapture:v0.1.0-beta.2
