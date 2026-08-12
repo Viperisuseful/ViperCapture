@@ -1244,6 +1244,7 @@ def _render_engine() -> RenderEngine:
             dict(playwright.devices) if playwright is not None else None
         ),
         allow_scripts=ALLOW_SCRIPTS,
+        hardware_video=getattr(app.state, "gpu_mode", GPU_MODE) != "off",
         profile_loader=load_profile,
         profile_saver=save_profile,
     )

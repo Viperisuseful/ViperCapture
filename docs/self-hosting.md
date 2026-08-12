@@ -92,7 +92,13 @@ Linux systems where normal graphics autodetection does not work, also try:
 VIPERCAPTURE_GPU_BACKEND=vulkan
 ```
 
-The host or container must expose the GPU device and its drivers to Chromium.
+The host or container must expose the GPU device and its drivers to Chromium
+and FFmpeg. The same switch also tries runtime-tested hardware video encoding
+through NVENC (NVIDIA), AMF (AMD), Quick Sync (Intel), VideoToolbox (Apple),
+Media Foundation (Windows), or VA-API (Linux). Unsupported or unusable encoders
+fall back to the existing software path. GIF, transparent WebM, and screenshot
+file compression remain CPU encoded; GPU acceleration can still speed the
+browser's page compositing and rasterization before those files are encoded.
 The Vulkan backend is workload- and driver-dependent, so benchmark it against
 the default backend before enabling it permanently. GPU acceleration primarily
 helps rasterization, compositing, canvas, and WebGL-heavy pages; navigation,

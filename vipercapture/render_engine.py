@@ -28,16 +28,16 @@ from typing import Awaitable, Callable
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
-from playwright.async_api import Browser, Page
-from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from PIL import Image
+from playwright.async_api import Browser, Page
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from .render_contract import (
-    BrowserEngine,
     ActionType,
+    BrowserEngine,
     DevicePreset,
     LazyLoadMode,
     OutputFormat,
@@ -81,6 +81,59 @@ VPX_QUALITY = (
     "-b:v", "8M", "-maxrate", "12M", "-bufsize", "16M",
 )
 H264_QUALITY = ("-preset", "fast", "-crf", "17")
+HARDWARE_VIDEO_BITRATE = (
+    "-b:v", "12M", "-maxrate", "18M", "-bufsize", "24M",
+)
+
+
+@dataclass(frozen=True)
+class HardwareVideoEncoder:
+    name: str
+    filter: str = "format=nv12"
+    global_args: tuple[str, ...] = ()
+    options: tuple[str, ...] = ()
+
+
+HARDWARE_VIDEO_ENCODERS = {
+    OutputFormat.MP4: (
+        HardwareVideoEncoder("h264_nvenc", options=("-preset", "p4", "-tune", "hq")),
+        HardwareVideoEncoder("h264_amf", options=("-quality", "quality")),
+        HardwareVideoEncoder("h264_qsv", options=("-preset", "fast")),
+        HardwareVideoEncoder("h264_videotoolbox", options=("-realtime", "true")),
+        HardwareVideoEncoder("h264_mf", options=("-hw_encoding", "1", "-quality", "80")),
+        HardwareVideoEncoder(
+            "h264_vaapi",
+            filter="format=nv12,hwupload",
+            global_args=(
+                "-init_hw_device", "vaapi=vipercapture_vaapi",
+                "-filter_hw_device", "vipercapture_vaapi",
+            ),
+        ),
+    ),
+    OutputFormat.WEBM: (
+        HardwareVideoEncoder("vp9_qsv", options=("-preset", "fast")),
+        HardwareVideoEncoder(
+            "vp9_vaapi",
+            filter="format=nv12,hwupload",
+            global_args=(
+                "-init_hw_device", "vaapi=vipercapture_vaapi",
+                "-filter_hw_device", "vipercapture_vaapi",
+            ),
+        ),
+        HardwareVideoEncoder("av1_nvenc", options=("-preset", "p4", "-tune", "hq")),
+        HardwareVideoEncoder("av1_amf", options=("-quality", "quality")),
+        HardwareVideoEncoder("av1_qsv", options=("-preset", "fast")),
+        HardwareVideoEncoder("av1_videotoolbox", options=("-realtime", "true")),
+        HardwareVideoEncoder(
+            "av1_vaapi",
+            filter="format=nv12,hwupload",
+            global_args=(
+                "-init_hw_device", "vaapi=vipercapture_vaapi",
+                "-filter_hw_device", "vipercapture_vaapi",
+            ),
+        ),
+    ),
+}
 STABILIZE_ANIMATIONS_SCRIPT = """() => {
     for (const animation of document.getAnimations()) {
         try {
@@ -177,6 +230,39 @@ def ffmpeg_has_encoder(name: str) -> bool:
     return result.returncode == 0 and name.encode() in result.stdout
 
 
+@lru_cache(maxsize=2)
+def hardware_video_encoder(output: OutputFormat) -> HardwareVideoEncoder | None:
+    """Return the first encoder that works with the current FFmpeg and GPU driver."""
+    try:
+        ffmpeg = _ffmpeg_executable()
+    except RenderError:
+        return None
+    for encoder in HARDWARE_VIDEO_ENCODERS.get(output, ()):
+        if not ffmpeg_has_encoder(encoder.name):
+            continue
+        command = [
+            str(ffmpeg), "-hide_banner", "-loglevel", "error",
+            *encoder.global_args,
+            "-f", "lavfi", "-i", "color=size=64x64:rate=1",
+            "-frames:v", "1", "-vf", encoder.filter,
+            "-c:v", encoder.name, *encoder.options, *HARDWARE_VIDEO_BITRATE,
+            "-f", "null", "-",
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode == 0:
+            return encoder
+    return None
+
+
 def _timestamp_ms(value: str) -> int:
     hours, minutes, seconds = value.split(":")
     return round(
@@ -237,11 +323,16 @@ async def _trim_webm(
     destination: Path,
     *,
     duration_ms: int,
+    hardware: bool = False,
 ) -> int:
     ffmpeg = _ffmpeg_executable()
     source_duration_ms = await _webm_duration_ms(ffmpeg, source)
     start_ms = max(0, source_duration_ms - duration_ms)
-    command = [
+    hardware_encoder = (
+        await _settled_thread(hardware_video_encoder, OutputFormat.WEBM)
+        if hardware else None
+    )
+    input_args = [
         str(ffmpeg),
         "-hide_banner",
         "-loglevel",
@@ -253,13 +344,34 @@ async def _trim_webm(
         "-t",
         f"{duration_ms / 1000:.3f}",
         "-an",
+    ]
+    software_encoding = [
         "-c:v",
         "libvpx",
         *VPX_QUALITY,
+    ]
+    hardware_encoding = [
+        "-vf", hardware_encoder.filter,
+        "-c:v", hardware_encoder.name,
+        *hardware_encoder.options,
+        *HARDWARE_VIDEO_BITRATE,
+    ] if hardware_encoder else software_encoding
+    command = [
+        str(ffmpeg),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        *(hardware_encoder.global_args if hardware_encoder else ()),
+        *input_args[4:],
+        *hardware_encoding,
         "-y",
         str(destination),
     ]
     returncode, _ = await _run_process(command, 45)
+    if returncode != 0 and hardware_encoder is not None:
+        returncode, _ = await _run_process(
+            [*input_args, *software_encoding, "-y", str(destination)], 45
+        )
     if returncode != 0:
         raise RenderError(
             "video_encode_failed",
@@ -270,20 +382,36 @@ async def _trim_webm(
     return await _webm_duration_ms(ffmpeg, destination)
 
 
-async def _transcode_video(source: Path, destination: Path, output: OutputFormat) -> None:
+async def _transcode_video(
+    source: Path,
+    destination: Path,
+    output: OutputFormat,
+    *,
+    hardware: bool = False,
+) -> None:
     ffmpeg = _ffmpeg_executable()
+    hardware_encoder = (
+        await _settled_thread(hardware_video_encoder, output)
+        if hardware and output is OutputFormat.MP4 else None
+    )
     if output is OutputFormat.MP4:
-        if not await _settled_thread(ffmpeg_has_encoder, "libx264"):
+        if hardware_encoder is None and not await _settled_thread(ffmpeg_has_encoder, "libx264"):
             raise RenderError(
                 "video_encoder_unavailable",
                 "This FFmpeg build cannot encode MP4 with libx264.",
                 503,
                 False,
             )
-        encoding = [
+        software_encoding = [
             "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-c:v", "libx264",
             *H264_QUALITY, "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         ]
+        encoding = [
+            "-vf", f"pad=ceil(iw/2)*2:ceil(ih/2)*2,{hardware_encoder.filter}",
+            "-c:v", hardware_encoder.name, *hardware_encoder.options,
+            *HARDWARE_VIDEO_BITRATE, "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+        ] if hardware_encoder else software_encoding
     elif output is OutputFormat.GIF:
         filters = (
             "fps=15,split[frames][palette_input];"
@@ -293,10 +421,22 @@ async def _transcode_video(source: Path, destination: Path, output: OutputFormat
         encoding = ["-filter_complex", filters, "-loop", "0"]
     else:
         return
+    prefix = [
+        str(ffmpeg), "-hide_banner", "-loglevel", "error",
+        *(hardware_encoder.global_args if hardware_encoder else ()),
+        "-i", str(source),
+    ]
     returncode, _ = await _run_process(
-        [str(ffmpeg), "-hide_banner", "-loglevel", "error", "-i", str(source), *encoding, "-y", str(destination)],
-        45,
+        [*prefix, *encoding, "-y", str(destination)], 45
     )
+    if returncode != 0 and hardware_encoder is not None:
+        returncode, _ = await _run_process(
+            [
+                str(ffmpeg), "-hide_banner", "-loglevel", "error",
+                "-i", str(source), *software_encoding, "-y", str(destination),
+            ],
+            45,
+        )
     if returncode != 0:
         raise RenderError("video_encode_failed", f"The requested {output.value.upper()} could not be encoded.", 502, True)
 
@@ -310,6 +450,7 @@ async def _encode_scrolling_media(
     height: int,
     duration_ms: int,
     transparent: bool,
+    hardware: bool = False,
 ) -> None:
     ffmpeg = _ffmpeg_executable()
     duration = duration_ms / 1000
@@ -322,6 +463,12 @@ async def _encode_scrolling_media(
     )
     if output is OutputFormat.MP4:
         frames += ",pad=ceil(iw/2)*2:ceil(ih/2)*2:color=black"
+    hardware_encoder = (
+        await _settled_thread(hardware_video_encoder, output)
+        if hardware and not transparent and output in {OutputFormat.WEBM, OutputFormat.MP4}
+        else None
+    )
+    software_encoding: list[str] | None = None
     if output is OutputFormat.GIF:
         filters = (
             f"{frames},split[frames][palette_input];"
@@ -338,30 +485,51 @@ async def _encode_scrolling_media(
                 503,
                 False,
             )
-        encoding = [
+        software_encoding = [
             "-vf", frames, "-c:v", encoder, *VPX_QUALITY,
             "-pix_fmt", "yuva420p" if transparent else "yuv420p",
         ]
+        encoding = [
+            "-vf", f"{frames},{hardware_encoder.filter}",
+            "-c:v", hardware_encoder.name, *hardware_encoder.options,
+            *HARDWARE_VIDEO_BITRATE, "-pix_fmt", "yuv420p",
+        ] if hardware_encoder else software_encoding
     else:
-        if not await _settled_thread(ffmpeg_has_encoder, "libx264"):
+        if hardware_encoder is None and not await _settled_thread(ffmpeg_has_encoder, "libx264"):
             raise RenderError(
                 "video_encoder_unavailable",
                 "This FFmpeg build cannot encode MP4 with libx264.",
                 503,
                 False,
             )
-        encoding = [
+        software_encoding = [
             "-vf", frames, "-c:v", "libx264", *H264_QUALITY,
             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         ]
-    returncode, _ = await _run_process(
-        [
-            str(ffmpeg), "-hide_banner", "-loglevel", "error", "-loop", "1",
+        encoding = [
+            "-vf", f"{frames},{hardware_encoder.filter}",
+            "-c:v", hardware_encoder.name, *hardware_encoder.options,
+            *HARDWARE_VIDEO_BITRATE, "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+        ] if hardware_encoder else software_encoding
+    prefix = [
+        str(ffmpeg), "-hide_banner", "-loglevel", "error",
+        *(hardware_encoder.global_args if hardware_encoder else ()),
+        "-loop", "1",
             "-framerate", "12", "-t", f"{duration:.3f}", "-i", str(source),
-            *encoding, "-y", str(destination),
-        ],
-        45,
+    ]
+    returncode, _ = await _run_process(
+        [*prefix, *encoding, "-y", str(destination)], 45
     )
+    if returncode != 0 and hardware_encoder is not None and software_encoding is not None:
+        returncode, _ = await _run_process(
+            [
+                str(ffmpeg), "-hide_banner", "-loglevel", "error", "-loop", "1",
+                "-framerate", "12", "-t", f"{duration:.3f}", "-i", str(source),
+                *software_encoding, "-y", str(destination),
+            ],
+            45,
+        )
     if returncode != 0:
         raise RenderError(
             "video_encode_failed",
@@ -1245,6 +1413,7 @@ class RenderEngine:
         browser_replacer: Callable[[Browser], Awaitable[None]] | None = None,
         device_descriptors: dict[str, dict[str, object]] | None = None,
         allow_scripts: bool = False,
+        hardware_video: bool = False,
         profile_loader: Callable[[str], Awaitable[dict[str, object] | None]] | None = None,
         profile_saver: Callable[[str, dict[str, object]], Awaitable[None]] | None = None,
     ) -> None:
@@ -1254,6 +1423,7 @@ class RenderEngine:
         self.browser_replacer = browser_replacer
         self.device_descriptors = device_descriptors or {}
         self.allow_scripts = allow_scripts
+        self.hardware_video = hardware_video
         self.profile_loader = profile_loader
         self.profile_saver = profile_saver
 
@@ -2102,6 +2272,7 @@ class RenderEngine:
                     await page.close()
                     await context.close()
                     context = None
+                    video_hardware = {"hardware": True} if self.hardware_video else {}
                     if request.full_page:
                         final_path = Path(video_directory.name) / f"final.{request.output.value}"
                         await _encode_scrolling_media(
@@ -2112,6 +2283,7 @@ class RenderEngine:
                             height=request.viewport.height,
                             duration_ms=options.duration_ms,
                             transparent=options.transparent_background,
+                            **video_hardware,
                         )
                         actual_duration_ms = options.duration_ms
                     else:
@@ -2121,11 +2293,17 @@ class RenderEngine:
                             Path(path),
                             trimmed_path,
                             duration_ms=options.duration_ms,
+                            **video_hardware,
                         )
                         final_path = trimmed_path
                         if request.output is not OutputFormat.WEBM:
                             final_path = Path(video_directory.name) / f"final.{request.output.value}"
-                            await _transcode_video(trimmed_path, final_path, request.output)
+                            await _transcode_video(
+                                trimmed_path,
+                                final_path,
+                                request.output,
+                                **video_hardware,
+                            )
                     size = (await asyncio.to_thread(final_path.stat)).st_size
                     if not size:
                         raise RenderError("empty_output", "The renderer produced an empty video.", 502, True)

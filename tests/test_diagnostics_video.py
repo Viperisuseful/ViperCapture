@@ -7,22 +7,25 @@ import threading
 import unittest
 import zipfile
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from pydantic import ValidationError
 
 from vipercapture.render_contract import OutputFormat, RenderRequest
 from vipercapture.render_engine import (
+    HARDWARE_VIDEO_ENCODERS,
+    HardwareVideoEncoder,
     RenderArtifact,
     RenderLimits,
-    _ffmpeg_executable,
     _encode_scrolling_media,
+    _ffmpeg_executable,
     _redact_trace_archive,
-    _trim_webm,
     _transcode_video,
+    _trim_webm,
     _warc_document,
     diagnostic_bundle,
     diagnostic_url,
+    hardware_video_encoder,
 )
 from vipercapture.render_errors import RenderError
 
@@ -50,9 +53,11 @@ class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_transparent_full_page_webm_uses_alpha_encoder_and_padding(self):
         process = AsyncMock(return_value=(0, b""))
+        hardware_probe = Mock()
         with (
             patch("vipercapture.render_engine._ffmpeg_executable", return_value=Path("ffmpeg")),
             patch("vipercapture.render_engine.ffmpeg_has_encoder", return_value=True),
+            patch("vipercapture.render_engine.hardware_video_encoder", hardware_probe),
             patch("vipercapture.render_engine._run_process", process),
         ):
             await _encode_scrolling_media(
@@ -63,6 +68,7 @@ class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
                 height=240,
                 duration_ms=1_000,
                 transparent=True,
+                hardware=True,
             )
         command = process.await_args.args[0]
         self.assertIn("libvpx-vp9", command)
@@ -72,6 +78,82 @@ class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(command[command.index("-maxrate") + 1], "12M")
         self.assertEqual(command[command.index("-cpu-used") + 1], "4")
         self.assertIn("color=black@0", command[command.index("-vf") + 1])
+        hardware_probe.assert_not_called()
+
+    def test_hardware_video_matrix_covers_major_gpu_platforms(self):
+        names = {
+            encoder.name
+            for encoders in HARDWARE_VIDEO_ENCODERS.values()
+            for encoder in encoders
+        }
+        self.assertTrue(
+            {
+                "h264_nvenc", "h264_amf", "h264_qsv", "h264_videotoolbox",
+                "h264_mf", "h264_vaapi", "vp9_qsv", "vp9_vaapi",
+            }.issubset(names)
+        )
+
+    def test_hardware_probe_skips_encoder_that_driver_cannot_run(self):
+        first = HardwareVideoEncoder("first")
+        second = HardwareVideoEncoder("second")
+        hardware_video_encoder.cache_clear()
+        with (
+            patch.dict(
+                "vipercapture.render_engine.HARDWARE_VIDEO_ENCODERS",
+                {OutputFormat.MP4: (first, second)},
+                clear=True,
+            ),
+            patch("vipercapture.render_engine._ffmpeg_executable", return_value=Path("ffmpeg")),
+            patch("vipercapture.render_engine.ffmpeg_has_encoder", return_value=True),
+            patch(
+                "vipercapture.render_engine.subprocess.run",
+                side_effect=[Mock(returncode=1), Mock(returncode=0)],
+            ) as run,
+        ):
+            self.assertEqual(hardware_video_encoder(OutputFormat.MP4), second)
+        hardware_video_encoder.cache_clear()
+        self.assertEqual(run.call_count, 2)
+
+    async def test_mp4_uses_selected_hardware_encoder_and_higher_bitrate(self):
+        process = AsyncMock(return_value=(0, b""))
+        encoder = HardwareVideoEncoder(
+            "h264_nvenc", global_args=("-gpu", "0"), options=("-preset", "p4")
+        )
+        with (
+            patch("vipercapture.render_engine._ffmpeg_executable", return_value=Path("ffmpeg")),
+            patch("vipercapture.render_engine.hardware_video_encoder", return_value=encoder),
+            patch("vipercapture.render_engine._run_process", process),
+        ):
+            await _transcode_video(
+                Path("capture.webm"),
+                Path("capture.mp4"),
+                OutputFormat.MP4,
+                hardware=True,
+            )
+        command = process.await_args.args[0]
+        self.assertIn("h264_nvenc", command)
+        self.assertLess(command.index("-gpu"), command.index("-i"))
+        self.assertEqual(command[command.index("-b:v") + 1], "12M")
+        self.assertEqual(command[command.index("-maxrate") + 1], "18M")
+
+    async def test_failed_hardware_encode_retries_with_software(self):
+        process = AsyncMock(side_effect=[(1, b"driver failed"), (0, b"")])
+        with (
+            patch("vipercapture.render_engine._ffmpeg_executable", return_value=Path("ffmpeg")),
+            patch(
+                "vipercapture.render_engine.hardware_video_encoder",
+                return_value=HardwareVideoEncoder("h264_nvenc"),
+            ),
+            patch("vipercapture.render_engine._run_process", process),
+        ):
+            await _transcode_video(
+                Path("capture.webm"),
+                Path("capture.mp4"),
+                OutputFormat.MP4,
+                hardware=True,
+            )
+        self.assertIn("h264_nvenc", process.await_args_list[0].args[0])
+        self.assertIn("libx264", process.await_args_list[1].args[0])
 
     async def test_live_webm_trim_uses_high_bitrate_constrained_quality(self):
         process = AsyncMock(return_value=(0, b""))
