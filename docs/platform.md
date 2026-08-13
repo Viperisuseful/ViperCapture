@@ -1,7 +1,8 @@
 # Platform configuration
 
-Platform features are disabled until the operator configures them. Existing
-single-operator installations can continue without enabling them.
+This page covers project controls, artifact options, distributed roles, and
+observability. Existing single-operator installations can continue without
+enabling the project control plane or distributed roles.
 
 ## Configure projects, keys, quotas, and profiles
 

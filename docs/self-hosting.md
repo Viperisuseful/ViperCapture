@@ -136,7 +136,7 @@ store cannot enforce private ACLs on Windows, so `VIPERCAPTURE_SCHEDULES`
 defaults to `0` there and the bundled store refuses direct startup. Use an
 external scheduler on Windows or keep the feature disabled.
 
-## Configure selectors and waits
+## Selectors and waits
 
 `selector` captures the first visible matching element and requires
 `full_page: false`. `wait_for.selector` waits for a matching element to become
@@ -153,7 +153,7 @@ For full-page captures of unusually wide documents, set
 `preserve_viewport_width: true` to clip horizontal overflow to the requested
 viewport while retaining the full document height.
 
-## Send custom headers
+## Custom headers
 
 `headers` must be a JSON object whose values are strings. At most 32 headers
 and 16 KiB serialized data are accepted; each name is limited to 128 bytes and
