@@ -48,8 +48,32 @@ class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
             )
         command = process.await_args.args[0]
         filters = command[command.index("-filter_complex") + 1]
-        self.assertIn("(ih-oh)*min(t/5.000,1)", filters)
+        self.assertIn("(ih-oh)*min(n/299,1)", filters)
         self.assertIn("color=black", filters)
+
+    async def test_single_frame_pan_reaches_bottom_and_fallback_keeps_fps(self):
+        process = AsyncMock(side_effect=[(1, b"driver failed"), (0, b"")])
+        with (
+            patch("vipercapture.render_engine._ffmpeg_executable", return_value=Path("ffmpeg")),
+            patch(
+                "vipercapture.render_engine.hardware_video_encoder",
+                return_value=HardwareVideoEncoder("h264_nvenc"),
+            ),
+            patch("vipercapture.render_engine._run_process", process),
+        ):
+            await _encode_scrolling_media(
+                Path("page.png"), Path("capture.mp4"), OutputFormat.MP4,
+                width=320, height=240, duration_ms=1_000, fps=1,
+                transparent=False, hardware=True,
+            )
+        first = process.await_args_list[0].args[0]
+        self.assertIn("(ih-oh)*1", first[first.index("-vf") + 1])
+        self.assertEqual(
+            process.await_args_list[1].args[0][
+                process.await_args_list[1].args[0].index("-framerate") + 1
+            ],
+            "1",
+        )
 
     async def test_transparent_full_page_webm_uses_alpha_encoder_and_padding(self):
         process = AsyncMock(return_value=(0, b""))
@@ -67,6 +91,8 @@ class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
                 width=320,
                 height=240,
                 duration_ms=1_000,
+                fps=48,
+                bitrate_mbps=24,
                 transparent=True,
                 hardware=True,
             )
@@ -74,8 +100,9 @@ class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("libvpx-vp9", command)
         self.assertIn("yuva420p", command)
         self.assertEqual(command[command.index("-crf") + 1], "12")
-        self.assertEqual(command[command.index("-b:v") + 1], "8M")
-        self.assertEqual(command[command.index("-maxrate") + 1], "12M")
+        self.assertIn("fps=48", command[command.index("-vf") + 1])
+        self.assertEqual(command[command.index("-b:v") + 1], "24M")
+        self.assertEqual(command[command.index("-maxrate") + 1], "24M")
         self.assertEqual(command[command.index("-cpu-used") + 1], "4")
         self.assertIn("color=black@0", command[command.index("-vf") + 1])
         hardware_probe.assert_not_called()
@@ -113,6 +140,7 @@ class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(hardware_video_encoder(OutputFormat.MP4), second)
         hardware_video_encoder.cache_clear()
         self.assertEqual(run.call_count, 2)
+        self.assertIn("color=size=128x128:rate=1", run.call_args_list[0].args[0])
 
     async def test_mp4_uses_selected_hardware_encoder_and_higher_bitrate(self):
         process = AsyncMock(return_value=(0, b""))
@@ -128,13 +156,16 @@ class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
                 Path("capture.webm"),
                 Path("capture.mp4"),
                 OutputFormat.MP4,
+                fps=60,
+                bitrate_mbps=32,
                 hardware=True,
             )
         command = process.await_args.args[0]
         self.assertIn("h264_nvenc", command)
         self.assertLess(command.index("-gpu"), command.index("-i"))
-        self.assertEqual(command[command.index("-b:v") + 1], "12M")
-        self.assertEqual(command[command.index("-maxrate") + 1], "18M")
+        self.assertIn("fps=60", command[command.index("-vf") + 1])
+        self.assertEqual(command[command.index("-b:v") + 1], "32M")
+        self.assertEqual(command[command.index("-maxrate") + 1], "32M")
 
     async def test_failed_hardware_encode_retries_with_software(self):
         process = AsyncMock(side_effect=[(1, b"driver failed"), (0, b"")])
@@ -164,12 +195,14 @@ class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
             patch("vipercapture.render_engine._run_process", process),
         ):
             await _trim_webm(
-                Path("source.webm"), Path("trimmed.webm"), duration_ms=1_000
+                Path("source.webm"), Path("trimmed.webm"),
+                duration_ms=1_000, fps=50, bitrate_mbps=25,
             )
         command = process.await_args.args[0]
         self.assertEqual(command[command.index("-crf") + 1], "12")
-        self.assertEqual(command[command.index("-b:v") + 1], "8M")
-        self.assertEqual(command[command.index("-maxrate") + 1], "12M")
+        self.assertIn("fps=50", command[command.index("-vf") + 1])
+        self.assertEqual(command[command.index("-b:v") + 1], "25M")
+        self.assertEqual(command[command.index("-maxrate") + 1], "25M")
         self.assertEqual(command[command.index("-cpu-used") + 1], "4")
 
     async def test_mp4_transcode_pads_odd_dimensions(self):
@@ -183,8 +216,11 @@ class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
                 Path("capture.webm"), Path("capture.mp4"), OutputFormat.MP4
             )
         command = process.await_args.args[0]
-        self.assertIn("pad=ceil(iw/2)*2:ceil(ih/2)*2", command)
-        self.assertEqual(command[command.index("-crf") + 1], "17")
+        self.assertIn(
+            "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            command[command.index("-vf") + 1],
+        )
+        self.assertNotIn("-crf", command)
         self.assertEqual(command[command.index("-preset") + 1], "fast")
 
     async def test_gif_transcode_keeps_source_size_and_uses_generated_palette(self):
@@ -194,11 +230,12 @@ class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
             patch("vipercapture.render_engine._run_process", process),
         ):
             await _transcode_video(
-                Path("capture.webm"), Path("capture.gif"), OutputFormat.GIF
+                Path("capture.webm"), Path("capture.gif"), OutputFormat.GIF,
+                fps=30,
             )
         command = process.await_args.args[0]
         filters = command[command.index("-filter_complex") + 1]
-        self.assertIn("fps=15", filters)
+        self.assertIn("fps=30", filters)
         self.assertIn("palettegen", filters)
         self.assertIn("paletteuse", filters)
         self.assertNotIn("scale=", filters)
@@ -367,7 +404,12 @@ class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
     def test_video_contract_defaults_and_rejects_invalid_combinations(self):
         request = RenderRequest(url="https://example.com", output="webm")
         self.assertEqual(request.video.duration_ms, 5_000)
+        self.assertEqual(request.video.fps, 60)
+        self.assertEqual(request.video.bitrate_mbps, 20)
         self.assertEqual(request.credit_cost, 1)
+        for video in ({"fps": 61}, {"bitrate_mbps": 101}):
+            with self.assertRaises(ValidationError):
+                RenderRequest(url="https://example.com", output="webm", video=video)
         with self.assertRaises(ValidationError):
             RenderRequest(url="https://example.com", output="png", video={})
         with self.assertRaises(ValidationError):

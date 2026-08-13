@@ -391,6 +391,8 @@ class SliceOptions(StrictModel):
 
 class VideoOptions(StrictModel):
     duration_ms: int = Field(default=5_000, ge=1_000, le=30_000)
+    fps: int = Field(default=60, ge=1, le=60)
+    bitrate_mbps: int = Field(default=20, ge=1, le=100)
     scroll: bool = False
     scroll_step: int = Field(default=500, ge=1, le=4_320)
     scroll_delay_ms: int = Field(default=250, ge=50, le=2_000)
