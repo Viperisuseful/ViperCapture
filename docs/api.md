@@ -131,9 +131,10 @@ Each processed envelope returns HTTP 200, including mixed or all-item failure.
 Every result contains `status`, `accepted`, `job`, and `error`; malformed,
 oversized, unauthenticated, or unavailable requests still use the normal
 request-level 4xx/5xx status. A bulk `Idempotency-Key` derives stable keys by
-item index and fingerprints the normalized whole envelope. Alternatively use
-per-item `idempotency_key` values; do not combine both forms. A retry reuses
-accepted jobs and retries rejected items.
+item index, fingerprints the normalized whole envelope, and atomically claims
+that fingerprint before creating any item. Alternatively use per-item
+`idempotency_key` values; do not combine both forms. A retry reuses accepted
+jobs and retries rejected items.
 
 Project RPM exhaustion returns 429 `rate_limit_exceeded` with `Retry-After`
 calculated from the oldest event in the sliding 60-second window. Render

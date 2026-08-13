@@ -215,6 +215,11 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.code, "diff_input_invalid")
         control.put_baseline.assert_not_called()
 
+        for name in (".", ".."):
+            with self.subTest(name=name), self.assertRaises(RenderError) as dot:
+                main._baseline_context(request, name)
+            self.assertEqual(dot.exception.code, "baseline_name_invalid")
+
     async def test_baseline_put_reports_create_and_replace(self):
         control = SimpleNamespace(
             put_baseline=Mock(
@@ -838,6 +843,7 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         service = SimpleNamespace(
             existing=AsyncMock(return_value=existing),
             submit=AsyncMock(),
+            claim_bulk_idempotency=AsyncMock(),
             cipher=SimpleNamespace(
                 fingerprint_bytes=Mock(return_value=b"bulk-fingerprint")
             ),
@@ -871,6 +877,7 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         validate.assert_not_awaited()
         service.submit.assert_not_awaited()
+        service.claim_bulk_idempotency.assert_awaited_once()
         self.assertEqual(
             service.existing.await_args.kwargs,
             {

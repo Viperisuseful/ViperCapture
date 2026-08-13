@@ -253,6 +253,11 @@ class SQLiteJobStore:
                 ON async_jobs(status, available_at, created_at);
             CREATE INDEX IF NOT EXISTS async_jobs_cleanup_idx
                 ON async_jobs(completed_at);
+            CREATE TABLE IF NOT EXISTS async_bulk_idempotency (
+                idempotency_key TEXT PRIMARY KEY,
+                request_fingerprint BLOB NOT NULL,
+                created_at REAL NOT NULL
+            );
             """
         )
         connection.execute("BEGIN IMMEDIATE")
@@ -600,6 +605,84 @@ class SQLiteJobStore:
                 (idempotency_key,),
             ).fetchone()
         )
+
+    async def get_legacy_by_idempotency_key(
+        self, idempotency_key: str
+    ) -> JobRecord | None:
+        return await self._run(
+            self._get_legacy_by_idempotency_key, idempotency_key
+        )
+
+    @classmethod
+    def _get_legacy_by_idempotency_key(
+        cls,
+        connection: sqlite3.Connection,
+        idempotency_key: str,
+    ) -> JobRecord | None:
+        return cls._from_row(
+            connection.execute(
+                """
+                SELECT * FROM async_jobs
+                WHERE idempotency_key = ? AND request_id = idempotency_key
+                """,
+                (idempotency_key,),
+            ).fetchone()
+        )
+
+    async def claim_bulk_idempotency(
+        self,
+        idempotency_key: str,
+        request_fingerprint: bytes,
+        now: datetime,
+    ) -> None:
+        await self._run(
+            self._claim_bulk_idempotency,
+            idempotency_key,
+            request_fingerprint,
+            now,
+            self.config.metadata_ttl,
+        )
+
+    @staticmethod
+    def _claim_bulk_idempotency(
+        connection: sqlite3.Connection,
+        idempotency_key: str,
+        request_fingerprint: bytes,
+        now: datetime,
+        retention: timedelta,
+    ) -> None:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                "DELETE FROM async_bulk_idempotency WHERE created_at < ?",
+                (_epoch(now - retention),),
+            )
+            row = connection.execute(
+                """
+                SELECT request_fingerprint FROM async_bulk_idempotency
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+            if row is not None:
+                if not hmac.compare_digest(
+                    bytes(row["request_fingerprint"]), request_fingerprint
+                ):
+                    raise IdempotencyConflictError
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO async_bulk_idempotency (
+                        idempotency_key, request_fingerprint, created_at
+                    ) VALUES (?, ?, ?)
+                    """,
+                    (idempotency_key, request_fingerprint, _epoch(now)),
+                )
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
 
     @classmethod
     def _get(

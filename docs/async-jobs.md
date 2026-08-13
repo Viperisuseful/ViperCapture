@@ -59,7 +59,9 @@ keeps existing jobs readable and lets a client migrate by sending its former
 `X-Request-Id` value as `Idempotency-Key`. New rows retain the legacy unique
 column as an internal compatibility slot. Custom job-store adapters must add
 equivalent fields and implement `get_by_idempotency_key`; ViperCapture cannot
-migrate external provider schemas.
+migrate external provider schemas. The SQLite adapter also recognizes migrated
+legacy rows for per-item bulk retries without reopening that namespace to new
+jobs.
 
 ViperCapture leaves claimed work `running` during shutdown. At startup it
 requeues interrupted jobs unless they have already reached the configured
@@ -126,6 +128,15 @@ uniqueness. `get_by_idempotency_key` performs replay lookup.
 It must compare `JobRecord.request_fingerprint` in constant time and raise
 `IdempotencyConflictError` when an existing idempotency key has a different or
 legacy-missing fingerprint.
+Request-level bulk idempotency additionally requires
+`claim_bulk_idempotency(key, fingerprint, now)`. It must atomically persist the
+normalized envelope fingerprint, accept an exact replay, reject a different
+fingerprint with `IdempotencyConflictError`, and expire claims no sooner than
+`JobStoreConfig.metadata_ttl`. ViperCapture returns 503 for a bulk
+`Idempotency-Key` when a custom adapter does not implement this capability;
+per-item keys remain available. Adapters migrating the former per-item
+`request_id` contract may optionally implement `get_legacy_by_idempotency_key`
+for transitional replay lookup.
 `claim` must atomically move one eligible job from `queued` to `running`; use
 the database's row-locking or compare-and-swap primitive. Retrying its
 `claim_token` after an ambiguous acknowledgement must return the same row

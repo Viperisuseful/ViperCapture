@@ -1625,7 +1625,9 @@ async def visual_diff(
 
 
 def _baseline_context(request: Request, name: str) -> tuple[ControlPlane, str]:
-    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", name):
+    if name in {".", ".."} or not re.fullmatch(
+        r"[A-Za-z0-9_.-]{1,128}", name
+    ):
         raise RenderError("baseline_name_invalid", "Baseline names use letters, numbers, dot, dash, and underscore.", 422, False)
     control = getattr(request.app.state, "control", None)
     if control is None or request.state.project_id is None:
@@ -1998,6 +2000,16 @@ async def create_bulk_render_jobs(
         if bulk_key is not None
         else None
     )
+    if bulk_key is not None:
+        assert bulk_fingerprint is not None
+        envelope_key = _project_idempotency_key(
+            request, f"@bulk-envelope:{bulk_key}"
+        )
+        assert envelope_key is not None
+        await service.claim_bulk_idempotency(
+            envelope_key,
+            bulk_fingerprint,
+        )
     request_ids = [
         _project_request_id(
             request,
@@ -2028,6 +2040,19 @@ async def create_bulk_render_jobs(
                 idempotency_key=idempotency_keys[index],
                 request_fingerprint=bulk_fingerprint,
             )
+            if (
+                existing_jobs[index] is None
+                and bulk_key is None
+                and item.idempotency_key is not None
+            ):
+                legacy_key = _project_idempotency_key(
+                    request, item.idempotency_key
+                )
+                assert legacy_key is not None
+                existing_jobs[index] = await service.existing_legacy(
+                    item.render,
+                    idempotency_key=legacy_key,
+                )
         except RenderError as exc:
             preflight_errors[index] = exc
     if bulk_key is not None:

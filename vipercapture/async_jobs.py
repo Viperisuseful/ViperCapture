@@ -825,6 +825,63 @@ class AsyncJobService:
             )
         return current
 
+    async def existing_legacy(
+        self,
+        payload: RenderRequest,
+        *,
+        idempotency_key: str,
+    ) -> JobRecord | None:
+        """Replay a row migrated from legacy X-Request-Id semantics."""
+        await self._maintain()
+        lookup = getattr(
+            self.job_store, "get_legacy_by_idempotency_key", None
+        )
+        if lookup is None:
+            return None
+        current = await lookup(idempotency_key)
+        if current is None:
+            return None
+        current = await self.job_store.get(current.id, datetime.now(UTC))
+        if current is None:
+            return None
+        fingerprint = self.cipher.fingerprint(payload)
+        if (
+            current.request_fingerprint is None
+            or not hmac.compare_digest(
+                current.request_fingerprint, fingerprint
+            )
+        ):
+            raise RenderError(
+                "idempotency_key_conflict",
+                "The Idempotency-Key was already used for a different request.",
+                409,
+                False,
+            )
+        return current
+
+    async def claim_bulk_idempotency(
+        self, idempotency_key: str, request_fingerprint: bytes
+    ) -> None:
+        claim = getattr(self.job_store, "claim_bulk_idempotency", None)
+        if claim is None:
+            raise RenderError(
+                "bulk_idempotency_unsupported",
+                "The configured job provider does not support bulk idempotency.",
+                503,
+                False,
+            )
+        try:
+            await claim(
+                idempotency_key, request_fingerprint, datetime.now(UTC)
+            )
+        except IdempotencyConflictError as exc:
+            raise RenderError(
+                "idempotency_key_conflict",
+                "The Idempotency-Key was already used for a different request.",
+                409,
+                False,
+            ) from exc
+
     async def get(self, job_id: str) -> JobRecord | None:
         await self._maintain()
         return await self.job_store.get(job_id, datetime.now(UTC))

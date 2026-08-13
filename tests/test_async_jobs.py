@@ -834,6 +834,12 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_legacy_sqlite_request_ids_migrate_to_both_fields(self):
         now = datetime.now(UTC).timestamp()
+        service = AsyncJobService(
+            self.settings,
+            self.store,
+            self.artifacts,
+            _successful_renderer,
+        )
         connection = sqlite3.connect(self.store.path)
         connection.executescript(
             """
@@ -863,7 +869,7 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
                 now,
                 now + 60,
                 now,
-                b"fingerprint",
+                service.cipher.fingerprint(_payload()),
             ),
         )
         connection.commit()
@@ -871,9 +877,49 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         self.store.path.chmod(0o600)
 
         await self.store.start()
+        await self.artifacts.start()
         migrated = await self.store.get_by_idempotency_key("legacy-key")
         self.assertEqual(migrated.request_id, "legacy-key")
         self.assertEqual(migrated.idempotency_key, "legacy-key")
+        replayed = await service.existing_legacy(
+            _payload(), idempotency_key="legacy-key"
+        )
+        self.assertEqual(replayed.id, migrated.id)
+        await self.artifacts.close()
+        await self.store.close()
+
+    async def test_bulk_idempotency_claim_is_atomic_across_stores(self):
+        other_store = SQLiteJobStore(
+            JobStoreConfig(self.root, self.settings.metadata_ttl)
+        )
+        await self.store.start()
+        await other_store.start()
+        first = AsyncJobService(
+            self.settings,
+            self.store,
+            self.artifacts,
+            _successful_renderer,
+        )
+        second = AsyncJobService(
+            self.settings,
+            other_store,
+            self.artifacts,
+            _successful_renderer,
+        )
+        results = await asyncio.gather(
+            first.claim_bulk_idempotency("bulk-key", b"first"),
+            second.claim_bulk_idempotency("bulk-key", b"second"),
+            return_exceptions=True,
+        )
+        self.assertEqual(sum(result is None for result in results), 1)
+        conflicts = [
+            result for result in results if isinstance(result, RenderError)
+        ]
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0].code, "idempotency_key_conflict")
+        winner = b"first" if results[0] is None else b"second"
+        await first.claim_bulk_idempotency("bulk-key", winner)
+        await other_store.close()
         await self.store.close()
 
     async def test_legacy_idempotency_migration_rolls_back_atomically(self):
