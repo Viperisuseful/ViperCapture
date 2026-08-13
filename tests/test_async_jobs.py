@@ -812,6 +812,26 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.artifacts.close()
         await self.store.close()
 
+    async def test_public_job_id_does_not_collide_with_idempotency_key(self):
+        await self.store.start()
+        await self.artifacts.start()
+        service = AsyncJobService(
+            _settings(self.root, queue_limit=2),
+            self.store,
+            self.artifacts,
+            _successful_renderer,
+        )
+        first = await service.submit(_payload(), request_id="first-trace")
+        second = await service.submit(
+            _payload(),
+            request_id="second-trace",
+            idempotency_key=first.id,
+        )
+        self.assertNotEqual(first.id, second.id)
+        self.assertEqual(second.idempotency_key, first.id)
+        await self.artifacts.close()
+        await self.store.close()
+
     async def test_legacy_sqlite_request_ids_migrate_to_both_fields(self):
         now = datetime.now(UTC).timestamp()
         connection = sqlite3.connect(self.store.path)
@@ -855,6 +875,44 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(migrated.request_id, "legacy-key")
         self.assertEqual(migrated.idempotency_key, "legacy-key")
         await self.store.close()
+
+    async def test_legacy_idempotency_migration_rolls_back_atomically(self):
+        connection = sqlite3.connect(self.store.path, isolation_level=None)
+        connection.executescript(
+            """
+            CREATE TABLE async_jobs (
+                id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL, payload BLOB, webhook_payload BLOB,
+                webhook_event_status TEXT, webhook_attempt_count INTEGER NOT NULL DEFAULT 0,
+                webhook_available_at REAL, attempt_count INTEGER NOT NULL DEFAULT 0,
+                available_at REAL NOT NULL, queue_expires_at REAL NOT NULL,
+                created_at REAL NOT NULL, started_at REAL, claim_token TEXT,
+                request_fingerprint BLOB, completed_at REAL, artifact_key TEXT,
+                media_type TEXT, filename TEXT, artifact_bytes INTEGER,
+                result_expires_at REAL, queue_ms INTEGER, render_ms INTEGER,
+                error_code TEXT, error_message TEXT, error_retryable INTEGER
+            );
+            """
+        )
+
+        def reject_backfill(action, table, _column, _database, _trigger):
+            if action == sqlite3.SQLITE_UPDATE and table == "async_jobs":
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        connection.set_authorizer(reject_backfill)
+        with self.assertRaises(sqlite3.DatabaseError):
+            SQLiteJobStore._initialize(connection)
+        connection.set_authorizer(None)
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(async_jobs)"
+            ).fetchall()
+        }
+        self.assertNotIn("correlation_id", columns)
+        self.assertNotIn("idempotency_key", columns)
+        connection.close()
 
     async def test_running_job_cannot_be_cancelled(self):
         rendering = asyncio.Event()

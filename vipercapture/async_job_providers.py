@@ -255,64 +255,70 @@ class SQLiteJobStore:
                 ON async_jobs(completed_at);
             """
         )
-        columns = {
-            row[1]
-            for row in connection.execute(
-                "PRAGMA table_info(async_jobs)"
-            ).fetchall()
-        }
-        if "claim_token" not in columns:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(async_jobs)"
+                ).fetchall()
+            }
+            if "claim_token" not in columns:
+                connection.execute(
+                    "ALTER TABLE async_jobs ADD COLUMN claim_token TEXT"
+                )
+            if "request_fingerprint" not in columns:
+                connection.execute(
+                    "ALTER TABLE async_jobs ADD COLUMN request_fingerprint BLOB"
+                )
+            if "correlation_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE async_jobs ADD COLUMN correlation_id TEXT"
+                )
+                connection.execute(
+                    "UPDATE async_jobs SET correlation_id=request_id"
+                )
+            if "idempotency_key" not in columns:
+                connection.execute(
+                    "ALTER TABLE async_jobs ADD COLUMN idempotency_key TEXT"
+                )
+                connection.execute(
+                    "UPDATE async_jobs SET idempotency_key=request_id"
+                )
+            if "webhook_payload" not in columns:
+                connection.execute(
+                    "ALTER TABLE async_jobs ADD COLUMN webhook_payload BLOB"
+                )
+            if "webhook_event_status" not in columns:
+                connection.execute(
+                    "ALTER TABLE async_jobs ADD COLUMN webhook_event_status TEXT"
+                )
+            if "webhook_attempt_count" not in columns:
+                connection.execute(
+                    "ALTER TABLE async_jobs ADD COLUMN webhook_attempt_count INTEGER NOT NULL DEFAULT 0"
+                )
+            if "webhook_available_at" not in columns:
+                connection.execute(
+                    "ALTER TABLE async_jobs ADD COLUMN webhook_available_at REAL"
+                )
             connection.execute(
-                "ALTER TABLE async_jobs ADD COLUMN claim_token TEXT"
-            )
-        if "request_fingerprint" not in columns:
-            connection.execute(
-                "ALTER TABLE async_jobs ADD COLUMN request_fingerprint BLOB"
-            )
-        if "correlation_id" not in columns:
-            connection.execute(
-                "ALTER TABLE async_jobs ADD COLUMN correlation_id TEXT"
+                """
+                CREATE INDEX IF NOT EXISTS async_jobs_webhook_idx
+                ON async_jobs(webhook_available_at, completed_at)
+                WHERE webhook_payload IS NOT NULL
+                """
             )
             connection.execute(
-                "UPDATE async_jobs SET correlation_id=request_id"
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS async_jobs_idempotency_idx
+                ON async_jobs(idempotency_key)
+                WHERE idempotency_key IS NOT NULL
+                """
             )
-        if "idempotency_key" not in columns:
-            connection.execute(
-                "ALTER TABLE async_jobs ADD COLUMN idempotency_key TEXT"
-            )
-            connection.execute(
-                "UPDATE async_jobs SET idempotency_key=request_id"
-            )
-        if "webhook_payload" not in columns:
-            connection.execute(
-                "ALTER TABLE async_jobs ADD COLUMN webhook_payload BLOB"
-            )
-        if "webhook_event_status" not in columns:
-            connection.execute(
-                "ALTER TABLE async_jobs ADD COLUMN webhook_event_status TEXT"
-            )
-        if "webhook_attempt_count" not in columns:
-            connection.execute(
-                "ALTER TABLE async_jobs ADD COLUMN webhook_attempt_count INTEGER NOT NULL DEFAULT 0"
-            )
-        if "webhook_available_at" not in columns:
-            connection.execute(
-                "ALTER TABLE async_jobs ADD COLUMN webhook_available_at REAL"
-            )
-        connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS async_jobs_webhook_idx
-            ON async_jobs(webhook_available_at, completed_at)
-            WHERE webhook_payload IS NOT NULL
-            """
-        )
-        connection.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS async_jobs_idempotency_idx
-            ON async_jobs(idempotency_key)
-            WHERE idempotency_key IS NOT NULL
-            """
-        )
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+        connection.execute("COMMIT")
 
     @staticmethod
     def _from_row(row: sqlite3.Row | None) -> JobRecord | None:
@@ -444,7 +450,7 @@ class SQLiteJobStore:
                 """,
                 (
                     job.id,
-                    job.idempotency_key or job.id,
+                    job.id,
                     job.request_id,
                     job.idempotency_key,
                     job.payload,

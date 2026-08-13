@@ -1,5 +1,6 @@
 import asyncio
 import hmac
+import json
 import os
 import re
 import secrets
@@ -54,7 +55,12 @@ from .page_cleanup import (
     should_block_resource,
 )
 from .render_cache import RenderCache
-from .render_contract import BrowserEngine, OutputFormat, RenderRequest
+from .render_contract import (
+    BrowserEngine,
+    OutputFormat,
+    RenderRequest,
+    canonical_render_document,
+)
 from .render_engine import (
     CleanupHooks,
     RenderArtifact,
@@ -1867,6 +1873,24 @@ def _project_idempotency_key(
     return _project_request_id(request, value) if value is not None else None
 
 
+def _canonical_bulk_payload(payload: BulkJobRequest) -> bytes:
+    return json.dumps(
+        {
+            "items": [
+                {
+                    "id": item.id,
+                    "idempotency_key": item.idempotency_key,
+                    "render": canonical_render_document(item.render),
+                }
+                for item in payload.items
+            ]
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
 async def _validate_profile_access(payload: RenderRequest, request: Request) -> None:
     if (
         payload.profile_id is None
@@ -1970,7 +1994,7 @@ async def create_bulk_render_jobs(
             False,
         )
     bulk_fingerprint = (
-        service.cipher.fingerprint_bytes(payload.model_dump_json().encode())
+        service.cipher.fingerprint_bytes(_canonical_bulk_payload(payload))
         if bulk_key is not None
         else None
     )

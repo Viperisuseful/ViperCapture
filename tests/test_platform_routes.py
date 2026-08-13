@@ -275,6 +275,42 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
             main._project_idempotency_key(second, "same-key"),
         )
 
+    def test_bulk_payload_fingerprint_input_is_canonical(self):
+        first = BulkJobRequest.model_validate(
+            {
+                "items": [
+                    {
+                        "render": {
+                            "url": "https://example.com",
+                            "headers": {"X-First": "1", "X-Second": "2"},
+                            "network": {
+                                "block_resource_types": ["image", "font"]
+                            },
+                        }
+                    }
+                ]
+            }
+        )
+        second = BulkJobRequest.model_validate(
+            {
+                "items": [
+                    {
+                        "render": {
+                            "network": {
+                                "block_resource_types": ["font", "image"]
+                            },
+                            "headers": {"X-Second": "2", "X-First": "1"},
+                            "url": "https://example.com",
+                        }
+                    }
+                ]
+            }
+        )
+        self.assertEqual(
+            main._canonical_bulk_payload(first),
+            main._canonical_bulk_payload(second),
+        )
+
     async def test_readiness_is_unavailable_without_a_browser(self):
         original_browser = getattr(main.app.state, "browser", None)
         main.app.state.browser = None
