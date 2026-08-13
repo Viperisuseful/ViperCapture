@@ -9,7 +9,7 @@ therefore uses a private Tauri mobile plugin with an offscreen Android WebView.
 Captures stay on the device until the user presses **Download**, which writes
 the image to `Downloads/ViperCapture` through Android MediaStore.
 
-## Requirements
+## Before you begin
 
 - Android 10 or newer
 - JDK 21
@@ -28,7 +28,7 @@ rustup target add `
 Set `JAVA_HOME`, `ANDROID_HOME`, and `NDK_HOME` as described in the
 [official Tauri prerequisites](https://v2.tauri.app/start/prerequisites/).
 
-## Build
+## Build the app
 
 From `desktop/`:
 
@@ -51,9 +51,9 @@ npm run tauri -- android build --apk --aab --ci
 The Gradle project reads signing values from the ignored file
 `desktop/src-tauri/gen/android/keystore.properties`.
 
-## Android renderer support
+## Supported capture options
 
-The Android interface exposes:
+The Android interface supports:
 
 - PNG, JPEG, and WebP output
 - full-page or viewport capture
@@ -67,7 +67,7 @@ CSS selector capture, custom request headers, and selector/text wait conditions
 remain desktop-only and are hidden on Android. Android WebView rendering can
 also differ from desktop Chromium for browser-specific layout or font behavior.
 
-## Release automation
+## Build a release
 
 The `Android Release` GitHub Actions workflow builds and verifies a signed,
 universal APK and AAB, writes SHA-256 checksums, and publishes them for tags

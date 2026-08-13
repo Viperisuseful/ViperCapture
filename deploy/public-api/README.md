@@ -1,15 +1,15 @@
 # Public API deployment
 
-This stack is the smallest supported public-beta topology. It pins the released
-GHCR image, keeps administrative and metrics routes off the public gateway,
+This stack defines the supported public-beta topology. It pins the released
+GHCR image, excludes administrative and metrics routes from the public gateway,
 applies global connection/request limits, uses project-level API keys and
 quotas, stores results in S3-compatible storage, exports Prometheus metrics,
 and gives the renderer a fixed Docker subnet for host-level egress filtering.
 
-It is not a substitute for TLS termination, host patching, alert delivery,
-object-store durability, or an incident-response owner.
+You must also configure TLS termination, host patching, alert delivery,
+object-store durability, and an incident-response owner.
 
-## Bring it up
+## Deploy the stack
 
 1. Copy `.env.example` to `.env`, pin `VIPERCAPTURE_VERSION`, and replace every
    placeholder. Generate each secret independently with `openssl rand -hex 32`.
@@ -43,7 +43,7 @@ The application enforces project RPM/concurrency. Nginx adds a coarse per-IP
 ceiling for unauthenticated floods. Put upstream DDoS filtering in front of the
 host; neither layer replaces network-level abuse protection.
 
-## Backups and restore drills
+## Back up and restore the deployment
 
 Enable bucket versioning and retention in S3/R2. The Docker volume contains
 control-plane state, encrypted queued inputs, schedules, and cache metadata. It
@@ -100,7 +100,7 @@ job/profile/baseline plus an S3-backed artifact. Delete the recovered plaintext
 `.env` when the isolated drill is complete. A backup that has not passed this
 full state, secret, and object-store restore drill is not release evidence.
 
-## Upgrade and rollback
+## Upgrade or roll back
 
 1. Record the current image digest and export the Compose config.
 2. Complete a backup and restore drill.
@@ -112,7 +112,7 @@ full state, secret, and object-store restore drill is not release evidence.
    data snapshot only when release notes explicitly identify an incompatible
    migration; restoring data loses work accepted after the snapshot.
 
-## Abuse and support boundary
+## Configure abuse controls and support
 
 - Require scoped project keys; revoke a key immediately when leaked.
 - Start customers at low RPM, concurrency, pixel, output, and queue limits.

@@ -1,9 +1,9 @@
-# API and workflow guide
+# API guide
 
-All request models reject unknown fields. Exactly one of `url`, `html`, or
-`markdown` is required. The canonical schema is `RenderRequest` in
-`vipercapture/render_contract.py`; FastAPI also exposes interactive OpenAPI documentation at
-`/docs` when the service is running.
+The API rejects unknown request fields. Each render request requires exactly
+one of `url`, `html`, or `markdown`. `RenderRequest` in
+`vipercapture/render_contract.py` is the canonical schema. When the service is
+running, the interactive OpenAPI reference is available at `/docs`.
 
 ## Outputs
 
@@ -50,7 +50,7 @@ open shadow roots as declarative shadow DOM. PDF options include A0–A6, Legal,
 Letter, and Tabloid paper, optional page ranges, and bounded header/footer
 templates. Metadata includes icons, loaded fonts, forms, and JSON-LD samples.
 
-## Browser preparation
+## Configure the browser
 
 - `environment`: device preset, color scheme, reduced motion, locale, timezone.
 - `network`: user agent, geolocation, proxy, cookies, CSP/HTTPS controls, URL
@@ -61,7 +61,7 @@ templates. Metadata includes icons, loaded fonts, forms, and JSON-LD samples.
 - `cleanup`: consent mode and ad/tracker/chat/newsletter blocking.
 - `custom_css`: up to 64 KiB of injected CSS.
 
-Hosted mode intentionally rejects per-request proxies, non-public targets and
+Hosted mode rejects per-request proxies, non-public targets and
 subresources, cookies outside the target site, and unsafe redirects.
 
 ## Actions and assertions
@@ -90,7 +90,7 @@ Supported action types are `click`, `hover`, `fill`, `press`, `select`,
 `scroll`, `wait`, `hide`, and `javascript`. JavaScript requires the operator to
 set `VIPERCAPTURE_ALLOW_SCRIPTS=1`.
 
-## Async, bulk, and schedules
+## Submit async, bulk, and scheduled work
 
 `POST /v1/jobs` returns 202. Send a stable `X-Request-Id` to make retries
 idempotent. Poll status and retrieve the result URL advertised in the job
@@ -135,7 +135,7 @@ the selected IANA timezone and stored in UTC. Inputs are encrypted with the
 same key as jobs. The scheduler advances the due time before idempotently
 submitting work, preventing a crash from creating a tight duplicate loop.
 
-## Signed links
+## Create signed links
 
 Set a random secret of at least 32 bytes in `VIPERCAPTURE_SIGNING_SECRET` and a
 separate administrator token in `VIPERCAPTURE_SIGNING_ADMIN_TOKEN`. Then:
@@ -150,11 +150,11 @@ curl http://127.0.0.1:8000/v1/signed-url?ttl_seconds=3600 \
 The returned GET URL contains a canonical base64url payload, absolute expiry,
 and versioned HMAC-SHA256 signature. The server rejects tampering, expiry, and
 links whose expiry exceeds the seven-day maximum. Large embedded HTML or
-Markdown inputs must use POST because signed links are intentionally URL-sized.
+Markdown inputs must use POST because signed links are limited to URL-sized payloads.
 Signing authenticates the payload; it does not encrypt it. Do not place secret
 headers, cookies, HTML, or Markdown in a URL that will be shared or logged.
 
-## Webhook verification
+## Verify webhooks
 
 Webhook bodies use canonical compact JSON. Verify the signature over
 `timestamp + "." + raw_body`:
@@ -178,7 +178,7 @@ Host and TLS server name. A terminal transition atomically creates an encrypted
 outbox entry; failed delivery remains pending across restarts until it is
 acknowledged.
 
-## S3, R2, and MinIO
+## Configure S3-compatible storage
 
 Set `VIPERCAPTURE_S3_BUCKET`. Optional variables:
 
@@ -194,9 +194,9 @@ The adapter writes exclusive, unguessable object keys plus ViperCapture owner
 and expiry metadata. Maintenance deletes only objects with the expected
 prefix/UUID key shape and owner marker; unrelated objects under a shared prefix
 are never selected solely because of age. Also configure a provider lifecycle
-rule as crash-safe defense in depth.
+rule so objects still expire if application maintenance does not run.
 
-## Visual differences
+## Compare images
 
 ```bash
 curl http://127.0.0.1:8000/v1/diff \
@@ -212,7 +212,7 @@ decoded RGBA and mask buffers are substantially larger than compressed inputs.
 `report.json` records changed/total pixels, difference ratio, pass/fail, and
 the changed bounding box. `diff.png` highlights changes in magenta.
 
-## Configuration index
+## Configuration variables
 
 See [self-hosting](self-hosting.md) for the security boundary and
 [async jobs](async-jobs.md) for queue/provider durability. Important feature

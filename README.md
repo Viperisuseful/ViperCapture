@@ -4,25 +4,24 @@
 
 <h1 align="center">ViperCapture</h1>
 
-<p align="center"><strong>An open-source, self-hosted alternative to ScreenshotOne and Urlbox.</strong></p>
+<p align="center"><strong>Self-hosted browser rendering API.</strong></p>
 
-ViperCapture is an MIT-licensed browser renderer that runs on your own
-infrastructure. Give it a URL, HTML, or Markdown and it can return screenshots,
+ViperCapture is an MIT-licensed browser renderer for your own infrastructure.
+Send a URL, HTML, or Markdown to produce screenshots,
 PDFs, AVIF images, WebM/MP4/GIF video, hydrated HTML, Markdown, or structured
-metadata through a strict JSON API. You control the machines and storage.
+metadata through a JSON API.
 
 > [!IMPORTANT]
-> ViperCapture OSS v0.2 is beta software. The engine and API are ready for
-> developer self-hosting and evaluation, but the public API may still change
+> ViperCapture OSS v0.2 is beta software. You can self-host and evaluate the
+> engine and API, but the public API may change
 > before v1. The desktop and Android applications are also beta releases;
 > desktop packages are not yet code-signed.
 
-The goal is practical workflow parity, not a renamed copy of every competitor
-option. Check the dated, source-linked [compatibility matrix](docs/compatibility.md),
-then run the [reproducible benchmark](benchmarks/README.md) against your own
-workload.
+The API does not implement every option from other rendering services. Check
+the dated [compatibility matrix](docs/compatibility.md) and run the
+[benchmark](benchmarks/README.md) with your own workload before migrating.
 
-## What ships
+## Features
 
 - Chromium, Firefox, and WebKit rendering; browsers start only when needed
 - PNG, JPEG, WebP, AVIF, PDF, HTML, Markdown, metadata, and WebM/MP4/GIF output
@@ -38,7 +37,7 @@ workload.
 - Timed, full-page GIF, WebM, and MP4 capture with higher-quality encoding,
   transparent padding where supported, and optional GPU acceleration with a
   safe software fallback
-- High local defaults: 500 megapixels, 16,384-pixel viewports, and 100,000-pixel
+- Default local limits: 500 megapixels, 16,384-pixel viewports, and 100,000-pixel
   full-page height, all configurable for remote hosting
 - Durable encrypted async jobs, idempotency, retries, polling, cancellation,
   bulk submission, cron schedules, and signed webhook callbacks
@@ -47,7 +46,7 @@ workload.
 - Expiring HMAC-signed render URLs and a 15-minute exact-request image cache
 - Visual regression ZIPs with pixel counts, pass/fail thresholds, bounds, and
   highlighted changes
-- Privacy-aware diagnostic ZIPs with console/network data and optional HAR,
+- Diagnostic ZIPs with console/network data and optional HAR,
   redacted Playwright trace, and WARC; Ed25519-certified artifact bundles
 - Deterministic capture controls, sectioned slice ZIPs, project-owned visual
   baselines, and reproducible comparison reports
@@ -62,7 +61,7 @@ workload.
 - Reproducible workflows for sustained load, forced restart recovery,
   constrained memory, same-host competitor tests, and longer real-site runs
 
-## Start in one command
+## Before you begin
 
 Direct installation requires Python 3.11 or newer and a full FFmpeg build on
 `PATH`. Video output needs the `libvpx`, `libvpx-vp9`, and `libx264` encoders;
@@ -71,7 +70,9 @@ package manager or the [FFmpeg download page](https://ffmpeg.org/download.html).
 Run `ffmpeg -encoders` to confirm the encoders are available. The Docker image
 already includes FFmpeg, and the desktop installers bundle it.
 
-Then run:
+## Install locally
+
+Run:
 
 ```bash
 git clone https://github.com/Viperisuseful/ViperCapture.git
@@ -82,7 +83,7 @@ python launch.py
 The launcher creates a virtual environment, installs Chromium, Firefox, and
 WebKit, starts the API, and opens `http://127.0.0.1:8000`.
 
-Or use Docker:
+To use Docker instead, run:
 
 ```bash
 docker compose up --build
@@ -95,7 +96,7 @@ a network. Set separate `VIPERCAPTURE_ADMIN_TOKEN` and
 `VIPERCAPTURE_CONTROL_SECRET` values to enable the built-in project control
 plane before exposing API routes to multiple tenants.
 
-## Render API
+## Send a render request
 
 ```bash
 curl --fail-with-body http://127.0.0.1:8000/v1/render \
@@ -139,7 +140,7 @@ See the [API and workflows guide](docs/api.md), [async provider guide](docs/asyn
 administer challenges the renderer, follow the least-privilege
 [Cloudflare/WAF authorization guide](docs/site-access.md).
 
-## Storage and webhooks
+## Configure storage and webhooks
 
 Set `VIPERCAPTURE_S3_BUCKET` to store job results through the built-in S3
 adapter instead of local files. It uses standard AWS credential resolution.
@@ -160,7 +161,7 @@ the operator explicitly opts in. Public DNS results stay pinned for the life
 of the callback connection to prevent rebinding, and the encrypted delivery
 outbox survives process restarts.
 
-## Security boundary
+## Secure the service
 
 Keep the service on loopback, enable `VIPERCAPTURE_ADMIN_TOKEN`, or put every
 route behind the same authenticated, rate-limited reverse proxy. When the
@@ -169,7 +170,7 @@ not provide access control. Hosted mode rejects targets and redirects that
 resolve to private addresses during validation, along with unsafe subresources,
 cross-origin credential headers, proxy use, and cross-site cookies. Browser DNS
 can change after validation, so deployments also need host or container egress
-rules to block rebinding. Self-host mode deliberately allows internal pages and
+rules to block rebinding. Self-host mode allows internal pages and
 proxies; isolate Chromium with that boundary in mind.
 
 JavaScript actions are disabled unless `VIPERCAPTURE_ALLOW_SCRIPTS=1`. Render
@@ -178,7 +179,7 @@ are AES-GCM encrypted and erased at terminal job states, but diagnostic console
 output and browser video can still record sensitive page content. Treat those
 artifacts accordingly.
 
-## Native apps and agent skill
+## Use the native apps and agent skill
 
 The beta Tauri 2 desktop app lives in [`desktop/`](desktop). The beta Android
 WebView renderer is documented in [docs/android.md](docs/android.md). Both are
@@ -187,7 +188,7 @@ The portable
 [`skills/vipercapture`](skills/vipercapture) skill works with Codex, Claude Code,
 and Cursor and includes a dependency-free client.
 
-## Development and proof
+## Run development checks
 
 ```bash
 python -m pip install -r requirements.txt

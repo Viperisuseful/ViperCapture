@@ -1,9 +1,10 @@
-# Platform and operator features
+# Platform configuration
 
-All platform features are opt-in and preserve the single-operator behavior of
-older ViperCapture installations.
+This page covers project controls, artifact options, distributed roles, and
+observability. Existing single-operator installations can continue without
+enabling the project control plane or distributed roles.
 
-## Projects, keys, quotas, and profiles
+## Configure projects, keys, quotas, and profiles
 
 Set separate random `VIPERCAPTURE_ADMIN_TOKEN` and
 `VIPERCAPTURE_CONTROL_SECRET` values of at least 32 bytes. The first
@@ -37,7 +38,7 @@ Each project may retain at most 100 schedules and 512 MiB of encrypted schedule
 payloads. Creation reserves quota before the durable schedule row is written;
 updates resize that reservation and deletion releases it.
 
-## Deterministic, diagnostic, and certified artifacts
+## Configure artifact options
 
 `deterministic.enabled` fixes `Date`, `Math.random`, Web Crypto random values
 and UUIDs, and the browser performance clock; it also waits for fonts and
@@ -48,14 +49,14 @@ Ed25519-signed manifest when `VIPERCAPTURE_CERTIFICATION_SECRET` is set to at
 least 32 bytes. Certification proves bundle integrity; it does not by itself
 make a legal-admissibility claim.
 
-## Distributed roles and observability
+## Configure distributed roles and observability
 
 `VIPERCAPTURE_ROLE=api` starts queue providers without consumers;
 `VIPERCAPTURE_ROLE=worker` consumes jobs and rejects public render traffic;
 `all` remains the default. Split roles require a shared job-store factory,
 shared artifact storage (S3/R2 or a factory), and `VIPERCAPTURE_JOB_SECRET`.
 This makes accidental split deployment with local SQLite/files impossible.
-The built-in SQLite control plane is intentionally restricted to `role=all`;
+The built-in SQLite control plane is restricted to `role=all`;
 split deployments must enforce shared authentication and quotas at their
 gateway. Schedules in split mode require a shared
 `VIPERCAPTURE_SCHEDULE_STORE_FACTORY`; disable them explicitly otherwise.
@@ -69,10 +70,10 @@ replica can recover only expired claims and cannot steal live work.
 readiness, and `/v1/admin/status` exposes authenticated operator state. Set
 `OTEL_EXPORTER_OTLP_ENDPOINT` to enable batched OpenTelemetry FastAPI traces.
 
-## Clients and integrations
+## Use clients and integrations
 
 The dependency-free Python client is under `skills/vipercapture/scripts`, typed
 TypeScript and Go clients are under `sdk/`, and the repository includes a
 composite GitHub Action, an importable n8n workflow, and a minimal Terraform
-Docker module. Compatibility adapters intentionally reject unknown vendor
+Docker module. Compatibility adapters reject unknown vendor
 options instead of silently changing render behavior.
