@@ -763,6 +763,7 @@ async def require_desktop_token(request: Request, call_next):
         DESKTOP_TOKEN
         and request.method != "OPTIONS"
         and path not in {"/health", "/ready"}
+        and not (path == "/metrics" and METRICS_PUBLIC)
         and not signed_render
         and not signing_admin
         and not desktop_authenticated
@@ -963,11 +964,11 @@ async def create_project(payload: ProjectCreate, request: Request) -> JSONRespon
 
 
 @app.get("/v1/admin/projects")
-async def list_projects(request: Request) -> JSONResponse:
-    projects = await asyncio.to_thread(_admin(request).list_projects)
-    return JSONResponse(
-        projects, headers={"Cache-Control": "private, no-store"}
-    )
+async def list_projects(
+    request: Request, response: Response
+) -> list[dict[str, object]]:
+    response.headers["Cache-Control"] = "private, no-store"
+    return await asyncio.to_thread(_admin(request).list_projects)
 
 
 @app.post("/v1/admin/projects/{project_id}/keys", status_code=201)
@@ -991,18 +992,23 @@ async def revoke_api_key(key_id: str, request: Request) -> Response:
 
 
 @app.get("/v1/admin/audit")
-async def audit_events(request: Request, limit: Annotated[int, Query(ge=1, le=1000)] = 100) -> JSONResponse:
-    events = await asyncio.to_thread(_admin(request).audits, limit)
-    return JSONResponse(
-        events, headers={"Cache-Control": "private, no-store"}
-    )
+async def audit_events(
+    request: Request,
+    response: Response,
+    limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+) -> list[dict[str, object]]:
+    response.headers["Cache-Control"] = "private, no-store"
+    return await asyncio.to_thread(_admin(request).audits, limit)
 
 
 @app.get("/v1/admin/status")
-async def operator_status(request: Request) -> JSONResponse:
+async def operator_status(
+    request: Request, response: Response
+) -> dict[str, object]:
     _admin(request)
+    response.headers["Cache-Control"] = "private, no-store"
     service = getattr(app.state, "async_jobs", None)
-    return JSONResponse({
+    return {
         "role": PROCESS_ROLE,
         "browser_connected": app.state.browser.is_connected(),
         "browsers": {
@@ -1012,7 +1018,7 @@ async def operator_status(request: Request) -> JSONResponse:
         "async_jobs": service is not None,
         "worker_count": ASYNC_JOB_SETTINGS.worker_count if ASYNC_JOB_SETTINGS else 0,
         "control_plane": CONTROL_ENABLED,
-    }, headers={"Cache-Control": "private, no-store"})
+    }
 
 
 @app.post("/v1/profiles", status_code=201)
@@ -1621,7 +1627,22 @@ def _baseline_context(request: Request, name: str) -> tuple[ControlPlane, str]:
     return control, request.state.project_id
 
 
-@app.put("/v1/baselines/{name}")
+@app.put(
+    "/v1/baselines/{name}",
+    response_model=dict[str, object],
+    responses={
+        201: {
+            "description": "Baseline created",
+            "model": dict[str, object],
+            "headers": {
+                "Location": {
+                    "description": "URL of the created baseline",
+                    "schema": {"type": "string"},
+                }
+            },
+        }
+    },
+)
 async def put_baseline(name: str, image: UploadFile, request: Request) -> JSONResponse:
     control, project_id = _baseline_context(request, name)
     body = await image.read(MAX_DIFF_INPUT_BYTES + 1)
@@ -1658,12 +1679,12 @@ async def put_baseline(name: str, image: UploadFile, request: Request) -> JSONRe
 
 
 @app.get("/v1/baselines")
-async def list_baselines(request: Request) -> JSONResponse:
+async def list_baselines(
+    request: Request, response: Response
+) -> list[dict[str, object]]:
     control, project_id = _baseline_context(request, "all")
-    baselines = await asyncio.to_thread(control.list_baselines, project_id)
-    return JSONResponse(
-        baselines, headers={"Cache-Control": "private, no-store"}
-    )
+    response.headers["Cache-Control"] = "private, no-store"
+    return await asyncio.to_thread(control.list_baselines, project_id)
 
 
 @app.delete("/v1/baselines/{name}", status_code=204)
@@ -1964,10 +1985,10 @@ async def create_bulk_render_jobs(
         _project_idempotency_key(
             request,
             (
-                f"bulk:{bulk_key}:{index}"
+                f"@bulk:{bulk_key}:{index}"
                 if bulk_key is not None
                 else (
-                    f"bulk-item:{item.idempotency_key}"
+                    f"@bulk-item:{item.idempotency_key}"
                     if item.idempotency_key is not None
                     else None
                 )

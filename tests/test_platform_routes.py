@@ -43,6 +43,20 @@ class PlatformRouteTests(unittest.TestCase):
                     for item in parameters
                 )
             )
+        baseline_put = paths["/v1/baselines/{name}"]["put"]["responses"]
+        self.assertIn("200", baseline_put)
+        self.assertIn("201", baseline_put)
+        self.assertIn("Location", baseline_put["201"]["headers"])
+        for path in (
+            "/v1/admin/projects",
+            "/v1/admin/audit",
+            "/v1/admin/status",
+            "/v1/baselines",
+        ):
+            schema = paths[path]["get"]["responses"]["200"]["content"][
+                "application/json"
+            ]["schema"]
+            self.assertTrue(schema, path)
 
     def test_desktop_cors_allows_schedule_updates(self):
         self.assertIn("PATCH", main.DESKTOP_ALLOW_METHODS)
@@ -107,6 +121,23 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(raised.exception.status_code, 401)
         self.assertEqual(authorized.status_code, 200)
+
+    async def test_public_metrics_bypass_desktop_authentication(self):
+        request = SimpleNamespace(
+            method="GET",
+            url=SimpleNamespace(path="/metrics"),
+            headers={},
+            query_params={},
+            app=SimpleNamespace(state=SimpleNamespace(control=None)),
+        )
+        call_next = AsyncMock(return_value=main.Response(status_code=200))
+        with (
+            patch("vipercapture.main.DESKTOP_TOKEN", "desktop-secret"),
+            patch("vipercapture.main.METRICS_PUBLIC", True),
+        ):
+            response = await main.require_desktop_token(request, call_next)
+        self.assertEqual(response.status_code, 200)
+        call_next.assert_awaited_once_with(request)
 
     async def test_query_auth_can_be_disabled_for_take(self):
         control = SimpleNamespace(authenticate=Mock())
@@ -807,10 +838,12 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             service.existing.await_args.kwargs,
             {
-                "idempotency_key": "bulk:replay-1:0",
+                "idempotency_key": "@bulk:replay-1:0",
                 "request_fingerprint": b"bulk-fingerprint",
             },
         )
+        with self.assertRaises(RenderError):
+            main._idempotency_key("@bulk:replay-1:0")
 
     async def test_async_cache_hit_bypasses_chromium_slot(self):
         original_cache = getattr(main.app.state, "render_cache", None)
