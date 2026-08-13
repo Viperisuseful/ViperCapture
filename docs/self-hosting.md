@@ -1,12 +1,12 @@
-# Self-hosting ViperCapture
+# Self-host ViperCapture
 
-The public ViperCapture repository contains the MIT-licensed rendering engine,
+This repository contains the MIT-licensed rendering engine,
 browser interface, orchestration APIs, local/S3-compatible storage, schedules,
 signed delivery, diagnostics, and video. The managed ViperCapture Cloud account,
 billing, credits, referrals, deployment configuration, and production secrets
 remain separate.
 
-## Local install
+## Install locally
 
 Use Python 3.11 or newer and install a full FFmpeg build through the operating
 system package manager. Confirm `ffmpeg -encoders` lists `libvpx`, `libvpx-vp9`,
@@ -16,7 +16,7 @@ The launcher creates a virtual environment, installs Playwright Chromium,
 Firefox, and WebKit, starts the application, and opens the local interface.
 The Docker image and released desktop installers already include FFmpeg.
 
-## Production boundaries
+## Configure a production deployment
 
 - Put hosted mode behind a rate-limited reverse proxy.
 - Run one application process; every process owns one Chromium process tree and
@@ -30,11 +30,11 @@ The Docker image and released desktop installers already include FFmpeg.
 
 ## Local render limits
 
-Local installs default to a deliberately large 500,000,000-pixel budget,
+Local installs default to a 500,000,000-pixel budget,
 16,384 CSS pixels for either viewport dimension, and 100,000 CSS pixels of
 full-page height. The encoded-output ceiling is 1 GiB. These are safety
-ceilings, not a promise that every machine,
-page, browser build, or image format can allocate that much memory. A decoded
+ceilings. A machine, page, browser build, or image format can fail below these
+limits. A decoded
 RGBA surface alone needs roughly four bytes per output pixel, and Chromium plus
 the encoder need additional working memory. Keep concurrency at one for very
 large captures.
@@ -63,7 +63,7 @@ Do not remove the pixel ceiling on an Internet-facing service. Also set an
 application memory limit, a request timeout, and low Chromium concurrency so
 one extreme page cannot exhaust the host.
 
-## Page cleanup and advanced controls
+## Configure page cleanup and rendering
 
 The local browser and desktop interfaces expose the Cloud cleanup controls:
 reject, accept, hide, or leave cookie consent unchanged; block known ad,
@@ -79,7 +79,7 @@ API additionally exposes actions, cookies, proxies, resource patterns,
 geolocation, assertions, deterministic time/randomness, slices, profiles,
 signed delivery, and certification as documented in [API and workflows](api.md).
 
-## Optional GPU rendering
+## Configure GPU rendering
 
 GPU acceleration is off by default. Self-hosters with a compatible GPU and
 driver can set:
@@ -117,7 +117,7 @@ only same-origin requests from the loopback interface; remotely hosted
 instances should continue to configure GPU mode through environment variables
 and restart the service normally.
 
-## Capability boundary
+## Feature limits
 
 The public engine implements the feature set documented in [API and workflows](api.md).
 It blocks detected page-level challenges by default. Callers may set
@@ -136,7 +136,7 @@ store cannot enforce private ACLs on Windows, so `VIPERCAPTURE_SCHEDULES`
 defaults to `0` there and the bundled store refuses direct startup. Use an
 external scheduler on Windows or keep the feature disabled.
 
-## Selectors and waits
+## Configure selectors and waits
 
 `selector` captures the first visible matching element and requires
 `full_page: false`. `wait_for.selector` waits for a matching element to become
@@ -153,7 +153,7 @@ For full-page captures of unusually wide documents, set
 `preserve_viewport_width: true` to clip horizontal overflow to the requested
 viewport while retaining the full document height.
 
-## Custom headers
+## Send custom headers
 
 `headers` must be a JSON object whose values are strings. At most 32 headers
 and 16 KiB serialized data are accepted; each name is limited to 128 bytes and
@@ -169,7 +169,7 @@ administer, use the scoped pattern in [site access](site-access.md): fixed
 renderer address, exact host and path, and an origin-only secret header. It
 does not disable or evade challenges on third-party sites.
 
-## Diagnostic response headers
+## Read diagnostic response headers
 
 Successful `POST /v1/render` responses include:
 

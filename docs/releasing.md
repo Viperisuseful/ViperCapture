@@ -1,4 +1,4 @@
-# Release and distribution guide
+# Release guide
 
 `release/versions.json` is the release manifest. For this train it prepares:
 
@@ -15,12 +15,12 @@
 | Desktop beta | 0.2.1 | GitHub Releases | MSI/NSIS, Apple/Intel DMGs, Debian package |
 | Android beta | 0.1.8 | GitHub Releases, then Play Console internal testing | signed universal APK/AAB |
 
-Android 0.1.8 is intentionally unchanged and already has a signed APK/AAB with
+Android remains at 0.1.8 and already has a signed APK/AAB with
 checksums. Desktop advances independently to 0.2.1 so PR #21's animated
 full-page output, quality, GPU encoding, and release-tooling changes ship in
 fresh native packages without relabeling the existing Android binary.
 
-## Review build
+## Build release artifacts
 
 Before tagging, build all repository artifacts without publishing:
 
@@ -38,7 +38,7 @@ inspect `oss-release-packages`, verify `SHA256SUMS.txt`, install both SDK
 packages in clean temporary environments, and test the source archive with
 `python launch.py` or Compose.
 
-## Registry setup required once
+## Configure registries
 
 - Configure PyPI trusted publishing for repository
   `Viperisuseful/ViperCapture` and workflow `oss-release.yml`.
@@ -53,7 +53,7 @@ packages in clean temporary environments, and test the source archive with
 - Add `SCREENSHOTONE_ACCESS_KEY` and `URLBOX_SECRET` only if managed-provider
   benchmark evidence is desired. They are not release credentials.
 
-## Publish order
+## Publish a release
 
 1. Confirm PR #21 is merged, then fast-forward `master`.
 2. Run Validate, CodeQL, Operational readiness, and Same-host benchmark.

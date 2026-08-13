@@ -1,7 +1,7 @@
 # Contributing to ViperCapture
 
-ViperCapture welcomes focused fixes, tests, documentation improvements, and
-small features for the open-source URL-to-image engine.
+This guide explains how to submit fixes, tests, documentation updates, and
+small features to the open-source rendering engine.
 
 ## Scope
 
@@ -13,7 +13,7 @@ Discuss large features or architectural changes in an issue before writing
 them. Report security vulnerabilities privately as described in
 [`SECURITY.md`](SECURITY.md).
 
-## Setup
+## Set up the repository
 
 Use Python 3.11 or newer:
 
@@ -26,9 +26,9 @@ python launch.py
 `python launch.py` is the supported setup and startup method. It creates the
 virtual environment, installs dependencies and Chromium, and starts the app.
 
-## Changes
+## Prepare a change
 
-Keep pull requests narrow and explain:
+Keep the pull request limited to one change. Include:
 
 - What changed and why
 - How to reproduce the original problem
@@ -50,7 +50,7 @@ The main files are:
 - `vipercapture/async_job_providers.py` — bundled SQLite and filesystem adapters
 - `templates/` and `static/` — local browser interface
 
-## Tests
+## Run tests
 
 Run the automated suite before submitting:
 

@@ -1,16 +1,15 @@
 # Security Policy
 
-## Boundary
+## Supported code
 
-This policy covers only the open-source ViperCapture engine in this
-repository. The hosted ViperCapture service is a separate product with its own
-code, infrastructure, and reporting boundary; this repository makes no support
-promise for it.
+This policy covers the open-source ViperCapture engine in this repository. It
+does not cover the hosted ViperCapture service, which uses separate code and
+infrastructure.
 
 Only the latest code on `master` is supported. Older commits, archived releases,
 third-party forks, and modified deployments are not supported.
 
-## Reporting a vulnerability
+## Report a vulnerability
 
 Do not publish vulnerability details in an issue, discussion, or pull request.
 Use GitHub's private vulnerability reporting:

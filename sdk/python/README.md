@@ -1,6 +1,7 @@
 # ViperCapture Python SDK
 
-Dependency-free beta client for a self-hosted ViperCapture API.
+This beta client connects to a self-hosted ViperCapture API and has no runtime
+dependencies.
 
 ```python
 from vipercapture import Client

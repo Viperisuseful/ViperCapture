@@ -4,12 +4,12 @@ This guide is for owners and administrators authorizing captures of a site they
 control. ViperCapture detects blocking challenges and can record the page as
 shown, but it does not solve CAPTCHAs or evade another site's access controls.
 
-## Recommended pattern
+## Create an access rule
 
-Use a dedicated preview hostname or path and require a random, revocable
-request header. Combine that with the fixed outbound address of your
-ViperCapture deployment, then skip only the security rule that causes the false
-positive. Keep logging and all unrelated protections enabled.
+Create a dedicated preview hostname or path and require a random, revocable
+request header. Match the header with the fixed outbound address of the
+ViperCapture deployment. Skip only the security rule that blocks the request.
+Keep logging and unrelated protections enabled.
 
 For example, send an origin-scoped header with the render request:
 
@@ -30,7 +30,7 @@ and cross-origin assets do not receive the secret. Persistent profiles are a
 better fit for short-lived login sessions; do not copy a person's long-lived
 session into a request.
 
-## Cloudflare rule
+## Configure Cloudflare
 
 Create a WAF custom rule above the rule that blocks the renderer. Replace the
 address, host, path, and value below:

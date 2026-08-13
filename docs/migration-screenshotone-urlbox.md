@@ -1,8 +1,8 @@
 # Migrating from ScreenshotOne or Urlbox
 
-ViperCapture uses one strict nested JSON contract rather than duplicating every
-vendor query-parameter name. Start by migrating server-side POST calls; signed
-embed URLs and async workflows can follow independently.
+ViperCapture uses a strict nested JSON contract. It does not support every
+vendor query parameter. Migrate server-side POST requests first. Migrate signed
+URLs and async workflows separately.
 
 For a staged cutover, the common ScreenshotOne query contract is available at
 `GET /take`; a project key may be sent as `access_key` or a bearer token. Urlbox
@@ -10,7 +10,7 @@ common POST options are accepted at `/compat/urlbox/v1/render/sync` and
 `/compat/urlbox/v1/render/async`. Once traffic is stable, migrate to the native
 contract to access every ViperCapture option.
 
-## Common option mapping
+## Map request options
 
 | Vendor-style concept | ViperCapture field |
 | --- | --- |
@@ -32,7 +32,7 @@ contract to access every ViperCapture option.
 | webhook URL | `delivery.webhook_url` on an async job |
 | cache | `cache: true` for a single image |
 
-Example translation:
+Example ViperCapture request:
 
 ```json
 {
@@ -46,7 +46,7 @@ Example translation:
 }
 ```
 
-## Rollout checklist
+## Migrate traffic
 
 1. Pin the ViperCapture commit and Chromium version in a staging deployment.
 2. Copy real requests with secrets removed into a private scenario suite.
@@ -61,6 +61,5 @@ Example translation:
 8. Move traffic gradually and retain the managed provider as rollback until
    workload-specific acceptance criteria pass.
 
-Compatibility endpoints intentionally reject unknown vendor options. Strict
-validation exposes unsupported options during migration instead of quietly
-producing the wrong artifact.
+Compatibility endpoints reject unknown vendor options. Handle each validation
+error before moving the corresponding request to ViperCapture.
