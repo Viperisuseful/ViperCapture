@@ -314,8 +314,8 @@ class ControlPlane:
         # constant-time digest is intentional; a password KDF would enable auth DoS.
         return hmac.digest(
             self._key_hash_secret,
-            raw.encode(),  # codeql[py/weak-sensitive-data-hashing]
-            "sha256",
+            raw.encode(),
+            "sha256",  # lgtm[py/weak-sensitive-data-hashing]
         )
 
     async def acquire(
