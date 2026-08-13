@@ -881,7 +881,7 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             service.existing.await_args.kwargs,
             {
-                "idempotency_key": "@bulk-item:8:replay-1:0",
+                "idempotency_key": "@bulk-header-item:8:replay-1:0",
                 "request_fingerprint": b"bulk-fingerprint",
             },
         )
@@ -890,8 +890,14 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
 
     def test_bulk_internal_keys_are_unambiguous(self):
         self.assertNotEqual(
-            main._bulk_internal_key("item", "release", ":2026:0"),
-            main._bulk_internal_key("item", "release:2026", ":0"),
+            main._bulk_internal_key("header-item", "release", ":2026:0"),
+            main._bulk_internal_key(
+                "header-item", "release:2026", ":0"
+            ),
+        )
+        self.assertNotEqual(
+            main._bulk_internal_key("header-item", "abc", ":0"),
+            "@bulk-item:3:abc:0",
         )
 
     async def test_async_cache_hit_bypasses_chromium_slot(self):

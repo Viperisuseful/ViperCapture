@@ -2025,7 +2025,7 @@ async def create_bulk_render_jobs(
         _project_idempotency_key(
             request,
             (
-                _bulk_internal_key("item", bulk_key, f":{index}")
+                _bulk_internal_key("header-item", bulk_key, f":{index}")
                 if bulk_key is not None
                 else (
                     f"@bulk-item:{item.idempotency_key}"

@@ -665,12 +665,12 @@ class SQLiteJobStore:
                         length(replace(
                             async_bulk_idempotency.idempotency_key,
                             '@bulk-envelope:',
-                            '@bulk-item:'
+                            '@bulk-header-item:'
                         ) || ':')
                     ) = replace(
                         async_bulk_idempotency.idempotency_key,
                         '@bulk-envelope:',
-                        '@bulk-item:'
+                        '@bulk-header-item:'
                     ) || ':'
                   )
                 """,
