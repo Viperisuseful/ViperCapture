@@ -881,12 +881,18 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             service.existing.await_args.kwargs,
             {
-                "idempotency_key": "@bulk:replay-1:0",
+                "idempotency_key": "@bulk-item:8:replay-1:0",
                 "request_fingerprint": b"bulk-fingerprint",
             },
         )
         with self.assertRaises(RenderError):
             main._idempotency_key("@bulk:replay-1:0")
+
+    def test_bulk_internal_keys_are_unambiguous(self):
+        self.assertNotEqual(
+            main._bulk_internal_key("item", "release", ":2026:0"),
+            main._bulk_internal_key("item", "release:2026", ":0"),
+        )
 
     async def test_async_cache_hit_bypasses_chromium_slot(self):
         original_cache = getattr(main.app.state, "render_cache", None)

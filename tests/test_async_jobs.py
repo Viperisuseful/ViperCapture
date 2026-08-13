@@ -932,8 +932,8 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             self.artifacts,
             _successful_renderer,
         )
-        envelope_key = "@bulk-envelope:release"
-        item_key = "@bulk:release:0"
+        envelope_key = "@bulk-envelope:7:release"
+        item_key = "@bulk-item:7:release:0"
         started = datetime.now(UTC)
         await self.store.claim_bulk_idempotency(
             envelope_key, b"first", started
@@ -950,7 +950,20 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
                 started + self.settings.metadata_ttl + timedelta(seconds=1),
             )
 
-        empty_key = "@bulk-envelope:all-rejected"
+        prefix_key = "@bulk-envelope:5:other"
+        await self.store.claim_bulk_idempotency(prefix_key, b"old", started)
+        await service.submit(
+            _payload(),
+            request_id="longer-prefix-item",
+            idempotency_key="@bulk-item:10:other:2026:0",
+        )
+        await self.store.claim_bulk_idempotency(
+            prefix_key,
+            b"new",
+            started + self.settings.metadata_ttl + timedelta(seconds=1),
+        )
+
+        empty_key = "@bulk-envelope:12:all-rejected"
         await self.store.claim_bulk_idempotency(empty_key, b"old", started)
         await self.store.claim_bulk_idempotency(
             empty_key,

@@ -1893,6 +1893,10 @@ def _canonical_bulk_payload(payload: BulkJobRequest) -> bytes:
     ).encode("utf-8")
 
 
+def _bulk_internal_key(kind: str, key: str, suffix: str = "") -> str:
+    return f"@bulk-{kind}:{len(key)}:{key}{suffix}"
+
+
 async def _validate_profile_access(payload: RenderRequest, request: Request) -> None:
     if (
         payload.profile_id is None
@@ -2003,7 +2007,7 @@ async def create_bulk_render_jobs(
     if bulk_key is not None:
         assert bulk_fingerprint is not None
         envelope_key = _project_idempotency_key(
-            request, f"@bulk-envelope:{bulk_key}"
+            request, _bulk_internal_key("envelope", bulk_key)
         )
         assert envelope_key is not None
         await service.claim_bulk_idempotency(
@@ -2021,7 +2025,7 @@ async def create_bulk_render_jobs(
         _project_idempotency_key(
             request,
             (
-                f"@bulk:{bulk_key}:{index}"
+                _bulk_internal_key("item", bulk_key, f":{index}")
                 if bulk_key is not None
                 else (
                     f"@bulk-item:{item.idempotency_key}"
