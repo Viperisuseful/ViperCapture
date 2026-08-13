@@ -1,8 +1,8 @@
 {
-  "oss": "0.2.0-beta.3",
-  "python_sdk": "0.2.0b3",
-  "typescript_sdk": "0.2.0-beta.3",
+  "oss": "0.2.0-beta.4",
+  "python_sdk": "0.2.0b4",
+  "typescript_sdk": "0.2.0-beta.4",
   "desktop": "0.2.2",
   "android": "0.1.8",
-  "container": "ghcr.io/viperisuseful/vipercapture:v0.2.0-beta.3"
+  "container": "ghcr.io/viperisuseful/vipercapture:v0.2.0-beta.4"
 }
