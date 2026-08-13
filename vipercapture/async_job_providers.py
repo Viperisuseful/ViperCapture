@@ -654,7 +654,26 @@ class SQLiteJobStore:
         connection.execute("BEGIN IMMEDIATE")
         try:
             connection.execute(
-                "DELETE FROM async_bulk_idempotency WHERE created_at < ?",
+                """
+                DELETE FROM async_bulk_idempotency
+                WHERE created_at < ?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM async_jobs
+                    WHERE substr(
+                        async_jobs.idempotency_key,
+                        1,
+                        length(replace(
+                            async_bulk_idempotency.idempotency_key,
+                            '@bulk-envelope:',
+                            '@bulk:'
+                        ) || ':')
+                    ) = replace(
+                        async_bulk_idempotency.idempotency_key,
+                        '@bulk-envelope:',
+                        '@bulk:'
+                    ) || ':'
+                  )
+                """,
                 (_epoch(now - retention),),
             )
             row = connection.execute(

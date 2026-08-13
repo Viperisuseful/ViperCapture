@@ -22,6 +22,7 @@ from vipercapture.async_jobs import (
     Artifact,
     ArtifactStoreConfig,
     AsyncJobService,
+    IdempotencyConflictError,
     JobConflictError,
     JobDeferred,
     JobRecord,
@@ -920,6 +921,43 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         winner = b"first" if results[0] is None else b"second"
         await first.claim_bulk_idempotency("bulk-key", winner)
         await other_store.close()
+        await self.store.close()
+
+    async def test_bulk_claim_outlives_retained_item_metadata(self):
+        await self.store.start()
+        await self.artifacts.start()
+        service = AsyncJobService(
+            self.settings,
+            self.store,
+            self.artifacts,
+            _successful_renderer,
+        )
+        envelope_key = "@bulk-envelope:release"
+        item_key = "@bulk:release:0"
+        started = datetime.now(UTC)
+        await self.store.claim_bulk_idempotency(
+            envelope_key, b"first", started
+        )
+        await service.submit(
+            _payload(),
+            request_id="bulk-item",
+            idempotency_key=item_key,
+        )
+        with self.assertRaises(IdempotencyConflictError):
+            await self.store.claim_bulk_idempotency(
+                envelope_key,
+                b"second",
+                started + self.settings.metadata_ttl + timedelta(seconds=1),
+            )
+
+        empty_key = "@bulk-envelope:all-rejected"
+        await self.store.claim_bulk_idempotency(empty_key, b"old", started)
+        await self.store.claim_bulk_idempotency(
+            empty_key,
+            b"new",
+            started + self.settings.metadata_ttl + timedelta(seconds=1),
+        )
+        await self.artifacts.close()
         await self.store.close()
 
     async def test_legacy_idempotency_migration_rolls_back_atomically(self):
