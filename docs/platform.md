@@ -30,6 +30,11 @@ profiles, and visual baselines are project-owned. Profile storage state is
 AES-GCM encrypted at rest; profile IDs are unguessable and can be supplied as
 `profile_id` on a render request.
 
+Native routes use `Authorization: Bearer vcp_...`; Bearer authentication
+failures include `WWW-Authenticate`. Query-string credentials are accepted
+only by the ScreenshotOne-compatible `/take` route and can be disabled with
+`VIPERCAPTURE_ALLOW_QUERY_AUTH=0`.
+
 RPM events and active-render leases are transactionally recorded in the
 control database. Processes using that same database therefore share project
 limits; abandoned concurrency leases expire after 15 minutes.
@@ -65,8 +70,12 @@ The combined `all` role recovers its own interrupted claims on restart. Split
 workers require an external job store with lease-based `recover_stale()` so a
 replica can recover only expired claims and cannot steal live work.
 
-`GET /metrics` exports Prometheus text, `GET /ready` reports role and browser
-readiness, and `/v1/admin/status` exposes authenticated operator state. Set
+`GET /metrics` exports Prometheus text. When the control plane is enabled it
+requires the administrator Bearer token unless
+`VIPERCAPTURE_METRICS_PUBLIC=1` is explicitly set. The supplied public gateway
+continues to block `/metrics` while Prometheus scrapes the internal listener.
+`GET /health` and `GET /ready` remain public; `/v1/admin/status` exposes
+authenticated operator state. Set
 `OTEL_EXPORTER_OTLP_ENDPOINT` to enable batched OpenTelemetry FastAPI traces.
 
 ## Clients and integrations

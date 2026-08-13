@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import math
 import os
 import secrets
 import sqlite3
@@ -14,6 +15,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -30,16 +32,37 @@ MAX_AUDIT_EVENTS = 100_000
 LIMIT_LEASE_SECONDS = 15 * 60
 
 
-class BaselineQuotaError(RuntimeError):
+class ProjectQuotaError(RuntimeError):
+    def __init__(self, **details: int) -> None:
+        self.details = details
+        super().__init__("project storage quota exceeded")
+
+
+class BaselineQuotaError(ProjectQuotaError):
     pass
 
 
-class ProfileQuotaError(RuntimeError):
+class ProfileQuotaError(ProjectQuotaError):
     pass
 
 
-class ScheduleQuotaError(RuntimeError):
+class ScheduleQuotaError(ProjectQuotaError):
     pass
+
+
+@dataclass(frozen=True)
+class LimitDecision:
+    allowed: bool
+    reason: str | None = None
+    retry_after: int | None = None
+
+    def __iter__(self):
+        # Preserve the existing two-value internal unpacking contract.
+        yield self.allowed
+        yield self.reason
+
+    def __getitem__(self, index: int):
+        return (self.allowed, self.reason)[index]
 
 
 async def _settled_thread(operation, *args):
@@ -295,13 +318,13 @@ class ControlPlane:
 
     async def acquire(
         self, identity: dict[str, object], *, concurrency: bool = True
-    ) -> tuple[bool, str | None]:
+    ) -> LimitDecision:
         project_id = str(identity["project_id"])
         async with self._limit_lock:
             result, lease_id = await self._settled_acquisition(
                 self._acquire, identity, project_id, concurrency
             )
-            if result[0] is False:
+            if not result.allowed:
                 return result
             if lease_id is not None:
                 self._leases[project_id].append(lease_id)
@@ -312,7 +335,7 @@ class ControlPlane:
         identity: dict[str, object],
         project_id: str,
         concurrency: bool,
-    ) -> tuple[tuple[bool, str | None], str | None]:
+    ) -> tuple[LimitDecision, str | None]:
         now = time.time()
         lease_id = secrets.token_hex(16)
         with self._connect() as db:
@@ -323,14 +346,23 @@ class ControlPlane:
                 "SELECT count(*) FROM rate_events WHERE project_id=?", (project_id,)
             ).fetchone()[0]
             if int(rpm) >= int(identity["rpm"]):
-                return (False, "rate_limit_exceeded"), None
+                oldest = db.execute(
+                    "SELECT min(created_at) FROM rate_events WHERE project_id=?",
+                    (project_id,),
+                ).fetchone()[0]
+                retry_after = max(1, math.ceil(float(oldest) + 60 - now))
+                return LimitDecision(
+                    False, "rate_limit_exceeded", retry_after
+                ), None
             if concurrency:
                 active = db.execute(
                     "SELECT count(*) FROM active_leases WHERE project_id=?",
                     (project_id,),
                 ).fetchone()[0]
                 if int(active) >= int(identity["concurrency"]):
-                    return (False, "concurrency_limit_exceeded"), None
+                    return LimitDecision(
+                        False, "concurrency_limit_exceeded", 1
+                    ), None
             db.execute(
                 "INSERT INTO rate_events VALUES (?, ?, ?)",
                 (secrets.token_hex(16), project_id, now),
@@ -340,7 +372,7 @@ class ControlPlane:
                     "INSERT INTO active_leases VALUES (?, ?, ?)",
                     (lease_id, project_id, now + LIMIT_LEASE_SECONDS),
                 )
-        return (True, None), lease_id if concurrency else None
+        return LimitDecision(True), lease_id if concurrency else None
 
     async def release(self, project_id: str) -> None:
         async with self._limit_lock:
@@ -416,7 +448,12 @@ class ControlPlane:
                 or int(usage["bytes"]) + size_bytes
                 > MAX_SCHEDULE_BYTES_PER_PROJECT
             ):
-                raise ScheduleQuotaError
+                raise ScheduleQuotaError(
+                    limit_count=MAX_SCHEDULES_PER_PROJECT,
+                    used_count=int(usage["count"]),
+                    limit_bytes=MAX_SCHEDULE_BYTES_PER_PROJECT,
+                    used_bytes=int(usage["bytes"]),
+                )
             db.execute(
                 "INSERT INTO resources(kind,id,project_id,created_at,expires_at,size_bytes) "
                 "VALUES ('schedule', ?, ?, ?, NULL, ?)",
@@ -441,7 +478,10 @@ class ControlPlane:
                 (project_id, resource_id),
             ).fetchone()[0]
             if int(other_bytes) + size_bytes > MAX_SCHEDULE_BYTES_PER_PROJECT:
-                raise ScheduleQuotaError
+                raise ScheduleQuotaError(
+                    limit_bytes=MAX_SCHEDULE_BYTES_PER_PROJECT,
+                    used_bytes=int(other_bytes) + int(existing["size_bytes"]),
+                )
             db.execute(
                 "UPDATE resources SET size_bytes=? "
                 "WHERE kind='schedule' AND id=? AND project_id=?",
@@ -541,7 +581,12 @@ class ControlPlane:
             + len(payload)
         )
         if count > MAX_PROFILES_PER_PROJECT or total > MAX_PROFILE_BYTES_PER_PROJECT:
-            raise ProfileQuotaError
+            raise ProfileQuotaError(
+                limit_count=MAX_PROFILES_PER_PROJECT,
+                used_count=int(usage["count"]),
+                limit_bytes=MAX_PROFILE_BYTES_PER_PROJECT,
+                used_bytes=int(usage["bytes"]),
+            )
 
     def get_profile(self, project_id: str, profile_id: str) -> dict[str, object] | None:
         with self._connect() as db:
@@ -604,7 +649,9 @@ class ControlPlane:
                 )
         return cursor.rowcount == 1
 
-    def put_baseline(self, project_id: str, name: str, body: bytes) -> dict[str, object]:
+    def put_baseline(
+        self, project_id: str, name: str, body: bytes
+    ) -> tuple[dict[str, object], bool]:
         digest = hashlib.sha256(body).hexdigest()
         updated_at = int(time.time())
         with self._connect() as db:
@@ -621,9 +668,22 @@ class ControlPlane:
             count = int(usage["count"]) + (0 if existing else 1)
             total = int(usage["bytes"]) - (int(existing["bytes"]) if existing else 0) + len(body)
             if count > MAX_BASELINES_PER_PROJECT or total > MAX_BASELINE_BYTES_PER_PROJECT:
-                raise BaselineQuotaError
+                raise BaselineQuotaError(
+                    limit_count=MAX_BASELINES_PER_PROJECT,
+                    used_count=int(usage["count"]),
+                    limit_bytes=MAX_BASELINE_BYTES_PER_PROJECT,
+                    used_bytes=int(usage["bytes"]),
+                )
             db.execute("INSERT OR REPLACE INTO baselines VALUES (?, ?, ?, ?, ?)", (name, project_id, body, digest, updated_at))
-        return {"name": name, "sha256": digest, "bytes": len(body), "updated_at": updated_at}
+        return (
+            {
+                "name": name,
+                "sha256": digest,
+                "bytes": len(body),
+                "updated_at": updated_at,
+            },
+            existing is None,
+        )
 
     def get_baseline(self, project_id: str, name: str) -> bytes | None:
         with self._connect() as db:

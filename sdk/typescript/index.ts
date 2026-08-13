@@ -20,10 +20,10 @@ export class ViperCapture {
     return new Uint8Array(await response.arrayBuffer());
   }
 
-  async createJob(request: RenderRequest, requestId?: string): Promise<Record<string, unknown>> {
+  async createJob(request: RenderRequest, idempotencyKey?: string): Promise<Record<string, unknown>> {
     const response = await fetch(`${this.baseUrl.replace(/\/$/, "")}/v1/jobs`, {
       method: "POST",
-      headers: {"content-type": "application/json", ...(this.apiKey ? {authorization: `Bearer ${this.apiKey}`} : {}), ...(requestId ? {"x-request-id": requestId} : {})},
+      headers: {"content-type": "application/json", ...(this.apiKey ? {authorization: `Bearer ${this.apiKey}`} : {}), ...(idempotencyKey ? {"idempotency-key": idempotencyKey} : {})},
       body: JSON.stringify(request),
     });
     if (!response.ok) throw new Error(`ViperCapture job failed: ${response.status} ${await response.text()}`);

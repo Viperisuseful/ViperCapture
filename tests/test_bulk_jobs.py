@@ -21,7 +21,7 @@ class BulkJobContractTests(unittest.TestCase):
                 "items": [
                     {
                         "id": "homepage",
-                        "request_id": "release-42-homepage",
+                        "idempotency_key": "release-42-homepage",
                         "render": {"url": "https://example.com"},
                     },
                     {
@@ -45,13 +45,13 @@ class BulkJobContractTests(unittest.TestCase):
                 {"items": [{"render": {"url": "https://example.com"}}] * 101}
             )
 
-    def test_bulk_request_rejects_reserved_project_request_id(self):
+    def test_bulk_request_rejects_unsafe_idempotency_key(self):
         with self.assertRaises(ValidationError):
             BulkJobRequest.model_validate(
                 {
                     "items": [
                         {
-                            "request_id": f"_project-{'a' * 24}:caller",
+                            "idempotency_key": f"_project-{'a' * 24}:caller",
                             "render": {"url": "https://example.com"},
                         }
                     ]

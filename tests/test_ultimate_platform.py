@@ -74,6 +74,22 @@ class ControlPlaneTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.control.revoke_key(key["id"]))
         self.assertIsNone(self.control.authenticate(key["api_key"]))
 
+    async def test_rate_limit_retry_after_tracks_sliding_window(self):
+        project = self.control.create_project("tests", 1, 1)
+        key = self.control.create_key(str(project["id"]), "ci")
+        identity = self.control.authenticate(key["api_key"])
+        with patch("vipercapture.control_plane.time.time", return_value=1000):
+            first = await self.control.acquire(identity, concurrency=False)
+        self.assertTrue(first.allowed)
+        with patch("vipercapture.control_plane.time.time", return_value=1001):
+            blocked = await self.control.acquire(identity, concurrency=False)
+        self.assertFalse(blocked.allowed)
+        self.assertEqual(blocked.reason, "rate_limit_exceeded")
+        self.assertEqual(blocked.retry_after, 59)
+        with patch("vipercapture.control_plane.time.time", return_value=1060.1):
+            allowed = await self.control.acquire(identity, concurrency=False)
+        self.assertTrue(allowed.allowed)
+
     async def test_read_only_requests_do_not_consume_render_concurrency(self):
         project = self.control.create_project("tests", 10, 1)
         project_id = str(project["id"])
@@ -182,9 +198,19 @@ class ControlPlaneTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_baseline_store(self):
         project = self.control.create_project("tests", 10, 1)
-        document = self.control.put_baseline(str(project["id"]), "home", b"png")
+        document, created = self.control.put_baseline(
+            str(project["id"]), "home", b"png"
+        )
+        self.assertTrue(created)
         self.assertEqual(document["sha256"], "8f8cbb7dcf46e0bc7d53265749a6c17d116093a6ba95e442764060c76fd4a86c")
-        self.assertEqual(self.control.get_baseline(str(project["id"]), "home"), b"png")
+        _document, created = self.control.put_baseline(
+            str(project["id"]), "home", b"updated"
+        )
+        self.assertFalse(created)
+        self.assertEqual(
+            self.control.get_baseline(str(project["id"]), "home"),
+            b"updated",
+        )
         self.assertTrue(self.control.delete_baseline(str(project["id"]), "home"))
 
     async def test_project_concurrency_is_atomic_across_control_instances(self):
@@ -218,12 +244,16 @@ class ControlPlaneTests(unittest.IsolatedAsyncioTestCase):
             ).fetchone()[0]
         self.assertEqual(saved_expiration, expires_at)
         with patch("vipercapture.control_plane.MAX_PROFILES_PER_PROJECT", 1):
-            with self.assertRaises(ProfileQuotaError):
+            with self.assertRaises(ProfileQuotaError) as profile_quota:
                 self.control.put_profile(project_id, "second", {}, None)
+        self.assertEqual(profile_quota.exception.details["limit_count"], 1)
+        self.assertEqual(profile_quota.exception.details["used_count"], 1)
         with patch("vipercapture.control_plane.MAX_BASELINES_PER_PROJECT", 1):
             self.control.put_baseline(project_id, "one", b"1")
-            with self.assertRaises(BaselineQuotaError):
+            with self.assertRaises(BaselineQuotaError) as baseline_quota:
                 self.control.put_baseline(project_id, "two", b"2")
+        self.assertEqual(baseline_quota.exception.details["limit_count"], 1)
+        self.assertEqual(baseline_quota.exception.details["used_count"], 1)
 
     async def test_profile_delete_wins_a_concurrent_save(self):
         project = self.control.create_project("tests", 10, 1)

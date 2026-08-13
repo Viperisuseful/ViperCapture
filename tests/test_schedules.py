@@ -29,7 +29,8 @@ class FakeJobs:
     def __init__(self) -> None:
         self.calls = []
 
-    async def submit(self, payload, *, request_id):
+    async def submit(self, payload, *, request_id, idempotency_key=None):
+        assert idempotency_key == request_id
         self.calls.append((payload, request_id))
         return SimpleNamespace(
             id=f"job-{len(self.calls)}", status="queued", attempt_count=0

@@ -781,6 +781,7 @@ class ScheduleService:
                     job = await self.jobs.submit(
                         render,
                         request_id=request_id,
+                        idempotency_key=request_id,
                     )
                     if job.status == "expired" and job.attempt_count == 0:
                         await self.store.advance_occurrence_attempt(

@@ -91,16 +91,31 @@ set `VIPERCAPTURE_ALLOW_SCRIPTS=1`.
 
 ## Async, bulk, and schedules
 
-`POST /v1/jobs` returns 202. Send a stable `X-Request-Id` to make retries
-idempotent. Poll status and retrieve the result URL advertised in the job
-document. Only queued jobs can be cancelled.
+`X-Request-Id` is a correlation value for logs and support. ViperCapture
+preserves a valid caller value or generates one; reusing it never deduplicates
+work. `POST /v1/jobs` returns 202 with a `Location` header. Send a stable
+`Idempotency-Key` to make creation retries safe:
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/jobs \
+  -H "Authorization: Bearer $VIPERCAPTURE_API_KEY" \
+  -H "Idempotency-Key: homepage-2026-08-12" \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com","output":"png"}'
+```
+
+The same key and normalized request replay the original job. The same key with
+a changed request returns 409 `idempotency_key_conflict`. Without the header,
+each submission creates a new job. Keys are project-scoped. Poll status and
+retrieve the result URL advertised in the job document. Only queued jobs can
+be cancelled.
 
 `POST /v1/jobs/bulk` accepts:
 
 ```json
 {
   "items": [
-    {"id": "desktop", "request_id": "release-42-desktop", "render": {
+    {"id": "desktop", "idempotency_key": "release-42-desktop", "render": {
       "url": "https://example.com", "full_page": false
     }},
     {"id": "mobile", "render": {
@@ -111,8 +126,24 @@ document. Only queued jobs can be cancelled.
 }
 ```
 
-Each item is submitted independently. HTTP 207 means some items were rejected;
-inspect every result.
+Each processed envelope returns HTTP 200, including mixed or all-item failure.
+Every result contains `status`, `accepted`, `job`, and `error`; malformed,
+oversized, unauthenticated, or unavailable requests still use the normal
+request-level 4xx/5xx status. A bulk `Idempotency-Key` derives stable keys by
+item index and fingerprints the normalized whole envelope. Alternatively use
+per-item `idempotency_key` values; do not combine both forms. A retry reuses
+accepted jobs and retries rejected items.
+
+Project RPM exhaustion returns 429 `rate_limit_exceeded` with `Retry-After`
+calculated from the oldest event in the sliding 60-second window. Render
+concurrency exhaustion returns the distinct `concurrency_limit_exceeded` code
+with a short heuristic delay. Payload/body limits use 413; persistent profile,
+baseline, and schedule project quotas use 403 with their specific error code
+and available `limit_count`, `used_count`, `limit_bytes`, and `used_bytes`
+details.
+
+`PUT /v1/baselines/{name}` returns 201 and `Location` when it creates a
+baseline, or 200 when it replaces one.
 
 Create a recurring job with `POST /v1/schedules`:
 

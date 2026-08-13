@@ -10,6 +10,12 @@ common POST options are accepted at `/compat/urlbox/v1/render/sync` and
 `/compat/urlbox/v1/render/async`. Once traffic is stable, migrate to the native
 contract to access every ViperCapture option.
 
+`access_key` remains a compatibility-only query credential for `/take` and is
+enabled by default. URLs can leak credentials through proxy/access logs,
+browser history, analytics, debugging tools, and copied links. Prefer
+`Authorization: Bearer ...` and set `VIPERCAPTURE_ALLOW_QUERY_AUTH=0` after
+legacy clients are migrated. Native `/v1/*` routes never accept query keys.
+
 ## Common option mapping
 
 | Vendor-style concept | ViperCapture field |

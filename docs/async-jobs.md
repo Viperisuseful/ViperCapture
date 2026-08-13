@@ -8,9 +8,10 @@ synchronous `POST /v1/render` endpoint remains available; async clients use:
 - `GET /v1/jobs/{id}/result` to download a successful artifact.
 - `DELETE /v1/jobs/{id}` to cancel work that is still queued.
 
-Submission returns HTTP 202 with `Location` and `Retry-After` headers. Supplying
-the same valid `X-Request-Id` returns the original job, making safe submission
-retries idempotent. Reusing it with a different request returns HTTP 409.
+Submission returns HTTP 202 with `Location` and `Retry-After` headers.
+`X-Request-Id` is correlation-only. Supplying the same valid `Idempotency-Key`
+and normalized body returns the original job; changing the body returns HTTP
+409. Omitting the key creates a new job on every submission.
 Statuses are `queued`, `running`, `succeeded`, `failed`, `cancelled`, and
 `expired`.
 
@@ -51,6 +52,14 @@ SQLite and filesystem providers refuse to start on Windows; use external
 providers plus an explicit `VIPERCAPTURE_JOB_SECRET` there. The packaged
 Windows desktop sidecar and the regular Windows launcher disable async jobs by
 default.
+
+On first start, the bundled SQLite provider adds nullable `correlation_id` and
+`idempotency_key` columns and copies legacy `request_id` values into both. This
+keeps existing jobs readable and lets a client migrate by sending its former
+`X-Request-Id` value as `Idempotency-Key`. New rows retain the legacy unique
+column as an internal compatibility slot. Custom job-store adapters must add
+equivalent fields and implement `get_by_idempotency_key`; ViperCapture cannot
+migrate external provider schemas.
 
 ViperCapture leaves claimed work `running` during shutdown. At startup it
 requeues interrupted jobs unless they have already reached the configured
@@ -112,9 +121,10 @@ VIPERCAPTURE_JOB_STORE_FACTORY=my_vipercapture_pg:create_job_store
 ```
 
 The adapter owns its client library, schema, connections, and migrations.
-`create` must atomically enforce the active limit and request-ID idempotency.
+`create` must atomically enforce the active limit and idempotency-key
+uniqueness. `get_by_idempotency_key` performs replay lookup.
 It must compare `JobRecord.request_fingerprint` in constant time and raise
-`IdempotencyConflictError` when an existing request ID has a different or
+`IdempotencyConflictError` when an existing idempotency key has a different or
 legacy-missing fingerprint.
 `claim` must atomically move one eligible job from `queued` to `running`; use
 the database's row-locking or compare-and-swap primitive. Retrying its
