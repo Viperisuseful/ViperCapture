@@ -64,6 +64,10 @@ def error_response(request: Request, *, code: str, message: str, status_code: in
                    headers: dict[str, str] | None = None) -> JSONResponse:
     request_id = request_id_for(request)
     response_headers = dict(headers or {})
+    if status_code == 401:
+        response_headers.setdefault(
+            "WWW-Authenticate", 'Bearer realm="ViperCapture"'
+        )
     response_headers["X-Request-Id"] = request_id
     return JSONResponse(status_code=status_code, headers=response_headers, content={
         "error": {"code": code, "message": message, "request_id": request_id,

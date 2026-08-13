@@ -70,6 +70,11 @@ class RenderErrorLayerTest(unittest.TestCase):
                 self.assertEqual(body["code"], "test_error")
                 self.assertEqual(body["request_id"], response.headers["x-request-id"])
                 self.assertIsInstance(body["details"], dict)
+                if status == 401:
+                    self.assertEqual(
+                        response.headers["www-authenticate"],
+                        'Bearer realm="ViperCapture"',
+                    )
 
     def test_validation_details_do_not_echo_input(self):
         response = self.client.post("/validate", json={"value": "secret-cookie=value"})

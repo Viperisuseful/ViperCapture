@@ -218,6 +218,8 @@ class SQLiteJobStore:
             CREATE TABLE IF NOT EXISTS async_jobs (
                 id TEXT PRIMARY KEY,
                 request_id TEXT NOT NULL UNIQUE,
+                correlation_id TEXT,
+                idempotency_key TEXT,
                 status TEXT NOT NULL,
                 payload BLOB,
                 webhook_payload BLOB,
@@ -251,45 +253,77 @@ class SQLiteJobStore:
                 ON async_jobs(status, available_at, created_at);
             CREATE INDEX IF NOT EXISTS async_jobs_cleanup_idx
                 ON async_jobs(completed_at);
+            CREATE TABLE IF NOT EXISTS async_bulk_idempotency (
+                idempotency_key TEXT PRIMARY KEY,
+                request_fingerprint BLOB NOT NULL,
+                created_at REAL NOT NULL
+            );
             """
         )
-        columns = {
-            row[1]
-            for row in connection.execute(
-                "PRAGMA table_info(async_jobs)"
-            ).fetchall()
-        }
-        if "claim_token" not in columns:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(async_jobs)"
+                ).fetchall()
+            }
+            if "claim_token" not in columns:
+                connection.execute(
+                    "ALTER TABLE async_jobs ADD COLUMN claim_token TEXT"
+                )
+            if "request_fingerprint" not in columns:
+                connection.execute(
+                    "ALTER TABLE async_jobs ADD COLUMN request_fingerprint BLOB"
+                )
+            if "correlation_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE async_jobs ADD COLUMN correlation_id TEXT"
+                )
+                connection.execute(
+                    "UPDATE async_jobs SET correlation_id=request_id"
+                )
+            if "idempotency_key" not in columns:
+                connection.execute(
+                    "ALTER TABLE async_jobs ADD COLUMN idempotency_key TEXT"
+                )
+                connection.execute(
+                    "UPDATE async_jobs SET idempotency_key=request_id"
+                )
+            if "webhook_payload" not in columns:
+                connection.execute(
+                    "ALTER TABLE async_jobs ADD COLUMN webhook_payload BLOB"
+                )
+            if "webhook_event_status" not in columns:
+                connection.execute(
+                    "ALTER TABLE async_jobs ADD COLUMN webhook_event_status TEXT"
+                )
+            if "webhook_attempt_count" not in columns:
+                connection.execute(
+                    "ALTER TABLE async_jobs ADD COLUMN webhook_attempt_count INTEGER NOT NULL DEFAULT 0"
+                )
+            if "webhook_available_at" not in columns:
+                connection.execute(
+                    "ALTER TABLE async_jobs ADD COLUMN webhook_available_at REAL"
+                )
             connection.execute(
-                "ALTER TABLE async_jobs ADD COLUMN claim_token TEXT"
+                """
+                CREATE INDEX IF NOT EXISTS async_jobs_webhook_idx
+                ON async_jobs(webhook_available_at, completed_at)
+                WHERE webhook_payload IS NOT NULL
+                """
             )
-        if "request_fingerprint" not in columns:
             connection.execute(
-                "ALTER TABLE async_jobs ADD COLUMN request_fingerprint BLOB"
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS async_jobs_idempotency_idx
+                ON async_jobs(idempotency_key)
+                WHERE idempotency_key IS NOT NULL
+                """
             )
-        if "webhook_payload" not in columns:
-            connection.execute(
-                "ALTER TABLE async_jobs ADD COLUMN webhook_payload BLOB"
-            )
-        if "webhook_event_status" not in columns:
-            connection.execute(
-                "ALTER TABLE async_jobs ADD COLUMN webhook_event_status TEXT"
-            )
-        if "webhook_attempt_count" not in columns:
-            connection.execute(
-                "ALTER TABLE async_jobs ADD COLUMN webhook_attempt_count INTEGER NOT NULL DEFAULT 0"
-            )
-        if "webhook_available_at" not in columns:
-            connection.execute(
-                "ALTER TABLE async_jobs ADD COLUMN webhook_available_at REAL"
-            )
-        connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS async_jobs_webhook_idx
-            ON async_jobs(webhook_available_at, completed_at)
-            WHERE webhook_payload IS NOT NULL
-            """
-        )
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+        connection.execute("COMMIT")
 
     @staticmethod
     def _from_row(row: sqlite3.Row | None) -> JobRecord | None:
@@ -297,13 +331,14 @@ class SQLiteJobStore:
             return None
         return JobRecord(
             id=row["id"],
-            request_id=row["request_id"],
+            request_id=row["correlation_id"] or row["request_id"],
             status=row["status"],
             payload=bytes(row["payload"]) if row["payload"] is not None else None,
             attempt_count=int(row["attempt_count"]),
             available_at=_datetime(row["available_at"]),
             queue_expires_at=_datetime(row["queue_expires_at"]),
             created_at=_datetime(row["created_at"]),
+            idempotency_key=row["idempotency_key"],
             request_fingerprint=(
                 bytes(row["request_fingerprint"])
                 if row["request_fingerprint"] is not None
@@ -382,10 +417,12 @@ class SQLiteJobStore:
                 """,
                 (current,),
             )
-            existing = connection.execute(
-                "SELECT * FROM async_jobs WHERE request_id = ?",
-                (job.request_id,),
-            ).fetchone()
+            existing = None
+            if job.idempotency_key is not None:
+                existing = connection.execute(
+                    "SELECT * FROM async_jobs WHERE idempotency_key = ?",
+                    (job.idempotency_key,),
+                ).fetchone()
             if existing:
                 existing_fingerprint = existing["request_fingerprint"]
                 if (
@@ -410,14 +447,17 @@ class SQLiteJobStore:
             connection.execute(
                 """
                 INSERT INTO async_jobs (
-                    id, request_id, status, payload, webhook_payload, attempt_count,
+                    id, request_id, correlation_id, idempotency_key, status,
+                    payload, webhook_payload, attempt_count,
                     available_at, queue_expires_at, created_at,
                     request_fingerprint
-                ) VALUES (?, ?, 'queued', ?, ?, 0, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, 'queued', ?, ?, 0, ?, ?, ?, ?)
                 """,
                 (
                     job.id,
+                    job.id,
                     job.request_id,
+                    job.idempotency_key,
                     job.payload,
                     job.webhook_payload,
                     _epoch(job.available_at),
@@ -539,10 +579,129 @@ class SQLiteJobStore:
     ) -> JobRecord | None:
         return cls._from_row(
             connection.execute(
-                "SELECT * FROM async_jobs WHERE request_id = ?",
+                "SELECT * FROM async_jobs "
+                "WHERE coalesce(correlation_id, request_id) = ? "
+                "ORDER BY created_at DESC LIMIT 1",
                 (request_id,),
             ).fetchone()
         )
+
+    async def get_by_idempotency_key(
+        self, idempotency_key: str
+    ) -> JobRecord | None:
+        return await self._run(
+            self._get_by_idempotency_key, idempotency_key
+        )
+
+    @classmethod
+    def _get_by_idempotency_key(
+        cls,
+        connection: sqlite3.Connection,
+        idempotency_key: str,
+    ) -> JobRecord | None:
+        return cls._from_row(
+            connection.execute(
+                "SELECT * FROM async_jobs WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+        )
+
+    async def get_legacy_by_idempotency_key(
+        self, idempotency_key: str
+    ) -> JobRecord | None:
+        return await self._run(
+            self._get_legacy_by_idempotency_key, idempotency_key
+        )
+
+    @classmethod
+    def _get_legacy_by_idempotency_key(
+        cls,
+        connection: sqlite3.Connection,
+        idempotency_key: str,
+    ) -> JobRecord | None:
+        return cls._from_row(
+            connection.execute(
+                """
+                SELECT * FROM async_jobs
+                WHERE idempotency_key = ? AND request_id = idempotency_key
+                """,
+                (idempotency_key,),
+            ).fetchone()
+        )
+
+    async def claim_bulk_idempotency(
+        self,
+        idempotency_key: str,
+        request_fingerprint: bytes,
+        now: datetime,
+    ) -> None:
+        await self._run(
+            self._claim_bulk_idempotency,
+            idempotency_key,
+            request_fingerprint,
+            now,
+            self.config.metadata_ttl,
+        )
+
+    @staticmethod
+    def _claim_bulk_idempotency(
+        connection: sqlite3.Connection,
+        idempotency_key: str,
+        request_fingerprint: bytes,
+        now: datetime,
+        retention: timedelta,
+    ) -> None:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                """
+                DELETE FROM async_bulk_idempotency
+                WHERE created_at < ?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM async_jobs
+                    WHERE substr(
+                        async_jobs.idempotency_key,
+                        1,
+                        length(replace(
+                            async_bulk_idempotency.idempotency_key,
+                            '@bulk-envelope:',
+                            '@bulk-header-item:'
+                        ) || ':')
+                    ) = replace(
+                        async_bulk_idempotency.idempotency_key,
+                        '@bulk-envelope:',
+                        '@bulk-header-item:'
+                    ) || ':'
+                  )
+                """,
+                (_epoch(now - retention),),
+            )
+            row = connection.execute(
+                """
+                SELECT request_fingerprint FROM async_bulk_idempotency
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+            if row is not None:
+                if not hmac.compare_digest(
+                    bytes(row["request_fingerprint"]), request_fingerprint
+                ):
+                    raise IdempotencyConflictError
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO async_bulk_idempotency (
+                        idempotency_key, request_fingerprint, created_at
+                    ) VALUES (?, ?, ?)
+                    """,
+                    (idempotency_key, request_fingerprint, _epoch(now)),
+                )
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
 
     @classmethod
     def _get(

@@ -22,6 +22,7 @@ from vipercapture.async_jobs import (
     Artifact,
     ArtifactStoreConfig,
     AsyncJobService,
+    IdempotencyConflictError,
     JobConflictError,
     JobDeferred,
     JobRecord,
@@ -745,7 +746,7 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(delivered[0].error_message)
         self.assertIsNone(delivered[0].error_retryable)
 
-    async def test_request_id_is_idempotent_and_queue_limit_is_atomic(self):
+    async def test_idempotency_key_is_independent_from_request_id(self):
         await self.store.start()
         await self.artifacts.start()
         service = AsyncJobService(
@@ -754,9 +755,18 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             self.artifacts,
             _successful_renderer,
         )
-        first = await service.submit(_payload(), request_id="same-request")
-        repeated = await service.submit(_payload(), request_id="same-request")
+        first = await service.submit(
+            _payload(),
+            request_id="first-trace",
+            idempotency_key="same-key",
+        )
+        repeated = await service.submit(
+            _payload(),
+            request_id="retry-trace",
+            idempotency_key="same-key",
+        )
         self.assertEqual(repeated.id, first.id)
+        self.assertEqual(repeated.request_id, "first-trace")
         different = RenderRequest.model_validate(
             {
                 "url": "https://example.com/different-report",
@@ -764,19 +774,242 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         with self.assertRaises(RenderError) as conflict:
-            await service.submit(different, request_id="same-request")
+            await service.submit(
+                different,
+                request_id="conflict-trace",
+                idempotency_key="same-key",
+            )
         self.assertEqual(
             conflict.exception.code,
             "idempotency_key_conflict",
         )
         with self.assertRaises(RenderError) as error:
-            await service.submit(_payload(), request_id="other-request")
+            await service.submit(
+                _payload(),
+                request_id="other-request",
+                idempotency_key="other-key",
+            )
         self.assertEqual(error.exception.code, "async_queue_full")
         cancelled = await service.cancel(first.id)
         self.assertEqual(cancelled.status, "cancelled")
         self.assertIsNone(cancelled.payload)
         await self.artifacts.close()
         await self.store.close()
+
+    async def test_reused_request_id_without_key_creates_distinct_jobs(self):
+        await self.store.start()
+        await self.artifacts.start()
+        service = AsyncJobService(
+            _settings(self.root, queue_limit=2),
+            self.store,
+            self.artifacts,
+            _successful_renderer,
+        )
+        first = await service.submit(_payload(), request_id="same-trace")
+        second = await service.submit(_payload(), request_id="same-trace")
+        self.assertNotEqual(first.id, second.id)
+        self.assertIsNone(first.idempotency_key)
+        self.assertIsNone(second.idempotency_key)
+        await self.artifacts.close()
+        await self.store.close()
+
+    async def test_public_job_id_does_not_collide_with_idempotency_key(self):
+        await self.store.start()
+        await self.artifacts.start()
+        service = AsyncJobService(
+            _settings(self.root, queue_limit=2),
+            self.store,
+            self.artifacts,
+            _successful_renderer,
+        )
+        first = await service.submit(_payload(), request_id="first-trace")
+        second = await service.submit(
+            _payload(),
+            request_id="second-trace",
+            idempotency_key=first.id,
+        )
+        self.assertNotEqual(first.id, second.id)
+        self.assertEqual(second.idempotency_key, first.id)
+        await self.artifacts.close()
+        await self.store.close()
+
+    async def test_legacy_sqlite_request_ids_migrate_to_both_fields(self):
+        now = datetime.now(UTC).timestamp()
+        service = AsyncJobService(
+            self.settings,
+            self.store,
+            self.artifacts,
+            _successful_renderer,
+        )
+        connection = sqlite3.connect(self.store.path)
+        connection.executescript(
+            """
+            CREATE TABLE async_jobs (
+                id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL, payload BLOB, webhook_payload BLOB,
+                webhook_event_status TEXT, webhook_attempt_count INTEGER NOT NULL DEFAULT 0,
+                webhook_available_at REAL, attempt_count INTEGER NOT NULL DEFAULT 0,
+                available_at REAL NOT NULL, queue_expires_at REAL NOT NULL,
+                created_at REAL NOT NULL, started_at REAL, claim_token TEXT,
+                request_fingerprint BLOB, completed_at REAL, artifact_key TEXT,
+                media_type TEXT, filename TEXT, artifact_bytes INTEGER,
+                result_expires_at REAL, queue_ms INTEGER, render_ms INTEGER,
+                error_code TEXT, error_message TEXT, error_retryable INTEGER
+            );
+            """
+        )
+        connection.execute(
+            "INSERT INTO async_jobs "
+            "(id,request_id,status,attempt_count,available_at,queue_expires_at,created_at,request_fingerprint) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (
+                "00000000-0000-0000-0000-000000000001",
+                "legacy-key",
+                "queued",
+                0,
+                now,
+                now + 60,
+                now,
+                service.cipher.fingerprint(_payload()),
+            ),
+        )
+        connection.commit()
+        connection.close()
+        self.store.path.chmod(0o600)
+
+        await self.store.start()
+        await self.artifacts.start()
+        migrated = await self.store.get_by_idempotency_key("legacy-key")
+        self.assertEqual(migrated.request_id, "legacy-key")
+        self.assertEqual(migrated.idempotency_key, "legacy-key")
+        replayed = await service.existing_legacy(
+            _payload(), idempotency_key="legacy-key"
+        )
+        self.assertEqual(replayed.id, migrated.id)
+        await self.artifacts.close()
+        await self.store.close()
+
+    async def test_bulk_idempotency_claim_is_atomic_across_stores(self):
+        other_store = SQLiteJobStore(
+            JobStoreConfig(self.root, self.settings.metadata_ttl)
+        )
+        await self.store.start()
+        await other_store.start()
+        first = AsyncJobService(
+            self.settings,
+            self.store,
+            self.artifacts,
+            _successful_renderer,
+        )
+        second = AsyncJobService(
+            self.settings,
+            other_store,
+            self.artifacts,
+            _successful_renderer,
+        )
+        results = await asyncio.gather(
+            first.claim_bulk_idempotency("bulk-key", b"first"),
+            second.claim_bulk_idempotency("bulk-key", b"second"),
+            return_exceptions=True,
+        )
+        self.assertEqual(sum(result is None for result in results), 1)
+        conflicts = [
+            result for result in results if isinstance(result, RenderError)
+        ]
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0].code, "idempotency_key_conflict")
+        winner = b"first" if results[0] is None else b"second"
+        await first.claim_bulk_idempotency("bulk-key", winner)
+        await other_store.close()
+        await self.store.close()
+
+    async def test_bulk_claim_outlives_retained_item_metadata(self):
+        await self.store.start()
+        await self.artifacts.start()
+        service = AsyncJobService(
+            self.settings,
+            self.store,
+            self.artifacts,
+            _successful_renderer,
+        )
+        envelope_key = "@bulk-envelope:7:release"
+        item_key = "@bulk-header-item:7:release:0"
+        started = datetime.now(UTC)
+        await self.store.claim_bulk_idempotency(
+            envelope_key, b"first", started
+        )
+        await service.submit(
+            _payload(),
+            request_id="bulk-item",
+            idempotency_key=item_key,
+        )
+        with self.assertRaises(IdempotencyConflictError):
+            await self.store.claim_bulk_idempotency(
+                envelope_key,
+                b"second",
+                started + self.settings.metadata_ttl + timedelta(seconds=1),
+            )
+
+        prefix_key = "@bulk-envelope:5:other"
+        await self.store.claim_bulk_idempotency(prefix_key, b"old", started)
+        await service.submit(
+            _payload(),
+            request_id="longer-prefix-item",
+            idempotency_key="@bulk-header-item:10:other:2026:0",
+        )
+        await self.store.claim_bulk_idempotency(
+            prefix_key,
+            b"new",
+            started + self.settings.metadata_ttl + timedelta(seconds=1),
+        )
+
+        empty_key = "@bulk-envelope:12:all-rejected"
+        await self.store.claim_bulk_idempotency(empty_key, b"old", started)
+        await self.store.claim_bulk_idempotency(
+            empty_key,
+            b"new",
+            started + self.settings.metadata_ttl + timedelta(seconds=1),
+        )
+        await self.artifacts.close()
+        await self.store.close()
+
+    async def test_legacy_idempotency_migration_rolls_back_atomically(self):
+        connection = sqlite3.connect(self.store.path, isolation_level=None)
+        connection.executescript(
+            """
+            CREATE TABLE async_jobs (
+                id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL, payload BLOB, webhook_payload BLOB,
+                webhook_event_status TEXT, webhook_attempt_count INTEGER NOT NULL DEFAULT 0,
+                webhook_available_at REAL, attempt_count INTEGER NOT NULL DEFAULT 0,
+                available_at REAL NOT NULL, queue_expires_at REAL NOT NULL,
+                created_at REAL NOT NULL, started_at REAL, claim_token TEXT,
+                request_fingerprint BLOB, completed_at REAL, artifact_key TEXT,
+                media_type TEXT, filename TEXT, artifact_bytes INTEGER,
+                result_expires_at REAL, queue_ms INTEGER, render_ms INTEGER,
+                error_code TEXT, error_message TEXT, error_retryable INTEGER
+            );
+            """
+        )
+
+        def reject_backfill(action, table, _column, _database, _trigger):
+            if action == sqlite3.SQLITE_UPDATE and table == "async_jobs":
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        connection.set_authorizer(reject_backfill)
+        with self.assertRaises(sqlite3.DatabaseError):
+            SQLiteJobStore._initialize(connection)
+        connection.set_authorizer(None)
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(async_jobs)"
+            ).fetchall()
+        }
+        self.assertNotIn("correlation_id", columns)
+        self.assertNotIn("idempotency_key", columns)
+        connection.close()
 
     async def test_running_job_cannot_be_cancelled(self):
         rendering = asyncio.Event()
@@ -1301,6 +1534,7 @@ class AsyncJobServiceTests(unittest.IsolatedAsyncioTestCase):
                 available_at=now,
                 queue_expires_at=now + timedelta(minutes=1),
                 created_at=now,
+                idempotency_key="expired-idempotent-result",
                 request_fingerprint=b"same-fingerprint",
             )
             await self.store.create(job, active_limit=1)
@@ -3905,7 +4139,7 @@ class ProviderLoadingTests(unittest.TestCase):
                 job_store,
                 (
                     "start", "close", "create", "claim",
-                    "get", "cancel",
+                    "get", "get_by_idempotency_key", "cancel",
                     "succeed", "fail", "requeue_running", "requeue", "defer", "maintain",
                     "expire_result",
                     "acknowledge_artifact_deletion",
@@ -4408,4 +4642,5 @@ class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/v1/jobs/{job_id}/result", paths)
 
     def test_desktop_cors_allows_idempotency_header(self):
+        self.assertIn("Idempotency-Key", main.DESKTOP_ALLOW_HEADERS)
         self.assertIn("X-Request-Id", main.DESKTOP_ALLOW_HEADERS)

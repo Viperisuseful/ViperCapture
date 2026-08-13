@@ -1,5 +1,6 @@
 import asyncio
 import hmac
+import json
 import os
 import re
 import secrets
@@ -15,7 +16,7 @@ from typing import Annotated, Awaitable, Literal, TypeVar
 from urllib.parse import urlencode, urlsplit
 from uuid import UUID, uuid4
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
     FileResponse,
@@ -54,7 +55,12 @@ from .page_cleanup import (
     should_block_resource,
 )
 from .render_cache import RenderCache
-from .render_contract import BrowserEngine, OutputFormat, RenderRequest
+from .render_contract import (
+    BrowserEngine,
+    OutputFormat,
+    RenderRequest,
+    canonical_render_document,
+)
 from .render_engine import (
     CleanupHooks,
     RenderArtifact,
@@ -106,6 +112,7 @@ DESKTOP_ORIGINS = [
 DESKTOP_ALLOW_HEADERS = [
     "Authorization",
     "Content-Type",
+    "Idempotency-Key",
     "X-Request-Id",
 ]
 DESKTOP_ALLOW_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"]
@@ -245,6 +252,8 @@ CACHE_MAX_BYTES = max(
 )
 CONTROL_ADMIN_TOKEN = os.getenv("VIPERCAPTURE_ADMIN_TOKEN", "")
 CONTROL_ENABLED = bool(CONTROL_ADMIN_TOKEN)
+ALLOW_QUERY_AUTH = os.getenv("VIPERCAPTURE_ALLOW_QUERY_AUTH", "1") == "1"
+METRICS_PUBLIC = os.getenv("VIPERCAPTURE_METRICS_PUBLIC", "0") == "1"
 if CONTROL_ENABLED and len(CONTROL_ADMIN_TOKEN.encode()) < 32:
     raise ValueError("VIPERCAPTURE_ADMIN_TOKEN must contain at least 32 bytes")
 CONTROL_SECRET = os.getenv("VIPERCAPTURE_CONTROL_SECRET", "")
@@ -692,7 +701,7 @@ async def require_desktop_token(request: Request, call_next):
         and not desktop_authenticated
     ):
         raw = authorization.removeprefix("Bearer ") if authorization.startswith("Bearer ") else ""
-        if not raw and path == "/take":
+        if not raw and path == "/take" and ALLOW_QUERY_AUTH:
             raw = request.query_params.get("access_key", "")
         identity = await asyncio.to_thread(control.authenticate, raw) if raw else None
         if identity is None:
@@ -708,17 +717,23 @@ async def require_desktop_token(request: Request, call_next):
             or path == "/compat/urlbox/v1/render/sync"
             or (path == "/v1/render" and request.method == "POST")
         )
-        allowed, reason = await control.acquire(
+        decision = await control.acquire(
             identity, concurrency=uses_render_capacity
         )
+        allowed, reason = decision
         if not allowed:
+            retry_after = getattr(decision, "retry_after", None) or 1
             return error_response(
                 request,
                 code=str(reason),
-                message="The project request limit was reached.",
+                message=(
+                    "The project concurrency limit was reached."
+                    if reason == "concurrency_limit_exceeded"
+                    else "The project request rate limit was reached."
+                ),
                 status_code=429,
                 retryable=True,
-                headers={"Retry-After": "1"},
+                headers={"Retry-After": str(retry_after)},
             )
         request.state.project_id = str(identity["project_id"])
         request.state.key_id = str(identity["key_id"])
@@ -754,6 +769,7 @@ async def require_desktop_token(request: Request, call_next):
         DESKTOP_TOKEN
         and request.method != "OPTIONS"
         and path not in {"/health", "/ready"}
+        and not (path == "/metrics" and METRICS_PUBLIC)
         and not signed_render
         and not signing_admin
         and not desktop_authenticated
@@ -833,7 +849,18 @@ async def ready() -> JSONResponse:
 
 
 @app.get("/metrics", response_class=Response)
-async def metrics() -> Response:
+async def metrics(request: Request) -> Response:
+    if (
+        CONTROL_ENABLED
+        and not METRICS_PUBLIC
+        and not getattr(request.state, "is_admin", False)
+    ):
+        raise RenderError(
+            "admin_unauthorized",
+            "A valid administrator token is required for metrics.",
+            401,
+            False,
+        )
     METRICS.gauge("capture_capacity", MAX_CONCURRENT_CAPTURES)
     METRICS.gauge("worker_count", ASYNC_JOB_SETTINGS.worker_count if ASYNC_JOB_SETTINGS else 0)
     return Response(METRICS.prometheus(), media_type="text/plain; version=0.0.4")
@@ -935,11 +962,18 @@ async def create_project(payload: ProjectCreate, request: Request) -> JSONRespon
     control = _admin(request)
     project = await asyncio.to_thread(control.create_project, payload.name, payload.requests_per_minute, payload.concurrency)
     await asyncio.to_thread(control.audit, str(project["id"]), "admin", "project.created", str(project["id"]))
-    return JSONResponse(project, status_code=201)
+    return JSONResponse(
+        project,
+        status_code=201,
+        headers={"Cache-Control": "private, no-store"},
+    )
 
 
 @app.get("/v1/admin/projects")
-async def list_projects(request: Request) -> list[dict[str, object]]:
+async def list_projects(
+    request: Request, response: Response
+) -> list[dict[str, object]]:
+    response.headers["Cache-Control"] = "private, no-store"
     return await asyncio.to_thread(_admin(request).list_projects)
 
 
@@ -964,13 +998,21 @@ async def revoke_api_key(key_id: str, request: Request) -> Response:
 
 
 @app.get("/v1/admin/audit")
-async def audit_events(request: Request, limit: Annotated[int, Query(ge=1, le=1000)] = 100) -> list[dict[str, object]]:
+async def audit_events(
+    request: Request,
+    response: Response,
+    limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+) -> list[dict[str, object]]:
+    response.headers["Cache-Control"] = "private, no-store"
     return await asyncio.to_thread(_admin(request).audits, limit)
 
 
 @app.get("/v1/admin/status")
-async def operator_status(request: Request) -> dict[str, object]:
+async def operator_status(
+    request: Request, response: Response
+) -> dict[str, object]:
     _admin(request)
+    response.headers["Cache-Control"] = "private, no-store"
     service = getattr(app.state, "async_jobs", None)
     return {
         "role": PROCESS_ROLE,
@@ -1006,8 +1048,9 @@ async def create_profile(payload: ProfileCreate, request: Request) -> JSONRespon
         raise RenderError(
             "profile_quota_exceeded",
             "The project profile storage quota was reached.",
-            413,
+            403,
             False,
+            exc.details,
         ) from exc
     except asyncio.CancelledError:
         await _settled_thread(control.delete_profile, project_id, profile_id)
@@ -1224,8 +1267,9 @@ def _render_engine() -> RenderEngine:
             raise RenderError(
                 "profile_quota_exceeded",
                 "The project profile storage quota was reached.",
-                413,
+                403,
                 False,
+                exc.details,
             ) from exc
         if not saved:
             raise RenderError("profile_not_found", "The browser profile was not found.", 404, False)
@@ -1581,7 +1625,9 @@ async def visual_diff(
 
 
 def _baseline_context(request: Request, name: str) -> tuple[ControlPlane, str]:
-    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", name):
+    if name in {".", ".."} or not re.fullmatch(
+        r"[A-Za-z0-9_.-]{1,128}", name
+    ):
         raise RenderError("baseline_name_invalid", "Baseline names use letters, numbers, dot, dash, and underscore.", 422, False)
     control = getattr(request.app.state, "control", None)
     if control is None or request.state.project_id is None:
@@ -1589,7 +1635,22 @@ def _baseline_context(request: Request, name: str) -> tuple[ControlPlane, str]:
     return control, request.state.project_id
 
 
-@app.put("/v1/baselines/{name}")
+@app.put(
+    "/v1/baselines/{name}",
+    response_model=dict[str, object],
+    responses={
+        201: {
+            "description": "Baseline created",
+            "model": dict[str, object],
+            "headers": {
+                "Location": {
+                    "description": "URL of the created baseline",
+                    "schema": {"type": "string"},
+                }
+            },
+        }
+    },
+)
 async def put_baseline(name: str, image: UploadFile, request: Request) -> JSONResponse:
     control, project_id = _baseline_context(request, name)
     body = await image.read(MAX_DIFF_INPUT_BYTES + 1)
@@ -1597,23 +1658,40 @@ async def put_baseline(name: str, image: UploadFile, request: Request) -> JSONRe
         raise RenderError("baseline_too_large", "The baseline image exceeds the input limit.", 413, False)
     await _settled_thread(validate_image, body, "baseline")
     try:
-        document = await asyncio.to_thread(
+        document, created = await asyncio.to_thread(
             control.put_baseline, project_id, name, body
         )
     except BaselineQuotaError as exc:
         raise RenderError(
             "baseline_quota_exceeded",
             "The project baseline storage quota was reached.",
-            413,
+            403,
             False,
+            exc.details,
         ) from exc
-    await asyncio.to_thread(control.audit, project_id, request.state.key_id, "baseline.updated", name)
-    return JSONResponse(document)
+    await asyncio.to_thread(
+        control.audit,
+        project_id,
+        request.state.key_id,
+        "baseline.created" if created else "baseline.updated",
+        name,
+    )
+    return JSONResponse(
+        document,
+        status_code=201 if created else 200,
+        headers={
+            "Location": f"/v1/baselines/{name}",
+            "Cache-Control": "private, no-store",
+        },
+    )
 
 
 @app.get("/v1/baselines")
-async def list_baselines(request: Request) -> list[dict[str, object]]:
+async def list_baselines(
+    request: Request, response: Response
+) -> list[dict[str, object]]:
     control, project_id = _baseline_context(request, "all")
+    response.headers["Cache-Control"] = "private, no-store"
     return await asyncio.to_thread(control.list_baselines, project_id)
 
 
@@ -1778,6 +1856,47 @@ def _project_request_id(request: Request, request_id: str) -> str:
     return f"_project-{project_id}:{request_id}" if project_id else request_id
 
 
+def _idempotency_key(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", value):
+        raise RenderError(
+            "idempotency_key_invalid",
+            "Idempotency-Key must contain 1 to 128 safe characters.",
+            422,
+            False,
+        )
+    return value
+
+
+def _project_idempotency_key(
+    request: Request, value: str | None
+) -> str | None:
+    return _project_request_id(request, value) if value is not None else None
+
+
+def _canonical_bulk_payload(payload: BulkJobRequest) -> bytes:
+    return json.dumps(
+        {
+            "items": [
+                {
+                    "id": item.id,
+                    "idempotency_key": item.idempotency_key,
+                    "render": canonical_render_document(item.render),
+                }
+                for item in payload.items
+            ]
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _bulk_internal_key(kind: str, key: str, suffix: str = "") -> str:
+    return f"@bulk-{kind}:{len(key)}:{key}{suffix}"
+
+
 async def _validate_profile_access(payload: RenderRequest, request: Request) -> None:
     if (
         payload.profile_id is None
@@ -1831,12 +1950,18 @@ async def _require_resource(request: Request | None, kind: str, resource_id: str
 async def create_render_job(
     payload: RenderRequest,
     request: Request,
+    idempotency_key: Annotated[
+        str | None, Header(alias="Idempotency-Key")
+    ] = None,
 ) -> JSONResponse:
     await _validate_profile_access(payload, request)
     job = await _submit_job(
         _async_job_service(),
         payload,
         request_id=_project_request_id(request, request.state.request_id),
+        idempotency_key=_project_idempotency_key(
+            request, _idempotency_key(idempotency_key)
+        ),
     )
     await _own_resource(request, "job", job.id)
     document = public_job_document(job)
@@ -1851,20 +1976,63 @@ async def create_render_job(
     )
 
 
-@app.post("/v1/jobs/bulk", status_code=202)
+@app.post("/v1/jobs/bulk", status_code=200)
 async def create_bulk_render_jobs(
     payload: BulkJobRequest,
     request: Request,
+    idempotency_key: Annotated[
+        str | None, Header(alias="Idempotency-Key")
+    ] = None,
 ) -> JSONResponse:
     service = _async_job_service()
     results = []
     failures = 0
     existing_jobs = [None] * len(payload.items)
     preflight_errors: list[RenderError | None] = [None] * len(payload.items)
+    bulk_key = _idempotency_key(idempotency_key)
+    if bulk_key is not None and any(
+        item.idempotency_key is not None for item in payload.items
+    ):
+        raise RenderError(
+            "idempotency_key_ambiguous",
+            "Use either the Idempotency-Key header or per-item idempotency keys, not both.",
+            422,
+            False,
+        )
+    bulk_fingerprint = (
+        service.cipher.fingerprint_bytes(_canonical_bulk_payload(payload))
+        if bulk_key is not None
+        else None
+    )
+    if bulk_key is not None:
+        assert bulk_fingerprint is not None
+        envelope_key = _project_idempotency_key(
+            request, _bulk_internal_key("envelope", bulk_key)
+        )
+        assert envelope_key is not None
+        await service.claim_bulk_idempotency(
+            envelope_key,
+            bulk_fingerprint,
+        )
     request_ids = [
         _project_request_id(
             request,
-            item.request_id or f"{request.state.request_id}-{index + 1}",
+            f"{request.state.request_id}-{index + 1}",
+        )
+        for index, _item in enumerate(payload.items)
+    ]
+    idempotency_keys = [
+        _project_idempotency_key(
+            request,
+            (
+                _bulk_internal_key("header-item", bulk_key, f":{index}")
+                if bulk_key is not None
+                else (
+                    f"@bulk-item:{item.idempotency_key}"
+                    if item.idempotency_key is not None
+                    else None
+                )
+            ),
         )
         for index, item in enumerate(payload.items)
     ]
@@ -1873,10 +2041,36 @@ async def create_bulk_render_jobs(
             await _validate_profile_access(item.render, request)
             existing_jobs[index] = await service.existing(
                 item.render,
-                request_id=request_ids[index],
+                idempotency_key=idempotency_keys[index],
+                request_fingerprint=bulk_fingerprint,
             )
+            if (
+                existing_jobs[index] is None
+                and bulk_key is None
+                and item.idempotency_key is not None
+            ):
+                legacy_key = _project_idempotency_key(
+                    request, item.idempotency_key
+                )
+                assert legacy_key is not None
+                existing_jobs[index] = await service.existing_legacy(
+                    item.render,
+                    idempotency_key=legacy_key,
+                )
         except RenderError as exc:
             preflight_errors[index] = exc
+    if bulk_key is not None:
+        conflict = next(
+            (
+                error
+                for error in preflight_errors
+                if error is not None
+                and error.code == "idempotency_key_conflict"
+            ),
+            None,
+        )
+        if conflict is not None:
+            raise conflict
     validation_tasks = {
         index: asyncio.create_task(_validate_webhook(item.render))
         for index, item in enumerate(payload.items)
@@ -1918,11 +2112,14 @@ async def create_bulk_render_jobs(
                 job = await service.submit(
                     item.render,
                     request_id=request_ids[index],
+                    idempotency_key=idempotency_keys[index],
+                    request_fingerprint=bulk_fingerprint,
                 )
             results.append(
                 {
                     "index": index,
                     "id": item.id,
+                    "status": 202,
                     "accepted": True,
                     "job": public_job_document(job),
                     "error": None,
@@ -1935,6 +2132,7 @@ async def create_bulk_render_jobs(
                 {
                     "index": index,
                     "id": item.id,
+                    "status": exc.status_code,
                     "accepted": False,
                     "job": None,
                     "error": {
@@ -1952,7 +2150,7 @@ async def create_bulk_render_jobs(
             "failed": failures,
             "results": results,
         },
-        status_code=207 if failures else 202,
+        status_code=200,
         headers={"Cache-Control": "private, no-store"},
     )
 
@@ -1988,8 +2186,14 @@ async def _submit_job(
     payload: RenderRequest,
     *,
     request_id: str,
+    idempotency_key: str | None = None,
+    request_fingerprint: bytes | None = None,
 ):
-    existing = await service.existing(payload, request_id=request_id)
+    existing = await service.existing(
+        payload,
+        idempotency_key=idempotency_key,
+        request_fingerprint=request_fingerprint,
+    )
     if existing is not None:
         return existing
     try:
@@ -1997,11 +2201,20 @@ async def _submit_job(
     except RenderError:
         # A concurrent request may have committed while validation was in
         # flight. Preserve idempotent replay semantics in that race too.
-        existing = await service.existing(payload, request_id=request_id)
+        existing = await service.existing(
+            payload,
+            idempotency_key=idempotency_key,
+            request_fingerprint=request_fingerprint,
+        )
         if existing is not None:
             return existing
         raise
-    return await service.submit(payload, request_id=request_id)
+    return await service.submit(
+        payload,
+        request_id=request_id,
+        idempotency_key=idempotency_key,
+        request_fingerprint=request_fingerprint,
+    )
 
 
 @app.post("/v1/schedules", status_code=201)
@@ -2033,8 +2246,9 @@ async def create_schedule(payload: ScheduleCreate, request: Request) -> JSONResp
             raise RenderError(
                 "schedule_quota_exceeded",
                 "The project schedule storage quota was reached.",
-                413,
+                403,
                 False,
+                exc.details,
             ) from exc
     try:
         record = await service.create(
@@ -2106,8 +2320,9 @@ async def update_schedule(schedule_id: UUID, payload: ScheduleUpdate, request: R
         raise RenderError(
             "schedule_quota_exceeded",
             "The project schedule storage quota was reached.",
-            413,
+            403,
             False,
+            exc.details,
         ) from exc
     return JSONResponse(public_schedule_document(updated), headers={"Cache-Control": "private, no-store"})
 

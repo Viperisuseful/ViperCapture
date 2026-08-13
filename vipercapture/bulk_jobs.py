@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 from .render_contract import RenderRequest
-from .render_errors import RenderError, reserved_request_id
+from .render_errors import RenderError
 
 MAX_BULK_BODY_BYTES = 6 * 1024 * 1024
 MAX_JSON_BODY_BYTES = 32 * 1024 * 1024
@@ -19,20 +19,13 @@ class StrictModel(BaseModel):
 
 class BulkJobItem(StrictModel):
     id: str | None = Field(default=None, min_length=1, max_length=128)
-    request_id: str | None = Field(
+    idempotency_key: str | None = Field(
         default=None,
         min_length=1,
         max_length=128,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
     )
     render: RenderRequest
-
-    @field_validator("request_id")
-    @classmethod
-    def reject_reserved_request_id(cls, value: str | None) -> str | None:
-        if value is not None and reserved_request_id(value):
-            raise ValueError("request_id uses a reserved internal namespace")
-        return value
 
 
 class BulkJobRequest(StrictModel):

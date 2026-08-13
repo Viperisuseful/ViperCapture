@@ -12,6 +12,7 @@ from pydantic import ValidationError
 import vipercapture.main as main
 from vipercapture.async_jobs import JobRecord
 from vipercapture.bulk_jobs import BulkJobRequest
+from vipercapture.control_plane import LimitDecision
 from vipercapture.render_contract import RenderRequest
 from vipercapture.render_engine import RenderArtifact
 from vipercapture.render_errors import RenderError
@@ -33,6 +34,29 @@ class PlatformRouteTests(unittest.TestCase):
         for path, methods in expected.items():
             self.assertIn(path, paths)
             self.assertTrue(methods.issubset(paths[path]), path)
+        for path in ("/v1/jobs", "/v1/jobs/bulk"):
+            parameters = paths[path]["post"]["parameters"]
+            self.assertTrue(
+                any(
+                    item["in"] == "header"
+                    and item["name"] == "Idempotency-Key"
+                    for item in parameters
+                )
+            )
+        baseline_put = paths["/v1/baselines/{name}"]["put"]["responses"]
+        self.assertIn("200", baseline_put)
+        self.assertIn("201", baseline_put)
+        self.assertIn("Location", baseline_put["201"]["headers"])
+        for path in (
+            "/v1/admin/projects",
+            "/v1/admin/audit",
+            "/v1/admin/status",
+            "/v1/baselines",
+        ):
+            schema = paths[path]["get"]["responses"]["200"]["content"][
+                "application/json"
+            ]["schema"]
+            self.assertTrue(schema, path)
 
     def test_desktop_cors_allows_schedule_updates(self):
         self.assertIn("PATCH", main.DESKTOP_ALLOW_METHODS)
@@ -84,6 +108,93 @@ class PlatformRouteTests(unittest.TestCase):
 
 
 class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_metrics_require_admin_when_control_plane_is_enabled(self):
+        request = SimpleNamespace(state=SimpleNamespace(is_admin=False))
+        with (
+            patch("vipercapture.main.CONTROL_ENABLED", True),
+            patch("vipercapture.main.METRICS_PUBLIC", False),
+        ):
+            with self.assertRaises(RenderError) as raised:
+                await main.metrics(request)
+            authorized = await main.metrics(
+                SimpleNamespace(state=SimpleNamespace(is_admin=True))
+            )
+        self.assertEqual(raised.exception.status_code, 401)
+        self.assertEqual(authorized.status_code, 200)
+
+    async def test_public_metrics_bypass_desktop_authentication(self):
+        request = SimpleNamespace(
+            method="GET",
+            url=SimpleNamespace(path="/metrics"),
+            headers={},
+            query_params={},
+            app=SimpleNamespace(state=SimpleNamespace(control=None)),
+        )
+        call_next = AsyncMock(return_value=main.Response(status_code=200))
+        with (
+            patch("vipercapture.main.DESKTOP_TOKEN", "desktop-secret"),
+            patch("vipercapture.main.METRICS_PUBLIC", True),
+        ):
+            response = await main.require_desktop_token(request, call_next)
+        self.assertEqual(response.status_code, 200)
+        call_next.assert_awaited_once_with(request)
+
+    async def test_query_auth_can_be_disabled_for_take(self):
+        control = SimpleNamespace(authenticate=Mock())
+        request = SimpleNamespace(
+            method="GET",
+            url=SimpleNamespace(path="/take"),
+            headers={},
+            query_params={"access_key": "legacy-key"},
+            app=SimpleNamespace(state=SimpleNamespace(control=control)),
+        )
+        with (
+            patch("vipercapture.main.CONTROL_ENABLED", True),
+            patch("vipercapture.main.ALLOW_QUERY_AUTH", False),
+        ):
+            response = await main.require_desktop_token(
+                request, AsyncMock(return_value=main.Response(status_code=200))
+            )
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(
+            response.headers["www-authenticate"],
+            'Bearer realm="ViperCapture"',
+        )
+        control.authenticate.assert_not_called()
+
+    async def test_rate_limit_response_uses_decision_retry_after(self):
+        control = SimpleNamespace(
+            authenticate=Mock(
+                return_value={
+                    "project_id": "project",
+                    "key_id": "key",
+                    "scopes": ["jobs"],
+                }
+            ),
+            acquire=AsyncMock(
+                return_value=LimitDecision(
+                    False, "rate_limit_exceeded", 59
+                )
+            ),
+        )
+        request = SimpleNamespace(
+            method="POST",
+            url=SimpleNamespace(path="/v1/jobs"),
+            headers={"authorization": "Bearer project-key"},
+            query_params={},
+            app=SimpleNamespace(state=SimpleNamespace(control=control)),
+        )
+        with patch("vipercapture.main.CONTROL_ENABLED", True):
+            response = await main.require_desktop_token(
+                request, AsyncMock(return_value=main.Response(status_code=200))
+            )
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.headers["retry-after"], "59")
+        self.assertEqual(
+            json.loads(response.body)["error"]["code"],
+            "rate_limit_exceeded",
+        )
+
     async def test_app_config_hides_mp4_without_libx264(self):
         with (
             patch("vipercapture.main.ffmpeg_has_encoder", return_value=False),
@@ -103,6 +214,107 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
             await main.put_baseline("home", image, request)
         self.assertEqual(raised.exception.code, "diff_input_invalid")
         control.put_baseline.assert_not_called()
+
+        for name in (".", ".."):
+            with self.subTest(name=name), self.assertRaises(RenderError) as dot:
+                main._baseline_context(request, name)
+            self.assertEqual(dot.exception.code, "baseline_name_invalid")
+
+    async def test_baseline_put_reports_create_and_replace(self):
+        control = SimpleNamespace(
+            put_baseline=Mock(
+                side_effect=[
+                    ({"name": "home"}, True),
+                    ({"name": "home"}, False),
+                ]
+            ),
+            audit=Mock(),
+        )
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(control=control)),
+            state=SimpleNamespace(project_id="project", key_id="key"),
+        )
+        image = SimpleNamespace(read=AsyncMock(return_value=b"valid-image"))
+        with patch("vipercapture.main.validate_image", return_value=None):
+            created = await main.put_baseline("home", image, request)
+            replaced = await main.put_baseline("home", image, request)
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(created.headers["location"], "/v1/baselines/home")
+        self.assertEqual(replaced.status_code, 200)
+
+    async def test_project_storage_quotas_are_forbidden_not_payload_too_large(self):
+        baseline_control = SimpleNamespace(
+            put_baseline=Mock(side_effect=main.BaselineQuotaError),
+        )
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(control=baseline_control)
+            ),
+            state=SimpleNamespace(project_id="project", key_id="key"),
+        )
+        image = SimpleNamespace(read=AsyncMock(return_value=b"valid-image"))
+        with patch("vipercapture.main.validate_image", return_value=None):
+            with self.assertRaises(RenderError) as baseline:
+                await main.put_baseline("home", image, request)
+        self.assertEqual(baseline.exception.status_code, 403)
+
+        profile_control = SimpleNamespace(
+            put_profile=Mock(side_effect=main.ProfileQuotaError),
+        )
+        profile_request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(control=profile_control)),
+            state=SimpleNamespace(project_id="project", key_id="key"),
+        )
+        profile = main.ProfileCreate(
+            storage_state={"cookies": [], "origins": []}
+        )
+        with self.assertRaises(RenderError) as profile_error:
+            await main.create_profile(profile, profile_request)
+        self.assertEqual(profile_error.exception.status_code, 403)
+
+    def test_project_idempotency_keys_are_project_scoped(self):
+        first = SimpleNamespace(state=SimpleNamespace(project_id="a" * 24))
+        second = SimpleNamespace(state=SimpleNamespace(project_id="b" * 24))
+        self.assertNotEqual(
+            main._project_idempotency_key(first, "same-key"),
+            main._project_idempotency_key(second, "same-key"),
+        )
+
+    def test_bulk_payload_fingerprint_input_is_canonical(self):
+        first = BulkJobRequest.model_validate(
+            {
+                "items": [
+                    {
+                        "render": {
+                            "url": "https://example.com",
+                            "headers": {"X-First": "1", "X-Second": "2"},
+                            "network": {
+                                "block_resource_types": ["image", "font"]
+                            },
+                        }
+                    }
+                ]
+            }
+        )
+        second = BulkJobRequest.model_validate(
+            {
+                "items": [
+                    {
+                        "render": {
+                            "network": {
+                                "block_resource_types": ["font", "image"]
+                            },
+                            "headers": {"X-Second": "2", "X-First": "1"},
+                            "url": "https://example.com",
+                        }
+                    }
+                ]
+            }
+        )
+        self.assertEqual(
+            main._canonical_bulk_payload(first),
+            main._canonical_bulk_payload(second),
+        )
 
     async def test_readiness_is_unavailable_without_a_browser(self):
         original_browser = getattr(main.app.state, "browser", None)
@@ -223,6 +435,10 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.headers["X-Request-Id"], "early-auth")
+        self.assertEqual(
+            response.headers["WWW-Authenticate"],
+            'Bearer realm="ViperCapture"',
+        )
         self.assertEqual(response.json()["error"]["request_id"], "early-auth")
 
     async def test_status_requests_skip_concurrency_and_jobs_can_read_cert_key(self):
@@ -547,9 +763,11 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
             main.app.state.async_jobs = original_service
             main.app.state.webhooks = original_dispatcher
         document = json.loads(response.body)
-        self.assertEqual(response.status_code, 207)
+        self.assertEqual(response.status_code, 200)
         self.assertFalse(document["results"][0]["accepted"])
+        self.assertEqual(document["results"][0]["status"], 422)
         self.assertTrue(document["results"][1]["accepted"])
+        self.assertEqual(document["results"][1]["status"], 202)
         service.submit.assert_awaited_once()
 
     async def test_bulk_webhook_validation_has_aggregate_deadline(self):
@@ -597,7 +815,7 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
             main.app.state.async_jobs = original_service
             main.app.state.webhooks = original_dispatcher
         document = json.loads(response.body)
-        self.assertEqual(response.status_code, 207)
+        self.assertEqual(response.status_code, 200)
         self.assertEqual(document["failed"], 2)
         self.assertTrue(
             all(
@@ -625,6 +843,10 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         service = SimpleNamespace(
             existing=AsyncMock(return_value=existing),
             submit=AsyncMock(),
+            claim_bulk_idempotency=AsyncMock(),
+            cipher=SimpleNamespace(
+                fingerprint_bytes=Mock(return_value=b"bulk-fingerprint")
+            ),
         )
         validate = AsyncMock(side_effect=RuntimeError("must not run"))
         main.app.state.async_jobs = service
@@ -633,7 +855,6 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
             {
                 "items": [
                     {
-                        "request_id": "replay-1",
                         "render": {
                             "url": "https://example.com",
                             "delivery": {
@@ -648,13 +869,36 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
             response = await main.create_bulk_render_jobs(
                 payload,
                 SimpleNamespace(state=SimpleNamespace(request_id="bulk")),
+                idempotency_key="replay-1",
             )
         finally:
             main.app.state.async_jobs = original_service
             main.app.state.webhooks = original_dispatcher
-        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.status_code, 200)
         validate.assert_not_awaited()
         service.submit.assert_not_awaited()
+        service.claim_bulk_idempotency.assert_awaited_once()
+        self.assertEqual(
+            service.existing.await_args.kwargs,
+            {
+                "idempotency_key": "@bulk-header-item:8:replay-1:0",
+                "request_fingerprint": b"bulk-fingerprint",
+            },
+        )
+        with self.assertRaises(RenderError):
+            main._idempotency_key("@bulk:replay-1:0")
+
+    def test_bulk_internal_keys_are_unambiguous(self):
+        self.assertNotEqual(
+            main._bulk_internal_key("header-item", "release", ":2026:0"),
+            main._bulk_internal_key(
+                "header-item", "release:2026", ":0"
+            ),
+        )
+        self.assertNotEqual(
+            main._bulk_internal_key("header-item", "abc", ":0"),
+            "@bulk-item:3:abc:0",
+        )
 
     async def test_async_cache_hit_bypasses_chromium_slot(self):
         original_cache = getattr(main.app.state, "render_cache", None)

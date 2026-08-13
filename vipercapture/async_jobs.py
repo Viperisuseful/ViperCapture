@@ -69,6 +69,7 @@ class JobRecord:
     available_at: datetime
     queue_expires_at: datetime
     created_at: datetime
+    idempotency_key: str | None = None
     request_fingerprint: bytes | None = None
     webhook_payload: bytes | None = None
     webhook_event_status: str | None = None
@@ -272,6 +273,9 @@ class JobStore(Protocol):
         claim_token: str,
     ) -> JobRecord | None: ...
     async def get(self, job_id: str, now: datetime) -> JobRecord | None: ...
+    async def get_by_idempotency_key(
+        self, idempotency_key: str
+    ) -> JobRecord | None: ...
     async def cancel(self, job_id: str, now: datetime) -> JobRecord | None: ...
     async def succeed(
         self,
@@ -504,9 +508,12 @@ class PayloadCipher:
         )
 
     def fingerprint(self, payload: RenderRequest) -> bytes:
+        return self.fingerprint_bytes(self._serialize(payload))
+
+    def fingerprint_bytes(self, payload: bytes) -> bytes:
         return hmac.digest(
             self._fingerprint_key,
-            self._serialize(payload),
+            payload,
             "sha256",
         )
 
@@ -692,6 +699,8 @@ class AsyncJobService:
         payload: RenderRequest,
         *,
         request_id: str,
+        idempotency_key: str | None = None,
+        request_fingerprint: bytes | None = None,
     ) -> JobRecord:
         if payload.delivery.webhook_url is not None and self.notifier is None:
             raise RenderError(
@@ -712,7 +721,10 @@ class AsyncJobService:
             available_at=now,
             queue_expires_at=now + self.settings.queue_ttl,
             created_at=now,
-            request_fingerprint=self.cipher.fingerprint(payload),
+            idempotency_key=idempotency_key,
+            request_fingerprint=(
+                request_fingerprint or self.cipher.fingerprint(payload)
+            ),
             webhook_payload=(
                 self.cipher.encrypt_webhook(
                     job_id, str(payload.delivery.webhook_url)
@@ -743,7 +755,7 @@ class AsyncJobService:
                 await self.ownership_releaser(job_id)
             raise RenderError(
                 "idempotency_key_conflict",
-                "X-Request-Id was already used for a different render.",
+                "The Idempotency-Key was already used for a different request.",
                 409,
                 False,
             ) from exc
@@ -781,20 +793,23 @@ class AsyncJobService:
         self,
         payload: RenderRequest,
         *,
-        request_id: str,
+        idempotency_key: str | None,
+        request_fingerprint: bytes | None = None,
     ) -> JobRecord | None:
         """Return an idempotent replay before repeating external validation."""
+        if idempotency_key is None:
+            return None
         await self._maintain()
-        lookup = getattr(self.job_store, "get_by_request_id", None)
+        lookup = getattr(self.job_store, "get_by_idempotency_key", None)
         if lookup is None:
             return None
-        current = await lookup(request_id)
+        current = await lookup(idempotency_key)
         if current is None:
             return None
         current = await self.job_store.get(current.id, datetime.now(UTC))
         if current is None:
             return None
-        fingerprint = self.cipher.fingerprint(payload)
+        fingerprint = request_fingerprint or self.cipher.fingerprint(payload)
         if (
             current.request_fingerprint is None
             or not hmac.compare_digest(
@@ -804,11 +819,68 @@ class AsyncJobService:
         ):
             raise RenderError(
                 "idempotency_key_conflict",
-                "X-Request-Id was already used for a different render.",
+                "The Idempotency-Key was already used for a different request.",
                 409,
                 False,
             )
         return current
+
+    async def existing_legacy(
+        self,
+        payload: RenderRequest,
+        *,
+        idempotency_key: str,
+    ) -> JobRecord | None:
+        """Replay a row migrated from legacy X-Request-Id semantics."""
+        await self._maintain()
+        lookup = getattr(
+            self.job_store, "get_legacy_by_idempotency_key", None
+        )
+        if lookup is None:
+            return None
+        current = await lookup(idempotency_key)
+        if current is None:
+            return None
+        current = await self.job_store.get(current.id, datetime.now(UTC))
+        if current is None:
+            return None
+        fingerprint = self.cipher.fingerprint(payload)
+        if (
+            current.request_fingerprint is None
+            or not hmac.compare_digest(
+                current.request_fingerprint, fingerprint
+            )
+        ):
+            raise RenderError(
+                "idempotency_key_conflict",
+                "The Idempotency-Key was already used for a different request.",
+                409,
+                False,
+            )
+        return current
+
+    async def claim_bulk_idempotency(
+        self, idempotency_key: str, request_fingerprint: bytes
+    ) -> None:
+        claim = getattr(self.job_store, "claim_bulk_idempotency", None)
+        if claim is None:
+            raise RenderError(
+                "bulk_idempotency_unsupported",
+                "The configured job provider does not support bulk idempotency.",
+                503,
+                False,
+            )
+        try:
+            await claim(
+                idempotency_key, request_fingerprint, datetime.now(UTC)
+            )
+        except IdempotencyConflictError as exc:
+            raise RenderError(
+                "idempotency_key_conflict",
+                "The Idempotency-Key was already used for a different request.",
+                409,
+                False,
+            ) from exc
 
     async def get(self, job_id: str) -> JobRecord | None:
         await self._maintain()
