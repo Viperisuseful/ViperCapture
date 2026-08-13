@@ -48,8 +48,32 @@ class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
             )
         command = process.await_args.args[0]
         filters = command[command.index("-filter_complex") + 1]
-        self.assertIn("(ih-oh)*min(t/5.000,1)", filters)
+        self.assertIn("(ih-oh)*min(n/299,1)", filters)
         self.assertIn("color=black", filters)
+
+    async def test_single_frame_pan_reaches_bottom_and_fallback_keeps_fps(self):
+        process = AsyncMock(side_effect=[(1, b"driver failed"), (0, b"")])
+        with (
+            patch("vipercapture.render_engine._ffmpeg_executable", return_value=Path("ffmpeg")),
+            patch(
+                "vipercapture.render_engine.hardware_video_encoder",
+                return_value=HardwareVideoEncoder("h264_nvenc"),
+            ),
+            patch("vipercapture.render_engine._run_process", process),
+        ):
+            await _encode_scrolling_media(
+                Path("page.png"), Path("capture.mp4"), OutputFormat.MP4,
+                width=320, height=240, duration_ms=1_000, fps=1,
+                transparent=False, hardware=True,
+            )
+        first = process.await_args_list[0].args[0]
+        self.assertIn("(ih-oh)*1", first[first.index("-vf") + 1])
+        self.assertEqual(
+            process.await_args_list[1].args[0][
+                process.await_args_list[1].args[0].index("-framerate") + 1
+            ],
+            "1",
+        )
 
     async def test_transparent_full_page_webm_uses_alpha_encoder_and_padding(self):
         process = AsyncMock(return_value=(0, b""))
@@ -196,7 +220,7 @@ class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
             "pad=ceil(iw/2)*2:ceil(ih/2)*2",
             command[command.index("-vf") + 1],
         )
-        self.assertEqual(command[command.index("-crf") + 1], "17")
+        self.assertNotIn("-crf", command)
         self.assertEqual(command[command.index("-preset") + 1], "fast")
 
     async def test_gif_transcode_keeps_source_size_and_uses_generated_palette(self):

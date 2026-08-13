@@ -79,7 +79,8 @@ MAX_DIAGNOSTIC_EVENTS = 500
 VPX_QUALITY = (
     "-deadline", "realtime", "-cpu-used", "4", "-crf", "12",
 )
-H264_QUALITY = ("-preset", "fast", "-crf", "17")
+H264_QUALITY = ("-preset", "fast")
+MP4_INTERMEDIATE_BITRATE_MBPS = 40
 
 
 def _video_bitrate_args(bitrate_mbps: int) -> tuple[str, ...]:
@@ -479,11 +480,13 @@ async def _encode_scrolling_media(
 ) -> None:
     ffmpeg = _ffmpeg_executable()
     duration = duration_ms / 1000
+    frame_count = max(1, math.ceil(fps * duration))
+    progress = "1" if frame_count == 1 else f"min(n/{frame_count - 1},1)"
     background = "black@0" if transparent else "black"
     frames = (
         f"scale='min(iw,{width})':-2:flags=lanczos,"
         f"pad={width}:'max(ih,{height})':(ow-iw)/2:0:color={background},"
-        f"crop={width}:{height}:0:'(ih-oh)*min(t/{duration:.3f},1)',fps={fps},"
+        f"crop={width}:{height}:0:'(ih-oh)*{progress}',fps={fps},"
         f"format={'rgba' if transparent else 'rgb24'}"
     )
     if output is OutputFormat.MP4:
@@ -552,7 +555,7 @@ async def _encode_scrolling_media(
         returncode, _ = await _run_process(
             [
                 str(ffmpeg), "-hide_banner", "-loglevel", "error", "-loop", "1",
-                "-framerate", "12", "-t", f"{duration:.3f}", "-i", str(source),
+                "-framerate", str(fps), "-t", f"{duration:.3f}", "-i", str(source),
                 *software_encoding, "-y", str(destination),
             ],
             45,
@@ -2323,7 +2326,11 @@ class RenderEngine:
                             trimmed_path,
                             duration_ms=options.duration_ms,
                             fps=options.fps,
-                            bitrate_mbps=options.bitrate_mbps,
+                            bitrate_mbps=(
+                                MP4_INTERMEDIATE_BITRATE_MBPS
+                                if request.output is OutputFormat.MP4
+                                else options.bitrate_mbps
+                            ),
                             **video_hardware,
                         )
                         final_path = trimmed_path
