@@ -18,7 +18,7 @@ The renderer listens only on `127.0.0.1`. Desktop API requests require the
 ephemeral secret passed directly from Rust, and the webview CSP permits only
 Tauri IPC and loopback HTTP.
 
-## Prerequisites
+## Before you begin
 
 Follow the [official Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/)
 for each operating system. Windows development requires:
@@ -51,7 +51,7 @@ npm run tauri:dev
 Tauri resources directory and creates the target-triple sidecar binary expected
 by Tauri.
 
-## Validation
+## Run validation
 
 From `desktop/`:
 
@@ -67,7 +67,7 @@ The sidecar smoke test starts the packaged binary, verifies authentication,
 renders `https://example.com`, checks the PNG signature, requests graceful
 shutdown, and fails if any step does not complete.
 
-## Release packages
+## Build release packages
 
 The `Desktop Release` GitHub Actions workflow builds on each native runner:
 

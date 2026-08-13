@@ -1,7 +1,7 @@
-# Async jobs and provider adapters
+# Async jobs
 
-ViperCapture can detach rendering from the client connection. The
-synchronous `POST /v1/render` endpoint remains available; async clients use:
+Use an async job when the client cannot keep a render connection open. Use
+`POST /v1/render` for synchronous requests. Async clients use these endpoints:
 
 - `POST /v1/jobs` to submit the normal `RenderRequest` JSON.
 - `GET /v1/jobs/{id}` to read queue, render, or terminal status.
@@ -15,7 +15,7 @@ and normalized body returns the original job; changing the body returns HTTP
 Statuses are `queued`, `running`, `succeeded`, `failed`, `cancelled`, and
 `expired`.
 
-## Local defaults
+## Use the local providers
 
 The default providers require no external service:
 
@@ -99,7 +99,7 @@ therefore includes failed attempts, retry backoff, and result persistence.
 Workers share `VIPERCAPTURE_MAX_CONCURRENCY` with synchronous renders. Raising
 the worker count does not bypass the Chromium semaphore.
 
-## Database adapters
+## Implement a database adapter
 
 `async_jobs.JobStore` is the provider contract. A factory receives a
 `JobStoreConfig` and returns an object implementing its async methods:
@@ -191,7 +191,7 @@ Durable job-store adapters also implement `pending_notifications` and
 encrypted webhook outbox record must be one atomic state transition. Delivery
 is at least once, so consumers should deduplicate the stable webhook ID.
 
-## Storage adapters
+## Implement a storage adapter
 
 `async_jobs.ArtifactStore` is the binary provider contract. Its factory
 receives `ArtifactStoreConfig`:
@@ -229,7 +229,7 @@ Database and artifact providers are selected separately. For example, SQLite
 state can be paired with S3-compatible storage, or PostgreSQL state with a
 local filesystem.
 
-## Security and deployment
+## Secure an async deployment
 
 The open-source server does not add user accounts or per-job authorization.
 Keep it on loopback or protect every render and job endpoint with the same

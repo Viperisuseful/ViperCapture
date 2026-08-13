@@ -1339,6 +1339,39 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("record_video_dir", browser.context_options)
         encoder.assert_awaited_once()
 
+    async def test_mp4_uses_high_quality_intermediate_then_requested_bitrate(self):
+        class Video:
+            async def path(self):
+                return "source.webm"
+
+        class VideoPage(FakePage):
+            video = Video()
+
+            async def close(self):
+                return None
+
+        async def trim(_source, target, **_options):
+            target.write_bytes(b"intermediate")
+            return 1_000
+
+        async def transcode(_source, target, _output, **_options):
+            target.write_bytes(b"mp4")
+
+        with (
+            patch("vipercapture.render_engine._trim_webm", side_effect=trim) as trimmer,
+            patch("vipercapture.render_engine._transcode_video", side_effect=transcode) as encoder,
+        ):
+            await RenderEngine(hosted=False).render_image(
+                FakeBrowser(FakeContext(VideoPage())),
+                RenderRequest(
+                    url="https://example.com", output="mp4", full_page=False,
+                    video={"duration_ms": 1_000, "bitrate_mbps": 1},
+                ),
+                RenderLimits(max_width=1920, max_height=1080, max_pixels=2_073_600),
+            )
+        self.assertEqual(trimmer.await_args.kwargs["bitrate_mbps"], 40)
+        self.assertEqual(encoder.await_args.kwargs["bitrate_mbps"], 1)
+
     async def test_cancelled_video_read_settles_before_cleanup(self):
         started = threading.Event()
         release = threading.Event()
@@ -1355,7 +1388,7 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
             async def close(self):
                 return None
 
-        async def trim(_source, target, *, duration_ms):
+        async def trim(_source, target, *, duration_ms, **_options):
             target.write_bytes(b"webm")
             return duration_ms
 

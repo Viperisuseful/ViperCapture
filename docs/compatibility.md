@@ -2,10 +2,10 @@
 
 Last verified against public vendor documentation: **2026-08-09**.
 
-This matrix compares workflows, not marketing plan entitlements. “Yes” means
-the repository implements and tests that capability. “Partial” identifies a
-real functional gap. Vendor capabilities can change; source links are included
-so corrections can be submitted as pull requests.
+This matrix compares documented workflows. “Yes” means that the repository
+implements and tests the capability. “Partial” means that the implementations
+differ. Vendor behavior can change. The links below identify the vendor
+documentation used for this comparison.
 
 | Capability | ViperCapture OSS | ScreenshotOne | Urlbox |
 | --- | --- | --- | --- |
@@ -58,24 +58,22 @@ Vendor sources:
   [render links](https://urlbox.com/docs/api/rest-api-vs-render-links), and
   [S3-compatible storage](https://urlbox.com/docs/guides/s3).
 
-## Deliberate non-parity
+## Unsupported managed services
 
-ViperCapture does not claim a managed proxy network, anti-bot bypass, legal
-admissibility opinion, SLA, or around-the-clock render support. Those are services,
-not repository features, and can be valid reasons to buy a managed provider.
-The open-source advantage is control: code, Chromium version, network, data,
-storage, capacity, and cost are inspectable and operator-owned.
+ViperCapture does not provide a managed proxy network, anti-bot bypass, legal
+admissibility opinion, SLA, or continuous render support. The operator manages
+the code version, browsers, network, data, storage, capacity, and cost.
 
 For a target the operator owns, the [site access guide](site-access.md) documents
 a narrow Cloudflare/WAF exception using the renderer address, exact host and
 path, and an origin-scoped secret header. This is authorization, not challenge
 evasion.
 
-## Adjacent alternatives
+## Other services
 
-- [Browserless](https://docs.browserless.io/enterprise/open-source) also ships
-  an open-source Docker deployment and is the strongest adjacent OSS option.
-  Its focus is general browser infrastructure: REST screenshot/PDF/content
+- [Browserless](https://docs.browserless.io/enterprise/open-source) provides
+  an open-source Docker deployment. It provides general browser infrastructure:
+  REST screenshot/PDF/content
   endpoints plus Playwright/Puppeteer WebSocket sessions. ViperCapture's focus
   is the artifact workflow around rendering—typed actions, encrypted jobs,
   signed delivery, bulk/schedules, visual diffs, and diagnostic bundles.
@@ -84,7 +82,6 @@ evasion.
 - [ApiFlash](https://apiflash.com/documentation) offers a narrower managed
   URL-to-image GET/POST API backed by AWS Lambda.
 
-The existence of Browserless is why ViperCapture should not claim to be the
-only open-source screenshot server. The defensible claim is a cohesive,
-self-hosted ScreenshotOne/Urlbox-style rendering and delivery workflow under
-MIT, with explicit gaps and tests.
+ViperCapture is one of several open-source screenshot servers. It provides a
+self-hosted rendering and delivery workflow under the MIT License. The matrix
+records the tested features and known gaps.

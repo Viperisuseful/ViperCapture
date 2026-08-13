@@ -78,12 +78,17 @@ PUBLIC_DNS_SLOTS = asyncio.Semaphore(MAX_DNS_CONCURRENCY)
 MAX_DIAGNOSTIC_EVENTS = 500
 VPX_QUALITY = (
     "-deadline", "realtime", "-cpu-used", "4", "-crf", "12",
-    "-b:v", "8M", "-maxrate", "12M", "-bufsize", "16M",
 )
-H264_QUALITY = ("-preset", "fast", "-crf", "17")
-HARDWARE_VIDEO_BITRATE = (
-    "-b:v", "12M", "-maxrate", "18M", "-bufsize", "24M",
-)
+H264_QUALITY = ("-preset", "fast")
+MP4_INTERMEDIATE_BITRATE_MBPS = 40
+
+
+def _video_bitrate_args(bitrate_mbps: int) -> tuple[str, ...]:
+    return (
+        "-b:v", f"{bitrate_mbps}M",
+        "-maxrate", f"{bitrate_mbps}M",
+        "-bufsize", f"{bitrate_mbps * 2}M",
+    )
 
 
 @dataclass(frozen=True)
@@ -259,9 +264,9 @@ def hardware_video_encoder(output: OutputFormat) -> HardwareVideoEncoder | None:
         command = [
             str(ffmpeg), "-hide_banner", "-loglevel", "error",
             *encoder.global_args,
-            "-f", "lavfi", "-i", "color=size=64x64:rate=1",
+            "-f", "lavfi", "-i", "color=size=128x128:rate=1",
             "-frames:v", "1", "-vf", encoder.filter,
-            "-c:v", encoder.name, *encoder.options, *HARDWARE_VIDEO_BITRATE,
+            "-c:v", encoder.name, *encoder.options, *_video_bitrate_args(12),
             "-f", "null", "-",
         ]
         try:
@@ -339,6 +344,8 @@ async def _trim_webm(
     destination: Path,
     *,
     duration_ms: int,
+    fps: int = 60,
+    bitrate_mbps: int = 20,
     hardware: bool = False,
 ) -> int:
     ffmpeg = _ffmpeg_executable()
@@ -362,15 +369,13 @@ async def _trim_webm(
         "-an",
     ]
     software_encoding = [
-        "-c:v",
-        "libvpx",
-        *VPX_QUALITY,
+        "-vf", f"fps={fps}", "-c:v", "libvpx", *VPX_QUALITY,
+        *_video_bitrate_args(bitrate_mbps),
     ]
     hardware_encoding = [
-        "-vf", hardware_encoder.filter,
+        "-vf", f"fps={fps},{hardware_encoder.filter}",
         "-c:v", hardware_encoder.name,
-        *hardware_encoder.options,
-        *HARDWARE_VIDEO_BITRATE,
+        *hardware_encoder.options, *_video_bitrate_args(bitrate_mbps),
     ] if hardware_encoder else software_encoding
     command = [
         str(ffmpeg),
@@ -403,6 +408,8 @@ async def _transcode_video(
     destination: Path,
     output: OutputFormat,
     *,
+    fps: int = 60,
+    bitrate_mbps: int = 20,
     hardware: bool = False,
 ) -> None:
     ffmpeg = _ffmpeg_executable()
@@ -419,18 +426,19 @@ async def _transcode_video(
                 False,
             )
         software_encoding = [
-            "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-c:v", "libx264",
-            *H264_QUALITY, "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            "-vf", f"fps={fps},pad=ceil(iw/2)*2:ceil(ih/2)*2", "-c:v", "libx264",
+            *H264_QUALITY, *_video_bitrate_args(bitrate_mbps),
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         ]
         encoding = [
-            "-vf", f"pad=ceil(iw/2)*2:ceil(ih/2)*2,{hardware_encoder.filter}",
+            "-vf", f"fps={fps},pad=ceil(iw/2)*2:ceil(ih/2)*2,{hardware_encoder.filter}",
             "-c:v", hardware_encoder.name, *hardware_encoder.options,
-            *HARDWARE_VIDEO_BITRATE, "-pix_fmt", "yuv420p",
+            *_video_bitrate_args(bitrate_mbps), "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
         ] if hardware_encoder else software_encoding
     elif output is OutputFormat.GIF:
         filters = (
-            "fps=15,split[frames][palette_input];"
+            f"fps={fps},split[frames][palette_input];"
             "[palette_input]palettegen=stats_mode=diff[palette];"
             "[frames][palette]paletteuse=dither=sierra2_4a"
         )
@@ -465,16 +473,20 @@ async def _encode_scrolling_media(
     width: int,
     height: int,
     duration_ms: int,
+    fps: int = 60,
+    bitrate_mbps: int = 20,
     transparent: bool,
     hardware: bool = False,
 ) -> None:
     ffmpeg = _ffmpeg_executable()
     duration = duration_ms / 1000
+    frame_count = max(1, math.ceil(fps * duration))
+    progress = "1" if frame_count == 1 else f"min(n/{frame_count - 1},1)"
     background = "black@0" if transparent else "black"
     frames = (
         f"scale='min(iw,{width})':-2:flags=lanczos,"
         f"pad={width}:'max(ih,{height})':(ow-iw)/2:0:color={background},"
-        f"crop={width}:{height}:0:'(ih-oh)*min(t/{duration:.3f},1)',fps=15,"
+        f"crop={width}:{height}:0:'(ih-oh)*{progress}',fps={fps},"
         f"format={'rgba' if transparent else 'rgb24'}"
     )
     if output is OutputFormat.MP4:
@@ -503,12 +515,13 @@ async def _encode_scrolling_media(
             )
         software_encoding = [
             "-vf", frames, "-c:v", encoder, *VPX_QUALITY,
+            *_video_bitrate_args(bitrate_mbps),
             "-pix_fmt", "yuva420p" if transparent else "yuv420p",
         ]
         encoding = [
             "-vf", f"{frames},{hardware_encoder.filter}",
             "-c:v", hardware_encoder.name, *hardware_encoder.options,
-            *HARDWARE_VIDEO_BITRATE, "-pix_fmt", "yuv420p",
+            *_video_bitrate_args(bitrate_mbps), "-pix_fmt", "yuv420p",
         ] if hardware_encoder else software_encoding
     else:
         if hardware_encoder is None and not await _settled_thread(ffmpeg_has_encoder, "libx264"):
@@ -520,19 +533,20 @@ async def _encode_scrolling_media(
             )
         software_encoding = [
             "-vf", frames, "-c:v", "libx264", *H264_QUALITY,
+            *_video_bitrate_args(bitrate_mbps),
             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         ]
         encoding = [
             "-vf", f"{frames},{hardware_encoder.filter}",
             "-c:v", hardware_encoder.name, *hardware_encoder.options,
-            *HARDWARE_VIDEO_BITRATE, "-pix_fmt", "yuv420p",
+            *_video_bitrate_args(bitrate_mbps), "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
         ] if hardware_encoder else software_encoding
     prefix = [
         str(ffmpeg), "-hide_banner", "-loglevel", "error",
         *(hardware_encoder.global_args if hardware_encoder else ()),
         "-loop", "1",
-            "-framerate", "12", "-t", f"{duration:.3f}", "-i", str(source),
+        "-framerate", str(fps), "-t", f"{duration:.3f}", "-i", str(source),
     ]
     returncode, _ = await _run_process(
         [*prefix, *encoding, "-y", str(destination)], 45
@@ -541,7 +555,7 @@ async def _encode_scrolling_media(
         returncode, _ = await _run_process(
             [
                 str(ffmpeg), "-hide_banner", "-loglevel", "error", "-loop", "1",
-                "-framerate", "12", "-t", f"{duration:.3f}", "-i", str(source),
+                "-framerate", str(fps), "-t", f"{duration:.3f}", "-i", str(source),
                 *software_encoding, "-y", str(destination),
             ],
             45,
@@ -2298,6 +2312,8 @@ class RenderEngine:
                             width=request.viewport.width,
                             height=request.viewport.height,
                             duration_ms=options.duration_ms,
+                            fps=options.fps,
+                            bitrate_mbps=options.bitrate_mbps,
                             transparent=options.transparent_background,
                             **video_hardware,
                         )
@@ -2309,6 +2325,12 @@ class RenderEngine:
                             Path(path),
                             trimmed_path,
                             duration_ms=options.duration_ms,
+                            fps=options.fps,
+                            bitrate_mbps=(
+                                MP4_INTERMEDIATE_BITRATE_MBPS
+                                if request.output is OutputFormat.MP4
+                                else options.bitrate_mbps
+                            ),
                             **video_hardware,
                         )
                         final_path = trimmed_path
@@ -2318,6 +2340,8 @@ class RenderEngine:
                                 trimmed_path,
                                 final_path,
                                 request.output,
+                                fps=options.fps,
+                                bitrate_mbps=options.bitrate_mbps,
                                 **video_hardware,
                             )
                     size = (await asyncio.to_thread(final_path.stat)).st_size
