@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vipercapture"
-version = "0.2.0b4"
+version = "0.3.0b1"
 description = "Dependency-free Python client for ViperCapture"
 requires-python = ">=3.11"
 license = "MIT"

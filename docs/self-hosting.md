@@ -65,7 +65,7 @@ one extreme page cannot exhaust the host.
 
 ## Configure page cleanup and rendering
 
-The local browser and desktop interfaces expose the Cloud cleanup controls:
+The local browser interface exposes the Cloud cleanup controls:
 reject, accept, hide, or leave cookie consent unchanged; block known ad,
 tracker, chat, and newsletter resources or overlays; and apply custom CSS.
 Cleanup is opt-in at the API layer and enabled by default only in the

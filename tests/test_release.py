@@ -30,6 +30,17 @@ class ReleaseVersionTests(unittest.TestCase):
         self.assertFalse((ROOT / ".github" / "workflows" / "desktop-release.yml").exists())
         self.assertFalse((ROOT / ".github" / "workflows" / "android-release.yml").exists())
 
+    def test_oss_workflow_matches_release_manifest(self):
+        versions = json.loads((ROOT / "release" / "versions.json").read_text("utf-8"))
+        version = versions["oss"]
+        workflow = (ROOT / ".github" / "workflows" / "oss-release.yml").read_text(
+            "utf-8"
+        )
+        self.assertIn(f"v{version}", workflow)
+        self.assertIn(f"docs/releases/v{version}.md", workflow)
+        self.assertNotIn("desktop", workflow.lower())
+        self.assertNotIn("android", workflow.lower())
+
 
 class ChecksumTests(unittest.TestCase):
     def test_checksum_script_uses_flat_published_asset_names(self):
