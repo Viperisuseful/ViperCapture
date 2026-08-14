@@ -32,7 +32,12 @@ def _cookie(item: dict[str, object], *, default_domain: str | None = None) -> di
     expires = float(raw_expires) if raw_expires not in (None, "") else -1
     if expires <= 0:
         expires = -1
-    return {
+    partition_key = item.get("partitionKey")
+    if partition_key is not None and (
+        not isinstance(partition_key, str) or not partition_key
+    ):
+        raise ValueError("cookie partitionKey must be a non-empty string")
+    cookie = {
         "name": name,
         "value": str(item.get("value") or ""),
         "domain": domain,
@@ -42,6 +47,9 @@ def _cookie(item: dict[str, object], *, default_domain: str | None = None) -> di
         "secure": bool(item.get("secure", False)),
         "sameSite": _same_site(item.get("sameSite")),
     }
+    if partition_key is not None:
+        cookie["partitionKey"] = partition_key
+    return cookie
 
 
 def _origin_host(origin: str | None) -> tuple[str, bool]:

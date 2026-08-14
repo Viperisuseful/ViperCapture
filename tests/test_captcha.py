@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 from playwright.async_api import async_playwright
@@ -117,6 +118,41 @@ class CaptchaTests(unittest.IsolatedAsyncioTestCase):
             timeout_ms=1_000,
         )
         handler.assert_awaited_once_with(page, BLOCKING, "internal", 1_000)
+
+    async def test_external_budget_wraps_only_an_actual_handler_call(self):
+        events = []
+
+        @asynccontextmanager
+        async def budget(timeout_ms):
+            events.append(("enter", timeout_ms))
+            yield
+            events.append(("exit", timeout_ms))
+
+        clear_page = AsyncMock()
+        clear_page.evaluate.return_value = None
+        await handle_challenge(
+            clear_page,
+            navigation_status=200,
+            action="external",
+            handler=AsyncMock(return_value=True),
+            solver=None,
+            timeout_ms=1_000,
+            budget=budget,
+        )
+        self.assertEqual(events, [])
+
+        blocked_page = AsyncMock()
+        blocked_page.evaluate.side_effect = [BLOCKING, None]
+        await handle_challenge(
+            blocked_page,
+            navigation_status=403,
+            action="external",
+            handler=AsyncMock(return_value=True),
+            solver=None,
+            timeout_ms=1_000,
+            budget=budget,
+        )
+        self.assertEqual(events, [("enter", 1_000), ("exit", 1_000)])
 
     async def test_external_handler_must_be_configured(self):
         page = AsyncMock()

@@ -885,6 +885,9 @@ class BrowserCookie(BaseModel):
     http_only: bool = Field(alias="httpOnly")
     secure: bool
     same_site: Literal["Strict", "Lax", "None"] = Field(alias="sameSite")
+    partition_key: str | None = Field(
+        default=None, alias="partitionKey", min_length=1, max_length=2_048
+    )
 
 
 class BrowserLocalStorageEntry(BaseModel):
@@ -1159,6 +1162,7 @@ async def _check_captcha(
     page,
     payload: RenderRequest,
     navigation_status: int | None = None,
+    budget=None,
 ) -> None:
     await handle_challenge(
         page,
@@ -1167,6 +1171,7 @@ async def _check_captcha(
         handler=getattr(app.state, "captcha_handler", None),
         solver=payload.captcha.solver,
         timeout_ms=payload.captcha.timeout_ms,
+        budget=budget,
     )
 
 

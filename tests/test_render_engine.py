@@ -24,13 +24,13 @@ from vipercapture.render_engine import (
     _resolve_public_origin,
     _run_process,
     capture_clipped_image,
+    captcha_handler_budget,
     ensure_dimensions,
     ensure_full_page_dimensions,
     is_public_http_url,
     load_lazy_content,
     normalized_origin,
     render_metadata,
-    render_deadline_seconds,
     routed_headers,
 )
 from vipercapture.render_errors import RenderError
@@ -166,14 +166,13 @@ class FakeBrowser:
 
 
 class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
-    def test_external_captcha_timeout_extends_the_total_render_budget(self):
-        request = RenderRequest(
-            url="https://example.com",
-            captcha={"action": "external", "timeout_ms": 120_000},
-        )
-        limits = RenderLimits(deadline_seconds=75)
-        self.assertEqual(render_deadline_seconds(request, limits), 435)
-        self.assertEqual(render_deadline_seconds(request, limits, 9), 1_155)
+    async def test_captcha_budget_pauses_deadline_only_for_handler_runtime(self):
+        async with asyncio.timeout(0.2) as deadline:
+            original = deadline.when()
+            async with captcha_handler_budget((deadline,), 1_000):
+                self.assertGreater(deadline.when(), original + 0.9)
+                await asyncio.sleep(0.01)
+            self.assertLess(deadline.when(), original + 0.1)
 
     async def test_request_proxy_and_stealth_are_applied_to_the_context(self):
         browser = FakeBrowser()
@@ -1353,7 +1352,7 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
                 await super().wait_for_timeout(delay)
                 self.recorded = True
 
-        async def checker(page, _request, _status):
+        async def checker(page, _request, _status, _budget):
             if page.recorded:
                 raise RenderError(
                     "captcha_detected", "Challenge appeared.", 422, False

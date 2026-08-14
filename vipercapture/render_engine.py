@@ -18,13 +18,13 @@ import tempfile
 import time
 import zipfile
 from base64 import b64decode
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from fnmatch import fnmatchcase
 from functools import lru_cache
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import AsyncContextManager, Awaitable, Callable
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
@@ -38,7 +38,6 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from .render_contract import (
     ActionType,
     BrowserEngine,
-    CaptchaAction,
     DevicePreset,
     LazyLoadMode,
     OutputFormat,
@@ -76,7 +75,6 @@ DNS_RESOLUTION_TIMEOUT_SECONDS = 5
 MAX_DNS_CONCURRENCY = 8
 MAX_DNS_ORIGINS = 100
 PUBLIC_DNS_SLOTS = asyncio.Semaphore(MAX_DNS_CONCURRENCY)
-MAX_CHALLENGE_CHECKS = 3
 MAX_DIAGNOSTIC_EVENTS = 500
 VPX_QUALITY = (
     "-deadline", "realtime", "-cpu-used", "4", "-crf", "12",
@@ -944,14 +942,31 @@ class RenderLimits:
     output_bytes: int = 1024 * 1024 * 1024
 
 
-def render_deadline_seconds(
-    request: RenderRequest,
-    limits: RenderLimits,
-    captcha_attempts: int = MAX_CHALLENGE_CHECKS,
-) -> float:
-    if request.captcha.action is not CaptchaAction.EXTERNAL:
-        return limits.deadline_seconds
-    return limits.deadline_seconds + request.captcha.timeout_ms / 1_000 * captcha_attempts
+@asynccontextmanager
+async def captcha_handler_budget(
+    deadlines: tuple[asyncio.Timeout, ...], timeout_ms: int
+):
+    """Pause render deadlines while an external CAPTCHA handler is running."""
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    original_deadlines = tuple(deadline.when() for deadline in deadlines)
+    for deadline, when in zip(deadlines, original_deadlines, strict=True):
+        if when is not None:
+            # Give the inner handler timeout enough room to report its own error.
+            deadline.reschedule(when + timeout_ms / 1_000 + 1)
+    try:
+        yield
+    finally:
+        elapsed = loop.time() - started
+        for deadline, when in zip(deadlines, original_deadlines, strict=True):
+            if when is not None and not deadline.expired():
+                deadline.reschedule(when + elapsed)
+
+
+ChallengeBudget = Callable[[int], AsyncContextManager[None]]
+ChallengeChecker = Callable[
+    [Page, RenderRequest, int | None, ChallengeBudget], Awaitable[None]
+]
 
 
 @dataclass(frozen=True)
@@ -1451,7 +1466,7 @@ class RenderEngine:
         *,
         hosted: bool,
         cleanup_hooks: CleanupHooks | None = None,
-        challenge_checker: Callable[[Page, RenderRequest, int | None], Awaitable[None]] | None = None,
+        challenge_checker: ChallengeChecker | None = None,
         stealth_context_options: Callable[
             [Browser, RenderRequest], Awaitable[dict[str, object]]
         ] | None = None,
@@ -1703,13 +1718,7 @@ class RenderEngine:
             return await self._render_single(browser, request, limits)
 
         try:
-            async with asyncio.timeout(
-                render_deadline_seconds(
-                    request,
-                    limits,
-                    MAX_CHALLENGE_CHECKS * len(request.viewports),
-                )
-            ):
+            async with asyncio.timeout(limits.deadline_seconds) as pack_timeout:
                 outputs: list[tuple[str, RenderArtifact]] = []
                 output_bytes = 0
                 for viewport in request.viewports:
@@ -1727,7 +1736,9 @@ class RenderEngine:
                             "environment": environment,
                         }
                     )
-                    artifact = await self._render_single(browser, single, limits)
+                    artifact = await self._render_single(
+                        browser, single, limits, parent_timeout=pack_timeout
+                    )
                     output_bytes += len(artifact.body)
                     if output_bytes > limits.output_bytes:
                         raise RenderError(
@@ -1804,6 +1815,8 @@ class RenderEngine:
         browser: Browser,
         request: RenderRequest,
         limits: RenderLimits,
+        *,
+        parent_timeout: asyncio.Timeout | None = None,
     ) -> RenderArtifact:
         from .content_rendering import input_document, render_document_output
 
@@ -1848,7 +1861,14 @@ class RenderEngine:
             or bool(request.network.block_resource_types),
         )
         try:
-            async with asyncio.timeout(render_deadline_seconds(request, limits)):
+            async with asyncio.timeout(limits.deadline_seconds) as render_timeout:
+                active_timeouts = (render_timeout,) + (
+                    (parent_timeout,) if parent_timeout is not None else ()
+                )
+
+                def challenge_budget(timeout_ms: int) -> AsyncContextManager[None]:
+                    return captcha_handler_budget(active_timeouts, timeout_ms)
+
                 context_options: dict[str, object] = {}
                 if request.profile_id is not None:
                     if self.profile_loader is None:
@@ -2231,7 +2251,9 @@ class RenderEngine:
                 if self.cleanup_hooks:
                     await self.cleanup_hooks.apply(page, request.cleanup)
                 if self.challenge_checker:
-                    await self.challenge_checker(page, request, navigation_status)
+                    await self.challenge_checker(
+                        page, request, navigation_status, challenge_budget
+                    )
                 resizing_image = (
                     request.image.width is not None
                     or request.image.height is not None
@@ -2270,7 +2292,9 @@ class RenderEngine:
                     if self.cleanup_hooks:
                         await self.cleanup_hooks.apply(page, request.cleanup)
                     if self.challenge_checker:
-                        await self.challenge_checker(page, request, navigation_status)
+                        await self.challenge_checker(
+                            page, request, navigation_status, challenge_budget
+                        )
                 if request.deterministic.enabled and request.deterministic.wait_for_fonts:
                     await page.evaluate("() => document.fonts?.ready")
                 await self._check_assertions(
@@ -2319,6 +2343,7 @@ class RenderEngine:
                             page,
                             request,
                             navigation_status,
+                            challenge_budget,
                         )
                     await self._check_assertions(
                         page,

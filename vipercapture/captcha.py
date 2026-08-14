@@ -6,7 +6,7 @@ import asyncio
 import importlib
 import inspect
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, AsyncContextManager
 
 from .render_errors import RenderError
 
@@ -186,6 +186,7 @@ async def handle_challenge(
     handler: CaptchaHandler | None,
     solver: str | None,
     timeout_ms: int,
+    budget: Callable[[int], AsyncContextManager[None]] | None = None,
 ) -> None:
     challenge = await detect_challenge(page, navigation_status)
     if not challenge or challenge.get("kind") == "embedded_widget":
@@ -201,11 +202,18 @@ async def handle_challenge(
                 False,
                 challenge,
             )
-        solved = handler(page, challenge, solver, timeout_ms)
-        if not inspect.isawaitable(solved):
-            raise TypeError("CAPTCHA handlers must return an awaitable")
+        async def invoke_handler() -> bool:
+            solved = handler(page, challenge, solver, timeout_ms)
+            if not inspect.isawaitable(solved):
+                raise TypeError("CAPTCHA handlers must return an awaitable")
+            return await asyncio.wait_for(solved, timeout=timeout_ms / 1_000)
+
         try:
-            cleared = await asyncio.wait_for(solved, timeout=timeout_ms / 1_000)
+            if budget is None:
+                cleared = await invoke_handler()
+            else:
+                async with budget(timeout_ms):
+                    cleared = await invoke_handler()
         except TimeoutError as exc:
             raise RenderError(
                 "captcha_handler_timeout",

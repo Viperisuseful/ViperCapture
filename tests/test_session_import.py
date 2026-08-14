@@ -20,6 +20,7 @@ class SessionImportTests(unittest.TestCase):
                             "httpOnly": True,
                             "secure": True,
                             "sameSite": "Lax",
+                            "partitionKey": "https://top-level.example",
                         }
                     ],
                     "origins": [
@@ -33,6 +34,9 @@ class SessionImportTests(unittest.TestCase):
             format_name="playwright",
         )
         self.assertEqual(state["cookies"][0]["name"], "session")
+        self.assertEqual(
+            state["cookies"][0]["partitionKey"], "https://top-level.example"
+        )
         self.assertEqual(state["origins"][0]["localStorage"][0]["value"], "dark")
 
     def test_imports_common_browser_extension_cookie_json(self):
@@ -84,6 +88,21 @@ class SessionImportTests(unittest.TestCase):
     def test_cookie_header_requires_an_origin(self):
         with self.assertRaisesRegex(ValueError, "origin is required"):
             import_storage_state("sid=abc")
+
+    def test_rejects_structured_partition_keys_instead_of_widening_scope(self):
+        with self.assertRaisesRegex(ValueError, "partitionKey"):
+            import_storage_state(
+                json.dumps(
+                    [
+                        {
+                            "name": "sid",
+                            "value": "secret",
+                            "domain": "example.com",
+                            "partitionKey": {"topLevelSite": "https://example.org"},
+                        }
+                    ]
+                )
+            )
 
     def test_rejects_oversized_imports(self):
         with self.assertRaises(RenderError) as raised:
