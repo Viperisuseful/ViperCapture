@@ -33,6 +33,16 @@ class CaptchaTests(unittest.IsolatedAsyncioTestCase):
                 friendly = await detect_challenge(page, 200)
                 self.assertEqual(friendly["kind"], "embedded_widget")
 
+                await page.set_content(
+                    '<iframe src="about:blank#google.com/recaptcha" '
+                    'style="width:300px;height:80px"></iframe>'
+                    '<iframe src="about:blank#geo.captcha-delivery.com" '
+                    'style="position:fixed;inset:0;width:800px;height:600px"></iframe>'
+                )
+                blocking = await detect_challenge(page, 403)
+                self.assertEqual(blocking["provider"], "datadome")
+                self.assertEqual(blocking["kind"], "access_denied")
+
                 await page.set_content("<main></main>")
                 await page.evaluate(
                     """() => {

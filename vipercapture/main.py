@@ -55,6 +55,7 @@ from .page_cleanup import (
 from .render_cache import RenderCache
 from .render_contract import (
     BrowserEngine,
+    DevicePreset,
     OutputFormat,
     RenderRequest,
     canonical_render_document,
@@ -289,6 +290,7 @@ async def _stealth_context_options(
 ) -> dict[str, object]:
     if (
         payload.network.user_agent is not None
+        or payload.environment.device is not DevicePreset.DESKTOP
         or payload.engine is not BrowserEngine.CHROMIUM
     ):
         return {}

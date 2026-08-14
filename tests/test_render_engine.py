@@ -172,8 +172,8 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
             captcha={"action": "external", "timeout_ms": 120_000},
         )
         limits = RenderLimits(deadline_seconds=75)
-        self.assertEqual(render_deadline_seconds(request, limits), 195)
-        self.assertEqual(render_deadline_seconds(request, limits, 3), 435)
+        self.assertEqual(render_deadline_seconds(request, limits), 435)
+        self.assertEqual(render_deadline_seconds(request, limits, 9), 1_155)
 
     async def test_request_proxy_and_stealth_are_applied_to_the_context(self):
         browser = FakeBrowser()

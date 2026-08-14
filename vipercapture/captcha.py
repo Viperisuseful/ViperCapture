@@ -98,25 +98,29 @@ DETECT_CHALLENGE_SCRIPT = r"""({ status }) => {
     const challengeText = challengePhrases.some((phrase) => title.includes(phrase)) ||
         (bodyText.length <= 5000 && challengePhrases.some((phrase) => bodyText.includes(phrase)));
     const signals = [];
-    let provider = null;
-    let elements = [];
-    let hasBlockingElement = false;
-    let hasObstruction = false;
+    let widgetMatch = null;
+    let blockingMatch = null;
     for (const [name, selectors] of Object.entries(providers)) {
         const widgets = query(selectors.widgets);
         const blocking = query(selectors.blocking);
         if (!widgets.length && !blocking.length) continue;
-        provider = name;
-        elements = [...widgets, ...blocking];
-        if (widgets.length) signals.push("provider_widget");
-        if (blocking.length) {
-            signals.push("challenge_form");
-            hasBlockingElement = true;
+        const elements = [...widgets, ...blocking];
+        const obstructed = elements.some(obstruction);
+        const match = {name, elements, widgets, blocking, obstructed};
+        if (blocking.length || obstructed) {
+            blockingMatch = match;
+            break;
         }
-        hasObstruction = elements.some(obstruction);
-        if (hasObstruction) signals.push("viewport_obstruction");
-        break;
+        if (!widgetMatch) widgetMatch = match;
     }
+    const match = blockingMatch || widgetMatch;
+    const provider = match?.name || null;
+    const elements = match?.elements || [];
+    const hasBlockingElement = Boolean(match?.blocking.length);
+    const hasObstruction = Boolean(match?.obstructed);
+    if (match?.widgets.length) signals.push("provider_widget");
+    if (hasBlockingElement) signals.push("challenge_form");
+    if (hasObstruction) signals.push("viewport_obstruction");
     if (status === 429) signals.push("main_response_429");
     else if ([401, 403, 503].includes(status)) signals.push(`main_response_${status}`);
     if (challengeText) signals.push("challenge_copy");

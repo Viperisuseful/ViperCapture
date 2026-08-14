@@ -659,6 +659,12 @@ class BrowserLaunchTests(unittest.IsolatedAsyncioTestCase):
         browser.new_page.assert_awaited_once()
         page.close.assert_awaited_once()
 
+        mobile = RenderRequest(
+            url="https://example.com", environment={"device": "pixel_7"}
+        )
+        self.assertEqual(await _stealth_context_options(browser, mobile), {})
+        browser.new_page.assert_awaited_once()
+
     async def test_chromium_uses_full_headless_browser_and_writable_paths(self):
         browser = object()
         launch = AsyncMock(return_value=browser)

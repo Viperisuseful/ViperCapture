@@ -76,6 +76,7 @@ DNS_RESOLUTION_TIMEOUT_SECONDS = 5
 MAX_DNS_CONCURRENCY = 8
 MAX_DNS_ORIGINS = 100
 PUBLIC_DNS_SLOTS = asyncio.Semaphore(MAX_DNS_CONCURRENCY)
+MAX_CHALLENGE_CHECKS = 3
 MAX_DIAGNOSTIC_EVENTS = 500
 VPX_QUALITY = (
     "-deadline", "realtime", "-cpu-used", "4", "-crf", "12",
@@ -944,7 +945,9 @@ class RenderLimits:
 
 
 def render_deadline_seconds(
-    request: RenderRequest, limits: RenderLimits, captcha_attempts: int = 1
+    request: RenderRequest,
+    limits: RenderLimits,
+    captcha_attempts: int = MAX_CHALLENGE_CHECKS,
 ) -> float:
     if request.captcha.action is not CaptchaAction.EXTERNAL:
         return limits.deadline_seconds
@@ -1701,7 +1704,11 @@ class RenderEngine:
 
         try:
             async with asyncio.timeout(
-                render_deadline_seconds(request, limits, len(request.viewports))
+                render_deadline_seconds(
+                    request,
+                    limits,
+                    MAX_CHALLENGE_CHECKS * len(request.viewports),
+                )
             ):
                 outputs: list[tuple[str, RenderArtifact]] = []
                 output_bytes = 0
