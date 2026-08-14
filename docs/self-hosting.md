@@ -14,7 +14,7 @@ and `libx264`; GPU video additionally requires the vendor encoder and driver.
 Then run `python launch.py`. This is the supported setup and startup method.
 The launcher creates a virtual environment, installs Playwright Chromium,
 Firefox, and WebKit, starts the application, and opens the local interface.
-The Docker image and released desktop installers already include FFmpeg.
+The Docker image already includes FFmpeg.
 
 ## Configure a production deployment
 

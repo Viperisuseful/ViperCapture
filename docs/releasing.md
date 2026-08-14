@@ -12,12 +12,6 @@
 | Python SDK | 0.2.0b4 | GitHub Releases; PyPI when enabled | release wheel/sdist or `pip install vipercapture==0.2.0b4` |
 | TypeScript SDK | 0.2.0-beta.4 | GitHub Releases; npm when enabled | release tarball or `npm install @vipercapture/sdk@0.2.0-beta.4` |
 | Go SDK | 0.2.0-beta.4 source | GitHub | `go get github.com/Viperisuseful/ViperCapture/sdk/go@v0.2.0-beta.4` |
-| Desktop beta | 0.2.2 | GitHub Releases | MSI/NSIS, Apple/Intel DMGs, Debian package |
-| Android beta | 0.1.8 | GitHub Releases, then Play Console internal testing | signed universal APK/AAB |
-
-Android remains at 0.1.8 and already has a signed APK/AAB with checksums.
-Desktop remains independently versioned at 0.2.2 and Android remains at 0.1.8;
-this OSS API release does not rebuild or relabel either native application.
 
 ## Build release artifacts
 
@@ -62,11 +56,7 @@ packages in clean temporary environments, and test the source archive with
    required `sdk/go/v0.2.0-beta.4` Go submodule tag. PyPI and npm publish only
    when their repository variables are enabled. It refuses to overwrite a
    Go tag that points at another commit.
-5. Keep `desktop-v0.2.2` as the existing desktop beta; do not rebuild native
-   packages for this API-only release.
-6. Keep `android-v0.1.8` as the existing Android beta. Upload its AAB to Play
-   Console internal testing only after completing store metadata and policy review.
-7. Deploy the exact GHCR digest with `deploy/public-api`, run a restore drill,
+5. Deploy the exact GHCR digest with `deploy/public-api`, run a restore drill,
    and start with a private/public-beta allowlist before general availability.
 
 Do not reuse or replace existing public tags. If a workflow fails before a

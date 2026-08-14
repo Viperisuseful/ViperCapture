@@ -765,9 +765,6 @@ class FrontendTests(unittest.TestCase):
         root = Path(__file__).resolve().parent.parent
         index = (root / "static" / "app" / "index.html").read_text(encoding="utf-8")
         source = (root / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
-        desktop_source = (root / "desktop" / "src" / "App.tsx").read_text(
-            encoding="utf-8"
-        )
         components = (root / "frontend" / "components.json").read_text(encoding="utf-8")
 
         self.assertIn("ViperCapture | Open-source webpage rendering", index)
@@ -776,14 +773,6 @@ class FrontendTests(unittest.TestCase):
         self.assertIn("Fast {output.toUpperCase()} encoding", source)
         self.assertIn('output === "png" || output === "webp"', source)
         self.assertIn("<FieldLegend>Page cleanup</FieldLegend>", source)
-        self.assertIn("Fast {output.toUpperCase()} encoding", desktop_source)
-        self.assertIn('output === "png" || output === "webp"', desktop_source)
-        self.assertIn("<FieldLegend>Page cleanup</FieldLegend>", desktop_source)
-        self.assertIn('pdfMode === "print" && <Field><FieldLabel>Paper', desktop_source)
-        self.assertIn(
-            'pdfMode === "print" && <Field><FieldLabel>Orientation',
-            desktop_source,
-        )
         self.assertIn('"style": "radix-nova"', components)
 
 

@@ -125,8 +125,6 @@ def main() -> int:
             "python_sdk": "PyPI",
             "typescript_sdk": "npm",
             "go_sdk": "GitHub module source",
-            "desktop": "GitHub Releases",
-            "android": "GitHub Releases and Play Console internal testing",
         },
     }
     (output / "release-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", "utf-8")

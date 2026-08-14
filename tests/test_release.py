@@ -18,27 +18,17 @@ class ReleaseVersionTests(unittest.TestCase):
         typescript_manifest = json.loads(
             (ROOT / "sdk" / "typescript" / "package.json").read_text("utf-8")
         )
-        desktop_manifest = json.loads((ROOT / "desktop" / "package.json").read_text("utf-8"))
-        android_manifest = json.loads(
-            (ROOT / "desktop" / "src-tauri" / "tauri.android.conf.json").read_text("utf-8")
-        )
         self.assertIn(f'version = "{versions["python_sdk"]}"', python_manifest)
         self.assertEqual(typescript_manifest["version"], versions["typescript_sdk"])
-        self.assertEqual(desktop_manifest["version"], versions["desktop"])
-        self.assertEqual(android_manifest["version"], versions["android"])
         self.assertTrue(versions["container"].endswith(versions["oss"]))
 
-    def test_desktop_and_android_release_tags_are_checked_independently(self):
-        script = ROOT / "desktop" / "scripts" / "check_release_version.py"
-        for app, tag in (("desktop", "desktop-v0.2.2"), ("android", "android-v0.1.8")):
-            completed = subprocess.run(
-                [sys.executable, str(script), app],
-                cwd=ROOT,
-                env={**os.environ, "RELEASE_TAG": tag},
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(completed.returncode, 0, completed.stderr)
+    def test_native_apps_are_not_part_of_the_distribution(self):
+        versions = json.loads((ROOT / "release" / "versions.json").read_text("utf-8"))
+        self.assertNotIn("desktop", versions)
+        self.assertNotIn("android", versions)
+        self.assertFalse((ROOT / "desktop").exists())
+        self.assertFalse((ROOT / ".github" / "workflows" / "desktop-release.yml").exists())
+        self.assertFalse((ROOT / ".github" / "workflows" / "android-release.yml").exists())
 
 
 class ChecksumTests(unittest.TestCase):
