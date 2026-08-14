@@ -30,6 +30,8 @@ the dated [compatibility matrix](docs/compatibility.md) and run the
   JavaScript actions
 - Wait conditions, assertions, custom CSS, devices, locale/timezone,
   geolocation, cookies, user agent, proxy, resource blocking, and cleanup
+- Request-aware stealth controls, operator-controlled residential/datacenter
+  proxies, and structured detection for common CAPTCHA and bot interstitials
 - Ad, tracker, chat, newsletter, and consent-banner cleanup backed by the
   vendored, license-preserved AutoConsent rule set
 - Cleanup and deterministic controls in the browser UI
@@ -50,7 +52,8 @@ the dated [compatibility matrix](docs/compatibility.md) and run the
 - Deterministic capture controls, sectioned slice ZIPs, project-owned visual
   baselines, and reproducible comparison reports
 - Optional projects, hashed API keys, quotas, resource ownership, encrypted
-  persistent profiles, audit logs, Prometheus metrics, and OTLP tracing
+  persistent profiles, portable browser-session imports, audit logs,
+  Prometheus metrics, and OTLP tracing
 - Separate API/worker roles for horizontally scaled provider-backed queues,
   plus ScreenshotOne and Urlbox compatibility adapters
 - Bounded concurrency, output/pixel/deadline limits, client-disconnect
@@ -128,6 +131,7 @@ callback by setting `delivery.webhook_url`. Related orchestration endpoints:
 | `POST /v1/diff` | Compare two images and download a deterministic report ZIP |
 | `PUT/GET/POST /v1/baselines` | Store project baselines and compare review bundles |
 | `POST/DELETE /v1/profiles` | Manage encrypted Playwright storage-state profiles |
+| `POST /v1/profiles/import` | Import pasted Cookie headers or browser-exported session files |
 | `GET /take` | ScreenshotOne-compatible common-options adapter |
 | `POST /compat/urlbox/v1/render/{sync,async}` | Urlbox-compatible adapters |
 

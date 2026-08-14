@@ -24,6 +24,7 @@ from vipercapture.render_engine import (
     _resolve_public_origin,
     _run_process,
     capture_clipped_image,
+    captcha_handler_budget,
     ensure_dimensions,
     ensure_full_page_dimensions,
     is_public_http_url,
@@ -165,6 +166,75 @@ class FakeBrowser:
 
 
 class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
+    async def test_captcha_budget_pauses_deadline_only_for_handler_runtime(self):
+        async with asyncio.timeout(0.2) as deadline:
+            original = deadline.when()
+            async with captcha_handler_budget((deadline,), 1_000):
+                self.assertGreater(deadline.when(), original + 0.9)
+                await asyncio.sleep(0.01)
+            self.assertLess(deadline.when(), original + 0.1)
+
+    async def test_request_proxy_and_stealth_are_applied_to_the_context(self):
+        browser = FakeBrowser()
+        stealth = AsyncMock()
+        request = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "network": {
+                    "proxy": {
+                        "server": "socks5://proxy.example:1080",
+                        "username": "user",
+                        "password": "secret",
+                    }
+                },
+            }
+        )
+        await RenderEngine(
+            hosted=True,
+            allow_proxies=True,
+            stealth_context_options=AsyncMock(
+                return_value={"user_agent": "Mozilla/5.0 Chrome/140"}
+            ),
+            stealth_applier=stealth,
+        ).render_image(
+            browser,
+            request,
+            RenderLimits(max_width=1920, max_height=1080, max_pixels=2_073_600),
+        )
+        self.assertEqual(browser.context_options["proxy"]["server"], "socks5://proxy.example:1080")
+        self.assertEqual(browser.context_options["proxy"]["password"], "secret")
+        self.assertEqual(
+            browser.context_options["user_agent"], "Mozilla/5.0 Chrome/140"
+        )
+        stealth.assert_awaited_once_with(browser.context, request)
+
+    async def test_operator_can_disable_request_proxies(self):
+        request = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "network": {"proxy": {"server": "http://proxy.example:8080"}},
+            }
+        )
+        with self.assertRaises(RenderError) as raised:
+            await RenderEngine(hosted=False, allow_proxies=False).render_image(
+                FakeBrowser(),
+                request,
+                RenderLimits(max_width=1920, max_height=1080, max_pixels=2_073_600),
+            )
+        self.assertEqual(raised.exception.code, "proxy_not_allowed")
+
+    async def test_stealth_can_be_disabled_per_request(self):
+        stealth = AsyncMock()
+        await RenderEngine(
+            hosted=False,
+            stealth_applier=stealth,
+        ).render_image(
+            FakeBrowser(),
+            RenderRequest(url="https://example.com", stealth=False),
+            RenderLimits(max_width=1920, max_height=1080, max_pixels=2_073_600),
+        )
+        stealth.assert_not_awaited()
+
     async def test_avif_encoder_failure_is_nonretryable_for_every_path(self):
         with patch(
             "vipercapture.render_engine._convert_image",
@@ -1266,7 +1336,57 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
             RenderLimits(max_width=1920, max_height=1080, max_pixels=2_073_600),
         )
         self.assertEqual(checker.await_count, 2)
-        self.assertTrue(all(call.args[1] is True for call in checker.await_args_list))
+        self.assertTrue(
+            all(
+                call.args[1].captcha.action.value == "capture"
+                for call in checker.await_args_list
+            )
+        )
+
+    async def test_action_navigation_refreshes_status_for_captcha_check(self):
+        class NavigationPage(FakePage):
+            main_frame = object()
+
+            def __init__(self):
+                super().__init__()
+                self.response_handlers = []
+
+            def on(self, event, handler):
+                if event == "response":
+                    self.response_handlers.append(handler)
+
+            async def goto(self, url, **options):
+                await super().goto(url, **options)
+                return SimpleNamespace(status=403)
+
+            def locator(self, _selector):
+                page = self
+
+                class NavigationLocator(FakeLocator):
+                    async def click(self, **_options):
+                        response = SimpleNamespace(
+                            frame=page.main_frame,
+                            status=200,
+                            url="https://example.com/verify-account",
+                            request=SimpleNamespace(
+                                is_navigation_request=lambda: True
+                            ),
+                        )
+                        for handler in page.response_handlers:
+                            handler(response)
+
+                return NavigationLocator(self)
+
+        checker = AsyncMock()
+        await RenderEngine(hosted=False, challenge_checker=checker).render_image(
+            FakeBrowser(FakeContext(NavigationPage())),
+            RenderRequest(
+                url="https://example.com",
+                actions=[{"type": "click", "selector": "a"}],
+            ),
+            RenderLimits(max_width=1920, max_height=1080, max_pixels=2_073_600),
+        )
+        self.assertEqual(checker.await_args.args[2], 200)
 
     async def test_video_rechecks_captcha_after_recording(self):
         class VideoPage(FakePage):
@@ -1277,7 +1397,7 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
                 await super().wait_for_timeout(delay)
                 self.recorded = True
 
-        async def checker(page, _proceed, _status):
+        async def checker(page, _request, _status, _budget):
             if page.recorded:
                 raise RenderError(
                     "captcha_detected", "Challenge appeared.", 422, False

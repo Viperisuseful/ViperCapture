@@ -305,6 +305,29 @@ class RenderContractTest(unittest.TestCase):
                     }
                 )
 
+    def test_captcha_external_handler_contract_is_explicit(self):
+        request = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "captcha": {
+                    "action": "external",
+                    "solver": "operator_route",
+                    "timeout_ms": 30_000,
+                },
+            }
+        )
+        self.assertEqual(request.captcha.action.value, "external")
+        self.assertTrue(request.stealth)
+        for captcha in (
+            {"solver": "route-without-opt-in"},
+            {"action": "external", "solver": "secret value"},
+            {"action": "external", "timeout_ms": 999},
+        ):
+            with self.subTest(captcha=captcha), self.assertRaises(ValidationError):
+                RenderRequest.model_validate(
+                    {"url": "https://example.com", "captcha": captcha}
+                )
+
     def test_new_feature_conflicts_and_bounds_are_rejected(self):
         invalid = (
             {

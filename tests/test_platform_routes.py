@@ -28,6 +28,7 @@ class PlatformRouteTests(unittest.TestCase):
             "/v1/diff": {"post"},
             "/v1/jobs": {"post"},
             "/v1/jobs/bulk": {"post"},
+            "/v1/profiles/import": {"post"},
             "/v1/schedules": {"get", "post"},
             "/v1/schedules/{schedule_id}": {"get", "patch", "delete"},
         }
@@ -104,6 +105,36 @@ class PlatformRouteTests(unittest.TestCase):
 
 
 class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_session_import_is_normalized_before_encrypted_profile_storage(self):
+        control = SimpleNamespace(put_profile=Mock(), audit=Mock())
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(control=control)),
+            state=SimpleNamespace(project_id="project", key_id="key", is_admin=False),
+        )
+        response = await main.import_profile(
+            main.ProfileImport(
+                format="cookie_header",
+                origin="https://example.com",
+                content="sid=secret",
+            ),
+            request,
+        )
+        document = json.loads(response.body)
+        self.assertEqual(document["cookies"], 1)
+        stored = control.put_profile.call_args.args[2]
+        self.assertEqual(stored["cookies"][0]["domain"], "example.com")
+        self.assertEqual(stored["cookies"][0]["value"], "secret")
+        control.audit.assert_called_once_with(
+            "project", "key", "profile.imported", document["id"]
+        )
+
+    async def test_oversized_session_import_uses_the_byte_limit_error(self):
+        payload = main.ProfileImport(content="x" * (main.MAX_IMPORT_BYTES + 1))
+        with self.assertRaises(RenderError) as raised:
+            await main.import_profile(payload, SimpleNamespace(),)
+        self.assertEqual(raised.exception.code, "session_import_too_large")
+        self.assertEqual(raised.exception.status_code, 413)
+
     async def test_metrics_require_admin_when_control_plane_is_enabled(self):
         request = SimpleNamespace(state=SimpleNamespace(is_admin=False))
         with (

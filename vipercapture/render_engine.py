@@ -18,20 +18,20 @@ import tempfile
 import time
 import zipfile
 from base64 import b64decode
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from fnmatch import fnmatchcase
 from functools import lru_cache
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import AsyncContextManager, Awaitable, Callable
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from PIL import Image
-from playwright.async_api import Browser, Page
+from playwright.async_api import Browser, BrowserContext, Page
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
@@ -942,6 +942,33 @@ class RenderLimits:
     output_bytes: int = 1024 * 1024 * 1024
 
 
+@asynccontextmanager
+async def captcha_handler_budget(
+    deadlines: tuple[asyncio.Timeout, ...], timeout_ms: int
+):
+    """Pause render deadlines while an external CAPTCHA handler is running."""
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    original_deadlines = tuple(deadline.when() for deadline in deadlines)
+    for deadline, when in zip(deadlines, original_deadlines, strict=True):
+        if when is not None:
+            # Give the inner handler timeout enough room to report its own error.
+            deadline.reschedule(when + timeout_ms / 1_000 + 1)
+    try:
+        yield
+    finally:
+        elapsed = loop.time() - started
+        for deadline, when in zip(deadlines, original_deadlines, strict=True):
+            if when is not None and not deadline.expired():
+                deadline.reschedule(when + elapsed)
+
+
+ChallengeBudget = Callable[[int], AsyncContextManager[None]]
+ChallengeChecker = Callable[
+    [Page, RenderRequest, int | None, ChallengeBudget], Awaitable[None]
+]
+
+
 @dataclass(frozen=True)
 class RenderArtifact:
     body: bytes
@@ -1439,10 +1466,17 @@ class RenderEngine:
         *,
         hosted: bool,
         cleanup_hooks: CleanupHooks | None = None,
-        challenge_checker: Callable[[Page, bool, int | None], Awaitable[None]] | None = None,
+        challenge_checker: ChallengeChecker | None = None,
+        stealth_context_options: Callable[
+            [Browser, RenderRequest], Awaitable[dict[str, object]]
+        ] | None = None,
+        stealth_applier: Callable[
+            [BrowserContext, RenderRequest], Awaitable[None]
+        ] | None = None,
         browser_replacer: Callable[[Browser], Awaitable[None]] | None = None,
         device_descriptors: dict[str, dict[str, object]] | None = None,
         allow_scripts: bool = False,
+        allow_proxies: bool | None = None,
         hardware_video: bool = False,
         profile_loader: Callable[[str], Awaitable[dict[str, object] | None]] | None = None,
         profile_saver: Callable[[str, dict[str, object]], Awaitable[None]] | None = None,
@@ -1450,9 +1484,12 @@ class RenderEngine:
         self.hosted = hosted
         self.cleanup_hooks = cleanup_hooks
         self.challenge_checker = challenge_checker
+        self.stealth_context_options = stealth_context_options
+        self.stealth_applier = stealth_applier
         self.browser_replacer = browser_replacer
         self.device_descriptors = device_descriptors or {}
         self.allow_scripts = allow_scripts
+        self.allow_proxies = not hosted if allow_proxies is None else allow_proxies
         self.hardware_video = hardware_video
         self.profile_loader = profile_loader
         self.profile_saver = profile_saver
@@ -1681,7 +1718,7 @@ class RenderEngine:
             return await self._render_single(browser, request, limits)
 
         try:
-            async with asyncio.timeout(limits.deadline_seconds):
+            async with asyncio.timeout(limits.deadline_seconds) as pack_timeout:
                 outputs: list[tuple[str, RenderArtifact]] = []
                 output_bytes = 0
                 for viewport in request.viewports:
@@ -1699,7 +1736,9 @@ class RenderEngine:
                             "environment": environment,
                         }
                     )
-                    artifact = await self._render_single(browser, single, limits)
+                    artifact = await self._render_single(
+                        browser, single, limits, parent_timeout=pack_timeout
+                    )
                     output_bytes += len(artifact.body)
                     if output_bytes > limits.output_bytes:
                         raise RenderError(
@@ -1776,6 +1815,8 @@ class RenderEngine:
         browser: Browser,
         request: RenderRequest,
         limits: RenderLimits,
+        *,
+        parent_timeout: asyncio.Timeout | None = None,
     ) -> RenderArtifact:
         from .content_rendering import input_document, render_document_output
 
@@ -1820,7 +1861,14 @@ class RenderEngine:
             or bool(request.network.block_resource_types),
         )
         try:
-            async with asyncio.timeout(limits.deadline_seconds):
+            async with asyncio.timeout(limits.deadline_seconds) as render_timeout:
+                active_timeouts = (render_timeout,) + (
+                    (parent_timeout,) if parent_timeout is not None else ()
+                )
+
+                def challenge_budget(timeout_ms: int) -> AsyncContextManager[None]:
+                    return captcha_handler_budget(active_timeouts, timeout_ms)
+
                 context_options: dict[str, object] = {}
                 if request.profile_id is not None:
                     if self.profile_loader is None:
@@ -1883,19 +1931,25 @@ class RenderEngine:
                     context_options["geolocation"] = request.network.geolocation.model_dump()
                     context_options["permissions"] = ["geolocation"]
                 if request.network.proxy is not None:
-                    if self.hosted:
+                    if not self.allow_proxies:
                         raise RenderError(
                             "proxy_not_allowed",
-                            "Per-request proxies are disabled in hosted security mode.",
+                            "Per-request proxies are disabled by the operator.",
                             403,
                             False,
                         )
                     context_options["proxy"] = request.network.proxy.model_dump(
                         exclude_none=True
                     )
+                if request.stealth and self.stealth_context_options is not None:
+                    context_options.update(
+                        await self.stealth_context_options(browser, request)
+                    )
                 context_options["bypass_csp"] = request.network.bypass_csp
                 context_options["ignore_https_errors"] = request.network.ignore_https_errors
                 context = await browser.new_context(**context_options)
+                if request.stealth and self.stealth_applier is not None:
+                    await self.stealth_applier(context, request)
                 if request.diagnostics.bundle and request.diagnostics.include_trace:
                     await context.tracing.start(screenshots=True, snapshots=True, sources=False)
                 if request.deterministic.enabled:
@@ -2061,6 +2115,17 @@ class RenderEngine:
                     await context.route_web_socket("**/*", block_web_socket)
 
                 page = await context.new_page()
+                navigation_status: int | None = None
+
+                def record_navigation_response(response) -> None:
+                    nonlocal navigation_status
+                    if (
+                        response.frame == page.main_frame
+                        and response.request.is_navigation_request()
+                    ):
+                        navigation_status = response.status
+
+                page.on("response", record_navigation_response)
 
                 def record_console(message) -> None:
                     if len(console_events) >= MAX_DIAGNOSTIC_EVENTS:
@@ -2164,7 +2229,7 @@ class RenderEngine:
                         400,
                         False,
                     )
-                navigation_status = navigation.status if navigation else None
+                navigation_status = navigation.status if navigation else navigation_status
                 if navigation_status in request.fail_on_status:
                     raise RenderError(
                         "target_status_failed",
@@ -2197,7 +2262,9 @@ class RenderEngine:
                 if self.cleanup_hooks:
                     await self.cleanup_hooks.apply(page, request.cleanup)
                 if self.challenge_checker:
-                    await self.challenge_checker(page, request.proceed_on_captcha, navigation_status)
+                    await self.challenge_checker(
+                        page, request, navigation_status, challenge_budget
+                    )
                 resizing_image = (
                     request.image.width is not None
                     or request.image.height is not None
@@ -2236,7 +2303,9 @@ class RenderEngine:
                     if self.cleanup_hooks:
                         await self.cleanup_hooks.apply(page, request.cleanup)
                     if self.challenge_checker:
-                        await self.challenge_checker(page, request.proceed_on_captcha, navigation_status)
+                        await self.challenge_checker(
+                            page, request, navigation_status, challenge_budget
+                        )
                 if request.deterministic.enabled and request.deterministic.wait_for_fonts:
                     await page.evaluate("() => document.fonts?.ready")
                 await self._check_assertions(
@@ -2283,8 +2352,9 @@ class RenderEngine:
                     if self.challenge_checker:
                         await self.challenge_checker(
                             page,
-                            request.proceed_on_captcha,
+                            request,
                             navigation_status,
+                            challenge_budget,
                         )
                     await self._check_assertions(
                         page,
