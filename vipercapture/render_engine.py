@@ -212,26 +212,10 @@ def _ffmpeg_executable() -> Path:
         candidate = Path(bundled)
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return candidate
-    roots = []
-    configured = os.getenv("PLAYWRIGHT_BROWSERS_PATH")
-    if configured:
-        roots.append(Path(configured))
-    roots.extend(
-        (
-            Path.home() / ".cache" / "ms-playwright",
-            Path.home() / "Library" / "Caches" / "ms-playwright",
-        )
-    )
-    local_app_data = os.getenv("LOCALAPPDATA")
-    if local_app_data:
-        roots.append(Path(local_app_data) / "ms-playwright")
-    for root in roots:
-        for candidate in sorted(root.glob("ffmpeg-*/ffmpeg-*")):
-            if candidate.is_file() and os.access(candidate, os.X_OK):
-                return candidate
     raise RenderError(
         "video_encoder_unavailable",
-        "An FFmpeg executable is unavailable.",
+        "A full FFmpeg executable is unavailable. Install FFmpeg on PATH or set "
+        "VIPERCAPTURE_FFMPEG.",
         503,
         False,
     )

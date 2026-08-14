@@ -252,32 +252,23 @@ class DiagnosticsAndVideoTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.code, "video_encoder_unavailable")
         self.assertFalse(raised.exception.retryable)
 
-    def test_ffmpeg_discovery_checks_native_playwright_caches(self):
+    def test_ffmpeg_discovery_rejects_playwright_recorder_binary(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            candidates = (
-                root / "Library" / "Caches" / "ms-playwright" / "ffmpeg-1" / "ffmpeg-mac",
-                root / "local" / "ms-playwright" / "ffmpeg-1" / "ffmpeg-win64.exe",
+            recorder = (
+                root / "ms-playwright" / "ffmpeg-1" / "ffmpeg-win64.exe"
             )
-            for candidate in candidates:
-                candidate.parent.mkdir(parents=True)
-                candidate.write_bytes(b"ffmpeg")
-                candidate.chmod(0o700)
-
+            recorder.parent.mkdir(parents=True)
+            recorder.write_bytes(b"playwright recorder")
+            recorder.chmod(0o700)
             with (
                 patch("vipercapture.render_engine.shutil.which", return_value=None),
-                patch("vipercapture.render_engine.Path.home", return_value=root),
-                patch.dict(os.environ, {"LOCALAPPDATA": str(root / "local")}, clear=True),
+                patch.dict(os.environ, {"LOCALAPPDATA": str(root)}, clear=True),
+                self.assertRaises(RenderError) as raised,
             ):
-                self.assertEqual(_ffmpeg_executable(), candidates[0])
-
-            candidates[0].unlink()
-            with (
-                patch("vipercapture.render_engine.shutil.which", return_value=None),
-                patch("vipercapture.render_engine.Path.home", return_value=root),
-                patch.dict(os.environ, {"LOCALAPPDATA": str(root / "local")}, clear=True),
-            ):
-                self.assertEqual(_ffmpeg_executable(), candidates[1])
+                _ffmpeg_executable()
+            self.assertEqual(raised.exception.code, "video_encoder_unavailable")
+            self.assertIn("full FFmpeg", raised.exception.message)
 
     def test_ffmpeg_discovery_uses_explicit_and_bundled_executables(self):
         with tempfile.TemporaryDirectory() as directory:
