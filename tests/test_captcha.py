@@ -35,6 +35,14 @@ class CaptchaTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(friendly["kind"], "embedded_widget")
 
                 await page.set_content(
+                    '<form><iframe src="https://service.mtcaptcha.com/widget" '
+                    'style="width:300px;height:80px"></iframe></form>'
+                )
+                mtcaptcha = await detect_challenge(page, 200)
+                self.assertEqual(mtcaptcha["provider"], "mtcaptcha")
+                self.assertEqual(mtcaptcha["kind"], "embedded_widget")
+
+                await page.set_content(
                     '<iframe src="about:blank#google.com/recaptcha" '
                     'style="width:300px;height:80px"></iframe>'
                     '<iframe src="about:blank#geo.captcha-delivery.com" '
@@ -118,6 +126,23 @@ class CaptchaTests(unittest.IsolatedAsyncioTestCase):
             timeout_ms=1_000,
         )
         handler.assert_awaited_once_with(page, BLOCKING, "internal", 1_000)
+
+    async def test_external_handler_recheck_drops_stale_navigation_status(self):
+        page = AsyncMock()
+
+        async def evaluate(_script, payload):
+            return BLOCKING if payload["status"] == 403 else None
+
+        page.evaluate.side_effect = evaluate
+        await handle_challenge(
+            page,
+            navigation_status=403,
+            action="external",
+            handler=AsyncMock(return_value=True),
+            solver=None,
+            timeout_ms=1_000,
+        )
+        self.assertIsNone(page.evaluate.await_args_list[1].args[1]["status"])
 
     async def test_external_budget_wraps_only_an_actual_handler_call(self):
         events = []

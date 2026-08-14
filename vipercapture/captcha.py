@@ -75,7 +75,7 @@ DETECT_CHALLENGE_SCRIPT = r"""({ status }) => {
         },
         mtcaptcha: {
             widgets: [".mtcaptcha", "iframe[src*='mtcaptcha.com']"],
-            blocking: ["iframe[src*='mtcaptcha.com']"]
+            blocking: []
         },
         imperva: {
             widgets: ["iframe[src*='incapsula.com']", "iframe[src*='_Incapsula_Resource']"],
@@ -223,7 +223,8 @@ async def handle_challenge(
                 challenge,
             ) from exc
         if cleared:
-            remaining = await detect_challenge(page, navigation_status)
+            # The handler may have navigated; the original response status is stale.
+            remaining = await detect_challenge(page, None)
             if not remaining or remaining.get("kind") == "embedded_widget":
                 return
             challenge = remaining
