@@ -374,7 +374,9 @@ class ArtifactFeatureTests(unittest.IsolatedAsyncioTestCase):
             )
 
     def test_browser_ui_exposes_every_render_output(self):
-        source = (Path(__file__).parent.parent / "frontend" / "src" / "App.tsx").read_text()
+        source = (Path(__file__).parent.parent / "frontend" / "src" / "App.tsx").read_text(
+            encoding="utf-8"
+        )
         for output in OutputFormat:
             self.assertIn(f'value="{output.value}"', source)
 
@@ -416,8 +418,10 @@ class ArtifactFeatureTests(unittest.IsolatedAsyncioTestCase):
 
     def test_integrations_use_safe_defaults(self):
         root = Path(__file__).parent.parent
-        action = (root / "action.yml").read_text()
-        terraform = (root / "integrations" / "terraform" / "main.tf").read_text()
+        action = (root / "action.yml").read_text(encoding="utf-8")
+        terraform = (root / "integrations" / "terraform" / "main.tf").read_text(
+            encoding="utf-8"
+        )
         self.assertIn("http://localhost:8000/v1/render", action)
         self.assertNotIn('--url "${{ inputs.url }}"', action)
         self.assertIn("internal = 8000", terraform)
@@ -425,14 +429,16 @@ class ArtifactFeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(";", terraform)
         self.assertIn('container_path = "/data"', terraform)
         workflow = json.loads(
-            (root / "integrations" / "n8n-workflow.json").read_text()
+            (root / "integrations" / "n8n-workflow.json").read_text(encoding="utf-8")
         )
         node_types = {node["type"] for node in workflow["nodes"]}
         self.assertIn("n8n-nodes-base.manualTrigger", node_types)
         self.assertIn("n8n-nodes-base.set", node_types)
         self.assertTrue(workflow["connections"])
-        self.assertIn("Pillow>=12.3.0", (root / "requirements.txt").read_text())
-        self.assertIn("ffmpeg", (root / "Dockerfile").read_text())
+        self.assertIn(
+            "Pillow>=12.3.0", (root / "requirements.txt").read_text(encoding="utf-8")
+        )
+        self.assertIn("ffmpeg", (root / "Dockerfile").read_text(encoding="utf-8"))
 
     def test_worker_role_requires_async_jobs(self):
         result = subprocess.run(
