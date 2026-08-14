@@ -32,6 +32,7 @@ import {
 } from "@/components/ui/alert-dialog"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { CpuIcon } from "@/components/ui/cpu"
 import {
   Card,
   CardContent,
@@ -42,10 +43,15 @@ import {
 } from "@/components/ui/card"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field"
+import { EyeIcon } from "@/components/ui/eye"
+import { GalleryThumbnailsIcon } from "@/components/ui/gallery-thumbnails"
 import { Input } from "@/components/ui/input"
 import { InputGroup, InputGroupAddon, InputGroupTextarea } from "@/components/ui/input-group"
+import { MonitorCheckIcon } from "@/components/ui/monitor-check"
 import { Progress } from "@/components/ui/progress"
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { SettingsIcon } from "@/components/ui/settings"
+import { ShieldCheckIcon } from "@/components/ui/shield-check"
 import { Switch } from "@/components/ui/switch"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 
@@ -637,12 +643,15 @@ export default function App() {
           <div className="grid min-h-[650px] lg:grid-cols-[380px_minmax(0,1fr)]">
             <aside className="border-b bg-muted/25 p-4 lg:border-r lg:border-b-0">
               <div className="mb-5 flex items-center justify-between">
-                <div><p className="font-medium">Capture settings</p><p className="text-xs text-muted-foreground">Runs on your machine</p></div>
+                <div className="flex items-start gap-2.5">
+                  <SettingsIcon data-title-icon="capture-settings" size={18} className="mt-0.5 shrink-0 text-primary" aria-hidden="true" />
+                  <div><p className="font-medium">Capture settings</p><p className="text-xs text-muted-foreground">Runs on your machine</p></div>
+                </div>
                 <Button size="icon-sm" variant="ghost" onClick={reset} aria-label="Reset settings"><RotateCcw /></Button>
               </div>
               <FieldGroup>
                 <FieldSet>
-                  <FieldLegend>Output</FieldLegend>
+                  <FieldLegend className="flex items-center gap-2"><GalleryThumbnailsIcon data-title-icon="output" size={16} className="shrink-0 text-primary" aria-hidden="true" />Output</FieldLegend>
                   <Field>
                     <Select value={output} onValueChange={(value: string) => setOutput(value as Output)}>
                       <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
@@ -656,7 +665,7 @@ export default function App() {
                 </FieldSet>
 
                 <FieldSet>
-                  <FieldLegend>Viewport</FieldLegend>
+                  <FieldLegend className="flex items-center gap-2"><MonitorCheckIcon data-title-icon="viewport" size={16} className="shrink-0 text-primary" aria-hidden="true" />Viewport</FieldLegend>
                   <div className="grid grid-cols-3 gap-3">
                     <Field><FieldLabel htmlFor="width">Width</FieldLabel><Input id="width" type="number" min={1} max={maxWidth} value={width} onChange={(event) => setWidth(Number(event.target.value))} /></Field>
                     <Field><FieldLabel htmlFor="height">Height</FieldLabel><Input id="height" type="number" min={1} max={maxHeight} value={height} onChange={(event) => setHeight(Number(event.target.value))} /></Field>
@@ -685,7 +694,7 @@ export default function App() {
                 </FieldSet>
 
                 <FieldSet>
-                  <FieldLegend>Rendering</FieldLegend>
+                  <FieldLegend className="flex items-center gap-2"><CpuIcon data-title-icon="rendering" size={16} className="shrink-0 text-primary" aria-hidden="true" />Rendering</FieldLegend>
                   <Field orientation="horizontal" data-disabled={!config?.gpu?.mutable}>
                     <FieldLabel htmlFor="gpu-rendering">
                       <span>
@@ -698,7 +707,7 @@ export default function App() {
                 </FieldSet>
 
                 <FieldSet>
-                  <FieldLegend>Page cleanup</FieldLegend>
+                  <FieldLegend className="flex items-center gap-2"><ShieldCheckIcon data-title-icon="page-cleanup" size={16} className="shrink-0 text-primary" aria-hidden="true" />Page cleanup</FieldLegend>
                   <Field>
                     <FieldLabel>Cookie consent</FieldLabel>
                     <Select value={consent} onValueChange={setConsent}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup>
@@ -794,7 +803,10 @@ export default function App() {
 
             <section className="flex min-w-0 flex-col bg-card p-4 sm:p-6">
               <div className="mb-4 flex items-center justify-between">
-                <div><p className="font-medium">Result</p><p className="text-xs text-muted-foreground">Preview and download your latest capture.</p></div>
+                <div className="flex items-start gap-2.5">
+                  <EyeIcon data-title-icon="result" size={18} className="mt-0.5 shrink-0 text-primary" aria-hidden="true" />
+                  <div><p className="font-medium">Result</p><p className="text-xs text-muted-foreground">Preview and download your latest capture.</p></div>
+                </div>
                 <Badge variant={status === "Complete" ? "default" : "secondary"}>{status}</Badge>
               </div>
               <div className="subtle-grid flex min-h-[420px] flex-1 items-center justify-center overflow-hidden rounded-xl border bg-muted/20 p-4">

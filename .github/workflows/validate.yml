@@ -56,11 +56,14 @@ jobs:
             --scenarios benchmarks/scenarios-local.json --runs 1 --warmups 0 \
             --output /tmp/vipercapture-benchmark.json
 
-      - name: Validate web frontend
-        run: |
-          npm run lint --prefix frontend
-          npm run build --prefix frontend
-          git diff --exit-code -- static/app
+      - name: Lint web frontend
+        run: npm run lint --prefix frontend
+
+      - name: Build web frontend
+        run: npm run build --prefix frontend
+
+      - name: Verify committed frontend bundle
+        run: git diff --exit-code -- static/app
 
   windows-web-and-renderer:
     runs-on: windows-2022
@@ -94,8 +97,11 @@ jobs:
       - name: Smoke Chromium, Firefox, and WebKit
         run: python -m benchmarks.smoke_cross_browser
 
-      - name: Validate web frontend
-        run: |
-          npm run lint --prefix frontend
-          npm run build --prefix frontend
-          git diff --exit-code -- static/app
+      - name: Lint web frontend
+        run: npm run lint --prefix frontend
+
+      - name: Build web frontend
+        run: npm run build --prefix frontend
+
+      - name: Verify committed frontend bundle
+        run: git diff --exit-code -- static/app

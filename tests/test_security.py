@@ -797,7 +797,8 @@ class FrontendTests(unittest.TestCase):
         self.assertIn("GPU rendering", source)
         self.assertIn("Fast {output.toUpperCase()} encoding", source)
         self.assertIn('output === "png" || output === "webp"', source)
-        self.assertIn("<FieldLegend>Page cleanup</FieldLegend>", source)
+        self.assertIn('data-title-icon="page-cleanup"', source)
+        self.assertIn("Page cleanup</FieldLegend>", source)
         self.assertIn('"style": "radix-nova"', components)
 
 
