@@ -128,6 +128,13 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
             "project", "key", "profile.imported", document["id"]
         )
 
+    async def test_oversized_session_import_uses_the_byte_limit_error(self):
+        payload = main.ProfileImport(content="x" * (main.MAX_IMPORT_BYTES + 1))
+        with self.assertRaises(RenderError) as raised:
+            await main.import_profile(payload, SimpleNamespace(),)
+        self.assertEqual(raised.exception.code, "session_import_too_large")
+        self.assertEqual(raised.exception.status_code, 413)
+
     async def test_metrics_require_admin_when_control_plane_is_enabled(self):
         request = SimpleNamespace(state=SimpleNamespace(is_admin=False))
         with (

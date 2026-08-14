@@ -938,7 +938,7 @@ class ProfileCreate(BaseModel):
 
 class ProfileImport(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    content: str = Field(min_length=1, max_length=MAX_IMPORT_BYTES)
+    content: str = Field(min_length=1)
     format: Literal[
         "auto", "playwright", "cookies_json", "netscape", "cookie_header"
     ] = "auto"

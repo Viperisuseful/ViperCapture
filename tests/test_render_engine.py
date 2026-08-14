@@ -1343,6 +1343,51 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    async def test_action_navigation_refreshes_status_for_captcha_check(self):
+        class NavigationPage(FakePage):
+            main_frame = object()
+
+            def __init__(self):
+                super().__init__()
+                self.response_handlers = []
+
+            def on(self, event, handler):
+                if event == "response":
+                    self.response_handlers.append(handler)
+
+            async def goto(self, url, **options):
+                await super().goto(url, **options)
+                return SimpleNamespace(status=403)
+
+            def locator(self, _selector):
+                page = self
+
+                class NavigationLocator(FakeLocator):
+                    async def click(self, **_options):
+                        response = SimpleNamespace(
+                            frame=page.main_frame,
+                            status=200,
+                            url="https://example.com/verify-account",
+                            request=SimpleNamespace(
+                                is_navigation_request=lambda: True
+                            ),
+                        )
+                        for handler in page.response_handlers:
+                            handler(response)
+
+                return NavigationLocator(self)
+
+        checker = AsyncMock()
+        await RenderEngine(hosted=False, challenge_checker=checker).render_image(
+            FakeBrowser(FakeContext(NavigationPage())),
+            RenderRequest(
+                url="https://example.com",
+                actions=[{"type": "click", "selector": "a"}],
+            ),
+            RenderLimits(max_width=1920, max_height=1080, max_pixels=2_073_600),
+        )
+        self.assertEqual(checker.await_args.args[2], 200)
+
     async def test_video_rechecks_captcha_after_recording(self):
         class VideoPage(FakePage):
             video = object()

@@ -2115,6 +2115,17 @@ class RenderEngine:
                     await context.route_web_socket("**/*", block_web_socket)
 
                 page = await context.new_page()
+                navigation_status: int | None = None
+
+                def record_navigation_response(response) -> None:
+                    nonlocal navigation_status
+                    if (
+                        response.frame == page.main_frame
+                        and response.request.is_navigation_request()
+                    ):
+                        navigation_status = response.status
+
+                page.on("response", record_navigation_response)
 
                 def record_console(message) -> None:
                     if len(console_events) >= MAX_DIAGNOSTIC_EVENTS:
@@ -2218,7 +2229,7 @@ class RenderEngine:
                         400,
                         False,
                     )
-                navigation_status = navigation.status if navigation else None
+                navigation_status = navigation.status if navigation else navigation_status
                 if navigation_status in request.fail_on_status:
                     raise RenderError(
                         "target_status_failed",

@@ -89,6 +89,22 @@ class SessionImportTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "origin is required"):
             import_storage_state("sid=abc")
 
+    def test_malformed_cookie_header_is_a_validation_error(self):
+        with self.assertRaisesRegex(ValueError, "malformed"):
+            import_storage_state(
+                "sid=ok; bad@name=x",
+                format_name="cookie_header",
+                origin="https://example.com",
+            )
+
+    def test_json_formats_require_their_document_shapes(self):
+        with self.assertRaisesRegex(ValueError, "requires cookie and origin arrays"):
+            import_storage_state('{"foo":"bar"}')
+        with self.assertRaisesRegex(TypeError, "must be a JSON array"):
+            import_storage_state(
+                '{"cookies":[],"origins":[]}', format_name="cookies_json"
+            )
+
     def test_rejects_structured_partition_keys_instead_of_widening_scope(self):
         with self.assertRaisesRegex(ValueError, "partitionKey"):
             import_storage_state(

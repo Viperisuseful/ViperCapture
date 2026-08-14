@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from http.cookies import SimpleCookie
+from http.cookies import CookieError, SimpleCookie
 from urllib.parse import urlsplit
 
 from .render_errors import RenderError
@@ -61,11 +61,13 @@ def _origin_host(origin: str | None) -> tuple[str, bool]:
 
 def _parse_json(content: str, format_name: str) -> dict[str, object]:
     document = json.loads(content)
-    if format_name == "playwright" or isinstance(document, dict):
+    if format_name == "playwright":
         if not isinstance(document, dict):
             raise ValueError("Playwright storage state must be a JSON object")
-        cookies = document.get("cookies", [])
-        origins = document.get("origins", [])
+        if "cookies" not in document or "origins" not in document:
+            raise ValueError("Playwright storage state requires cookie and origin arrays")
+        cookies = document["cookies"]
+        origins = document["origins"]
         if not isinstance(cookies, list) or not isinstance(origins, list):
             raise ValueError("Playwright storage state requires cookie and origin arrays")
         if any(not isinstance(item, dict) for item in cookies):
@@ -115,7 +117,10 @@ def _parse_cookie_header(content: str, origin: str | None) -> dict[str, object]:
     header = content.strip()
     if header.lower().startswith("cookie:"):
         header = header.partition(":")[2].strip()
-    jar.load(header)
+    try:
+        jar.load(header)
+    except CookieError as exc:
+        raise ValueError("Cookie header is malformed") from exc
     if not jar:
         raise ValueError("Cookie header did not contain any cookies")
     return {
