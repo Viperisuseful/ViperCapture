@@ -58,10 +58,6 @@ class PlatformRouteTests(unittest.TestCase):
             ]["schema"]
             self.assertTrue(schema, path)
 
-    def test_desktop_cors_allows_schedule_updates(self):
-        self.assertIn("PATCH", main.DESKTOP_ALLOW_METHODS)
-        self.assertIn("PUT", main.DESKTOP_ALLOW_METHODS)
-
     def test_profile_storage_state_is_validated_before_persistence(self):
         with self.assertRaises(ValidationError):
             main.ProfileCreate(storage_state={"cookies": "invalid", "origins": []})
@@ -122,7 +118,7 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 401)
         self.assertEqual(authorized.status_code, 200)
 
-    async def test_public_metrics_bypass_desktop_authentication(self):
+    async def test_public_metrics_pass_authentication_middleware(self):
         request = SimpleNamespace(
             method="GET",
             url=SimpleNamespace(path="/metrics"),
@@ -131,11 +127,8 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
             app=SimpleNamespace(state=SimpleNamespace(control=None)),
         )
         call_next = AsyncMock(return_value=main.Response(status_code=200))
-        with (
-            patch("vipercapture.main.DESKTOP_TOKEN", "desktop-secret"),
-            patch("vipercapture.main.METRICS_PUBLIC", True),
-        ):
-            response = await main.require_desktop_token(request, call_next)
+        with patch("vipercapture.main.METRICS_PUBLIC", True):
+            response = await main.authenticate_request(request, call_next)
         self.assertEqual(response.status_code, 200)
         call_next.assert_awaited_once_with(request)
 
@@ -152,7 +145,7 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
             patch("vipercapture.main.CONTROL_ENABLED", True),
             patch("vipercapture.main.ALLOW_QUERY_AUTH", False),
         ):
-            response = await main.require_desktop_token(
+            response = await main.authenticate_request(
                 request, AsyncMock(return_value=main.Response(status_code=200))
             )
         self.assertEqual(response.status_code, 401)
@@ -185,7 +178,7 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
             app=SimpleNamespace(state=SimpleNamespace(control=control)),
         )
         with patch("vipercapture.main.CONTROL_ENABLED", True):
-            response = await main.require_desktop_token(
+            response = await main.authenticate_request(
                 request, AsyncMock(return_value=main.Response(status_code=200))
             )
         self.assertEqual(response.status_code, 429)
@@ -326,25 +319,23 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 503)
         self.assertFalse(json.loads(response.body)["ready"])
 
-    async def test_health_and_readiness_bypass_desktop_token(self):
+    async def test_health_and_readiness_pass_authentication_middleware(self):
         expected = main.Response(status_code=200)
         call_next = AsyncMock(return_value=expected)
-        with patch("vipercapture.main.DESKTOP_TOKEN", "secret"):
-            for path in ("/health", "/ready"):
-                request = SimpleNamespace(
-                    method="GET",
-                    url=SimpleNamespace(path=path),
-                    headers={},
-                )
-                response = await main.require_desktop_token(request, call_next)
-                self.assertIs(response, expected)
+        for path in ("/health", "/ready"):
+            request = SimpleNamespace(
+                method="GET",
+                url=SimpleNamespace(path=path),
+                headers={},
+            )
+            response = await main.authenticate_request(request, call_next)
+            self.assertIs(response, expected)
         self.assertEqual(call_next.await_count, 2)
 
     async def test_signed_routes_use_their_own_authentication(self):
         expected = main.Response(status_code=200)
         call_next = AsyncMock(return_value=expected)
         with (
-            patch("vipercapture.main.DESKTOP_TOKEN", "desktop"),
             patch("vipercapture.main.SIGNING_SECRET", "signing-secret"),
             patch("vipercapture.main.SIGNING_ADMIN_TOKEN", "signing-admin"),
         ):
@@ -361,13 +352,13 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
                     url=SimpleNamespace(path=path),
                     headers=headers,
                 )
-                response = await main.require_desktop_token(
+                response = await main.authenticate_request(
                     request, call_next
                 )
                 self.assertIs(response, expected)
         self.assertEqual(call_next.await_count, 2)
 
-    async def test_control_credentials_also_satisfy_desktop_auth(self):
+    async def test_control_credentials_authenticate(self):
         expected = main.Response(status_code=200)
         call_next = AsyncMock(return_value=expected)
         control = SimpleNamespace(
@@ -382,7 +373,6 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
             release=AsyncMock(),
         )
         with (
-            patch("vipercapture.main.DESKTOP_TOKEN", "desktop"),
             patch("vipercapture.main.CONTROL_ENABLED", True),
             patch("vipercapture.main.CONTROL_ADMIN_TOKEN", "admin"),
         ):
@@ -394,7 +384,7 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
                     query_params={},
                     app=SimpleNamespace(state=SimpleNamespace(control=control)),
                 )
-                response = await main.require_desktop_token(request, call_next)
+                response = await main.authenticate_request(request, call_next)
                 self.assertIs(response, expected)
         self.assertEqual(call_next.await_count, 2)
 
@@ -409,14 +399,15 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async def authenticate(inner_request):
-            return await main.require_desktop_token(
+            return await main.authenticate_request(
                 inner_request,
                 AsyncMock(return_value=main.Response(status_code=200)),
             )
 
-        with (
-            patch("vipercapture.main.METRICS", metrics),
-            patch("vipercapture.main.DESKTOP_TOKEN", "desktop"),
+        control = SimpleNamespace(authenticate=Mock(return_value=None))
+        request.app = SimpleNamespace(state=SimpleNamespace(control=control))
+        with patch("vipercapture.main.METRICS", metrics), patch(
+            "vipercapture.main.CONTROL_ENABLED", True
         ):
             response = await main.record_http_metrics(request, authenticate)
         self.assertEqual(response.status_code, 401)
@@ -426,10 +417,7 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_early_auth_failure_has_correlated_request_id(self):
-        with (
-            patch("vipercapture.main.DESKTOP_TOKEN", "desktop"),
-            patch("vipercapture.main.CONTROL_ENABLED", False),
-        ):
+        with patch("vipercapture.main.CONTROL_ENABLED", True):
             response = TestClient(main.app).get(
                 "/v1/jobs", headers={"X-Request-Id": "early-auth"}
             )
@@ -471,7 +459,7 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
                     app=SimpleNamespace(state=SimpleNamespace(control=control)),
                 )
                 self.assertIs(
-                    await main.require_desktop_token(request, call_next), expected
+                    await main.authenticate_request(request, call_next), expected
                 )
         self.assertTrue(
             all(
@@ -510,7 +498,7 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
                     query_params={},
                     app=SimpleNamespace(state=SimpleNamespace(control=control)),
                 )
-                await main.require_desktop_token(request, call_next)
+                await main.authenticate_request(request, call_next)
         self.assertFalse(control.acquire.await_args_list[0].kwargs["concurrency"])
         self.assertTrue(control.acquire.await_args_list[1].kwargs["concurrency"])
         control.release.assert_awaited_once_with("project")
@@ -524,9 +512,7 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         main.app.state.control = control
         main.app.state.schedules = service
         request = SimpleNamespace(
-            state=SimpleNamespace(
-                is_admin=True, trusted_local=False, project_id=None
-            )
+            state=SimpleNamespace(is_admin=True, project_id=None)
         )
         try:
             with patch("vipercapture.main.CONTROL_ENABLED", True):
@@ -551,9 +537,7 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
         main.app.state.control = control
         main.app.state.schedules = service
         request = SimpleNamespace(
-            state=SimpleNamespace(
-                is_admin=True, trusted_local=False, project_id=None
-            )
+            state=SimpleNamespace(is_admin=True, project_id=None)
         )
         try:
             with patch("vipercapture.main.CONTROL_ENABLED", True), self.assertRaises(

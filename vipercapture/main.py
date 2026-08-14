@@ -4,12 +4,10 @@ import json
 import os
 import re
 import secrets
-import subprocess
 import sys
 import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
-from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Annotated, Awaitable, Literal, TypeVar
@@ -17,7 +15,6 @@ from urllib.parse import urlencode, urlsplit
 from uuid import UUID, uuid4
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
     FileResponse,
     JSONResponse,
@@ -94,30 +91,6 @@ if sys.platform.startswith("win"):
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-CAPTURES_DIR = Path(
-    os.getenv("VIPERCAPTURE_CAPTURES_DIR", str(BASE_DIR / "captures"))
-).expanduser()
-DESKTOP_TOKEN = os.getenv("VIPERCAPTURE_DESKTOP_TOKEN")
-DESKTOP_ORIGINS = [
-    origin.strip()
-    for origin in os.getenv(
-        "VIPERCAPTURE_DESKTOP_ORIGINS",
-        (
-            "http://tauri.localhost,https://tauri.localhost,tauri://localhost,"
-            "http://localhost:1420,http://127.0.0.1:1420"
-        ),
-    ).split(",")
-    if origin.strip()
-]
-DESKTOP_ALLOW_HEADERS = [
-    "Authorization",
-    "Content-Type",
-    "Idempotency-Key",
-    "X-Request-Id",
-]
-DESKTOP_ALLOW_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"]
-
-
 def _load_local_env() -> None:
     """Load machine-only KEY=VALUE settings without another dependency."""
     path = BASE_DIR / ".env.local"
@@ -288,10 +261,6 @@ class _SlotStreamingResponse(StreamingResponse):
             await super().__call__(scope, receive, send)
         finally:
             self._release_slot()
-
-if not HOSTED:
-    CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
-
 
 def gpu_launch_args(
     mode: str = GPU_MODE,
@@ -640,27 +609,13 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 TELEMETRY_ENABLED = configure_telemetry(app)
 app.add_middleware(BulkBodyLimitMiddleware)
-if DESKTOP_TOKEN:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=DESKTOP_ORIGINS,
-        allow_credentials=False,
-        allow_methods=DESKTOP_ALLOW_METHODS,
-        allow_headers=DESKTOP_ALLOW_HEADERS,
-        expose_headers=[
-            "Content-Disposition",
-            "Location",
-            "Retry-After",
-            "X-Request-ID",
-        ],
-    )
 STATIC_DIR = BASE_DIR / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 @app.middleware("http")
-async def require_desktop_token(request: Request, call_next):
+async def authenticate_request(request: Request, call_next):
     path = request.url.path
     protected_api = path.startswith("/v1") or path == "/take" or path.startswith("/compat/")
     signed_render = request.method == "GET" and path == "/v1/render/signed"
@@ -680,16 +635,10 @@ async def require_desktop_token(request: Request, call_next):
     request.state.key_id = None
     request.state.scopes = []
     request.state.is_admin = False
-    request.state.trusted_local = False
     request_app = getattr(request, "app", app)
     control = getattr(request_app.state, "control", None)
     acquired_project = None
     authorization = request.headers.get("authorization", "")
-    desktop_authenticated = bool(
-        DESKTOP_TOKEN
-        and hmac.compare_digest(authorization, f"Bearer {DESKTOP_TOKEN}")
-    )
-    request.state.trusted_local = desktop_authenticated
     if CONTROL_ENABLED and hmac.compare_digest(authorization, f"Bearer {CONTROL_ADMIN_TOKEN}"):
         request.state.is_admin = True
     elif (
@@ -698,7 +647,6 @@ async def require_desktop_token(request: Request, call_next):
         and protected_api
         and not signed_render
         and not signing_admin
-        and not desktop_authenticated
     ):
         raw = authorization.removeprefix("Bearer ") if authorization.startswith("Bearer ") else ""
         if not raw and path == "/take" and ALLOW_QUERY_AUTH:
@@ -765,26 +713,6 @@ async def require_desktop_token(request: Request, call_next):
             )
         if uses_render_capacity:
             acquired_project = request.state.project_id
-    if (
-        DESKTOP_TOKEN
-        and request.method != "OPTIONS"
-        and path not in {"/health", "/ready"}
-        and not (path == "/metrics" and METRICS_PUBLIC)
-        and not signed_render
-        and not signing_admin
-        and not desktop_authenticated
-        and not request.state.is_admin
-        and request.state.project_id is None
-    ):
-        if acquired_project is not None:
-            await control.release(acquired_project)
-        return error_response(
-            request,
-            code="unauthorized",
-            message="A valid desktop or project credential is required.",
-            status_code=401,
-            retryable=False,
-        )
     if (
         PROCESS_ROLE == "worker"
         and protected_api
@@ -1068,16 +996,6 @@ async def delete_profile(profile_id: str, request: Request) -> Response:
     await asyncio.to_thread(control.delete_profile, project_id, profile_id)
     await asyncio.to_thread(control.audit, project_id, request.state.key_id, "profile.deleted", profile_id)
     return Response(status_code=204)
-
-
-if DESKTOP_TOKEN:
-    @app.post("/shutdown")
-    async def shutdown(request: Request) -> dict[str, bool]:
-        callback = getattr(request.app.state, "shutdown_callback", None)
-        if callback is None:
-            raise HTTPException(status_code=503, detail="Shutdown is unavailable")
-        asyncio.get_running_loop().call_later(0.1, callback)
-        return {"shutting_down": True}
 
 
 async def _await_while_connected(
@@ -1902,7 +1820,6 @@ async def _validate_profile_access(payload: RenderRequest, request: Request) -> 
         payload.profile_id is None
         or not CONTROL_ENABLED
         or request.state.is_admin
-        or request.state.trusted_local
     ):
         return
     project_id = getattr(request.state, "project_id", None)
@@ -1937,7 +1854,6 @@ async def _require_resource(request: Request | None, kind: str, resource_id: str
         request is None
         or not CONTROL_ENABLED
         or request.state.is_admin
-        or request.state.trusted_local
     ):
         return
     if request.state.project_id is None or not await asyncio.to_thread(
@@ -2480,34 +2396,7 @@ async def read_render_job_result(job_id: UUID, request: Request) -> Response:
     )
 
 
-def _safe_filename(filename: str, image_format: str | None = None) -> str:
-    name = filename.strip() or "screenshot.png"
-    name = re.sub(r"[^a-zA-Z0-9._-]+", "_", name)
-    existing = re.search(r"\.(png|jpe?g|webp)$", name, flags=re.IGNORECASE)
-    selected = image_format or (
-        "jpeg" if existing and existing.group(1).lower() in {"jpg", "jpeg"}
-        else existing.group(1).lower() if existing else "png"
-    )
-    extension = "jpg" if selected == "jpeg" else selected
-    stem = name[:existing.start()] if existing else name
-    return f"{stem}.{extension}"
-
-
-def _unique_capture_path(filename: str) -> Path:
-    safe_name = _safe_filename(filename)
-    target = CAPTURES_DIR / safe_name
-    if not target.exists():
-        return target
-
-    stem = target.stem
-    suffix = target.suffix
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return CAPTURES_DIR / f"{stem}_{timestamp}{suffix}"
-
-
 def _is_local_control_request(request: Request) -> bool:
-    if DESKTOP_TOKEN:
-        return request.headers.get("authorization") == f"Bearer {DESKTOP_TOKEN}"
     client = request.client.host if request.client else ""
     host_header = request.headers.get("host", "").lower()
     host = (
@@ -2542,7 +2431,6 @@ async def app_config():
     if not await _settled_thread(ffmpeg_has_encoder, "libx264"):
         output_formats.remove(OutputFormat.MP4.value)
     return {
-        "server_saves": not HOSTED,
         "control_plane": CONTROL_ENABLED,
         "max_screenshot_pixels": MAX_SCREENSHOT_PIXELS,
         "max_viewport_width": MAX_VIEWPORT_WIDTH,
@@ -2614,50 +2502,6 @@ if not HOSTED:
                 app.state.capture_slots.release()
 
         return {"gpu": await _gpu_config(app)}
-
-
-    @app.post("/save-screenshot")
-    async def save_screenshot(
-        screenshot: UploadFile = File(...),
-        filename: str = Form("screenshot.png"),
-    ):
-        data = await screenshot.read()
-        if not data:
-            raise HTTPException(status_code=400, detail="No screenshot data provided")
-
-        target = _unique_capture_path(filename)
-        target.write_bytes(data)
-        return {
-            "saved": True,
-            "filename": target.name,
-            "path": str(target),
-            "directory": str(CAPTURES_DIR),
-        }
-
-
-    @app.post("/open-downloads-folder")
-    async def open_downloads_folder():
-        downloads = Path(
-            os.getenv("VIPERCAPTURE_DOWNLOADS_DIR", str(Path.home() / "Downloads"))
-        ).expanduser()
-        try:
-            if sys.platform.startswith("win"):
-                override = os.getenv("VIPERCAPTURE_DOWNLOADS_DIR")
-                if override:
-                    os.startfile(str(downloads))
-                else:
-                    subprocess.Popen(["explorer.exe", "shell:Downloads"])
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(downloads)])
-            else:
-                # ponytail: VIPERCAPTURE_DOWNLOADS_DIR covers custom browser locations.
-                subprocess.Popen(["xdg-open", str(downloads)])
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail="Failed to open Downloads folder") from exc
-
-        return {"opened": True, "directory": str(downloads)}
-
-
 if __name__ == "__main__":
     import uvicorn
 

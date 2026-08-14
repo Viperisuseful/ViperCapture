@@ -32,7 +32,6 @@ const form              = document.getElementById("captureForm");
 const captureBtn        = document.getElementById("captureBtn");
 const captureBtnLabel   = captureBtn.querySelector(".capture-label");
 const downloadBtn       = document.getElementById("downloadBtn");
-const openFolderBtn     = document.getElementById("openFolderBtn");
 const previewPanel      = document.getElementById("previewPanel");
 const previewImage      = document.getElementById("previewImage");
 const previewPlaceholder = document.getElementById("previewPlaceholder");
@@ -40,7 +39,6 @@ const previewFname      = document.getElementById("previewFilename");
 const historyList       = document.getElementById("historyList");
 const filmstripHint     = document.getElementById("filmstripHint");
 const filmstripSection  = document.getElementById("filmstripSection");
-const openAfterDownload = document.getElementById("openAfterDownload");
 const statusEl          = document.getElementById("status");
 const densityHint       = document.getElementById("densityHint");
 const outputFormat      = document.getElementById("outputFormat");
@@ -83,14 +81,11 @@ const appConfig = fetch("/app-config")
     if (!res.ok) throw new Error("Config unavailable");
     return res.json();
   })
-  .catch(() => ({ server_saves: false }));
+  .catch(() => ({}));
 
-appConfig.then(({ server_saves: serverSaves, max_screenshot_pixels: maxPixels }) => {
+appConfig.then(({ max_screenshot_pixels: maxPixels }) => {
   const parsedLimit = Number(maxPixels);
   if (Number.isFinite(parsedLimit) && parsedLimit > 0) maxScreenshotPixels = parsedLimit;
-  document.documentElement.dataset.mode = serverSaves ? "local" : "hosted";
-  openFolderBtn.hidden = !serverSaves;
-  openAfterDownload.closest(".toggle-standalone").hidden = !serverSaves;
   syncScaleAvailability();
 });
 
@@ -245,25 +240,6 @@ const triggerDownload = (blob, objectUrl, filename) => {
   document.body.appendChild(a);
   a.click();
   a.remove();
-};
-
-/* ── Server-side save ──────────────────────────────────────── */
-const saveScreenshotToAppFolder = async (blob, filename) => {
-  const payload = new FormData();
-  payload.append("filename", filename);
-  payload.append("screenshot", blob, filename);
-  const res = await fetch("/save-screenshot", { method: "POST", body: payload });
-  if (!res.ok) {
-    let msg = `Save failed (${res.status})`;
-    try { const b = await res.json(); if (b?.detail) msg = b.detail; } catch {}
-    throw new Error(msg);
-  }
-};
-
-/* ── Open captures folder ──────────────────────────────────── */
-const openFileLocation = async () => {
-  const res = await fetch("/open-downloads-folder", { method: "POST" });
-  if (!res.ok) throw new Error("Couldn't open the Downloads folder");
 };
 
 /* ── Render history filmstrip ──────────────────────────────── */
@@ -433,34 +409,11 @@ form.addEventListener("submit", async (e) => {
 });
 
 /* ── DOWNLOAD ──────────────────────────────────────────────── */
-downloadBtn.addEventListener("click", async () => {
+downloadBtn.addEventListener("click", () => {
   if (!latestBlob || !latestObjectUrl) return;
 
   triggerDownload(latestBlob, latestObjectUrl, latestFilename);
-
-  const { server_saves: serverSaves } = await appConfig;
-  if (!serverSaves) {
-    setStatus("Downloaded to your device.", "success");
-    return;
-  }
-
-  try {
-    await saveScreenshotToAppFolder(latestBlob, latestFilename);
-    if (openAfterDownload.checked) await openFileLocation();
-    setStatus("Downloaded. A local copy was saved in captures.", "success");
-  } catch (err) {
-    setStatus(err.message || "Downloaded, but the local copy could not be saved", "error");
-  }
-});
-
-/* ── OPEN FOLDER ───────────────────────────────────────────── */
-openFolderBtn.addEventListener("click", async () => {
-  try {
-    await openFileLocation();
-    setStatus("Opened Downloads folder.", "success");
-  } catch (err) {
-    setStatus(err.message || "Couldn't open the Downloads folder", "error");
-  }
+  setStatus("Downloaded to your device.", "success");
 });
 
 /* ── Cleanup on unload ─────────────────────────────────────── */

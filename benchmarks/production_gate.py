@@ -69,7 +69,6 @@ class LocalServer:
                 "VIPERCAPTURE_ASYNC_JOBS": "1",
                 "VIPERCAPTURE_SCHEDULES": "0",
                 "VIPERCAPTURE_DATA_DIR": str(self.data_dir),
-                "VIPERCAPTURE_CAPTURES_DIR": str(self.data_dir / "captures"),
                 "VIPERCAPTURE_MAX_CONCURRENCY": "2",
                 "VIPERCAPTURE_JOB_WORKERS": "1",
                 "VIPERCAPTURE_JOB_POLL_SECONDS": "1",

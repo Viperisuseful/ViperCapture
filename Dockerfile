@@ -13,13 +13,12 @@ RUN apt-get update \
     && python -m pip install --no-cache-dir -r requirements.txt \
     && python -m playwright install --with-deps --no-shell chromium firefox webkit \
     && useradd --create-home --uid 10001 vipercapture \
-    && mkdir -p /data /app/captures \
-    && chown -R vipercapture:vipercapture /data /app/captures /ms-playwright
+    && mkdir -p /data \
+    && chown -R vipercapture:vipercapture /data /ms-playwright
 
 COPY --chown=vipercapture:vipercapture . .
 USER vipercapture
-ENV VIPERCAPTURE_DATA_DIR=/data \
-    VIPERCAPTURE_CAPTURES_DIR=/app/captures
+ENV VIPERCAPTURE_DATA_DIR=/data
 EXPOSE 8000
 VOLUME ["/data"]
 HEALTHCHECK --interval=30s --timeout=3s --start-period=30s --retries=3 \

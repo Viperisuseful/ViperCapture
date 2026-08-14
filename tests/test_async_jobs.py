@@ -4640,7 +4640,3 @@ class AsyncJobRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/v1/jobs", paths)
         self.assertIn("/v1/jobs/{job_id}", paths)
         self.assertIn("/v1/jobs/{job_id}/result", paths)
-
-    def test_desktop_cors_allows_idempotency_header(self):
-        self.assertIn("Idempotency-Key", main.DESKTOP_ALLOW_HEADERS)
-        self.assertIn("X-Request-Id", main.DESKTOP_ALLOW_HEADERS)

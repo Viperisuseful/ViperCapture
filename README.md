@@ -14,8 +14,7 @@ metadata through a JSON API.
 > [!IMPORTANT]
 > ViperCapture OSS v0.2 is beta software. You can self-host and evaluate the
 > engine and API, but the public API may change
-> before v1. The desktop and Android applications are also beta releases;
-> desktop packages are not yet code-signed.
+> before v1.
 
 The API does not implement every option from other rendering services. Check
 the dated [compatibility matrix](docs/compatibility.md) and run the
@@ -33,7 +32,7 @@ the dated [compatibility matrix](docs/compatibility.md) and run the
   geolocation, cookies, user agent, proxy, resource blocking, and cleanup
 - Ad, tracker, chat, newsletter, and consent-banner cleanup backed by the
   vendored, license-preserved AutoConsent rule set
-- Cleanup and deterministic controls in both the browser UI and desktop app
+- Cleanup and deterministic controls in the browser UI
 - Timed, full-page GIF, WebM, and MP4 capture with higher-quality encoding,
   transparent padding where supported, and optional GPU acceleration with a
   safe software fallback
@@ -56,8 +55,7 @@ the dated [compatibility matrix](docs/compatibility.md) and run the
   plus ScreenshotOne and Urlbox compatibility adapters
 - Bounded concurrency, output/pixel/deadline limits, client-disconnect
   cancellation, consistent error envelopes, and hosted-mode SSRF defenses
-- Browser UI, Tauri desktop app, native Android app, Docker Compose, and a
-  portable agent skill
+- Browser UI, Docker Compose, SDKs, integrations, and a portable agent skill
 - Reproducible workflows for sustained load, forced restart recovery,
   constrained memory, same-host competitor tests, and longer real-site runs
 
@@ -68,7 +66,7 @@ Direct installation requires Python 3.11 or newer and a full FFmpeg build on
 GPU video also needs the matching hardware encoder and driver. Use your OS
 package manager or the [FFmpeg download page](https://ffmpeg.org/download.html).
 Run `ffmpeg -encoders` to confirm the encoders are available. The Docker image
-already includes FFmpeg, and the desktop installers bundle it.
+already includes FFmpeg.
 
 ## Install locally
 
@@ -179,11 +177,8 @@ are AES-GCM encrypted and erased at terminal job states, but diagnostic console
 output and browser video can still record sensitive page content. Treat those
 artifacts accordingly.
 
-## Use the native apps and agent skill
+## Use the agent skill
 
-The beta Tauri 2 desktop app lives in [`desktop/`](desktop). The beta Android
-WebView renderer is documented in [docs/android.md](docs/android.md). Both are
-available from [GitHub Releases](https://github.com/Viperisuseful/ViperCapture/releases).
 The portable
 [`skills/vipercapture`](skills/vipercapture) skill works with Codex, Claude Code,
 and Cursor and includes a dependency-free client.
@@ -197,7 +192,7 @@ python -m unittest -v
 npm ci --prefix frontend && npm run lint --prefix frontend && npm run build --prefix frontend
 ```
 
-CI runs the renderer suite and builds both web interfaces. Benchmarks write the
+CI runs the renderer suite and builds the web interface. Benchmarks write the
 raw samples used in their reports and do not fill in missing competitor data.
 Use your own provider credentials to compare services from the same host with
 the same scenario file.
