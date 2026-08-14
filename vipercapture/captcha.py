@@ -31,7 +31,7 @@ DETECT_CHALLENGE_SCRIPT = r"""({ status }) => {
     const roots = [document];
     for (let index = 0; index < roots.length && roots.length < 256; index += 1) {
         for (const element of roots[index].querySelectorAll("*")) {
-            if (element.shadowRoot) roots.push(element.shadowRoot);
+            if (element.shadowRoot && roots.length < 256) roots.push(element.shadowRoot);
         }
     }
     const query = (selectors) => selectors.flatMap((selector) =>
@@ -71,7 +71,7 @@ DETECT_CHALLENGE_SCRIPT = r"""({ status }) => {
         },
         friendlycaptcha: {
             widgets: [".frc-captcha", "[data-sitekey][class*='frc-']"],
-            blocking: [".frc-captcha"]
+            blocking: []
         },
         mtcaptcha: {
             widgets: [".mtcaptcha", "iframe[src*='mtcaptcha.com']"],
@@ -125,7 +125,8 @@ DETECT_CHALLENGE_SCRIPT = r"""({ status }) => {
     if (challengeUrl) signals.push("challenge_url");
 
     let kind = null;
-    const blockingSignal = hasBlockingElement || hasObstruction || challengeText || challengeUrl;
+    const blockingSignal = hasBlockingElement || hasObstruction || challengeText ||
+        (challengeUrl && [401, 403, 429, 503].includes(status));
     if (status === 429 && blockingSignal) kind = "rate_limited";
     else if ([401, 403, 503].includes(status) && blockingSignal) kind = "access_denied";
     else if (blockingSignal) kind = "blocking_interstitial";

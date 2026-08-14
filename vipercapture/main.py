@@ -284,6 +284,27 @@ async def _apply_stealth(context, payload: RenderRequest) -> None:
     await _stealth_for_request(payload).apply_stealth_async(context)
 
 
+async def _stealth_context_options(
+    browser: Browser, payload: RenderRequest
+) -> dict[str, object]:
+    if (
+        payload.network.user_agent is not None
+        or payload.engine is not BrowserEngine.CHROMIUM
+    ):
+        return {}
+    cached = getattr(browser, "_vipercapture_user_agent", None)
+    if cached is not None:
+        return {"user_agent": cached}
+    page = await browser.new_page()
+    try:
+        user_agent = await page.evaluate("navigator.userAgent")
+    finally:
+        await page.close()
+    user_agent = user_agent.replace("HeadlessChrome/", "Chrome/")
+    setattr(browser, "_vipercapture_user_agent", user_agent)
+    return {"user_agent": user_agent}
+
+
 class _SlotStreamingResponse(StreamingResponse):
     def __init__(self, *args, release_slot, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1201,6 +1222,7 @@ def _render_engine() -> RenderEngine:
             blocked_category=_blocked_resource_category,
         ),
         challenge_checker=_check_captcha,
+        stealth_context_options=_stealth_context_options,
         stealth_applier=_apply_stealth,
         browser_replacer=lambda failed: _replace_browser(app, failed),
         device_descriptors=(

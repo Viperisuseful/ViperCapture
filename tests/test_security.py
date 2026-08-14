@@ -18,6 +18,7 @@ from starlette.requests import Request
 
 from vipercapture.main import (
     STEALTH,
+    _stealth_context_options,
     _launch_browser,
     _await_while_connected,
     _is_local_control_request,
@@ -640,6 +641,24 @@ class CaptureCancellationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class BrowserLaunchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stealth_normalizes_and_caches_the_network_user_agent(self):
+        page = SimpleNamespace(
+            evaluate=AsyncMock(
+                return_value="Mozilla/5.0 HeadlessChrome/140.0 Safari/537.36"
+            ),
+            close=AsyncMock(),
+        )
+        browser = SimpleNamespace(new_page=AsyncMock(return_value=page))
+        request = RenderRequest(url="https://example.com")
+
+        first = await _stealth_context_options(browser, request)
+        second = await _stealth_context_options(browser, request)
+
+        self.assertNotIn("HeadlessChrome", first["user_agent"])
+        self.assertEqual(second, first)
+        browser.new_page.assert_awaited_once()
+        page.close.assert_awaited_once()
+
     async def test_chromium_uses_full_headless_browser_and_writable_paths(self):
         browser = object()
         launch = AsyncMock(return_value=browser)

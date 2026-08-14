@@ -30,6 +30,7 @@ from vipercapture.render_engine import (
     load_lazy_content,
     normalized_origin,
     render_metadata,
+    render_deadline_seconds,
     routed_headers,
 )
 from vipercapture.render_errors import RenderError
@@ -165,6 +166,15 @@ class FakeBrowser:
 
 
 class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
+    def test_external_captcha_timeout_extends_the_total_render_budget(self):
+        request = RenderRequest(
+            url="https://example.com",
+            captcha={"action": "external", "timeout_ms": 120_000},
+        )
+        limits = RenderLimits(deadline_seconds=75)
+        self.assertEqual(render_deadline_seconds(request, limits), 195)
+        self.assertEqual(render_deadline_seconds(request, limits, 3), 435)
+
     async def test_request_proxy_and_stealth_are_applied_to_the_context(self):
         browser = FakeBrowser()
         stealth = AsyncMock()
@@ -183,6 +193,9 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
         await RenderEngine(
             hosted=True,
             allow_proxies=True,
+            stealth_context_options=AsyncMock(
+                return_value={"user_agent": "Mozilla/5.0 Chrome/140"}
+            ),
             stealth_applier=stealth,
         ).render_image(
             browser,
@@ -191,6 +204,9 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(browser.context_options["proxy"]["server"], "socks5://proxy.example:1080")
         self.assertEqual(browser.context_options["proxy"]["password"], "secret")
+        self.assertEqual(
+            browser.context_options["user_agent"], "Mozilla/5.0 Chrome/140"
+        )
         stealth.assert_awaited_once_with(browser.context, request)
 
     async def test_operator_can_disable_request_proxies(self):

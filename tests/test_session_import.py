@@ -64,6 +64,15 @@ class SessionImportTests(unittest.TestCase):
         self.assertTrue(cookie["secure"])
         self.assertEqual(cookie["expires"], -1)
 
+    def test_netscape_preserves_empty_values_and_subdomain_scope(self):
+        state = import_storage_state(
+            "example.com\tTRUE\t/\tFALSE\t0\tempty\t\n",
+            format_name="netscape",
+        )
+        cookie = state["cookies"][0]
+        self.assertEqual(cookie["domain"], ".example.com")
+        self.assertEqual(cookie["value"], "")
+
     def test_imports_pasted_cookie_header_for_an_origin(self):
         state = import_storage_state(
             "cookie: sid=abc; theme=dark",

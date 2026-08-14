@@ -38,6 +38,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from .render_contract import (
     ActionType,
     BrowserEngine,
+    CaptchaAction,
     DevicePreset,
     LazyLoadMode,
     OutputFormat,
@@ -942,6 +943,14 @@ class RenderLimits:
     output_bytes: int = 1024 * 1024 * 1024
 
 
+def render_deadline_seconds(
+    request: RenderRequest, limits: RenderLimits, captcha_attempts: int = 1
+) -> float:
+    if request.captcha.action is not CaptchaAction.EXTERNAL:
+        return limits.deadline_seconds
+    return limits.deadline_seconds + request.captcha.timeout_ms / 1_000 * captcha_attempts
+
+
 @dataclass(frozen=True)
 class RenderArtifact:
     body: bytes
@@ -1440,6 +1449,9 @@ class RenderEngine:
         hosted: bool,
         cleanup_hooks: CleanupHooks | None = None,
         challenge_checker: Callable[[Page, RenderRequest, int | None], Awaitable[None]] | None = None,
+        stealth_context_options: Callable[
+            [Browser, RenderRequest], Awaitable[dict[str, object]]
+        ] | None = None,
         stealth_applier: Callable[
             [BrowserContext, RenderRequest], Awaitable[None]
         ] | None = None,
@@ -1454,6 +1466,7 @@ class RenderEngine:
         self.hosted = hosted
         self.cleanup_hooks = cleanup_hooks
         self.challenge_checker = challenge_checker
+        self.stealth_context_options = stealth_context_options
         self.stealth_applier = stealth_applier
         self.browser_replacer = browser_replacer
         self.device_descriptors = device_descriptors or {}
@@ -1687,7 +1700,9 @@ class RenderEngine:
             return await self._render_single(browser, request, limits)
 
         try:
-            async with asyncio.timeout(limits.deadline_seconds):
+            async with asyncio.timeout(
+                render_deadline_seconds(request, limits, len(request.viewports))
+            ):
                 outputs: list[tuple[str, RenderArtifact]] = []
                 output_bytes = 0
                 for viewport in request.viewports:
@@ -1826,7 +1841,7 @@ class RenderEngine:
             or bool(request.network.block_resource_types),
         )
         try:
-            async with asyncio.timeout(limits.deadline_seconds):
+            async with asyncio.timeout(render_deadline_seconds(request, limits)):
                 context_options: dict[str, object] = {}
                 if request.profile_id is not None:
                     if self.profile_loader is None:
@@ -1898,6 +1913,10 @@ class RenderEngine:
                         )
                     context_options["proxy"] = request.network.proxy.model_dump(
                         exclude_none=True
+                    )
+                if request.stealth and self.stealth_context_options is not None:
+                    context_options.update(
+                        await self.stealth_context_options(browser, request)
                     )
                 context_options["bypass_csp"] = request.network.bypass_csp
                 context_options["ignore_https_errors"] = request.network.ignore_https_errors

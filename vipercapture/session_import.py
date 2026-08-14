@@ -73,16 +73,18 @@ def _parse_json(content: str, format_name: str) -> dict[str, object]:
 def _parse_netscape(content: str) -> dict[str, object]:
     cookies = []
     for number, raw_line in enumerate(content.splitlines(), 1):
-        line = raw_line.strip()
+        line = raw_line.strip("\r\n")
         http_only = line.startswith("#HttpOnly_")
-        if not line or (line.startswith("#") and not http_only):
+        if not line.strip() or (line.startswith("#") and not http_only):
             continue
         if http_only:
             line = line.removeprefix("#HttpOnly_")
         parts = line.split("\t")
         if len(parts) != 7:
             raise ValueError(f"invalid Netscape cookie on line {number}")
-        domain, _include_subdomains, path, secure, expires, name, value = parts
+        domain, include_subdomains, path, secure, expires, name, value = parts
+        if include_subdomains.upper() == "TRUE" and not domain.startswith("."):
+            domain = f".{domain}"
         cookies.append(
             _cookie(
                 {

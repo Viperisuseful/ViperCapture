@@ -2,7 +2,9 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock
 
-from vipercapture.captcha import handle_challenge
+from playwright.async_api import async_playwright
+
+from vipercapture.captcha import detect_challenge, handle_challenge
 from vipercapture.render_errors import RenderError
 
 BLOCKING = {
@@ -14,6 +16,40 @@ BLOCKING = {
 
 
 class CaptchaTests(unittest.IsolatedAsyncioTestCase):
+    async def test_browser_detection_avoids_url_widget_and_shadow_limit_false_positives(self):
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page(viewport={"width": 800, "height": 600})
+            try:
+                await page.goto(
+                    "data:text/html,<title>Verified</title><p>Success</p>#verify-email"
+                )
+                self.assertIsNone(await detect_challenge(page, 200))
+
+                await page.set_content(
+                    '<form><div class="frc-captcha" data-sitekey="public" '
+                    'style="width:300px;height:80px"></div></form>'
+                )
+                friendly = await detect_challenge(page, 200)
+                self.assertEqual(friendly["kind"], "embedded_widget")
+
+                await page.set_content("<main></main>")
+                await page.evaluate(
+                    """() => {
+                        for (let index = 0; index < 300; index += 1) {
+                            const host = document.createElement("div");
+                            const root = host.attachShadow({mode: "open"});
+                            if (index === 299) {
+                                root.innerHTML = '<div id="challenge-stage" style="width:800px;height:600px"></div>';
+                            }
+                            document.body.append(host);
+                        }
+                    }"""
+                )
+                self.assertIsNone(await detect_challenge(page, 200))
+            finally:
+                await browser.close()
+
     async def test_plain_forbidden_response_is_not_mislabeled_as_captcha(self):
         page = AsyncMock()
         page.evaluate.return_value = None
