@@ -49,9 +49,8 @@ deletion and truncates the WAL after transitions that clear queued payloads so
 coordinated backups do not retain decryptable historical request ciphertext.
 Because Python file modes do not create private Windows ACLs, the bundled
 SQLite and filesystem providers refuse to start on Windows; use external
-providers plus an explicit `VIPERCAPTURE_JOB_SECRET` there. The packaged
-Windows desktop sidecar and the regular Windows launcher disable async jobs by
-default.
+providers plus an explicit `VIPERCAPTURE_JOB_SECRET` there. The regular
+launcher disables async jobs by default on Windows.
 
 On first start, the bundled SQLite provider adds nullable `correlation_id` and
 `idempotency_key` columns and copies legacy `request_id` values into both. This

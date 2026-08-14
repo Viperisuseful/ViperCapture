@@ -14,7 +14,7 @@ Unit tests and one successful package build do not satisfy these gates.
 | Egress | Private, loopback, link-local, carrier-grade NAT, cloud metadata, IPv6-private, and DNS-rebinding probes blocked at both application and network layers |
 | Rate/abuse control | Project RPM/concurrency limits plus gateway flood limits, key revocation, audit retention, and an exercised incident runbook |
 | Observability | Ready/metrics/trace signals, error and queue alerts, container CPU/RAM/PID monitoring, log retention, and alert delivery to an owned channel |
-| Releases | Reproducible source/package/container builds, checksums, packaged-renderer smoke tests, signed mobile artifact, rollback instructions, and release provenance |
+| Releases | Reproducible source/package/container builds, checksums, packaged-renderer smoke tests, rollback instructions, and release provenance |
 
 Use the operational and benchmark workflows to collect initial evidence:
 

@@ -12,7 +12,7 @@ PDFs, AVIF images, WebM/MP4/GIF video, hydrated HTML, Markdown, or structured
 metadata through a JSON API.
 
 > [!IMPORTANT]
-> ViperCapture OSS v0.2 is beta software. You can self-host and evaluate the
+> ViperCapture OSS v0.3 is beta software. You can self-host and evaluate the
 > engine and API, but the public API may change
 > before v1.
 
@@ -141,6 +141,38 @@ See the [API and workflows guide](docs/api.md), [async provider guide](docs/asyn
 [release guide](docs/releasing.md), and [migration guide](docs/migration-screenshotone-urlbox.md). If a site you
 administer challenges the renderer, follow the least-privilege
 [Cloudflare/WAF authorization guide](docs/site-access.md).
+
+## Use proxies, sessions, and CAPTCHA hooks
+
+Self-hosted renders can route an isolated browser context through an HTTP,
+HTTPS, SOCKS4, or SOCKS5 proxy. Keep credentials in separate fields instead of
+embedding them in the proxy URL:
+
+```json
+{
+  "url": "https://example.com",
+  "network": {
+    "proxy": {
+      "server": "socks5://proxy.example:1080",
+      "username": "account-zone-residential",
+      "password": "secret"
+    }
+  }
+}
+```
+
+With the project control plane enabled, `POST /v1/profiles/import` normalizes
+Playwright storage state, Cookie-Editor JSON, Netscape `cookies.txt`, or a
+pasted Cookie header into an encrypted profile. Pass its returned `id` as
+`profile_id` on later renders. Imports preserve local storage and partitioned
+cookies where the export format supports them.
+
+ViperCapture detects common blocking CAPTCHA and bot interstitials but does not
+solve or bypass them. The default `captcha.action` is `error`; use `capture` to
+render the challenge as-is. Operators may configure their own approved async
+handler with `VIPERCAPTURE_CAPTCHA_HANDLER_FACTORY` and opt in per request with
+`captcha.action: "external"`. See the [API guide](docs/api.md) for the handler
+contract and timeout behavior.
 
 ## Configure storage and webhooks
 
