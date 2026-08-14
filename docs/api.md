@@ -60,9 +60,74 @@ templates. Metadata includes icons, loaded fonts, forms, and JSON-LD samples.
 - `wait_for`: load event, visible selector, body text, delay, and timeout.
 - `cleanup`: consent mode and ad/tracker/chat/newsletter blocking.
 - `custom_css`: up to 64 KiB of injected CSS.
+- `stealth`: applies balanced, request-aware automation evasions by default;
+  set it to `false` for debugging or strict browser-parity tests.
+- `captcha`: chooses `error` (default), `capture`, or an operator-provided
+  `external` handler when a blocking challenge is detected.
 
-Hosted mode rejects per-request proxies, non-public targets and
-subresources, cookies outside the target site, and unsafe redirects.
+Self-hosted mode accepts an HTTP, HTTPS, SOCKS4, or SOCKS5 proxy in
+`network.proxy`. Credentials are separate fields and are never embedded in the
+proxy URL:
+
+```json
+{
+  "url": "https://example.com",
+  "network": {
+    "proxy": {
+      "server": "socks5://proxy.example:1080",
+      "username": "account-zone-residential",
+      "password": "secret",
+      "bypass": ".internal.example"
+    }
+  }
+}
+```
+
+The proxy is attached to the isolated browser context, so navigation and page
+subresources use it. Operators can disable it with
+`VIPERCAPTURE_ALLOW_CUSTOM_PROXIES=0`. Hosted mode defaults to disabled and
+must opt in with `VIPERCAPTURE_ALLOW_CUSTOM_PROXIES=1`. Proxy access does not
+replace container/host egress controls.
+
+CAPTCHA detection recognizes blocking interstitials from Cloudflare,
+reCAPTCHA, hCaptcha, Arkose Labs, DataDome, AWS WAF, GeeTest, Friendly Captcha,
+MTCaptcha, Imperva, and HUMAN/PerimeterX, including widgets inside open shadow
+roots. An ordinary embedded widget does not fail a capture until it becomes a
+blocking challenge. Detection is heuristic and returns the provider, kind,
+confidence, and signals in the error details; ViperCapture does not solve or
+bypass CAPTCHAs.
+
+Hosted mode also rejects non-public targets and subresources, cookies outside
+the target site, and unsafe redirects.
+
+## Import browser sessions
+
+With the project control plane enabled, `POST /v1/profiles/import` accepts up
+to 5 MiB of pasted/exported session data and encrypts the normalized Playwright
+storage state with `VIPERCAPTURE_CONTROL_SECRET`. Supported formats are:
+
+- `playwright`: a Playwright `storageState` JSON object, including localStorage
+- `cookies_json`: the common Cookie-Editor-style JSON array exported by Chrome,
+  Edge, Brave, Firefox, and compatible browsers
+- `netscape`: a Netscape `cookies.txt` export
+- `cookie_header`: a pasted `Cookie` request header; this requires `origin`
+- `auto`: detects one of the above from its content
+
+For example, import an exported file without putting its secrets on the command
+line, then use the returned `id` as `profile_id`:
+
+```bash
+jq -Rs '{format:"auto", content:.}' browser-cookies.txt |
+  curl --fail-with-body http://127.0.0.1:8000/v1/profiles/import \
+    -H "Authorization: Bearer $VIPERCAPTURE_API_KEY" \
+    -H 'Content-Type: application/json' --data-binary @-
+```
+
+For a pasted header, send `{"format":"cookie_header",
+"origin":"https://example.com","content":"Cookie: sid=..."}`. Session exports
+are credentials: avoid shell history, logs, shared folders, and unencrypted
+transport. ViperCapture intentionally does not read or decrypt live browser
+profile databases on a user's machine.
 
 ## Actions and assertions
 

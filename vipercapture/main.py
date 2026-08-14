@@ -36,6 +36,7 @@ from .async_jobs import (
     settings_from_environment,
 )
 from .bulk_jobs import BulkBodyLimitMiddleware, BulkJobRequest
+from .captcha import handle_challenge, load_captcha_handler
 from .compatibility import screenshotone_request, urlbox_request
 from .control_plane import (
     BaselineQuotaError,
@@ -77,6 +78,7 @@ from .schedules import (
     schedule_cursor,
 )
 from .signed_urls import sign_render_request, verify_render_request
+from .session_import import MAX_IMPORT_BYTES, import_storage_state
 from .telemetry import configure_telemetry
 from .visual_diff import (
     MAX_DIFF_INPUT_BYTES,
@@ -110,6 +112,11 @@ _load_local_env()
 
 HOSTED = os.getenv("VIPERCAPTURE_HOSTED") == "1"
 ALLOW_SCRIPTS = os.getenv("VIPERCAPTURE_ALLOW_SCRIPTS") == "1"
+ALLOW_CUSTOM_PROXIES = os.getenv(
+    "VIPERCAPTURE_ALLOW_CUSTOM_PROXIES",
+    "0" if HOSTED else "1",
+) == "1"
+CAPTCHA_HANDLER_FACTORY = os.getenv("VIPERCAPTURE_CAPTCHA_HANDLER_FACTORY", "")
 SIGNING_SECRET = os.getenv("VIPERCAPTURE_SIGNING_SECRET", "")
 SIGNING_ADMIN_TOKEN = os.getenv("VIPERCAPTURE_SIGNING_ADMIN_TOKEN", "")
 PUBLIC_URL = os.getenv("VIPERCAPTURE_PUBLIC_URL", "").rstrip("/")
@@ -248,7 +255,33 @@ STEALTH = Stealth(
     ),
     sec_ch_ua=False,
     webgl_vendor=False,
+    init_scripts_only=True,
 )
+
+
+def _stealth_for_request(payload: RenderRequest) -> Stealth:
+    locale = payload.environment.locale or "en-US"
+    languages = (locale, locale.partition("-")[0])
+    user_agent = (payload.network.user_agent or "").lower()
+    platform = (
+        "Win32" if "windows" in user_agent
+        else "iPhone" if "iphone" in user_agent or payload.environment.device.value == "iphone_14"
+        else "MacIntel" if "macintosh" in user_agent or payload.environment.device.value == "ipad"
+        else "Linux armv8l" if "android" in user_agent or payload.environment.device.value == "pixel_7"
+        else STEALTH.navigator_platform_override
+    )
+    return Stealth(
+        navigator_languages_override=languages,
+        navigator_platform_override=platform,
+        navigator_user_agent_override=payload.network.user_agent,
+        sec_ch_ua=False,
+        webgl_vendor=False,
+        init_scripts_only=True,
+    )
+
+
+async def _apply_stealth(context, payload: RenderRequest) -> None:
+    await _stealth_for_request(payload).apply_stealth_async(context)
 
 
 class _SlotStreamingResponse(StreamingResponse):
@@ -445,14 +478,15 @@ async def lifespan(app: FastAPI):
             raise RuntimeError(
                 "split api/worker roles require VIPERCAPTURE_SCHEDULE_STORE_FACTORY or VIPERCAPTURE_SCHEDULES=0"
             )
+    captcha_handler = load_captcha_handler(CAPTCHA_HANDLER_FACTORY)
     playwright: Playwright = await async_playwright().start()
-    STEALTH.hook_playwright_context(playwright)
     browser = await _launch_browser(playwright)
     app.state.playwright = playwright
     app.state.browser = browser
     app.state.browsers = {BrowserEngine.CHROMIUM: browser}
     app.state.gpu_mode = GPU_MODE
     app.state.gpu_hardware_active = await _detect_hardware_gpu(browser, GPU_MODE)
+    app.state.captcha_handler = captcha_handler
     app.state.capture_slots = asyncio.Semaphore(MAX_CONCURRENT_CAPTURES)
     app.state.diff_slots = asyncio.Semaphore(MAX_DIFF_CONCURRENCY)
     app.state.async_result_slots = asyncio.Semaphore(MAX_ASYNC_RESULT_DOWNLOADS)
@@ -876,6 +910,16 @@ class ProfileCreate(BaseModel):
     ttl_seconds: int | None = Field(default=None, ge=60, le=31_536_000)
 
 
+class ProfileImport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    content: str = Field(min_length=1, max_length=MAX_IMPORT_BYTES)
+    format: Literal[
+        "auto", "playwright", "cookies_json", "netscape", "cookie_header"
+    ] = "auto"
+    origin: str | None = Field(default=None, max_length=2_048)
+    ttl_seconds: int | None = Field(default=None, ge=60, le=31_536_000)
+
+
 def _admin(request: Request) -> ControlPlane:
     control = getattr(request.app.state, "control", None)
     if control is None:
@@ -952,11 +996,18 @@ async def operator_status(
         "async_jobs": service is not None,
         "worker_count": ASYNC_JOB_SETTINGS.worker_count if ASYNC_JOB_SETTINGS else 0,
         "control_plane": CONTROL_ENABLED,
+        "custom_proxies": ALLOW_CUSTOM_PROXIES,
+        "captcha_handler": getattr(app.state, "captcha_handler", None) is not None,
     }
 
 
-@app.post("/v1/profiles", status_code=201)
-async def create_profile(payload: ProfileCreate, request: Request) -> JSONResponse:
+async def _store_profile(
+    storage_state: BrowserStorageState,
+    ttl_seconds: int | None,
+    request: Request,
+    *,
+    audit_action: str = "profile.created",
+) -> str:
     control = getattr(request.app.state, "control", None)
     if control is None or (request.state.project_id is None and not request.state.is_admin):
         raise RenderError("profiles_disabled", "Project authentication is required for profiles.", 503, False)
@@ -969,8 +1020,8 @@ async def create_profile(payload: ProfileCreate, request: Request) -> JSONRespon
             control.put_profile,
             project_id,
             profile_id,
-            payload.storage_state.model_dump(mode="json", by_alias=True),
-            payload.ttl_seconds,
+            storage_state.model_dump(mode="json", by_alias=True),
+            ttl_seconds,
         )
     except ProfileQuotaError as exc:
         raise RenderError(
@@ -983,8 +1034,52 @@ async def create_profile(payload: ProfileCreate, request: Request) -> JSONRespon
     except asyncio.CancelledError:
         await _settled_thread(control.delete_profile, project_id, profile_id)
         raise
-    await asyncio.to_thread(control.audit, project_id, request.state.key_id, "profile.created", profile_id)
+    await asyncio.to_thread(control.audit, project_id, request.state.key_id, audit_action, profile_id)
+    return profile_id
+
+
+@app.post("/v1/profiles", status_code=201)
+async def create_profile(payload: ProfileCreate, request: Request) -> JSONResponse:
+    profile_id = await _store_profile(
+        payload.storage_state, payload.ttl_seconds, request
+    )
     return JSONResponse({"id": profile_id, "expires_in": payload.ttl_seconds}, status_code=201, headers={"Cache-Control": "private, no-store"})
+
+
+@app.post("/v1/profiles/import", status_code=201)
+async def import_profile(payload: ProfileImport, request: Request) -> JSONResponse:
+    try:
+        imported = import_storage_state(
+            payload.content,
+            format_name=payload.format,
+            origin=payload.origin,
+        )
+        storage_state = BrowserStorageState.model_validate(imported)
+    except RenderError:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise RenderError(
+            "session_import_invalid",
+            "The browser session export does not match the selected format.",
+            422,
+            False,
+        ) from exc
+    profile_id = await _store_profile(
+        storage_state,
+        payload.ttl_seconds,
+        request,
+        audit_action="profile.imported",
+    )
+    return JSONResponse(
+        {
+            "id": profile_id,
+            "expires_in": payload.ttl_seconds,
+            "cookies": len(storage_state.cookies),
+            "origins": len(storage_state.origins),
+        },
+        status_code=201,
+        headers={"Cache-Control": "private, no-store"},
+    )
 
 
 @app.delete("/v1/profiles/{profile_id}", status_code=204)
@@ -1039,112 +1134,17 @@ async def index() -> FileResponse:
 
 async def _check_captcha(
     page,
-    proceed_on_captcha: bool,
+    payload: RenderRequest,
     navigation_status: int | None = None,
 ) -> None:
-    challenge = await page.evaluate("""({ status }) => {
-        const visible = (element) => {
-            const style = getComputedStyle(element);
-            const rect = element.getBoundingClientRect();
-            return style.display !== "none" && style.visibility !== "hidden" &&
-                Number(style.opacity) > 0 && rect.width > 0 && rect.height > 0;
-        };
-        const obstruction = (element) => {
-            const rect = element.getBoundingClientRect();
-            const viewportArea = Math.max(1, innerWidth * innerHeight);
-            const area = Math.max(0, rect.width) * Math.max(0, rect.height);
-            const coversCenter = rect.left <= innerWidth / 2 && rect.right >= innerWidth / 2 &&
-                rect.top <= innerHeight / 2 && rect.bottom >= innerHeight / 2;
-            const areaRatio = area / viewportArea;
-            return areaRatio >= 0.25 || (coversCenter && areaRatio >= 0.10);
-        };
-        const providers = {
-            cloudflare: {
-                widgets: [".cf-turnstile", "iframe[src*='challenges.cloudflare.com']"],
-                blocking: ["#challenge-stage", "#challenge-running", "#challenge-form",
-                    "iframe[src*='/cdn-cgi/challenge-platform/']"]
-            },
-            recaptcha: {
-                widgets: [".g-recaptcha", "iframe[src*='google.com/recaptcha']",
-                    "iframe[src*='recaptcha.net/recaptcha']"],
-                blocking: ["iframe[src*='/recaptcha/api2/bframe']"]
-            },
-            hcaptcha: {
-                widgets: [".h-captcha", "iframe[src*='hcaptcha.com/captcha']"],
-                blocking: ["iframe[src*='newassets.hcaptcha.com/captcha']"]
-            },
-            funcaptcha: {
-                widgets: [".arkose", "iframe[src*='arkoselabs.com']"],
-                blocking: ["iframe[src*='/fc/gc/']"]
-            },
-            datadome: {
-                widgets: ["iframe[src*='captcha-delivery.com']", "#datadome-captcha"],
-                blocking: ["iframe[src*='geo.captcha-delivery.com']"]
-            }
-        };
-        const title = (document.title || "").toLowerCase();
-        const bodyText = (document.body?.innerText || "").slice(0, 20000).toLowerCase();
-        const challengeText = [
-            "checking your browser", "verify you are human", "verification required",
-            "complete the security check", "performing security verification",
-            "unusual traffic", "attention required"
-        ].some((phrase) => title.includes(phrase) || bodyText.includes(phrase));
-        const signals = [];
-        let provider = null;
-        let hasBlockingElement = false;
-        let hasObstruction = false;
-        for (const [name, selectors] of Object.entries(providers)) {
-            const widgetElements = selectors.widgets.flatMap((selector) =>
-                [...document.querySelectorAll(selector)].filter(visible));
-            const blockingElements = selectors.blocking.flatMap((selector) =>
-                [...document.querySelectorAll(selector)].filter(visible));
-            if (!widgetElements.length && !blockingElements.length) continue;
-            provider = name;
-            if (widgetElements.length) signals.push("provider_widget");
-            if (blockingElements.length) {
-                signals.push("challenge_form");
-                hasBlockingElement = true;
-            }
-            hasObstruction = [...widgetElements, ...blockingElements].some(obstruction);
-            if (hasObstruction) signals.push("viewport_obstruction");
-            break;
-        }
-        if (status === 429) signals.push("main_response_429");
-        else if ([403, 503].includes(status)) signals.push(`main_response_${status}`);
-        if (challengeText) signals.push("challenge_copy");
-
-        let kind = null;
-        if (status === 429) kind = "rate_limited";
-        else if (status === 403 && !provider && !challengeText) kind = "access_denied";
-        else if (hasBlockingElement || hasObstruction || challengeText) kind = "blocking_interstitial";
-        else if (provider) kind = "embedded_widget";
-        if (!kind) return null;
-
-        const confidence = kind === "embedded_widget" ? 0.72 :
-            (provider && signals.length >= 2 ? 0.98 : 0.88);
-        return { provider: provider || "unknown", kind, confidence, signals };
-    }""", {"status": navigation_status})
-    if (
-        challenge
-        and challenge.get("kind") != "embedded_widget"
-        and not proceed_on_captcha
-    ):
-        provider = str(challenge.get("provider") or "unknown")
-        provider_label = {
-            "cloudflare": "Cloudflare",
-            "recaptcha": "Google reCAPTCHA",
-            "hcaptcha": "hCaptcha",
-            "funcaptcha": "Arkose Labs",
-            "datadome": "DataDome",
-            "unknown": "A page-level",
-        }.get(provider, provider.replace("_", " ").title())
-        raise RenderError(
-            "captcha_detected",
-            f"{provider_label} challenge blocked the page.",
-            409,
-            False,
-            challenge,
-        )
+    await handle_challenge(
+        page,
+        navigation_status=navigation_status,
+        action=payload.captcha.action.value,
+        handler=getattr(app.state, "captcha_handler", None),
+        solver=payload.captcha.solver,
+        timeout_ms=payload.captcha.timeout_ms,
+    )
 
 
 def _page_cleanup_options(options) -> CleanupOptions:
@@ -1201,11 +1201,13 @@ def _render_engine() -> RenderEngine:
             blocked_category=_blocked_resource_category,
         ),
         challenge_checker=_check_captcha,
+        stealth_applier=_apply_stealth,
         browser_replacer=lambda failed: _replace_browser(app, failed),
         device_descriptors=(
             dict(playwright.devices) if playwright is not None else None
         ),
         allow_scripts=ALLOW_SCRIPTS,
+        allow_proxies=ALLOW_CUSTOM_PROXIES,
         hardware_video=getattr(app.state, "gpu_mode", GPU_MODE) != "off",
         profile_loader=load_profile,
         profile_saver=save_profile,
@@ -2439,6 +2441,8 @@ async def app_config():
         "max_output_bytes": MAX_OUTPUT_BYTES,
         "browser_engines": [engine.value for engine in BrowserEngine],
         "output_formats": output_formats,
+        "custom_proxies": ALLOW_CUSTOM_PROXIES,
+        "captcha_handler": getattr(app.state, "captcha_handler", None) is not None,
         "async_jobs": {
             "enabled": ASYNC_JOBS_ENABLED,
             "workers": (

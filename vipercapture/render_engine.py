@@ -31,7 +31,7 @@ from uuid import uuid4
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from PIL import Image
-from playwright.async_api import Browser, Page
+from playwright.async_api import Browser, BrowserContext, Page
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
@@ -1439,10 +1439,14 @@ class RenderEngine:
         *,
         hosted: bool,
         cleanup_hooks: CleanupHooks | None = None,
-        challenge_checker: Callable[[Page, bool, int | None], Awaitable[None]] | None = None,
+        challenge_checker: Callable[[Page, RenderRequest, int | None], Awaitable[None]] | None = None,
+        stealth_applier: Callable[
+            [BrowserContext, RenderRequest], Awaitable[None]
+        ] | None = None,
         browser_replacer: Callable[[Browser], Awaitable[None]] | None = None,
         device_descriptors: dict[str, dict[str, object]] | None = None,
         allow_scripts: bool = False,
+        allow_proxies: bool | None = None,
         hardware_video: bool = False,
         profile_loader: Callable[[str], Awaitable[dict[str, object] | None]] | None = None,
         profile_saver: Callable[[str, dict[str, object]], Awaitable[None]] | None = None,
@@ -1450,9 +1454,11 @@ class RenderEngine:
         self.hosted = hosted
         self.cleanup_hooks = cleanup_hooks
         self.challenge_checker = challenge_checker
+        self.stealth_applier = stealth_applier
         self.browser_replacer = browser_replacer
         self.device_descriptors = device_descriptors or {}
         self.allow_scripts = allow_scripts
+        self.allow_proxies = not hosted if allow_proxies is None else allow_proxies
         self.hardware_video = hardware_video
         self.profile_loader = profile_loader
         self.profile_saver = profile_saver
@@ -1883,10 +1889,10 @@ class RenderEngine:
                     context_options["geolocation"] = request.network.geolocation.model_dump()
                     context_options["permissions"] = ["geolocation"]
                 if request.network.proxy is not None:
-                    if self.hosted:
+                    if not self.allow_proxies:
                         raise RenderError(
                             "proxy_not_allowed",
-                            "Per-request proxies are disabled in hosted security mode.",
+                            "Per-request proxies are disabled by the operator.",
                             403,
                             False,
                         )
@@ -1896,6 +1902,8 @@ class RenderEngine:
                 context_options["bypass_csp"] = request.network.bypass_csp
                 context_options["ignore_https_errors"] = request.network.ignore_https_errors
                 context = await browser.new_context(**context_options)
+                if request.stealth and self.stealth_applier is not None:
+                    await self.stealth_applier(context, request)
                 if request.diagnostics.bundle and request.diagnostics.include_trace:
                     await context.tracing.start(screenshots=True, snapshots=True, sources=False)
                 if request.deterministic.enabled:
@@ -2197,7 +2205,7 @@ class RenderEngine:
                 if self.cleanup_hooks:
                     await self.cleanup_hooks.apply(page, request.cleanup)
                 if self.challenge_checker:
-                    await self.challenge_checker(page, request.proceed_on_captcha, navigation_status)
+                    await self.challenge_checker(page, request, navigation_status)
                 resizing_image = (
                     request.image.width is not None
                     or request.image.height is not None
@@ -2236,7 +2244,7 @@ class RenderEngine:
                     if self.cleanup_hooks:
                         await self.cleanup_hooks.apply(page, request.cleanup)
                     if self.challenge_checker:
-                        await self.challenge_checker(page, request.proceed_on_captcha, navigation_status)
+                        await self.challenge_checker(page, request, navigation_status)
                 if request.deterministic.enabled and request.deterministic.wait_for_fonts:
                     await page.evaluate("() => document.fonts?.ready")
                 await self._check_assertions(
@@ -2283,7 +2291,7 @@ class RenderEngine:
                     if self.challenge_checker:
                         await self.challenge_checker(
                             page,
-                            request.proceed_on_captcha,
+                            request,
                             navigation_status,
                         )
                     await self._check_assertions(

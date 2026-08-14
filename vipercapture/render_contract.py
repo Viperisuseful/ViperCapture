@@ -169,6 +169,12 @@ class ConsentMode(str, Enum):
     HIDE = "hide"
 
 
+class CaptchaAction(str, Enum):
+    ERROR = "error"
+    CAPTURE = "capture"
+    EXTERNAL = "external"
+
+
 class Viewport(StrictModel):
     width: int = Field(default=1280, ge=1, le=65_535)
     height: int = Field(default=720, ge=1, le=65_535)
@@ -503,6 +509,24 @@ class CleanupOptions(StrictModel):
     block_newsletters: bool = False
 
 
+class CaptchaOptions(StrictModel):
+    action: CaptchaAction = CaptchaAction.ERROR
+    solver: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_-]+$",
+        description="Operator-defined handler name; never contains solver credentials.",
+    )
+    timeout_ms: int = Field(default=120_000, ge=1_000, le=300_000)
+
+    @model_validator(mode="after")
+    def validate_solver(self) -> "CaptchaOptions":
+        if self.solver is not None and self.action is not CaptchaAction.EXTERNAL:
+            raise ValueError("captcha.solver requires action=external")
+        return self
+
+
 def _validate_headers(headers: dict[str, str]) -> dict[str, str]:
     if len(headers) > MAX_HEADERS:
         raise ValueError(f"headers may contain at most {MAX_HEADERS} entries")
@@ -579,6 +603,11 @@ class RenderRequest(StrictModel):
     headers: dict[str, str] = Field(default_factory=dict)
     wait_for: WaitOptions = Field(default_factory=WaitOptions)
     cleanup: CleanupOptions = Field(default_factory=CleanupOptions)
+    stealth: bool = Field(
+        default=True,
+        description="Apply balanced, request-aware browser automation evasions.",
+    )
+    captcha: CaptchaOptions = Field(default_factory=CaptchaOptions)
     cache: bool = Field(
         default=False,
         description=(
@@ -604,6 +633,12 @@ class RenderRequest(StrictModel):
             raise ValueError("preserve_viewport_width requires full_page=true")
         if self.save_profile and self.profile_id is None:
             raise ValueError("save_profile requires profile_id")
+        if self.proceed_on_captcha:
+            if self.captcha.action is CaptchaAction.EXTERNAL:
+                raise ValueError(
+                    "proceed_on_captcha cannot be combined with captcha.action=external"
+                )
+            self.captcha.action = CaptchaAction.CAPTURE
         for source in (self.html, self.markdown):
             if source is not None and len(source.encode("utf-8")) > MAX_SOURCE_BYTES:
                 raise ValueError("HTML and Markdown input may not exceed 5242880 bytes")

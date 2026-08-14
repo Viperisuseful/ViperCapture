@@ -31,6 +31,13 @@ profiles, and visual baselines are project-owned. Profile storage state is
 AES-GCM encrypted at rest; profile IDs are unguessable and can be supplied as
 `profile_id` on a render request.
 
+Portable browser exports can be normalized through `POST /v1/profiles/import`.
+This accepts Playwright storage state, common Chrome/Edge/Brave/Firefox cookie
+JSON exports, Netscape `cookies.txt`, and a pasted Cookie header. Directly
+reading local browser databases is deliberately out of scope: it is
+platform-specific, often requires OS credential decryption, and would give the
+service broader access than an explicit export.
+
 Native routes use `Authorization: Bearer vcp_...`; Bearer authentication
 failures include `WWW-Authenticate`. Query-string credentials are accepted
 only by the ScreenshotOne-compatible `/take` route and can be disabled with
@@ -86,3 +93,38 @@ TypeScript and Go clients are under `sdk/`, and the repository includes a
 composite GitHub Action, an importable n8n workflow, and a minimal Terraform
 Docker module. Compatibility adapters reject unknown vendor
 options instead of silently changing render behavior.
+
+## Configure proxies, stealth, and CAPTCHA callbacks
+
+Per-request proxies are enabled by default in self-host mode and disabled by
+default in hosted mode. Set `VIPERCAPTURE_ALLOW_CUSTOM_PROXIES=0` to turn them
+off or `=1` to opt in. The setting controls HTTP(S), SOCKS4, and SOCKS5 proxy
+objects supplied under `network.proxy`; it does not weaken URL validation or
+the recommended network egress firewall.
+
+Stealth scripts are applied to each isolated context by default and align
+language, platform, and user-agent signals with the request. They are balanced
+evasive defaults, not a promise that a site cannot detect automation. Callers
+can set `stealth:false` for diagnosis and compatibility testing.
+
+ViperCapture only detects CAPTCHA/bot challenges. To let an operator connect
+an approved internal or third-party integration, set
+`VIPERCAPTURE_CAPTCHA_HANDLER_FACTORY=package.module:create_handler`. The
+factory is called once at startup and must return an async callable with this
+contract:
+
+```python
+async def handler(page, challenge, solver_name, timeout_ms) -> bool:
+    # Dispatch to the operator's integration. Return True only after the page
+    # is ready for ViperCapture to re-check it.
+    return False
+
+def create_handler():
+    return handler
+```
+
+Requests opt in with `"captcha":{"action":"external",
+"solver":"operator-alias","timeout_ms":120000}`. The solver name is only a
+non-secret routing label. ViperCapture enforces the timeout, re-runs detection,
+and fails if the challenge remains. No solver provider, credentials, token
+injection, or challenge-solving implementation ships with the project.

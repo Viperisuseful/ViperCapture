@@ -165,6 +165,61 @@ class FakeBrowser:
 
 
 class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
+    async def test_request_proxy_and_stealth_are_applied_to_the_context(self):
+        browser = FakeBrowser()
+        stealth = AsyncMock()
+        request = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "network": {
+                    "proxy": {
+                        "server": "socks5://proxy.example:1080",
+                        "username": "user",
+                        "password": "secret",
+                    }
+                },
+            }
+        )
+        await RenderEngine(
+            hosted=True,
+            allow_proxies=True,
+            stealth_applier=stealth,
+        ).render_image(
+            browser,
+            request,
+            RenderLimits(max_width=1920, max_height=1080, max_pixels=2_073_600),
+        )
+        self.assertEqual(browser.context_options["proxy"]["server"], "socks5://proxy.example:1080")
+        self.assertEqual(browser.context_options["proxy"]["password"], "secret")
+        stealth.assert_awaited_once_with(browser.context, request)
+
+    async def test_operator_can_disable_request_proxies(self):
+        request = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "network": {"proxy": {"server": "http://proxy.example:8080"}},
+            }
+        )
+        with self.assertRaises(RenderError) as raised:
+            await RenderEngine(hosted=False, allow_proxies=False).render_image(
+                FakeBrowser(),
+                request,
+                RenderLimits(max_width=1920, max_height=1080, max_pixels=2_073_600),
+            )
+        self.assertEqual(raised.exception.code, "proxy_not_allowed")
+
+    async def test_stealth_can_be_disabled_per_request(self):
+        stealth = AsyncMock()
+        await RenderEngine(
+            hosted=False,
+            stealth_applier=stealth,
+        ).render_image(
+            FakeBrowser(),
+            RenderRequest(url="https://example.com", stealth=False),
+            RenderLimits(max_width=1920, max_height=1080, max_pixels=2_073_600),
+        )
+        stealth.assert_not_awaited()
+
     async def test_avif_encoder_failure_is_nonretryable_for_every_path(self):
         with patch(
             "vipercapture.render_engine._convert_image",
@@ -1266,7 +1321,12 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
             RenderLimits(max_width=1920, max_height=1080, max_pixels=2_073_600),
         )
         self.assertEqual(checker.await_count, 2)
-        self.assertTrue(all(call.args[1] is True for call in checker.await_args_list))
+        self.assertTrue(
+            all(
+                call.args[1].captcha.action.value == "capture"
+                for call in checker.await_args_list
+            )
+        )
 
     async def test_video_rechecks_captcha_after_recording(self):
         class VideoPage(FakePage):
@@ -1277,7 +1337,7 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
                 await super().wait_for_timeout(delay)
                 self.recorded = True
 
-        async def checker(page, _proceed, _status):
+        async def checker(page, _request, _status):
             if page.recorded:
                 raise RenderError(
                     "captcha_detected", "Challenge appeared.", 422, False
