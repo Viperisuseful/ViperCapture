@@ -149,8 +149,6 @@ def import_storage_state(
     """Parse Playwright, Cookie-Editor JSON, cookies.txt, or a Cookie header."""
     if format_name not in SUPPORTED_FORMATS:
         raise ValueError(f"unsupported session import format {format_name!r}")
-    if not content.strip():
-        raise ValueError("session import content is empty")
     if len(content.encode("utf-8")) > MAX_IMPORT_BYTES:
         raise RenderError(
             "session_import_too_large",
@@ -158,6 +156,9 @@ def import_storage_state(
             413,
             False,
         )
+    content = content.removeprefix("\ufeff")
+    if not content.strip():
+        raise ValueError("session import content is empty")
     selected = format_name
     if selected == "auto":
         stripped = content.lstrip()

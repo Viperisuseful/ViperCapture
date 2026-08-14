@@ -181,7 +181,7 @@ be cancelled.
 ```json
 {
   "items": [
-    {"id": "desktop", "idempotency_key": "release-42-desktop", "render": {
+    {"id": "primary", "idempotency_key": "release-42-primary", "render": {
       "url": "https://example.com", "full_page": false
     }},
     {"id": "mobile", "render": {
