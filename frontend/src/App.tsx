@@ -12,7 +12,6 @@ import {
   Loader2,
   Moon,
   RotateCcw,
-  SlidersHorizontal,
   Sparkles,
   Square,
   Sun,
@@ -31,7 +30,10 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
 import { Badge } from "@/components/ui/badge"
+import { BookTextIcon } from "@/components/ui/book-text"
 import { Button } from "@/components/ui/button"
+import { ClapIcon } from "@/components/ui/clap"
+import { ContrastIcon } from "@/components/ui/contrast"
 import { CpuIcon } from "@/components/ui/cpu"
 import {
   Card,
@@ -44,15 +46,20 @@ import {
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field"
 import { EyeIcon } from "@/components/ui/eye"
+import { FileTextIcon } from "@/components/ui/file-text"
+import { FrameIcon } from "@/components/ui/frame"
 import { GalleryThumbnailsIcon } from "@/components/ui/gallery-thumbnails"
 import { Input } from "@/components/ui/input"
 import { InputGroup, InputGroupAddon, InputGroupTextarea } from "@/components/ui/input-group"
 import { MonitorCheckIcon } from "@/components/ui/monitor-check"
+import { MonitorCogIcon } from "@/components/ui/monitor-cog"
 import { Progress } from "@/components/ui/progress"
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { SettingsIcon } from "@/components/ui/settings"
 import { ShieldCheckIcon } from "@/components/ui/shield-check"
+import { SlidersHorizontalIcon } from "@/components/ui/sliders-horizontal"
 import { Switch } from "@/components/ui/switch"
+import { TimerIcon } from "@/components/ui/timer"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 
 type Output = "png" | "jpeg" | "webp" | "avif" | "pdf" | "html" | "markdown" | "metadata" | "webm" | "mp4" | "gif"
@@ -729,12 +736,12 @@ export default function App() {
 
                 <Collapsible>
                   <CollapsibleTrigger asChild>
-                    <Button variant="outline" className="w-full justify-between"><span className="flex items-center gap-2"><SlidersHorizontal />Advanced controls</span><ChevronDown /></Button>
+                    <Button variant="outline" className="w-full justify-between"><span className="flex items-center gap-2"><SlidersHorizontalIcon data-title-icon="advanced-controls" size={16} className="shrink-0 text-primary" aria-hidden="true" />Advanced controls</span><ChevronDown /></Button>
                   </CollapsibleTrigger>
                   <CollapsibleContent className="pt-4">
                     <FieldGroup>
                       <FieldSet>
-                        <FieldLegend>Deterministic environment</FieldLegend>
+                        <FieldLegend className="flex items-center gap-2"><MonitorCogIcon data-title-icon="deterministic-environment" size={16} className="shrink-0 text-primary" aria-hidden="true" />Deterministic environment</FieldLegend>
                         <Field><FieldLabel>Device signals</FieldLabel><Select value={device} onValueChange={(value) => setDevice(value as Device)}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup>
                           <SelectItem value="desktop">Desktop Chromium</SelectItem><SelectItem value="iphone_14">iPhone 14</SelectItem><SelectItem value="pixel_7">Pixel 7</SelectItem><SelectItem value="ipad">iPad</SelectItem>
                         </SelectGroup></SelectContent></Select><FieldDescription>Applies user-agent, touch, and mobile signals without changing the explicit viewport.</FieldDescription></Field>
@@ -747,47 +754,63 @@ export default function App() {
                           <Field><FieldLabel htmlFor="timezone">IANA timezone</FieldLabel><Input id="timezone" value={timezone} onChange={(event) => setTimezone(event.target.value)} placeholder="America/New_York" /></Field>
                         </div>
                       </FieldSet>
-                      <Field data-invalid={selectorTouched && Boolean(selectorError)}>
-                        <FieldLabel htmlFor="selector">Element selector · <a href={`${docsUrl}#selectors-and-waits`} target="_blank" rel="noreferrer">Docs</a></FieldLabel>
-                        <Input id="selector" value={selector} onChange={(event) => { setSelector(event.target.value); if (event.target.value) setClipEnabled(false) }} onBlur={() => setSelectorTouched(true)} placeholder="main, #invoice" aria-invalid={selectorTouched && Boolean(selectorError)} />
-                        {selectorTouched && <FieldError>{selectorError}</FieldError>}
-                      </Field>
-                      <Field orientation="horizontal"><FieldLabel htmlFor="clip-enabled"><span><span className="block">Rectangular crop</span><FieldDescription>Crop CSS-pixel coordinates from the final document.</FieldDescription></span></FieldLabel><Switch id="clip-enabled" checked={clipEnabled} onCheckedChange={(checked) => { setClipEnabled(checked); if (checked) setSelector("") }} disabled={!imageOutput} /></Field>
-                      {clipEnabled && imageOutput && <div className="grid grid-cols-4 gap-2">
-                        <Field><FieldLabel htmlFor="clip-x">X</FieldLabel><Input id="clip-x" type="number" min={0} max={100000} value={clipX} onChange={(event) => setClipX(Number(event.target.value))} /></Field>
-                        <Field><FieldLabel htmlFor="clip-y">Y</FieldLabel><Input id="clip-y" type="number" min={0} max={100000} value={clipY} onChange={(event) => setClipY(Number(event.target.value))} /></Field>
-                        <Field><FieldLabel htmlFor="clip-width">Width</FieldLabel><Input id="clip-width" type="number" min={1} max={100000} value={clipWidth} onChange={(event) => setClipWidth(Number(event.target.value))} /></Field>
-                        <Field><FieldLabel htmlFor="clip-height">Height</FieldLabel><Input id="clip-height" type="number" min={1} max={100000} value={clipHeight} onChange={(event) => setClipHeight(Number(event.target.value))} /></Field>
-                      </div>}
+                      <FieldSet>
+                        <FieldLegend className="flex items-center gap-2"><FrameIcon data-title-icon="capture-region" size={16} className="shrink-0 text-primary" aria-hidden="true" />Capture region</FieldLegend>
+                        <Field data-invalid={selectorTouched && Boolean(selectorError)}>
+                          <FieldLabel htmlFor="selector">Element selector · <a href={`${docsUrl}#selectors-and-waits`} target="_blank" rel="noreferrer">Docs</a></FieldLabel>
+                          <Input id="selector" value={selector} onChange={(event) => { setSelector(event.target.value); if (event.target.value) setClipEnabled(false) }} onBlur={() => setSelectorTouched(true)} placeholder="main, #invoice" aria-invalid={selectorTouched && Boolean(selectorError)} />
+                          {selectorTouched && <FieldError>{selectorError}</FieldError>}
+                        </Field>
+                        <Field orientation="horizontal"><FieldLabel htmlFor="clip-enabled"><span><span className="block">Rectangular crop</span><FieldDescription>Crop CSS-pixel coordinates from the final document.</FieldDescription></span></FieldLabel><Switch id="clip-enabled" checked={clipEnabled} onCheckedChange={(checked) => { setClipEnabled(checked); if (checked) setSelector("") }} disabled={!imageOutput} /></Field>
+                        {clipEnabled && imageOutput && <div className="grid grid-cols-4 gap-2">
+                          <Field><FieldLabel htmlFor="clip-x">X</FieldLabel><Input id="clip-x" type="number" min={0} max={100000} value={clipX} onChange={(event) => setClipX(Number(event.target.value))} /></Field>
+                          <Field><FieldLabel htmlFor="clip-y">Y</FieldLabel><Input id="clip-y" type="number" min={0} max={100000} value={clipY} onChange={(event) => setClipY(Number(event.target.value))} /></Field>
+                          <Field><FieldLabel htmlFor="clip-width">Width</FieldLabel><Input id="clip-width" type="number" min={1} max={100000} value={clipWidth} onChange={(event) => setClipWidth(Number(event.target.value))} /></Field>
+                          <Field><FieldLabel htmlFor="clip-height">Height</FieldLabel><Input id="clip-height" type="number" min={1} max={100000} value={clipHeight} onChange={(event) => setClipHeight(Number(event.target.value))} /></Field>
+                        </div>}
+                      </FieldSet>
                       <Field><FieldLabel htmlFor="custom-css">Custom CSS</FieldLabel><InputGroup><InputGroupTextarea id="custom-css" rows={4} value={customCss} onChange={(event) => setCustomCss(event.target.value)} placeholder="header, .cookie-banner { display: none !important; }" /></InputGroup><FieldDescription>Applied to the main document for this render; maximum 64 KiB.</FieldDescription></Field>
                       <Field><FieldLabel htmlFor="fail-statuses">Fail on HTTP status</FieldLabel><Input id="fail-statuses" value={failStatuses} onChange={(event) => setFailStatuses(event.target.value)} placeholder="404,429,500,502,503" /><FieldDescription>Comma-separated exact status codes.</FieldDescription></Field>
                       <Field><FieldLabel>Lazy content loading</FieldLabel><Select value={lazyLoad} onValueChange={setLazyLoad}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="thorough">Thorough (default)</SelectItem><SelectItem value="adaptive">Adaptive (faster)</SelectItem><SelectItem value="none">None (fastest)</SelectItem></SelectGroup></SelectContent></Select></Field>
-                      <div className="grid grid-cols-3 gap-3">
-                        <Field><FieldLabel>Load event</FieldLabel><Select value={waitEvent} onValueChange={setWaitEvent}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="load">Load</SelectItem><SelectItem value="domcontentloaded">DOM ready</SelectItem><SelectItem value="networkidle">Network idle</SelectItem></SelectGroup></SelectContent></Select></Field>
-                        <Field><FieldLabel htmlFor="delay">Wait (sec)</FieldLabel><Input id="delay" type="number" min={0} max={15} value={waitDelay} onChange={(event) => setWaitDelay(Number(event.target.value))} /></Field>
-                        <Field><FieldLabel htmlFor="timeout">Timeout</FieldLabel><Input id="timeout" type="number" min={1} max={30} value={waitTimeout} onChange={(event) => setWaitTimeout(Number(event.target.value))} /></Field>
-                      </div>
-                      <div className="grid grid-cols-2 gap-3">
-                        <Field data-invalid={waitSelectorTouched && Boolean(waitSelectorError)}>
-                          <FieldLabel htmlFor="wait-selector">Wait selector · <a href={`${docsUrl}#selectors-and-waits`} target="_blank" rel="noreferrer">Docs</a></FieldLabel>
-                          <Input id="wait-selector" value={waitSelector} onChange={(event) => setWaitSelector(event.target.value)} onBlur={() => setWaitSelectorTouched(true)} placeholder=".ready" aria-invalid={waitSelectorTouched && Boolean(waitSelectorError)} />
-                          {waitSelectorTouched && <FieldError>{waitSelectorError}</FieldError>}
-                        </Field>
-                        <Field><FieldLabel htmlFor="wait-text">Wait text</FieldLabel><Input id="wait-text" value={waitText} onChange={(event) => setWaitText(event.target.value)} placeholder="Loaded" /></Field>
-                      </div>
-                      {(output === "jpeg" || output === "webp" || output === "avif") && <Field><FieldLabel htmlFor="quality">Image quality</FieldLabel><Input id="quality" type="number" min={1} max={100} value={quality} onChange={(event) => setQuality(Number(event.target.value))} /></Field>}
-                      {(output === "png" || output === "webp" || output === "avif") && <Field orientation="horizontal"><FieldLabel htmlFor="transparent">Transparent background</FieldLabel><Switch id="transparent" checked={transparent} onCheckedChange={setTransparent} /></Field>}
-                      {(output === "png" || output === "webp") && <Field orientation="horizontal"><FieldLabel htmlFor="optimize-image"><span><span className="block">Fast {output.toUpperCase()} encoding</span><FieldDescription>Prioritizes render speed over the smallest file size.</FieldDescription></span></FieldLabel><Switch id="optimize-image" checked={optimizePng} onCheckedChange={setOptimizePng} /></Field>}
-                      {(output === "html" || output === "markdown") && <Field><FieldLabel>Extraction</FieldLabel><Select value={extractMode} onValueChange={setExtractMode}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="document">Full document</SelectItem><SelectItem value="article">Main article</SelectItem></SelectGroup></SelectContent></Select></Field>}
-                      {output === "pdf" && <>
+                      <FieldSet>
+                        <FieldLegend className="flex items-center gap-2"><TimerIcon data-title-icon="wait-conditions" size={16} className="shrink-0 text-primary" aria-hidden="true" />Wait conditions</FieldLegend>
+                        <div className="grid grid-cols-3 gap-3">
+                          <Field><FieldLabel>Load event</FieldLabel><Select value={waitEvent} onValueChange={setWaitEvent}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="load">Load</SelectItem><SelectItem value="domcontentloaded">DOM ready</SelectItem><SelectItem value="networkidle">Network idle</SelectItem></SelectGroup></SelectContent></Select></Field>
+                          <Field><FieldLabel htmlFor="delay">Wait (sec)</FieldLabel><Input id="delay" type="number" min={0} max={15} value={waitDelay} onChange={(event) => setWaitDelay(Number(event.target.value))} /></Field>
+                          <Field><FieldLabel htmlFor="timeout">Timeout</FieldLabel><Input id="timeout" type="number" min={1} max={30} value={waitTimeout} onChange={(event) => setWaitTimeout(Number(event.target.value))} /></Field>
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                          <Field data-invalid={waitSelectorTouched && Boolean(waitSelectorError)}>
+                            <FieldLabel htmlFor="wait-selector">Wait selector · <a href={`${docsUrl}#selectors-and-waits`} target="_blank" rel="noreferrer">Docs</a></FieldLabel>
+                            <Input id="wait-selector" value={waitSelector} onChange={(event) => setWaitSelector(event.target.value)} onBlur={() => setWaitSelectorTouched(true)} placeholder=".ready" aria-invalid={waitSelectorTouched && Boolean(waitSelectorError)} />
+                            {waitSelectorTouched && <FieldError>{waitSelectorError}</FieldError>}
+                          </Field>
+                          <Field><FieldLabel htmlFor="wait-text">Wait text</FieldLabel><Input id="wait-text" value={waitText} onChange={(event) => setWaitText(event.target.value)} placeholder="Loaded" /></Field>
+                        </div>
+                      </FieldSet>
+                      {imageOutput && <FieldSet>
+                        <FieldLegend className="flex items-center gap-2"><ContrastIcon data-title-icon="image-encoding" size={16} className="shrink-0 text-primary" aria-hidden="true" />Image encoding</FieldLegend>
+                        {(output === "jpeg" || output === "webp" || output === "avif") && <Field><FieldLabel htmlFor="quality">Image quality</FieldLabel><Input id="quality" type="number" min={1} max={100} value={quality} onChange={(event) => setQuality(Number(event.target.value))} /></Field>}
+                        {(output === "png" || output === "webp" || output === "avif") && <Field orientation="horizontal"><FieldLabel htmlFor="transparent">Transparent background</FieldLabel><Switch id="transparent" checked={transparent} onCheckedChange={setTransparent} /></Field>}
+                        {(output === "png" || output === "webp") && <Field orientation="horizontal"><FieldLabel htmlFor="optimize-image"><span><span className="block">Fast {output.toUpperCase()} encoding</span><FieldDescription>Prioritizes render speed over the smallest file size.</FieldDescription></span></FieldLabel><Switch id="optimize-image" checked={optimizePng} onCheckedChange={setOptimizePng} /></Field>}
+                      </FieldSet>}
+                      {(output === "html" || output === "markdown") && <FieldSet>
+                        <FieldLegend className="flex items-center gap-2"><BookTextIcon data-title-icon="content-extraction" size={16} className="shrink-0 text-primary" aria-hidden="true" />Content extraction</FieldLegend>
+                        <Field><FieldLabel>Extraction</FieldLabel><Select value={extractMode} onValueChange={setExtractMode}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="document">Full document</SelectItem><SelectItem value="article">Main article</SelectItem></SelectGroup></SelectContent></Select></Field>
+                      </FieldSet>}
+                      {output === "pdf" && <FieldSet>
+                        <FieldLegend className="flex items-center gap-2"><FileTextIcon data-title-icon="pdf-layout" size={16} className="shrink-0 text-primary" aria-hidden="true" />PDF layout</FieldLegend>
                         <div className="grid grid-cols-3 gap-3">
                           <Field><FieldLabel>PDF mode</FieldLabel><Select value={pdfMode} onValueChange={setPdfMode}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="print">Print pages</SelectItem><SelectItem value="single_page">Single page</SelectItem></SelectGroup></SelectContent></Select></Field>
                           <Field><FieldLabel>Paper</FieldLabel><Select value={paperSize} onValueChange={setPaperSize}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="A4">A4</SelectItem><SelectItem value="Letter">Letter</SelectItem></SelectGroup></SelectContent></Select></Field>
                           <Field><FieldLabel>Orientation</FieldLabel><Select value={orientation} onValueChange={setOrientation}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="portrait">Portrait</SelectItem><SelectItem value="landscape">Landscape</SelectItem></SelectGroup></SelectContent></Select></Field>
                         </div>
                         <Field><FieldLabel htmlFor="pdf-margin">PDF margins (inches)</FieldLabel><Input id="pdf-margin" type="number" min={0} max={4} step={0.1} value={pdfMargin} onChange={(event) => setPdfMargin(Number(event.target.value))} /></Field>
-                      </>}
-                      {videoOutput && <><div className="grid grid-cols-3 items-end gap-3"><Field><FieldLabel htmlFor="video-duration">Duration (seconds)</FieldLabel><Input id="video-duration" type="number" min={1} max={30} value={videoDuration} onChange={(event) => setVideoDuration(Number(event.target.value))} /></Field><Field><FieldLabel htmlFor="video-fps">Frame rate (FPS)</FieldLabel><Input id="video-fps" type="number" min={1} max={60} value={videoFps} onChange={(event) => setVideoFps(Number(event.target.value))} /></Field>{output !== "gif" && <Field><FieldLabel htmlFor="video-bitrate">Bitrate (Mbps)</FieldLabel><Input id="video-bitrate" type="number" min={1} max={100} value={videoBitrate} onChange={(event) => setVideoBitrate(Number(event.target.value))} /></Field>}</div>{fullPage ? <FieldDescription>Full-page output scrolls from the top to the bottom at the chosen frame rate{output === "gif" ? "." : " and bitrate."}</FieldDescription> : <Field orientation="horizontal"><FieldLabel htmlFor="video-scroll">Scroll viewport while recording</FieldLabel><Switch id="video-scroll" checked={videoScroll} onCheckedChange={setVideoScroll} /></Field>}{fullPage && output !== "mp4" && <Field orientation="horizontal"><FieldLabel htmlFor="transparent-video">Transparent side padding</FieldLabel><Switch id="transparent-video" checked={transparent} onCheckedChange={setTransparent} /></Field>}</>}
+                      </FieldSet>}
+                      {videoOutput && <FieldSet>
+                        <FieldLegend className="flex items-center gap-2"><ClapIcon data-title-icon="video-capture" size={16} className="shrink-0 text-primary" aria-hidden="true" />Video capture</FieldLegend>
+                        <div className="grid grid-cols-3 items-end gap-3"><Field><FieldLabel htmlFor="video-duration">Duration (seconds)</FieldLabel><Input id="video-duration" type="number" min={1} max={30} value={videoDuration} onChange={(event) => setVideoDuration(Number(event.target.value))} /></Field><Field><FieldLabel htmlFor="video-fps">Frame rate (FPS)</FieldLabel><Input id="video-fps" type="number" min={1} max={60} value={videoFps} onChange={(event) => setVideoFps(Number(event.target.value))} /></Field>{output !== "gif" && <Field><FieldLabel htmlFor="video-bitrate">Bitrate (Mbps)</FieldLabel><Input id="video-bitrate" type="number" min={1} max={100} value={videoBitrate} onChange={(event) => setVideoBitrate(Number(event.target.value))} /></Field>}</div>{fullPage ? <FieldDescription>Full-page output scrolls from the top to the bottom at the chosen frame rate{output === "gif" ? "." : " and bitrate."}</FieldDescription> : <Field orientation="horizontal"><FieldLabel htmlFor="video-scroll">Scroll viewport while recording</FieldLabel><Switch id="video-scroll" checked={videoScroll} onCheckedChange={setVideoScroll} /></Field>}{fullPage && output !== "mp4" && <Field orientation="horizontal"><FieldLabel htmlFor="transparent-video">Transparent side padding</FieldLabel><Switch id="transparent-video" checked={transparent} onCheckedChange={setTransparent} /></Field>}
+                      </FieldSet>}
                       <Field orientation="horizontal"><FieldLabel htmlFor="diagnostics"><span><span className="block">Diagnostic bundle</span><FieldDescription>ZIP the artifact with console and network reports.</FieldDescription></span></FieldLabel><Switch id="diagnostics" checked={diagnostics} onCheckedChange={setDiagnostics} /></Field>
                       <Field data-invalid={headersTouched && Boolean(headersValidation.error)}>
                         <FieldLabel htmlFor="headers">Same-origin headers · <a href={`${docsUrl}#custom-headers`} target="_blank" rel="noreferrer">Docs</a></FieldLabel>
