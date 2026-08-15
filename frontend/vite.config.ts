@@ -14,5 +14,18 @@ export default defineConfig({
   build: {
     outDir: '../static/app',
     emptyOutDir: true,
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          groups: [
+            {
+              name: 'motion',
+              test: /node_modules[\\/](motion|framer-motion|motion-dom|motion-utils)[\\/]/,
+              priority: 20,
+            },
+          ],
+        },
+      },
+    },
   },
 })

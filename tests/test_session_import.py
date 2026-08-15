@@ -6,6 +6,19 @@ from vipercapture.session_import import MAX_IMPORT_BYTES, import_storage_state
 
 
 class SessionImportTests(unittest.TestCase):
+    def test_imports_utf8_bom_exports(self):
+        cookie_json = '\ufeff[{"name":"sid","value":"value","domain":"example.com"}]'
+        playwright = '\ufeff{"cookies":[],"origins":[]}'
+
+        imported_cookies = import_storage_state(cookie_json)
+        imported_playwright = import_storage_state(
+            playwright,
+            format_name="playwright",
+        )
+
+        self.assertEqual(imported_cookies["cookies"][0]["name"], "sid")
+        self.assertEqual(imported_playwright, {"cookies": [], "origins": []})
+
     def test_imports_playwright_storage_state_with_local_storage(self):
         state = import_storage_state(
             json.dumps(

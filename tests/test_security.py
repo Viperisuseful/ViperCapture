@@ -797,7 +797,13 @@ class FrontendTests(unittest.TestCase):
         self.assertIn("GPU rendering", source)
         self.assertIn("Fast {output.toUpperCase()} encoding", source)
         self.assertIn('output === "png" || output === "webp"', source)
-        self.assertIn("<FieldLegend>Page cleanup</FieldLegend>", source)
+        self.assertIn('data-title-icon="page-cleanup"', source)
+        self.assertIn("Page cleanup</FieldLegend>", source)
+        self.assertIn('data-title-icon="advanced-controls"', source)
+        self.assertIn('data-title-icon="deterministic-environment"', source)
+        for group in ("capture-region", "wait-conditions", "image-encoding", "content-extraction", "pdf-layout", "video-capture"):
+            self.assertIn(f'data-title-icon="{group}"', source)
+        self.assertIn("Video capture</FieldLegend>", source)
         self.assertIn('"style": "radix-nova"', components)
 
 

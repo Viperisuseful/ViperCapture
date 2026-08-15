@@ -22,13 +22,12 @@ class ReleaseVersionTests(unittest.TestCase):
         self.assertEqual(typescript_manifest["version"], versions["typescript_sdk"])
         self.assertTrue(versions["container"].endswith(versions["oss"]))
 
-    def test_native_apps_are_not_part_of_the_distribution(self):
+    def test_release_manifest_contains_only_supported_packages(self):
         versions = json.loads((ROOT / "release" / "versions.json").read_text("utf-8"))
-        self.assertNotIn("desktop", versions)
-        self.assertNotIn("android", versions)
-        self.assertFalse((ROOT / "desktop").exists())
-        self.assertFalse((ROOT / ".github" / "workflows" / "desktop-release.yml").exists())
-        self.assertFalse((ROOT / ".github" / "workflows" / "android-release.yml").exists())
+        self.assertEqual(
+            set(versions),
+            {"oss", "python_sdk", "typescript_sdk", "container"},
+        )
 
     def test_oss_workflow_matches_release_manifest(self):
         versions = json.loads((ROOT / "release" / "versions.json").read_text("utf-8"))
@@ -38,8 +37,6 @@ class ReleaseVersionTests(unittest.TestCase):
         )
         self.assertIn(f"v{version}", workflow)
         self.assertIn(f"docs/releases/v{version}.md", workflow)
-        self.assertNotIn("desktop", workflow.lower())
-        self.assertNotIn("android", workflow.lower())
 
 
 class ChecksumTests(unittest.TestCase):
