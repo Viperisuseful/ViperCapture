@@ -214,7 +214,12 @@ function ResultMetric({ label, value, mono = false }: { label: string; value: st
 }
 
 export default function App() {
-  const [dark, setDark] = useState(() => localStorage.getItem("theme") === "dark")
+  const [dark, setDark] = useState(() => {
+    const stored = localStorage.getItem("theme")
+    return stored === null
+      ? window.matchMedia("(prefers-color-scheme: dark)").matches
+      : stored === "dark"
+  })
   const [url, setUrl] = useState("https://example.com")
   const [apiKey, setApiKey] = useState("")
   const [output, setOutput] = useState<Output>("png")
