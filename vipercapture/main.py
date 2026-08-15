@@ -2535,6 +2535,59 @@ if not HOSTED:
                 app.state.capture_slots.release()
 
         return {"gpu": await _gpu_config(app)}
+
+    PRESETS_DIRECTORY = BASE_DIR / "presets"
+    PRESETS_FILE = PRESETS_DIRECTORY / "presets.json"
+    MAX_PRESETS = 12
+    MAX_PRESET_SETTINGS_BYTES = 16_384
+
+    def _read_presets() -> list[dict]:
+        try:
+            data = json.loads(PRESETS_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
+    def _write_presets(presets: list[dict]) -> None:
+        PRESETS_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        PRESETS_FILE.write_text(json.dumps(presets, indent=2), encoding="utf-8")
+
+    def _check_local_request(request: Request) -> None:
+        if not _is_local_control_request(request):
+            raise HTTPException(
+                status_code=403,
+                detail="Presets can only be managed from the local ViperCapture interface",
+            )
+
+    @app.get("/local/presets")
+    async def list_local_presets(request: Request):
+        _check_local_request(request)
+        return {"presets": await asyncio.to_thread(_read_presets)}
+
+    @app.post("/local/presets", status_code=201)
+    async def save_local_preset(request: Request):
+        _check_local_request(request)
+        payload = await request.json()
+        name = payload.get("name") if isinstance(payload, dict) else None
+        settings = payload.get("settings") if isinstance(payload, dict) else None
+        if not isinstance(name, str) or not (name := name.strip()) or len(name) > 40:
+            raise HTTPException(status_code=422, detail="Preset name must be 1-40 characters")
+        if not isinstance(settings, dict) or len(json.dumps(settings)) > MAX_PRESET_SETTINGS_BYTES:
+            raise HTTPException(status_code=422, detail="Preset settings must be a small JSON object")
+        presets = await asyncio.to_thread(_read_presets)
+        if any(preset.get("name") == name for preset in presets):
+            raise HTTPException(status_code=409, detail="A preset with that name already exists")
+        presets.insert(0, {"name": name, "settings": settings})
+        del presets[MAX_PRESETS:]
+        await asyncio.to_thread(_write_presets, presets)
+        return JSONResponse({"presets": presets}, status_code=201)
+
+    @app.delete("/local/presets/{name}")
+    async def delete_local_preset(name: str, request: Request):
+        _check_local_request(request)
+        presets = [preset for preset in await asyncio.to_thread(_read_presets) if preset.get("name") != name]
+        await asyncio.to_thread(_write_presets, presets)
+        return {"presets": presets}
 if __name__ == "__main__":
     import uvicorn
 

@@ -1,20 +1,20 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import {
   AlertTriangle,
+  Bookmark,
   CheckCircle2,
   ChevronDown,
   Download,
   ExternalLink,
-  Gauge,
   Code2,
   Globe2,
   ImageIcon,
   Loader2,
   Moon,
   RotateCcw,
-  Sparkles,
   Square,
   Sun,
+  Trash2,
   Zap,
 } from "lucide-react"
 import { toast } from "sonner"
@@ -84,6 +84,101 @@ type AppConfig = {
   gpu?: { mode?: "off" | "auto" | "required"; hardware_active?: boolean; mutable?: boolean }
 }
 type CaptchaWarning = { provider: string; requestId?: string }
+
+type PresetSettings = {
+  output: Output
+  width: number
+  height: number
+  density: number
+  fullPage: boolean
+  preserveViewportWidth: boolean
+  selector: string
+  quality: number
+  transparent: boolean
+  lazyLoad: string
+  optimizePng: boolean
+  diagnostics: boolean
+  videoDuration: number
+  videoFps: number
+  videoBitrate: number
+  videoScroll: boolean
+  waitEvent: string
+  waitDelay: number
+  waitSelector: string
+  waitText: string
+  waitTimeout: number
+  headers: string
+  consent: string
+  blockAds: boolean
+  blockTrackers: boolean
+  blockChats: boolean
+  blockNewsletters: boolean
+  device: Device
+  colorScheme: string
+  reducedMotion: string
+  locale: string
+  timezone: string
+  customCss: string
+  failStatuses: string
+  clipEnabled: boolean
+  clipX: number
+  clipY: number
+  clipWidth: number
+  clipHeight: number
+  extractMode: string
+  pdfMode: string
+  paperSize: string
+  orientation: string
+  pdfMargin: number
+}
+type SavedPreset = { name: string; settings: PresetSettings }
+
+const defaultSettings: PresetSettings = {
+  output: "png",
+  width: 1280,
+  height: 720,
+  density: 1,
+  fullPage: true,
+  preserveViewportWidth: false,
+  selector: "",
+  quality: 90,
+  transparent: false,
+  lazyLoad: "thorough",
+  optimizePng: false,
+  diagnostics: false,
+  videoDuration: 5,
+  videoFps: 60,
+  videoBitrate: 20,
+  videoScroll: false,
+  waitEvent: "load",
+  waitDelay: 1,
+  waitSelector: "",
+  waitText: "",
+  waitTimeout: 15,
+  headers: "",
+  consent: "reject",
+  blockAds: true,
+  blockTrackers: true,
+  blockChats: true,
+  blockNewsletters: true,
+  device: "desktop",
+  colorScheme: "system",
+  reducedMotion: "system",
+  locale: "",
+  timezone: "",
+  customCss: "",
+  failStatuses: "",
+  clipEnabled: false,
+  clipX: 0,
+  clipY: 0,
+  clipWidth: 640,
+  clipHeight: 480,
+  extractMode: "document",
+  pdfMode: "print",
+  paperSize: "A4",
+  orientation: "portrait",
+  pdfMargin: 0.4,
+}
 
 const presets = [
   ["Phone", 390, 844],
@@ -278,6 +373,9 @@ export default function App() {
   const [latest, setLatest] = useState<Capture | null>(null)
   const [history, setHistory] = useState<Capture[]>([])
   const [captchaWarning, setCaptchaWarning] = useState<CaptchaWarning | null>(null)
+  const [savedPresets, setSavedPresets] = useState<SavedPreset[]>([])
+  const [presetName, setPresetName] = useState("")
+  const [savePresetOpen, setSavePresetOpen] = useState(false)
   const historyRef = useRef<Capture[]>([])
   const abortControllerRef = useRef<AbortController | null>(null)
   const captureStartedAtRef = useRef(0)
@@ -288,6 +386,10 @@ export default function App() {
   }, [dark])
   useEffect(() => {
     fetch("/app-config").then((response) => response.json()).then(setConfig).catch(() => null)
+    fetch("/local/presets")
+      .then((response) => (response.ok ? response.json() : { presets: [] }))
+      .then((body) => setSavedPresets(Array.isArray(body.presets) ? body.presets : []))
+      .catch(() => null)
   }, [])
   useEffect(
     () => () => {
@@ -347,54 +449,113 @@ export default function App() {
     6 + (elapsedMs / Math.max(10_000, ((activeRun?.waitTimeout ?? 15) + 10) * 1000)) * 86,
   )
 
-  const reset = () => {
-    setOutput("png")
-    setWidth(1280)
-    setHeight(720)
-    setDensity(1)
-    setFullPage(true)
-    setPreserveViewportWidth(false)
-    setSelector("")
-    setQuality(90)
-    setTransparent(false)
-    setLazyLoad("thorough")
-    setOptimizePng(false)
-    setDiagnostics(false)
-    setVideoDuration(5)
-    setVideoFps(60)
-    setVideoBitrate(20)
-    setVideoScroll(false)
-    setWaitEvent("load")
-    setWaitDelay(1)
-    setWaitSelector("")
-    setWaitText("")
-    setWaitTimeout(15)
-    setHeaders("")
-    setConsent("reject")
-    setBlockAds(true)
-    setBlockTrackers(true)
-    setBlockChats(true)
-    setBlockNewsletters(true)
-    setDevice("desktop")
-    setColorScheme("system")
-    setReducedMotion("system")
-    setLocale("")
-    setTimezone("")
-    setCustomCss("")
-    setFailStatuses("")
-    setClipEnabled(false)
-    setClipX(0)
-    setClipY(0)
-    setClipWidth(640)
-    setClipHeight(480)
-    setExtractMode("document")
-    setPdfMode("print")
-    setPaperSize("A4")
-    setOrientation("portrait")
-    setPdfMargin(0.4)
+  const currentSettings = (): PresetSettings => ({
+    output, width, height, density, fullPage, preserveViewportWidth, selector,
+    quality, transparent, lazyLoad, optimizePng, diagnostics, videoDuration,
+    videoFps, videoBitrate, videoScroll, waitEvent, waitDelay, waitSelector,
+    waitText, waitTimeout, headers, consent, blockAds, blockTrackers, blockChats,
+    blockNewsletters, device, colorScheme, reducedMotion, locale, timezone,
+    customCss, failStatuses, clipEnabled, clipX, clipY, clipWidth, clipHeight,
+    extractMode, pdfMode, paperSize, orientation, pdfMargin,
+  })
+
+  const applySettings = (value: Partial<PresetSettings>) => {
+    const merged = { ...defaultSettings, ...value }
+    const imageOutput = ["png", "jpeg", "webp", "avif"].includes(merged.output)
+    setOutput(merged.output)
+    setWidth(merged.width)
+    setHeight(merged.height)
+    setDensity(merged.density)
+    setFullPage(merged.fullPage)
+    setPreserveViewportWidth(merged.preserveViewportWidth)
+    setSelector(merged.selector)
+    setQuality(merged.quality)
+    setTransparent(merged.transparent)
+    setLazyLoad(merged.lazyLoad)
+    setOptimizePng(merged.optimizePng)
+    setDiagnostics(merged.diagnostics)
+    setVideoDuration(merged.videoDuration)
+    setVideoFps(merged.videoFps)
+    setVideoBitrate(merged.videoBitrate)
+    setVideoScroll(merged.videoScroll)
+    setWaitEvent(merged.waitEvent)
+    setWaitDelay(merged.waitDelay)
+    setWaitSelector(merged.waitSelector)
+    setWaitText(merged.waitText)
+    setWaitTimeout(merged.waitTimeout)
+    setHeaders(merged.headers)
+    setConsent(merged.consent)
+    setBlockAds(merged.blockAds)
+    setBlockTrackers(merged.blockTrackers)
+    setBlockChats(merged.blockChats)
+    setBlockNewsletters(merged.blockNewsletters)
+    setDevice(merged.device)
+    setColorScheme(merged.colorScheme)
+    setReducedMotion(merged.reducedMotion)
+    setLocale(merged.locale)
+    setTimezone(merged.timezone)
+    setCustomCss(merged.customCss)
+    setFailStatuses(merged.failStatuses)
+    setClipEnabled(merged.clipEnabled && imageOutput)
+    setClipX(merged.clipX)
+    setClipY(merged.clipY)
+    setClipWidth(merged.clipWidth)
+    setClipHeight(merged.clipHeight)
+    setExtractMode(merged.extractMode)
+    setPdfMode(merged.pdfMode)
+    setPaperSize(merged.paperSize)
+    setOrientation(merged.orientation)
+    setPdfMargin(merged.pdfMargin)
     setHeadersTouched(false)
     setSelectorTouched(false)
     setWaitSelectorTouched(false)
+  }
+
+  const reset = () => applySettings(defaultSettings)
+
+  const currentSettingsJson = JSON.stringify(currentSettings())
+  const matchedPreset = savedPresets.find(
+    (preset) => JSON.stringify(preset.settings) === currentSettingsJson,
+  )
+
+  const savePreset = async () => {
+    const name = presetName.trim().slice(0, 40)
+    if (!name) {
+      toast.error("Give this preset a name.")
+      return
+    }
+    if (savedPresets.some((preset) => preset.name === name)) {
+      toast.error("A preset with that name already exists.")
+      return
+    }
+    const response = await fetch("/local/presets", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, settings: currentSettings() }),
+    })
+    if (response.status === 409) {
+      toast.error("A preset with that name already exists.")
+      return
+    }
+    if (!response.ok) {
+      toast.error("Could not save the preset.")
+      return
+    }
+    const body = await response.json()
+    setSavedPresets(body.presets)
+    setPresetName("")
+    setSavePresetOpen(false)
+    toast.success("Preset saved")
+  }
+
+  const deletePreset = async (name: string) => {
+    const response = await fetch(`/local/presets/${encodeURIComponent(name)}`, { method: "DELETE" })
+    if (!response.ok) {
+      toast.error("Could not delete the preset.")
+      return
+    }
+    const body = await response.json()
+    setSavedPresets(body.presets)
   }
 
   const setGpu = async (enabled: boolean) => {
@@ -606,30 +767,7 @@ export default function App() {
       </header>
 
       <main className="site-shell py-10 sm:py-14">
-        <section className="mb-8 grid gap-6 lg:grid-cols-[1fr_auto] lg:items-end">
-          <div className="max-w-3xl">
-            <Badge variant="outline" className="mb-4"><Sparkles data-icon="inline-start" />Local Chromium renderer</Badge>
-            <h1 className="page-title">The whole webpage, in one capture.</h1>
-            <p className="mt-4 max-w-2xl text-base leading-7 text-muted-foreground sm:text-lg">
-              Self-host screenshots, documents, metadata, and video with the complete ViperCapture render contract.
-            </p>
-          </div>
-          <div className="grid grid-cols-3 gap-2">
-            {[
-              [Gauge, "Local", "Private"],
-              [Zap, "Fast", "Chromium"],
-              [ImageIcon, "11", "Outputs"],
-            ].map(([Icon, value, label]) => (
-              <Card key={String(label)} size="sm" className="min-w-24">
-                <CardContent className="flex items-center gap-2">
-                  <Icon />
-                  <div><p className="text-sm font-medium">{String(value)}</p><p className="text-xs text-muted-foreground">{String(label)}</p></div>
-                </CardContent>
-              </Card>
-            ))}
-          </div>
-        </section>
-
+        <h1 className="sr-only">ViperCapture</h1>
         <section className="hairline-panel overflow-hidden">
           <div className="flex flex-col gap-4 border-b bg-card p-4 lg:flex-row lg:items-end">
             <Field className="min-w-0 flex-1">
@@ -659,8 +797,42 @@ export default function App() {
                   <SettingsIcon data-title-icon="capture-settings" size={18} className="mt-0.5 shrink-0 text-primary" aria-hidden="true" />
                   <div><p className="font-medium">Capture settings</p><p className="text-xs text-muted-foreground">Runs on your machine</p></div>
                 </div>
-                <Button size="icon-sm" variant="ghost" onClick={reset} aria-label="Reset settings"><RotateCcw /></Button>
+                <div className="flex items-center gap-1">
+                  <Button
+                    size="icon-sm"
+                    variant="ghost"
+                    onClick={() => { setPresetName(matchedPreset?.name ?? ""); setSavePresetOpen(true) }}
+                    aria-label={matchedPreset ? `Manage presets (${matchedPreset.name} applied)` : "Save preset"}
+                    title={matchedPreset ? `${matchedPreset.name} applied` : "Save preset"}
+                  >
+                    <Bookmark fill={matchedPreset ? "currentColor" : "none"} />
+                  </Button>
+                  <Button size="icon-sm" variant="ghost" onClick={reset} aria-label="Reset settings"><RotateCcw /></Button>
+                </div>
               </div>
+              {savedPresets.length > 0 && (
+                <Select
+                  value={matchedPreset?.name ?? ""}
+                  onValueChange={(name: string) => {
+                    const preset = savedPresets.find((item) => item.name === name)
+                    if (preset) {
+                      applySettings(preset.settings)
+                      toast.success(`Applied ${preset.name}`)
+                    }
+                  }}
+                >
+                  <SelectTrigger className="mb-5 w-full" aria-label="Load saved preset">
+                    <SelectValue placeholder="Load preset" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      {savedPresets.map((preset) => (
+                        <SelectItem key={preset.name} value={preset.name}>{preset.name}</SelectItem>
+                      ))}
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+              )}
               <FieldGroup>
                 <FieldSet>
                   <FieldLegend className="flex items-center gap-2"><GalleryThumbnailsIcon data-title-icon="output" size={16} className="shrink-0 text-primary" aria-hidden="true" />Output</FieldLegend>
@@ -918,6 +1090,46 @@ export default function App() {
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel capture</AlertDialogCancel>
             <AlertDialogAction onClick={() => { setCaptchaWarning(null); void capture(true) }}>Capture anyway</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog open={savePresetOpen} onOpenChange={setSavePresetOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Save capture preset</AlertDialogTitle>
+            <AlertDialogDescription>Stored in this browser only.</AlertDialogDescription>
+          </AlertDialogHeader>
+          <Field>
+            <FieldLabel htmlFor="preset-name">Preset name</FieldLabel>
+            <Input
+              id="preset-name"
+              value={presetName}
+              onChange={(event) => setPresetName(event.target.value)}
+              placeholder="e.g. Blog article"
+              maxLength={40}
+            />
+          </Field>
+          {savedPresets.length > 0 && (
+            <ul className="flex flex-col gap-1">
+              {savedPresets.map((preset) => (
+                <li key={preset.name} className="flex items-center justify-between gap-2 text-sm">
+                  <span className="truncate">{preset.name}</span>
+                  <Button size="icon-sm" variant="ghost" aria-label={`Delete ${preset.name}`} onClick={() => deletePreset(preset.name)}>
+                    <Trash2 />
+                  </Button>
+                </li>
+              ))}
+            </ul>
+          )}
+          <AlertDialogFooter>
+            <AlertDialogCancel>Close</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => void savePreset()}
+              disabled={!presetName.trim() || savedPresets.some((preset) => preset.name === presetName.trim())}
+            >
+              Save preset
+            </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>

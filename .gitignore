@@ -42,3 +42,6 @@ ehthumbs.db
 *.swp
 *.swo
 *~
+
+# Local capture presets (user data)
+presets/
