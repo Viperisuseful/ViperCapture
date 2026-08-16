@@ -81,6 +81,7 @@ type AppConfig = {
   max_viewport_height?: number
   max_full_page_height?: number
   control_plane?: boolean
+  presets?: boolean
   gpu?: { mode?: "off" | "auto" | "required"; hardware_active?: boolean; mutable?: boolean }
 }
 type CaptchaWarning = { provider: string; requestId?: string }
@@ -513,9 +514,12 @@ export default function App() {
 
   const reset = () => applySettings(defaultSettings)
 
-  const currentSettingsJson = JSON.stringify(currentSettings())
+  // Settings are flat; sorting keys makes the comparison order-insensitive.
+  const stableStringify = (value: PresetSettings) =>
+    JSON.stringify(value, Object.keys(value).sort())
+  const currentSettingsJson = stableStringify(currentSettings())
   const matchedPreset = savedPresets.find(
-    (preset) => JSON.stringify(preset.settings) === currentSettingsJson,
+    (preset) => stableStringify(preset.settings) === currentSettingsJson,
   )
 
   const savePreset = async () => {
@@ -528,34 +532,43 @@ export default function App() {
       toast.error("A preset with that name already exists.")
       return
     }
-    const response = await fetch("/local/presets", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, settings: currentSettings() }),
-    })
-    if (response.status === 409) {
-      toast.error("A preset with that name already exists.")
-      return
+    try {
+      const response = await fetch("/local/presets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, settings: currentSettings() }),
+      })
+      if (response.status === 409) {
+        toast.error("A preset with that name already exists.")
+        return
+      }
+      if (!response.ok) {
+        const body = await response.json().catch(() => null)
+        toast.error(body?.error?.message ?? "Could not save the preset.")
+        return
+      }
+      const body = await response.json()
+      setSavedPresets(body.presets)
+      setPresetName("")
+      setSavePresetOpen(false)
+      toast.success("Preset saved")
+    } catch {
+      toast.error("Could not reach the preset store.")
     }
-    if (!response.ok) {
-      toast.error("Could not save the preset.")
-      return
-    }
-    const body = await response.json()
-    setSavedPresets(body.presets)
-    setPresetName("")
-    setSavePresetOpen(false)
-    toast.success("Preset saved")
   }
 
   const deletePreset = async (name: string) => {
-    const response = await fetch(`/local/presets/${encodeURIComponent(name)}`, { method: "DELETE" })
-    if (!response.ok) {
-      toast.error("Could not delete the preset.")
-      return
+    try {
+      const response = await fetch(`/local/presets/${encodeURIComponent(name)}`, { method: "DELETE" })
+      if (!response.ok) {
+        toast.error("Could not delete the preset.")
+        return
+      }
+      const body = await response.json()
+      setSavedPresets(body.presets)
+    } catch {
+      toast.error("Could not reach the preset store.")
     }
-    const body = await response.json()
-    setSavedPresets(body.presets)
   }
 
   const setGpu = async (enabled: boolean) => {
@@ -798,19 +811,21 @@ export default function App() {
                   <div><p className="font-medium">Capture settings</p><p className="text-xs text-muted-foreground">Runs on your machine</p></div>
                 </div>
                 <div className="flex items-center gap-1">
-                  <Button
-                    size="icon-sm"
-                    variant="ghost"
-                    onClick={() => { setPresetName(matchedPreset?.name ?? ""); setSavePresetOpen(true) }}
-                    aria-label={matchedPreset ? `Manage presets (${matchedPreset.name} applied)` : "Save preset"}
-                    title={matchedPreset ? `${matchedPreset.name} applied` : "Save preset"}
-                  >
-                    <Bookmark fill={matchedPreset ? "currentColor" : "none"} />
-                  </Button>
+                  {config?.presets && (
+                    <Button
+                      size="icon-sm"
+                      variant="ghost"
+                      onClick={() => { setPresetName(matchedPreset?.name ?? ""); setSavePresetOpen(true) }}
+                      aria-label={matchedPreset ? `Manage presets (${matchedPreset.name} applied)` : "Save preset"}
+                      title={matchedPreset ? `${matchedPreset.name} applied` : "Save preset"}
+                    >
+                      <Bookmark fill={matchedPreset ? "currentColor" : "none"} />
+                    </Button>
+                  )}
                   <Button size="icon-sm" variant="ghost" onClick={reset} aria-label="Reset settings"><RotateCcw /></Button>
                 </div>
               </div>
-              {savedPresets.length > 0 && (
+              {config?.presets && savedPresets.length > 0 && (
                 <Select
                   value={matchedPreset?.name ?? ""}
                   onValueChange={(name: string) => {
@@ -1098,7 +1113,7 @@ export default function App() {
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>Save capture preset</AlertDialogTitle>
-            <AlertDialogDescription>Stored in this browser only.</AlertDialogDescription>
+            <AlertDialogDescription>Saved on this machine.</AlertDialogDescription>
           </AlertDialogHeader>
           <Field>
             <FieldLabel htmlFor="preset-name">Preset name</FieldLabel>

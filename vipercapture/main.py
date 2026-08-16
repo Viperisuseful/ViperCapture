@@ -5,6 +5,7 @@ import os
 import re
 import secrets
 import sys
+import threading
 import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
@@ -2444,7 +2445,8 @@ def _is_local_control_request(request: Request) -> bool:
     return (
         client in {"127.0.0.1", "::1"}
         and host in {"127.0.0.1", "localhost", "::1"}
-        and origin in expected_origins
+        # Same-origin browser GETs omit Origin; cross-origin browser requests always send it.
+        and (origin is None or origin in expected_origins)
     )
 
 
@@ -2463,6 +2465,7 @@ async def app_config():
         output_formats.remove(OutputFormat.MP4.value)
     return {
         "control_plane": CONTROL_ENABLED,
+        "presets": not HOSTED,
         "max_screenshot_pixels": MAX_SCREENSHOT_PIXELS,
         "max_viewport_width": MAX_VIEWPORT_WIDTH,
         "max_viewport_height": MAX_VIEWPORT_HEIGHT,
@@ -2536,21 +2539,57 @@ if not HOSTED:
 
         return {"gpu": await _gpu_config(app)}
 
-    PRESETS_DIRECTORY = BASE_DIR / "presets"
+    PRESETS_DIRECTORY = CACHE_DIRECTORY.parent / "presets"
     PRESETS_FILE = PRESETS_DIRECTORY / "presets.json"
+    PRESETS_LOCK = threading.Lock()
     MAX_PRESETS = 12
-    MAX_PRESET_SETTINGS_BYTES = 16_384
+    MAX_PRESET_SETTINGS_BYTES = 131_072
 
     def _read_presets() -> list[dict]:
         try:
             data = json.loads(PRESETS_FILE.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return []
-        return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+        if not isinstance(data, list):
+            return []
+        return [
+            item
+            for item in data
+            if isinstance(item, dict)
+            and isinstance(item.get("name"), str)
+            and isinstance(item.get("settings"), dict)
+        ]
 
     def _write_presets(presets: list[dict]) -> None:
         PRESETS_DIRECTORY.mkdir(parents=True, exist_ok=True)
-        PRESETS_FILE.write_text(json.dumps(presets, indent=2), encoding="utf-8")
+        # Presets can hold credential-bearing headers; keep them owner-only.
+        with suppress(OSError):
+            os.chmod(PRESETS_DIRECTORY, 0o700)
+        temporary = PRESETS_DIRECTORY / f".{PRESETS_FILE.name}.{os.getpid()}.tmp"
+        temporary.write_text(json.dumps(presets, indent=2), encoding="utf-8")
+        with suppress(OSError):
+            os.chmod(temporary, 0o600)
+        os.replace(temporary, PRESETS_FILE)
+
+    def _save_preset(name: str, settings: dict) -> list[dict]:
+        with PRESETS_LOCK:
+            presets = _read_presets()
+            if any(preset["name"] == name for preset in presets):
+                raise HTTPException(status_code=409, detail="A preset with that name already exists")
+            if len(presets) >= MAX_PRESETS:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Preset limit reached ({MAX_PRESETS}); delete one first",
+                )
+            presets.insert(0, {"name": name, "settings": settings})
+            _write_presets(presets)
+            return presets
+
+    def _delete_preset(name: str) -> list[dict]:
+        with PRESETS_LOCK:
+            presets = [preset for preset in _read_presets() if preset["name"] != name]
+            _write_presets(presets)
+            return presets
 
     def _check_local_request(request: Request) -> None:
         if not _is_local_control_request(request):
@@ -2572,22 +2611,15 @@ if not HOSTED:
         settings = payload.get("settings") if isinstance(payload, dict) else None
         if not isinstance(name, str) or not (name := name.strip()) or len(name) > 40:
             raise HTTPException(status_code=422, detail="Preset name must be 1-40 characters")
-        if not isinstance(settings, dict) or len(json.dumps(settings)) > MAX_PRESET_SETTINGS_BYTES:
+        if not isinstance(settings, dict) or len(json.dumps(settings, separators=(",", ":")).encode("utf-8")) > MAX_PRESET_SETTINGS_BYTES:
             raise HTTPException(status_code=422, detail="Preset settings must be a small JSON object")
-        presets = await asyncio.to_thread(_read_presets)
-        if any(preset.get("name") == name for preset in presets):
-            raise HTTPException(status_code=409, detail="A preset with that name already exists")
-        presets.insert(0, {"name": name, "settings": settings})
-        del presets[MAX_PRESETS:]
-        await asyncio.to_thread(_write_presets, presets)
+        presets = await asyncio.to_thread(_save_preset, name, settings)
         return JSONResponse({"presets": presets}, status_code=201)
 
     @app.delete("/local/presets/{name}")
     async def delete_local_preset(name: str, request: Request):
         _check_local_request(request)
-        presets = [preset for preset in await asyncio.to_thread(_read_presets) if preset.get("name") != name]
-        await asyncio.to_thread(_write_presets, presets)
-        return {"presets": presets}
+        return {"presets": await asyncio.to_thread(_delete_preset, name)}
 if __name__ == "__main__":
     import uvicorn
 
