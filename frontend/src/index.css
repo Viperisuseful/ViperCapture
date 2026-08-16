@@ -99,9 +99,6 @@
   .hairline-panel {
     @apply rounded-xl border bg-card shadow-[0_1px_2px_rgb(15_23_42/0.03),0_12px_36px_rgb(15_23_42/0.04)];
   }
-  .page-title {
-    @apply text-4xl font-semibold tracking-[-0.045em] text-balance sm:text-5xl lg:text-6xl;
-  }
   .mono-label {
     @apply font-mono text-[11px] font-medium tracking-[0.08em] text-muted-foreground uppercase;
   }
