@@ -100,7 +100,7 @@ jobs:
         if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish)
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v0.3.0-beta.1' }}
+          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v0.3.0-beta.2' }}
         run: |
           mapfile -t assets < <(find dist -type f -print)
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -124,12 +124,12 @@ jobs:
             done
             gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --prerelease \
               --title "ViperCapture OSS ${RELEASE_TAG#v} Developer Beta" \
-              --notes-file docs/releases/v0.3.0-beta.1.md
+              --notes-file docs/releases/v0.3.0-beta.2.md
           else
             gh release create "$RELEASE_TAG" "${assets[@]}" \
               --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
               --title "ViperCapture OSS ${RELEASE_TAG#v} Developer Beta" \
-              --notes-file docs/releases/v0.3.0-beta.1.md
+              --notes-file docs/releases/v0.3.0-beta.2.md
           fi
 
   container:
@@ -149,7 +149,7 @@ jobs:
         id: version-image
         if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish)
         env:
-          VERSION_IMAGE: ghcr.io/viperisuseful/vipercapture:v0.3.0-beta.1
+          VERSION_IMAGE: ghcr.io/viperisuseful/vipercapture:v0.3.0-beta.2
         run: |
           if docker buildx imagetools inspect "$VERSION_IMAGE" >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
@@ -162,10 +162,10 @@ jobs:
         with:
           context: .
           push: false
-          tags: ghcr.io/viperisuseful/vipercapture:v0.3.0-beta.1
+          tags: ghcr.io/viperisuseful/vipercapture:v0.3.0-beta.2
           labels: |
             org.opencontainers.image.source=https://github.com/Viperisuseful/ViperCapture
-            org.opencontainers.image.version=0.3.0-beta.1
+            org.opencontainers.image.version=0.3.0-beta.2
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Publish new immutable version image
@@ -175,11 +175,11 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/viperisuseful/vipercapture:v0.3.0-beta.1
+            ghcr.io/viperisuseful/vipercapture:v0.3.0-beta.2
             ghcr.io/viperisuseful/vipercapture:beta
           labels: |
             org.opencontainers.image.source=https://github.com/Viperisuseful/ViperCapture
-            org.opencontainers.image.version=0.3.0-beta.1
+            org.opencontainers.image.version=0.3.0-beta.2
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Reuse immutable version image on rerun
@@ -187,4 +187,4 @@ jobs:
         run: |
           docker buildx imagetools create \
             --tag ghcr.io/viperisuseful/vipercapture:beta \
-            ghcr.io/viperisuseful/vipercapture:v0.3.0-beta.1
+            ghcr.io/viperisuseful/vipercapture:v0.3.0-beta.2

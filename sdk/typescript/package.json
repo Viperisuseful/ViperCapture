@@ -1,6 +1,6 @@
 {
   "name": "@vipercapture/sdk",
-  "version": "0.3.0-beta.1",
+  "version": "0.3.0-beta.2",
   "description": "Typed beta client for the ViperCapture rendering API",
   "type": "module",
   "main": "dist/index.js",
