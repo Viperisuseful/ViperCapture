@@ -11,11 +11,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
 import signal
+import sqlite3
 import statistics
 import subprocess
 import sys
@@ -52,9 +53,18 @@ def _cgroup_number(name: str) -> int | None:
 
 
 class LocalServer:
-    def __init__(self, port: int, data_dir: Path) -> None:
+    def __init__(
+        self,
+        port: int,
+        data_dir: Path,
+        *,
+        schedules: bool = False,
+        webhook_secret: str = "",
+    ) -> None:
         self.port = port
         self.data_dir = data_dir
+        self.schedules = schedules
+        self.webhook_secret = webhook_secret
         self.process: subprocess.Popen[bytes] | None = None
         self.log_path = data_dir / "operational-server.log"
 
@@ -67,13 +77,23 @@ class LocalServer:
         environment.update(
             {
                 "VIPERCAPTURE_ASYNC_JOBS": "1",
-                "VIPERCAPTURE_SCHEDULES": "0",
+                "VIPERCAPTURE_SCHEDULES": "1" if self.schedules else "0",
                 "VIPERCAPTURE_DATA_DIR": str(self.data_dir),
                 "VIPERCAPTURE_MAX_CONCURRENCY": "2",
                 "VIPERCAPTURE_JOB_WORKERS": "1",
                 "VIPERCAPTURE_JOB_POLL_SECONDS": "1",
             }
         )
+        if self.webhook_secret:
+            environment.update(
+                {
+                    "VIPERCAPTURE_WEBHOOK_SECRET": self.webhook_secret,
+                    "VIPERCAPTURE_ALLOW_PRIVATE_WEBHOOKS": "1",
+                }
+            )
+        else:
+            environment.pop("VIPERCAPTURE_WEBHOOK_SECRET", None)
+            environment.pop("VIPERCAPTURE_ALLOW_PRIVATE_WEBHOOKS", None)
         creationflags = 0
         start_new_session = os.name != "nt"
         if os.name == "nt":
@@ -173,15 +193,23 @@ async def sustained_load(
     started = time.perf_counter()
     deadline = started + duration_seconds
     peak_memory = _cgroup_number("memory.current")
+    memory_samples: list[dict[str, int | float]] = []
     stop_memory_sampling = asyncio.Event()
     issued = 0
 
     async def sample_memory() -> None:
         nonlocal peak_memory
+        next_record = 0.0
         while not stop_memory_sampling.is_set():
             current = _cgroup_number("memory.current")
             if current is not None:
                 peak_memory = max(peak_memory or 0, current)
+                elapsed = time.perf_counter() - started
+                if elapsed >= next_record:
+                    memory_samples.append(
+                        {"elapsed_seconds": round(elapsed, 3), "bytes": current}
+                    )
+                    next_record = elapsed + 1
             try:
                 await asyncio.wait_for(stop_memory_sampling.wait(), timeout=0.01)
             except TimeoutError:
@@ -229,6 +257,15 @@ async def sustained_load(
     if cgroup_peak is not None:
         peak_memory = max(peak_memory or 0, cgroup_peak)
 
+    memory_growth = None
+    if len(memory_samples) >= 4:
+        sample_values = [int(item["bytes"]) for item in memory_samples]
+        quarter = max(1, len(sample_values) // 4)
+        memory_growth = int(
+            statistics.median(sample_values[-quarter:])
+            - statistics.median(sample_values[:quarter])
+        )
+
     elapsed = time.perf_counter() - started
     completed = len(latencies) + len(failures)
     return {
@@ -254,6 +291,8 @@ async def sustained_load(
         "memory": {
             "cgroup_limit_bytes": _cgroup_number("memory.max"),
             "peak_cgroup_bytes": peak_memory,
+            "first_to_last_quarter_median_growth_bytes": memory_growth,
+            "samples": memory_samples,
         },
     }
 
@@ -284,7 +323,7 @@ async def restart_recovery(port: int, data_dir: Path) -> dict[str, Any]:
                 status.raise_for_status()
                 document = status.json()
                 if document["status"] == "running":
-                    first_attempt = document.get("attempt_count")
+                    first_attempt = document.get("attempts")
                     break
                 await asyncio.sleep(0.1)
             else:
@@ -307,7 +346,7 @@ async def restart_recovery(port: int, data_dir: Path) -> dict[str, Any]:
                         "job_id": job_id,
                         "status": document["status"],
                         "attempt_before_crash": first_attempt,
-                        "attempt_after_restart": document.get("attempt_count"),
+                        "attempt_after_restart": document.get("attempts"),
                         "artifact_bytes": len(result.content),
                         "dimensions": dimensions,
                     }
@@ -317,6 +356,252 @@ async def restart_recovery(port: int, data_dir: Path) -> dict[str, Any]:
         raise TimeoutError("recovered job did not finish after restart")
     finally:
         await server.close()
+
+
+class WebhookReceiver:
+    def __init__(self) -> None:
+        self.accepting = False
+        self.accepted_job_ids: set[str] = set()
+        self.server: asyncio.Server | None = None
+        self.port = 0
+
+    async def start(self) -> None:
+        self.server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
+        socket = self.server.sockets[0]
+        self.port = int(socket.getsockname()[1])
+
+    async def close(self) -> None:
+        if self.server is not None:
+            self.server.close()
+            await self.server.wait_closed()
+
+    async def _handle(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        try:
+            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
+            length = 0
+            for line in head.decode("ascii", "replace").split("\r\n")[1:]:
+                name, separator, value = line.partition(":")
+                if separator and name.lower() == "content-length":
+                    length = int(value.strip())
+                    break
+            body = await asyncio.wait_for(reader.readexactly(length), timeout=5)
+            document = json.loads(body)
+            job_id = str(document.get("job", {}).get("id", ""))
+            if self.accepting and job_id:
+                self.accepted_job_ids.add(job_id)
+            status = b"204 No Content" if self.accepting else b"503 Unavailable"
+            writer.write(b"HTTP/1.1 " + status + b"\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+        finally:
+            writer.close()
+            with suppress(OSError):
+                await writer.wait_closed()
+
+
+def _render_payload(*, delay_ms: int = 0) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "html": "<!doctype html><h1>recovery matrix</h1>",
+        "output": "png",
+        "full_page": False,
+        "viewport": {"width": 640, "height": 480},
+    }
+    if delay_ms:
+        payload["actions"] = [{"type": "wait", "delay_ms": delay_ms}]
+    return payload
+
+
+async def _submit_job(
+    client: httpx.AsyncClient,
+    server: LocalServer,
+    payload: dict[str, Any],
+) -> str:
+    response = await client.post(
+        server.endpoint + "/v1/jobs",
+        json=payload,
+        headers={"X-Request-Id": f"recovery-{uuid4()}"},
+    )
+    response.raise_for_status()
+    return str(response.json()["id"])
+
+
+async def _wait_for_job(
+    client: httpx.AsyncClient,
+    server: LocalServer,
+    job_id: str,
+    statuses: set[str],
+    *,
+    attempts: int = 320,
+) -> dict[str, Any]:
+    for _ in range(attempts):
+        response = await client.get(server.endpoint + f"/v1/jobs/{job_id}")
+        response.raise_for_status()
+        document = response.json()
+        if document["status"] in statuses:
+            return document
+        if document["status"] in {"failed", "cancelled", "expired"}:
+            raise RuntimeError(f"job became {document['status']}: {document}")
+        await asyncio.sleep(0.25)
+    raise TimeoutError(f"job {job_id} did not reach {sorted(statuses)}")
+
+
+async def _verify_job_result(
+    client: httpx.AsyncClient, server: LocalServer, job_id: str
+) -> dict[str, Any]:
+    document = await _wait_for_job(client, server, job_id, {"succeeded"})
+    response = await client.get(server.endpoint + f"/v1/jobs/{job_id}/result")
+    response.raise_for_status()
+    with Image.open(io.BytesIO(response.content)) as image:
+        dimensions = list(image.size)
+        image.verify()
+    return {
+        "job_id": job_id,
+        "status": document["status"],
+        "attempts": document.get("attempts"),
+        "artifact_bytes": len(response.content),
+        "dimensions": dimensions,
+    }
+
+
+async def _recovery_case(
+    state: str,
+    index: int,
+    port: int,
+    data_dir: Path,
+) -> dict[str, Any]:
+    case_dir = data_dir / f"{state}-{index + 1}"
+    case_dir.mkdir(parents=True, mode=0o700)
+    receiver = WebhookReceiver() if state == "webhook-pending" else None
+    if receiver is not None:
+        await receiver.start()
+    server = LocalServer(
+        port,
+        case_dir,
+        schedules=state == "scheduled",
+        webhook_secret=("recovery-webhook-secret-32-bytes" if receiver else ""),
+    )
+    job_id = ""
+    accepted_job_ids: list[str] = []
+    before: dict[str, Any] = {}
+    try:
+        await server.start()
+        async with httpx.AsyncClient(timeout=30) as client:
+            if state == "queued":
+                blocker_id = await _submit_job(
+                    client, server, _render_payload(delay_ms=8000)
+                )
+                accepted_job_ids.append(blocker_id)
+                await _wait_for_job(client, server, blocker_id, {"running"})
+                job_id = await _submit_job(client, server, _render_payload())
+                accepted_job_ids.append(job_id)
+                before = await _wait_for_job(client, server, job_id, {"queued"})
+            elif state == "running":
+                job_id = await _submit_job(
+                    client, server, _render_payload(delay_ms=8000)
+                )
+                accepted_job_ids.append(job_id)
+                before = await _wait_for_job(client, server, job_id, {"running"})
+            elif state == "succeeded":
+                job_id = await _submit_job(client, server, _render_payload())
+                accepted_job_ids.append(job_id)
+                before = await _wait_for_job(client, server, job_id, {"succeeded"})
+                await _verify_job_result(client, server, job_id)
+            elif state == "webhook-pending":
+                assert receiver is not None
+                payload = _render_payload()
+                payload["delivery"] = {
+                    "webhook_url": f"http://127.0.0.1:{receiver.port}/events"
+                }
+                job_id = await _submit_job(client, server, payload)
+                accepted_job_ids.append(job_id)
+                before = await _wait_for_job(client, server, job_id, {"succeeded"})
+            elif state == "scheduled":
+                response = await client.post(
+                    server.endpoint + "/v1/schedules",
+                    json={
+                        "name": f"recovery-{index + 1}",
+                        "cron": "0 0 1 1 *",
+                        "timezone": "UTC",
+                        "render": _render_payload(),
+                    },
+                )
+                response.raise_for_status()
+                before = response.json()
+                job_id = str(before["id"])
+            else:
+                raise ValueError(f"unsupported recovery state: {state}")
+
+        await server.crash()
+        if state == "scheduled":
+            due = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+            with sqlite3.connect(case_dir / "schedules.sqlite3") as connection:
+                connection.execute(
+                    "UPDATE schedules SET next_run_at=?, updated_at=? WHERE id=?",
+                    (due, due, job_id),
+                )
+                connection.commit()
+        if receiver is not None:
+            receiver.accepting = True
+        await server.start()
+        async with httpx.AsyncClient(timeout=30) as client:
+            if state == "scheduled":
+                schedule_id = job_id
+                for _ in range(320):
+                    response = await client.get(
+                        server.endpoint + f"/v1/schedules/{schedule_id}"
+                    )
+                    response.raise_for_status()
+                    scheduled = response.json()
+                    if scheduled.get("last_job_id"):
+                        job_id = str(scheduled["last_job_id"])
+                        accepted_job_ids.append(job_id)
+                        break
+                    await asyncio.sleep(0.25)
+                else:
+                    raise TimeoutError("schedule did not create a job after restart")
+            accepted_jobs = [
+                await _verify_job_result(client, server, accepted_job_id)
+                for accepted_job_id in accepted_job_ids
+            ]
+            result = next(
+                item for item in accepted_jobs if item["job_id"] == job_id
+            )
+            if receiver is not None:
+                for _ in range(320):
+                    if job_id in receiver.accepted_job_ids:
+                        break
+                    await asyncio.sleep(0.25)
+                else:
+                    raise TimeoutError("pending webhook was not delivered after restart")
+                result["webhook_delivered"] = True
+            return {
+                "state": state,
+                "before": before,
+                "after": result,
+                "accepted_jobs": accepted_jobs,
+            }
+    finally:
+        await server.close()
+        if receiver is not None:
+            await receiver.close()
+
+
+async def restart_recovery_matrix(
+    port: int,
+    data_dir: Path,
+    cases_per_state: int = 4,
+) -> list[dict[str, Any]]:
+    if os.name == "nt":
+        raise RuntimeError("the durable recovery matrix requires Linux POSIX permissions")
+    data_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.chmod(0o700)
+    states = ("queued", "running", "succeeded", "webhook-pending", "scheduled")
+    results = []
+    for state in states:
+        for index in range(cases_per_state):
+            results.append(await _recovery_case(state, index, port, data_dir))
+    return results
 
 
 def _write(report: dict[str, Any], output: Path | None) -> None:
@@ -361,6 +646,47 @@ async def _restart_recovery_gate(
     return 0
 
 
+async def _restart_recovery_matrix_gate(
+    port: int,
+    data_dir: Path,
+    cases_per_state: int,
+    output: Path | None,
+    generated_at: str,
+) -> int:
+    diagnostics = {
+        "data_dir": str(data_dir),
+        "cases_per_state": cases_per_state,
+    }
+    try:
+        results = await restart_recovery_matrix(
+            port, data_dir, cases_per_state=cases_per_state
+        )
+    except Exception as exc:
+        report = {
+            "schema_version": 1,
+            "generated_at": generated_at,
+            "gate": "restart-recovery-matrix",
+            "result": None,
+            "error": {"type": type(exc).__name__, "message": str(exc)},
+            "diagnostics": diagnostics,
+        }
+        _write(report, output)
+        return 1
+    report = {
+        "schema_version": 1,
+        "generated_at": generated_at,
+        "gate": "restart-recovery-matrix",
+        "result": {
+            "cases": results,
+            "case_count": len(results),
+            "states": sorted({item["state"] for item in results}),
+        },
+        "diagnostics": diagnostics,
+    }
+    _write(report, output)
+    return 0
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -373,6 +699,7 @@ async def main() -> int:
     load.add_argument("--duration-seconds", type=float, default=0)
     load.add_argument("--min-success-rate", type=float, default=1.0)
     load.add_argument("--max-p95-ms", type=float, default=15000)
+    load.add_argument("--max-memory-growth-bytes", type=int, default=0)
     load.add_argument("--require-memory-limit", action="store_true")
     load.add_argument("--output", type=Path)
 
@@ -380,6 +707,11 @@ async def main() -> int:
     recovery.add_argument("--port", type=int, default=8017)
     recovery.add_argument("--data-dir", type=Path)
     recovery.add_argument("--output", type=Path)
+    recovery_matrix = subparsers.add_parser("restart-recovery-matrix")
+    recovery_matrix.add_argument("--port", type=int, default=8017)
+    recovery_matrix.add_argument("--data-dir", type=Path)
+    recovery_matrix.add_argument("--cases-per-state", type=int, default=4)
+    recovery_matrix.add_argument("--output", type=Path)
     args = parser.parse_args()
 
     generated_at = datetime.now(timezone.utc).isoformat()
@@ -389,8 +721,12 @@ async def main() -> int:
             or args.concurrency < 1
             or args.concurrency > args.requests
             or args.duration_seconds < 0
+            or args.max_memory_growth_bytes < 0
         ):
-            parser.error("requests and concurrency must be positive, and concurrency <= requests")
+            parser.error(
+                "requests and concurrency must be positive, concurrency <= requests, "
+                "and duration/memory growth must be non-negative"
+            )
         result = await sustained_load(
             args.api_url,
             requests=args.requests,
@@ -401,13 +737,52 @@ async def main() -> int:
         report = {"schema_version": 1, "generated_at": generated_at, "gate": "sustained-load", "result": result}
         _write(report, args.output)
         memory_ok = not args.require_memory_limit or result["memory"]["cgroup_limit_bytes"] is not None
+        memory_growth = result["memory"]["first_to_last_quarter_median_growth_bytes"]
+        memory_growth_ok = args.max_memory_growth_bytes <= 0 or (
+            memory_growth is not None
+            and memory_growth <= args.max_memory_growth_bytes
+        )
         latency = result["latency_ms"]["p95"]
         return 0 if (
             result["success_rate"] >= args.min_success_rate
             and latency is not None
             and latency <= args.max_p95_ms
             and memory_ok
+            and memory_growth_ok
         ) else 1
+
+    if args.command == "restart-recovery-matrix":
+        if args.cases_per_state < 1:
+            parser.error("cases-per-state must be positive")
+        if args.data_dir:
+            args.data_dir.mkdir(parents=True, exist_ok=True)
+            return await _restart_recovery_matrix_gate(
+                args.port,
+                args.data_dir,
+                args.cases_per_state,
+                args.output,
+                generated_at,
+            )
+        if args.output:
+            data_dir = args.output.parent / f"{args.output.stem}-data"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            return await _restart_recovery_matrix_gate(
+                args.port,
+                data_dir,
+                args.cases_per_state,
+                args.output,
+                generated_at,
+            )
+        with tempfile.TemporaryDirectory(
+            prefix="vipercapture-recovery-matrix-"
+        ) as directory:
+            return await _restart_recovery_matrix_gate(
+                args.port,
+                Path(directory),
+                args.cases_per_state,
+                args.output,
+                generated_at,
+            )
 
     if args.data_dir:
         args.data_dir.mkdir(parents=True, exist_ok=True)

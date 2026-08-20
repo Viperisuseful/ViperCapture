@@ -24,6 +24,9 @@ Use the operational and benchmark workflows to collect initial evidence:
 - **Same-host benchmark**: 30 measured runs after two warmups across six public
   real sites for ViperCapture and Browserless, with optional ScreenshotOne and
   Urlbox calls from that exact runner.
+- **Stable Linux qualification**: twenty forced crashes across all five durable
+  states plus parallel one-hour 768 MiB, 1 GiB, and 2 GiB cgroup profiles. Its
+  artifacts are release evidence only when run from the exact RC commit.
 
 The workflow defaults are regression checks. They are not the required
 one-hour v1 evidence.

@@ -267,6 +267,34 @@ class ManagedProviderAdapterTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RecoveryDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_recovery_matrix_reports_twenty_cases_across_required_states(self):
+        states = ("queued", "running", "succeeded", "webhook-pending", "scheduled")
+
+        async def matrix(_port: int, _data_dir: Path, cases_per_state: int):
+            return [
+                {"state": state, "case": index}
+                for state in states
+                for index in range(cases_per_state)
+            ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "restart-recovery-matrix.json"
+            argv = [
+                "production_gate",
+                "restart-recovery-matrix",
+                "--output",
+                str(output),
+            ]
+            with patch.object(
+                production_gate, "restart_recovery_matrix", new=matrix
+            ), patch("sys.argv", argv):
+                exit_code = await production_gate.main()
+
+            report = json.loads(output.read_text("utf-8"))
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(report["result"]["case_count"], 20)
+            self.assertEqual(report["result"]["states"], sorted(states))
+
     async def test_failure_keeps_log_and_writes_machine_readable_error(self):
         async def fail_recovery(_port: int, data_dir: Path):
             data_dir.mkdir(parents=True, exist_ok=True)

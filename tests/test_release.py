@@ -153,6 +153,20 @@ class OperationalPackagingTests(unittest.TestCase):
         self.assertIn("|| gate_status=$?", gate)
         self.assertLess(gate.index("docker cp"), gate.index('test "$gate_status" -eq 0'))
 
+    def test_stable_linux_gate_covers_crashes_and_one_hour_memory_profiles(self):
+        workflow = (
+            ROOT / ".github" / "workflows" / "stable-linux-qualification.yml"
+        ).read_text("utf-8")
+        self.assertIn('default: "3600"', workflow)
+        self.assertIn('default: "4"', workflow)
+        self.assertIn("restart-recovery-matrix", workflow)
+        self.assertIn("--cases-per-state", workflow)
+        for profile in ("768m", "1g", "2g"):
+            self.assertIn(f"name: {profile}", workflow)
+        self.assertIn("--max-memory-growth-bytes 67108864", workflow)
+        self.assertIn("--min-success-rate 0.999", workflow)
+        self.assertIn(".State.OOMKilled", workflow)
+
     def test_container_waits_for_validated_packages_and_go_tag_is_prefixed(self):
         workflow = (ROOT / ".github" / "workflows" / "oss-release.yml").read_text(
             "utf-8"

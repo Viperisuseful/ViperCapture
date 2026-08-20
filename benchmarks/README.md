@@ -75,6 +75,8 @@ throughput tests:
 python -m benchmarks.production_gate load --requests 120 --concurrency 4 \
   --duration-seconds 300
 python -m benchmarks.production_gate restart-recovery
+python -m benchmarks.production_gate restart-recovery-matrix \
+  --cases-per-state 4 --output stable-linux-results/restart-recovery-matrix.json
 ```
 
 The **Operational readiness** workflow records concurrency 1/2/4/8 saturation,
@@ -84,6 +86,14 @@ artifact. A separate job builds the Docker image, applies a 1 GiB cgroup
 ceiling and PID limit, runs 40 real renders inside that cgroup, and rejects OOM
 termination. Every gate uploads its raw JSON and logs. Use a 3,600-second gate
 on the intended production host for the stable-v1 evidence set.
+
+The manual **Stable Linux qualification** workflow is the full-duration Linux
+gate. It runs four forced process crashes in each required durable state
+(queued, running, succeeded, webhook-pending, and scheduled) and runs the
+renderer for one hour in parallel 768 MiB, 1 GiB, and 2 GiB cgroups. Each
+profile requires at least 99.9% successful renders, a p95 below 20 seconds, no
+OOM kill, a healthy container after the run, and no more than 64 MiB growth
+between the first and last quarter's median cgroup-memory samples.
 
 ## Published results
 

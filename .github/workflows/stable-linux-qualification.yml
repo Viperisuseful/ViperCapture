@@ -1,0 +1,119 @@
+name: Stable Linux qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: Seconds to run each constrained-memory profile
+        required: true
+        default: "3600"
+      crashes_per_state:
+        description: Forced crashes for each durable state
+        required: true
+        default: "4"
+
+permissions:
+  contents: read
+
+jobs:
+  crash-recovery:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install renderer
+        run: |
+          python -m pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+      - name: Run durable-state crash matrix
+        env:
+          CRASHES_PER_STATE: ${{ inputs.crashes_per_state }}
+        run: >-
+          python -m benchmarks.production_gate restart-recovery-matrix
+          --cases-per-state "$CRASHES_PER_STATE"
+          --output stable-linux-results/restart-recovery-matrix.json
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: stable-linux-crash-recovery
+          path: stable-linux-results/
+          if-no-files-found: error
+
+  constrained-memory:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        profile:
+          - name: 768m
+            limit: 768m
+          - name: 1g
+            limit: 1g
+          - name: 2g
+            limit: 2g
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build image
+        run: docker build --tag vipercapture:stable-linux .
+      - name: Start constrained renderer
+        env:
+          MEMORY_LIMIT: ${{ matrix.profile.limit }}
+        run: |
+          docker run --detach --name vipercapture-stable-memory \
+            --memory="$MEMORY_LIMIT" --memory-swap="$MEMORY_LIMIT" \
+            --pids-limit=512 --shm-size=256m \
+            --env VIPERCAPTURE_MAX_CONCURRENCY=1 \
+            --env VIPERCAPTURE_MAX_PIXELS=12000000 \
+            vipercapture:stable-linux
+          for attempt in $(seq 1 160); do
+            docker exec vipercapture-stable-memory \
+              python -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/ready", timeout=2).read()' \
+              && exit 0
+            sleep 0.5
+          done
+          docker logs vipercapture-stable-memory
+          exit 1
+      - name: Run one-hour memory profile
+        env:
+          DURATION_SECONDS: ${{ inputs.duration_seconds }}
+        run: |
+          gate_status=0
+          docker exec vipercapture-stable-memory \
+            python -m benchmarks.production_gate load \
+              --api-url http://127.0.0.1:8000 \
+              --requests 1 --concurrency 1 \
+              --duration-seconds "$DURATION_SECONDS" \
+              --min-success-rate 0.999 --max-p95-ms 20000 \
+              --max-memory-growth-bytes 67108864 \
+              --require-memory-limit \
+              --output /tmp/stable-memory.json || gate_status=$?
+          mkdir -p stable-linux-results
+          docker cp vipercapture-stable-memory:/tmp/stable-memory.json \
+            "stable-linux-results/memory-${{ matrix.profile.name }}.json"
+          test "$gate_status" -eq 0
+          test "$(docker inspect --format '{{.State.OOMKilled}}' vipercapture-stable-memory)" = false
+          test "$(docker inspect --format '{{.State.Running}}' vipercapture-stable-memory)" = true
+          docker exec vipercapture-stable-memory \
+            python -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/ready", timeout=2).read()'
+      - name: Capture container diagnostics
+        if: always()
+        run: |
+          mkdir -p stable-linux-results
+          docker inspect vipercapture-stable-memory \
+            > "stable-linux-results/container-${{ matrix.profile.name }}.json" || true
+          docker top vipercapture-stable-memory -eo pid,ppid,state,etimes,args \
+            > "stable-linux-results/processes-${{ matrix.profile.name }}.txt" || true
+          docker logs vipercapture-stable-memory \
+            > "stable-linux-results/container-${{ matrix.profile.name }}.log" 2>&1 || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: stable-linux-memory-${{ matrix.profile.name }}
+          path: stable-linux-results/
+          if-no-files-found: error
