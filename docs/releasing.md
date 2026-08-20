@@ -4,14 +4,14 @@
 
 | Deliverable | Version | Ship to | How users consume it |
 | --- | --- | --- | --- |
-| OSS developer beta | 0.3.0-beta.1 | GitHub Releases | source archive or repository tag |
-| Container | 0.3.0-beta.1 | GitHub Container Registry | `docker pull ghcr.io/viperisuseful/vipercapture:v0.3.0-beta.1` |
-| GitHub Action | 0.3.0-beta.1 | Repository tag | `uses: Viperisuseful/ViperCapture@v0.3.0-beta.1` |
-| Agent skill | 0.3.0-beta.1 | GitHub Release asset | extract/install `vipercapture-skill-*.zip` |
-| n8n/Terraform integrations | 0.3.0-beta.1 | GitHub Release asset | import/extract `vipercapture-integrations-*.zip` |
-| Python SDK | 0.3.0b1 | GitHub Releases; PyPI when enabled | release wheel/sdist or `pip install vipercapture==0.3.0b1` |
-| TypeScript SDK | 0.3.0-beta.1 | GitHub Releases; npm when enabled | release tarball or `npm install @vipercapture/sdk@0.3.0-beta.1` |
-| Go SDK | 0.3.0-beta.1 source | GitHub | `go get github.com/Viperisuseful/ViperCapture/sdk/go@v0.3.0-beta.1` |
+| OSS developer beta | 0.3.0-beta.2 | GitHub Releases | source archive or repository tag |
+| Container | 0.3.0-beta.2 | GitHub Container Registry | `docker pull ghcr.io/viperisuseful/vipercapture:v0.3.0-beta.2` |
+| GitHub Action | 0.3.0-beta.2 | Repository tag | `uses: Viperisuseful/ViperCapture@v0.3.0-beta.2` |
+| Agent skill | 0.3.0-beta.2 | GitHub Release asset | extract/install `vipercapture-skill-*.zip` |
+| n8n/Terraform integrations | 0.3.0-beta.2 | GitHub Release asset | import/extract `vipercapture-integrations-*.zip` |
+| Python SDK | 0.3.0b2 | GitHub Releases; PyPI when enabled | release wheel/sdist or `pip install vipercapture==0.3.0b2` |
+| TypeScript SDK | 0.3.0-beta.2 | GitHub Releases; npm when enabled | release tarball or `npm install @vipercapture/sdk@0.3.0-beta.2` |
+| Go SDK | 0.3.0-beta.2 source | GitHub | `go get github.com/Viperisuseful/ViperCapture/sdk/go@v0.3.0-beta.2` |
 
 ## Build release artifacts
 
@@ -51,9 +51,9 @@ packages in clean temporary environments, and test the source archive with
 1. Confirm the release PR is merged, then fast-forward `master`.
 2. Run Validate, CodeQL, Operational readiness, and Same-host benchmark.
 3. Run OSS release with `publish=false`; inspect and smoke-test its artifacts.
-4. Create and push annotated tag `v0.3.0-beta.1`. The OSS workflow publishes
+4. Create and push annotated tag `v0.3.0-beta.2`. The OSS workflow publishes
    GitHub assets, GHCR, PyPI, npm, Action tag, skill, integrations, and the
-   required `sdk/go/v0.3.0-beta.1` Go submodule tag. PyPI and npm publish only
+   required `sdk/go/v0.3.0-beta.2` Go submodule tag. PyPI and npm publish only
    when their repository variables are enabled. It refuses to overwrite a
    Go tag that points at another commit.
 5. Deploy the exact GHCR digest with `deploy/public-api`, run a restore drill,
