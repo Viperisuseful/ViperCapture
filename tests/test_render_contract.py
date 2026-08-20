@@ -45,6 +45,22 @@ class RenderContractTest(unittest.TestCase):
             canonical_render_document(disabled)["network"]["java_script_enabled"]
         )
 
+    def test_tagged_pdf_is_opt_in_and_canonical(self):
+        default = RenderRequest.model_validate(
+            {"url": "https://example.com", "output": "pdf"}
+        )
+        tagged = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "output": "pdf",
+                "pdf": {"tagged": True},
+            }
+        )
+        self.assertIsNone(default.pdf.tagged)
+        self.assertNotIn("tagged", canonical_render_document(default)["pdf"])
+        self.assertTrue(tagged.pdf.tagged)
+        self.assertTrue(canonical_render_document(tagged)["pdf"]["tagged"])
+
     def test_media_emulation_is_explicit_and_canonical(self):
         default = RenderRequest(url="https://example.com")
         screen = RenderRequest.model_validate(

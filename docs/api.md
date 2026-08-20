@@ -10,7 +10,7 @@ running, the interactive OpenAPI reference is available at `/docs`.
 | `output` | Response | Notes |
 | --- | --- | --- |
 | `png`, `jpeg`, `webp`, `avif` | image | Full page, viewport, selector, clip, resize, slices, or multi-viewport |
-| `pdf` | PDF | Print or single-page mode, paper/orientation/margins |
+| `pdf` | PDF | Print or single-page mode, paper/orientation/margins, optional tags |
 | `html` | UTF-8 HTML | Fully rendered document or article extraction |
 | `markdown` | UTF-8 Markdown | Document or readability-based article extraction |
 | `metadata` | JSON | Title, description, canonical URL, headings, links, images |
@@ -49,6 +49,10 @@ aspect ratio. HTML and Markdown requests may set `include_shadow_dom` to embed
 open shadow roots as declarative shadow DOM. PDF options include A0–A6, Legal,
 Letter, and Tabloid paper, optional page ranges, and bounded header/footer
 templates. Metadata includes icons, loaded fonts, forms, and JSON-LD samples.
+Set `pdf.tagged` explicitly to request or suppress Chromium's accessible PDF
+structure tags. Omitting it preserves Chromium's default. Tags alone do not
+guarantee PDF/UA conformance; source semantics and independent validation still
+matter.
 
 ## Configure the browser
 

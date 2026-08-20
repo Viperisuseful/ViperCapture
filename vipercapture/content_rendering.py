@@ -115,6 +115,8 @@ async def _render_pdf(
             "left": f"{options.margins.left}in",
         },
     }
+    if options.tagged is not None:
+        common["tagged"] = options.tagged
     media = request.environment.media.value if request.environment.media else "print"
     if options.header_template is not None or options.footer_template is not None:
         common.update(

@@ -13,7 +13,7 @@ documentation used for this comparison.
 | URL and raw HTML input | Yes | Yes | Yes |
 | Markdown input | Yes | Yes | Partial: Markdown is documented as an output |
 | PNG / JPEG / WebP | Yes | Yes | Yes |
-| PDF / hydrated HTML / Markdown / metadata | Yes | Yes | Yes |
+| PDF (including opt-in structure tags) / hydrated HTML / Markdown / metadata | Yes | Yes | Yes |
 | Video | **WebM, MP4, GIF** | GIF/WebM animations | MP4/WebM |
 | Full page / viewport / selector / clip | Yes | Yes | Yes |
 | Multiple viewports in one request | Yes, ZIP | Bulk API | Batch/API workflows |

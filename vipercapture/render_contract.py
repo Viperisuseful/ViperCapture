@@ -448,6 +448,7 @@ class PdfOptions(StrictModel):
     paper_size: PaperSize = PaperSize.A4
     orientation: Orientation = Orientation.PORTRAIT
     print_background: bool = True
+    tagged: bool | None = None
     margins: PdfMargins = Field(default_factory=PdfMargins)
     header_template: str | None = Field(default=None, max_length=16_384)
     footer_template: str | None = Field(default=None, max_length=16_384)
@@ -823,6 +824,9 @@ def canonical_render_document(
             wait_for.pop("selector_state", None)
         if wait_for.get("images") is False:
             wait_for.pop("images", None)
+    pdf = document.get("pdf")
+    if isinstance(pdf, dict) and pdf.get("tagged") is None:
+        pdf.pop("tagged", None)
     network = document.get("network")
     if isinstance(network, dict):
         if network.get("java_script_enabled") is True:

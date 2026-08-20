@@ -250,6 +250,7 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(print_page.pdf_options["format"], "A4")
         self.assertEqual(print_page.pdf_options["page_ranges"], "1-51")
         self.assertEqual(print_page.emulated_media, "print")
+        self.assertNotIn("tagged", print_page.pdf_options)
 
         custom_print = FakePage()
         await render_document_output(
@@ -262,6 +263,7 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
                         "paper_size": "Legal",
                         "page_ranges": "2-3",
                         "header_template": '<span class="title"></span>',
+                        "tagged": True,
                     },
                 }
             ),
@@ -270,6 +272,21 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(custom_print.pdf_options["format"], "Legal")
         self.assertEqual(custom_print.pdf_options["page_ranges"], "2-3")
         self.assertTrue(custom_print.pdf_options["display_header_footer"])
+        self.assertTrue(custom_print.pdf_options["tagged"])
+
+        explicitly_untagged = FakePage()
+        await render_document_output(
+            explicitly_untagged,
+            RenderRequest.model_validate(
+                {
+                    "url": "https://example.com",
+                    "output": "pdf",
+                    "pdf": {"tagged": False},
+                }
+            ),
+            LIMITS,
+        )
+        self.assertFalse(explicitly_untagged.pdf_options["tagged"])
 
         single_page = FakePage()
         single = await render_document_output(
