@@ -293,6 +293,7 @@ class CookieOptions(StrictModel):
 
 
 class NetworkOptions(StrictModel):
+    java_script_enabled: bool = True
     user_agent: str | None = Field(default=None, min_length=1, max_length=1_024)
     geolocation: GeolocationOptions | None = None
     proxy: ProxyOptions | None = None
@@ -823,10 +824,11 @@ def canonical_render_document(
         if wait_for.get("images") is False:
             wait_for.pop("images", None)
     network = document.get("network")
-    if isinstance(network, dict) and isinstance(
-        network.get("block_resource_types"), list
-    ):
-        network["block_resource_types"] = sorted(
-            network["block_resource_types"]
-        )
+    if isinstance(network, dict):
+        if network.get("java_script_enabled") is True:
+            network.pop("java_script_enabled", None)
+        if isinstance(network.get("block_resource_types"), list):
+            network["block_resource_types"] = sorted(
+                network["block_resource_types"]
+            )
     return document

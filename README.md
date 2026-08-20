@@ -28,7 +28,8 @@ the dated [compatibility matrix](docs/compatibility.md) and run the
   multi-viewport ZIP captures
 - Typed click, hover, fill, select, key, scroll, wait, hide, and opt-in
   JavaScript actions
-- Selector-state and image-readiness waits, assertions, custom CSS, devices, locale/timezone,
+- Selector-state and image-readiness waits, target JavaScript control,
+  assertions, custom CSS, devices, locale/timezone,
   geolocation, cookies, user agent, proxy, resource blocking, and cleanup
 - Request-aware stealth controls, operator-controlled residential/datacenter
   proxies, and structured detection for common CAPTCHA and bot interstitials

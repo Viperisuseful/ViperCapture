@@ -1975,6 +1975,7 @@ class RenderEngine:
                             "height": request.viewport.height,
                         },
                         "device_scale_factor": request.viewport.device_scale_factor,
+                        "java_script_enabled": request.network.java_script_enabled,
                         "service_workers": (
                             "block"
                             if (

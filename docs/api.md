@@ -55,8 +55,9 @@ templates. Metadata includes icons, loaded fonts, forms, and JSON-LD samples.
 - `environment`: device preset, color scheme, reduced motion, CSS media, locale,
   and timezone. Set `media` to `screen` or `print` to apply it before the target
   loads. When omitted, screenshots keep browser screen media and PDFs use print.
-- `network`: user agent, geolocation, proxy, cookies, CSP/HTTPS controls, URL
-  glob blocks, and resource-type blocks.
+- `network`: target-page JavaScript, user agent, geolocation, proxy, cookies,
+  CSP/HTTPS controls, URL glob blocks, and resource-type blocks. Set
+  `java_script_enabled: false` to prevent target-provided scripts from running.
 - `headers`: bounded target headers. Credential-bearing headers are stripped
   from cross-origin requests.
 - `wait_for`: load event, selector plus `visible`, `attached`, `hidden`, or

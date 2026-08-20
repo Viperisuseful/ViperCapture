@@ -28,6 +28,23 @@ class RenderContractTest(unittest.TestCase):
             ["font", "image", "script"],
         )
 
+    def test_target_javascript_control_is_canonical(self):
+        default = RenderRequest(url="https://example.com")
+        disabled = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "network": {"java_script_enabled": False},
+            }
+        )
+        self.assertTrue(default.network.java_script_enabled)
+        self.assertNotIn(
+            "java_script_enabled", canonical_render_document(default)["network"]
+        )
+        self.assertFalse(disabled.network.java_script_enabled)
+        self.assertFalse(
+            canonical_render_document(disabled)["network"]["java_script_enabled"]
+        )
+
     def test_media_emulation_is_explicit_and_canonical(self):
         default = RenderRequest(url="https://example.com")
         screen = RenderRequest.model_validate(

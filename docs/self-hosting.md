@@ -158,6 +158,14 @@ For full-page captures of unusually wide documents, set
 `preserve_viewport_width: true` to clip horizontal overflow to the requested
 viewport while retaining the full document height.
 
+## Target-page JavaScript
+
+Set `network.java_script_enabled` to `false` to prevent scripts delivered by
+the target page from running. It defaults to `true`. This browser-context
+control is separate from `VIPERCAPTURE_ALLOW_SCRIPTS`, which gates caller-
+supplied JavaScript actions; disabling either setting does not enable the
+other.
+
 ## Custom headers
 
 `headers` must be a JSON object whose values are strings. At most 32 headers

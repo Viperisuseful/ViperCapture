@@ -1035,6 +1035,21 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(clipped.await_args.kwargs["clip"]["x"], 5)
         self.assertEqual(artifact.metadata["width"], 320)
 
+    async def test_target_javascript_can_be_disabled(self):
+        request = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "network": {"java_script_enabled": False},
+            }
+        )
+        browser = FakeBrowser(FakeContext(FakePage()))
+        await RenderEngine(hosted=False).render_image(
+            browser,
+            request,
+            RenderLimits(max_width=1920, max_height=1080, max_pixels=2_073_600),
+        )
+        self.assertFalse(browser.context_options["java_script_enabled"])
+
     async def test_resize_rejects_sources_above_pillow_pixel_ceiling(self):
         page = FakePage()
         request = RenderRequest.model_validate(
