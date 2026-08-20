@@ -103,6 +103,14 @@ class ChecksumTests(unittest.TestCase):
 
 
 class OperationalPackagingTests(unittest.TestCase):
+    def test_compose_forwards_browser_recycle_limit(self):
+        compose = (ROOT / "docker-compose.yml").read_text("utf-8")
+        self.assertIn(
+            "VIPERCAPTURE_BROWSER_RECYCLE_RENDERS: "
+            "${VIPERCAPTURE_BROWSER_RECYCLE_RENDERS:-1000}",
+            compose,
+        )
+
     def test_egress_policy_targets_only_renderer_and_allows_replies(self):
         policy = (ROOT / "deploy" / "public-api" / "egress-firewall.sh").read_text(
             "utf-8"

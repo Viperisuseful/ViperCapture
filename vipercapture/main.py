@@ -442,10 +442,32 @@ async def _browser_for(app: FastAPI, engine: BrowserEngine) -> Browser:
                 503,
                 False,
             ) from exc
+        previous = browsers.get(engine)
         browsers[engine] = browser
+        counts = app.state.browser_render_counts
+        if previous is not None:
+            counts.pop(id(previous), None)
+        counts[id(browser)] = 0
         if engine.value == BrowserEngine.CHROMIUM.value:
             app.state.browser = browser
         return browser
+
+
+def _retain_browser_for_shutdown(app: FastAPI, browser: Browser) -> None:
+    retired = app.state.retired_browsers
+    if all(active is not browser for active in retired):
+        retired.append(browser)
+
+
+async def _close_browser(app: FastAPI, browser: Browser) -> None:
+    try:
+        await asyncio.wait_for(browser.close(), timeout=5)
+    except BaseException:
+        _retain_browser_for_shutdown(app, browser)
+        raise
+    app.state.retired_browsers[:] = [
+        active for active in app.state.retired_browsers if active is not browser
+    ]
 
 
 async def _replace_browser(app: FastAPI, failed_browser: Browser) -> None:
@@ -462,7 +484,7 @@ async def _replace_browser(app: FastAPI, failed_browser: Browser) -> None:
         if engine is None:
             return
         with suppress(Exception):
-            await asyncio.wait_for(failed_browser.close(), timeout=5)
+            await _close_browser(app, failed_browser)
         replacement = await asyncio.wait_for(
             _launch_browser(app.state.playwright, app.state.gpu_mode, engine),
             timeout=15,
@@ -507,12 +529,18 @@ async def _record_browser_render(app: FastAPI, browser: Browser) -> None:
                 if browsers.get(engine) is not browser:
                     counts.pop(browser_id, None)
                     return
+                try:
+                    await _close_browser(app, browser)
+                except Exception:
+                    if browser.is_connected():
+                        counts[browser_id] = 0
+                        return
+                counts.pop(browser_id, None)
                 replacement = await asyncio.wait_for(
                     _launch_browser(app.state.playwright, app.state.gpu_mode, engine),
                     timeout=15,
                 )
                 browsers[engine] = replacement
-                counts.pop(browser_id, None)
                 counts[id(replacement)] = 0
                 if engine is BrowserEngine.CHROMIUM:
                     app.state.browser = replacement
@@ -520,8 +548,6 @@ async def _record_browser_render(app: FastAPI, browser: Browser) -> None:
                         replacement,
                         app.state.gpu_mode,
                     )
-                with suppress(Exception):
-                    await asyncio.wait_for(browser.close(), timeout=5)
         finally:
             for _ in range(acquired):
                 app.state.capture_slots.release()
@@ -570,6 +596,7 @@ async def lifespan(app: FastAPI):
     app.state.browser_restart_lock = asyncio.Lock()
     app.state.browser_recycle_lock = asyncio.Lock()
     app.state.browser_render_counts = {id(browser): 0}
+    app.state.retired_browsers = []
     app.state.async_jobs = None
     app.state.schedules = None
     app.state.render_cache = RenderCache(
@@ -710,7 +737,11 @@ async def lifespan(app: FastAPI):
                 await app.state.async_jobs.close()
         finally:
             closed_browser_ids: set[int] = set()
-            for active_browser in app.state.browsers.values():
+            active_browsers = [
+                *app.state.browsers.values(),
+                *app.state.retired_browsers,
+            ]
+            for active_browser in active_browsers:
                 if id(active_browser) in closed_browser_ids:
                     continue
                 closed_browser_ids.add(id(active_browser))
@@ -2598,7 +2629,7 @@ if not HOSTED:
                     app.state.gpu_mode = mode
                     app.state.gpu_hardware_active = hardware_active
                     with suppress(Exception):
-                        await asyncio.wait_for(previous.close(), timeout=5)
+                        await _close_browser(app, previous)
             except TimeoutError as exc:
                 raise HTTPException(
                     status_code=503,
