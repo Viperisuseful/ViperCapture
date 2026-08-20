@@ -137,5 +137,8 @@ Callers may instead complete an authorized access flow independently and make
 a fresh render with short-lived, target-scoped session state as documented in
 [site access](site-access.md). That caller-managed flow does not invoke the
 operator handler. Neither flow relaxes same-origin header routing, hosted
-cookie-domain checks, redirect validation, SSRF protection, or network egress
-policy.
+target-domain checks for `network.cookies`, or network egress policy. Hosted
+mode also keeps public-address and redirect validation. Imported profiles are
+not target-filtered, and self-host mode permits internal targets, so operators
+must use dedicated target-scoped profiles and enforce private and metadata-
+network blocks at the egress layer.

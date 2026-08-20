@@ -43,8 +43,11 @@ This caller-managed handoff is separate from the optional operator handler
 described in the [platform guide](platform.md). ViperCapture is not affiliated
 with external providers and does not bundle, call, endorse, or configure one
 for this workflow. It does not solve or bypass challenges. Same-origin header
-routing, hosted cookie-domain checks, redirect validation, and SSRF controls
-remain in force.
+routing remains in force, and hosted mode keeps its target-domain check for
+`network.cookies` plus public-address and redirect validation. Imported profile
+state is not target-filtered, so create a dedicated profile containing only the
+authorized site's state. Self-hosters must enforce private and metadata-network
+blocks with the deployment's egress policy.
 
 ## Configure Cloudflare
 

@@ -112,9 +112,12 @@ An authorized caller can also complete an access flow with an independent
 external tool, then submit a fresh render using short-lived, target-scoped
 cookies, a profile, or exact-origin headers. Keep external-service credentials
 outside render payloads. This does not invoke the operator handler or relax
-origin, cookie-domain, redirect, SSRF, or egress controls. ViperCapture has no
-affiliation with or built-in integration for those tools; see
-[site access](site-access.md).
+exact-origin header routing or, in hosted mode, the target-domain check for
+`network.cookies` and public-address/redirect validation. Imported profiles are
+not target-filtered. Self-host mode allows internal targets, so its operator
+must enforce private and metadata-network blocks with an egress policy.
+ViperCapture has no affiliation with or built-in integration for those tools;
+see [site access](site-access.md).
 
 Hosted mode also rejects non-public targets and subresources, cookies outside
 the target site, and unsafe redirects.
