@@ -22,6 +22,10 @@ The Docker image already includes FFmpeg.
 - Run one application process; every process owns one Chromium process tree and
   starts Firefox or WebKit lazily when requested.
 - Keep `VIPERCAPTURE_MAX_CONCURRENCY=1` until memory and swap pressure are measured.
+- Keep the default `VIPERCAPTURE_BROWSER_RECYCLE_RENDERS=1000`; it replaces a
+  drained browser process after that many render attempts so long-lived
+  Chromium allocations remain bounded. Set it to `0` only for controlled
+  diagnostics.
 - Apply container or systemd memory, PID, and CPU limits.
 - Enforce network egress rules that block private ranges and cloud metadata endpoints.
 - Do not place credentials in the repository or browser-facing JavaScript.
@@ -50,6 +54,7 @@ VIPERCAPTURE_MAX_HEIGHT=4320
 VIPERCAPTURE_MAX_FULL_PAGE_HEIGHT=20000
 VIPERCAPTURE_MAX_OUTPUT_BYTES=52428800
 VIPERCAPTURE_MAX_CONCURRENCY=1
+VIPERCAPTURE_BROWSER_RECYCLE_RENDERS=1000
 ```
 
 Put these values in the `.env` file beside `docker-compose.yml`, or export them

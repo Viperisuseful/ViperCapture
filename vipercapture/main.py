@@ -140,6 +140,9 @@ if GPU_BACKEND not in {"default", "vulkan"}:
 MAX_CONCURRENT_CAPTURES = max(
     1, int(os.getenv("VIPERCAPTURE_MAX_CONCURRENCY", "1"))
 )
+BROWSER_RECYCLE_RENDERS = max(
+    0, int(os.getenv("VIPERCAPTURE_BROWSER_RECYCLE_RENDERS", "1000"))
+)
 PROCESS_ROLE = os.getenv("VIPERCAPTURE_ROLE", "all").lower()
 if PROCESS_ROLE not in {"all", "api", "worker"}:
     raise ValueError("VIPERCAPTURE_ROLE must be all, api, or worker")
@@ -466,12 +469,62 @@ async def _replace_browser(app: FastAPI, failed_browser: Browser) -> None:
         )
         if browsers is not None:
             browsers[engine] = replacement
+        app.state.browser_render_counts.pop(id(failed_browser), None)
+        app.state.browser_render_counts[id(replacement)] = 0
         if engine.value == BrowserEngine.CHROMIUM.value:
             app.state.browser = replacement
             app.state.gpu_hardware_active = await _detect_hardware_gpu(
                 replacement,
                 app.state.gpu_mode,
             )
+
+
+async def _record_browser_render(app: FastAPI, browser: Browser) -> None:
+    if BROWSER_RECYCLE_RENDERS == 0:
+        return
+    browser_id = id(browser)
+    counts = app.state.browser_render_counts
+    counts[browser_id] = counts.get(browser_id, 0) + 1
+    if counts[browser_id] < BROWSER_RECYCLE_RENDERS:
+        return
+
+    async with app.state.browser_recycle_lock:
+        browsers = app.state.browsers
+        engine = next(
+            (name for name, active in browsers.items() if active is browser),
+            None,
+        )
+        if engine is None or counts.get(browser_id, 0) < BROWSER_RECYCLE_RENDERS:
+            counts.pop(browser_id, None)
+            return
+
+        acquired = 0
+        try:
+            for _ in range(MAX_CONCURRENT_CAPTURES):
+                await app.state.capture_slots.acquire()
+                acquired += 1
+            async with app.state.browser_restart_lock:
+                if browsers.get(engine) is not browser:
+                    counts.pop(browser_id, None)
+                    return
+                replacement = await asyncio.wait_for(
+                    _launch_browser(app.state.playwright, app.state.gpu_mode, engine),
+                    timeout=15,
+                )
+                browsers[engine] = replacement
+                counts.pop(browser_id, None)
+                counts[id(replacement)] = 0
+                if engine is BrowserEngine.CHROMIUM:
+                    app.state.browser = replacement
+                    app.state.gpu_hardware_active = await _detect_hardware_gpu(
+                        replacement,
+                        app.state.gpu_mode,
+                    )
+                with suppress(Exception):
+                    await asyncio.wait_for(browser.close(), timeout=5)
+        finally:
+            for _ in range(acquired):
+                app.state.capture_slots.release()
 
 
 @asynccontextmanager
@@ -515,6 +568,8 @@ async def lifespan(app: FastAPI):
     app.state.diff_slots = asyncio.Semaphore(MAX_DIFF_CONCURRENCY)
     app.state.async_result_slots = asyncio.Semaphore(MAX_ASYNC_RESULT_DOWNLOADS)
     app.state.browser_restart_lock = asyncio.Lock()
+    app.state.browser_recycle_lock = asyncio.Lock()
+    app.state.browser_render_counts = {id(browser): 0}
     app.state.async_jobs = None
     app.state.schedules = None
     app.state.render_cache = RenderCache(
@@ -1313,14 +1368,18 @@ async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
             if durable_queue_ms is not None
             else slot_queue_ms
         )
+        browser = None
+        render_attempted = False
         try:
             browser = await _browser_for(app, payload.engine)
             engine = _render_engine()
             render_started = time.perf_counter()
             try:
+                render_attempted = True
                 artifact, cache_hit = await _render_with_cache(
                     engine, browser, payload, namespace=project_id
                 )
+                render_attempted = not cache_hit
             except RenderError:
                 if not browser.is_connected():
                     with suppress(Exception):
@@ -1328,6 +1387,9 @@ async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
                 raise
         finally:
             app.state.capture_slots.release()
+            if render_attempted and browser is not None:
+                with suppress(Exception):
+                    await _record_browser_render(app, browser)
         render_ms = (
             0
             if cache_hit
@@ -1424,6 +1486,8 @@ async def _render_response(payload: RenderRequest, request: Request) -> Response
                 "capture_queue_busy", "The render queue is busy.", 503, True
             ) from exc
         queue_ms = round((time.perf_counter() - queue_started) * 1000)
+        browser = None
+        render_attempted = False
         try:
             browser = await _browser_for(app, payload.engine)
             engine = _render_engine()
@@ -1435,6 +1499,7 @@ async def _render_response(payload: RenderRequest, request: Request) -> Response
                     cache_hit = artifact is not None
                 if artifact is None:
                     render_started = time.perf_counter()
+                    render_attempted = True
                     artifact = await _await_while_connected(
                         request,
                         engine.render_image(
@@ -1461,6 +1526,9 @@ async def _render_response(payload: RenderRequest, request: Request) -> Response
                 raise
         finally:
             app.state.capture_slots.release()
+            if render_attempted and browser is not None:
+                with suppress(Exception):
+                    await _record_browser_render(app, browser)
     metadata = artifact.metadata or {}
     _record_render_metrics(
         payload,
@@ -2507,35 +2575,38 @@ if not HOSTED:
         if mode == app.state.gpu_mode:
             return {"gpu": await _gpu_config(app)}
 
-        acquired = 0
-        try:
-            for _ in range(MAX_CONCURRENT_CAPTURES):
-                await asyncio.wait_for(
-                    app.state.capture_slots.acquire(),
-                    timeout=CAPTURE_QUEUE_TIMEOUT_SECONDS,
-                )
-                acquired += 1
-            async with app.state.browser_restart_lock:
-                replacement = await asyncio.wait_for(
-                    _launch_browser(app.state.playwright, mode),
-                    timeout=15,
-                )
-                hardware_active = await _detect_hardware_gpu(replacement, mode)
-                previous = app.state.browser
-                app.state.browser = replacement
-                app.state.browsers[BrowserEngine.CHROMIUM] = replacement
-                app.state.gpu_mode = mode
-                app.state.gpu_hardware_active = hardware_active
-                with suppress(Exception):
-                    await asyncio.wait_for(previous.close(), timeout=5)
-        except TimeoutError as exc:
-            raise HTTPException(
-                status_code=503,
-                detail="The renderer is busy; try the GPU switch again shortly",
-            ) from exc
-        finally:
-            for _ in range(acquired):
-                app.state.capture_slots.release()
+        async with app.state.browser_recycle_lock:
+            acquired = 0
+            try:
+                for _ in range(MAX_CONCURRENT_CAPTURES):
+                    await asyncio.wait_for(
+                        app.state.capture_slots.acquire(),
+                        timeout=CAPTURE_QUEUE_TIMEOUT_SECONDS,
+                    )
+                    acquired += 1
+                async with app.state.browser_restart_lock:
+                    replacement = await asyncio.wait_for(
+                        _launch_browser(app.state.playwright, mode),
+                        timeout=15,
+                    )
+                    hardware_active = await _detect_hardware_gpu(replacement, mode)
+                    previous = app.state.browser
+                    app.state.browser = replacement
+                    app.state.browsers[BrowserEngine.CHROMIUM] = replacement
+                    app.state.browser_render_counts.pop(id(previous), None)
+                    app.state.browser_render_counts[id(replacement)] = 0
+                    app.state.gpu_mode = mode
+                    app.state.gpu_hardware_active = hardware_active
+                    with suppress(Exception):
+                        await asyncio.wait_for(previous.close(), timeout=5)
+            except TimeoutError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="The renderer is busy; try the GPU switch again shortly",
+                ) from exc
+            finally:
+                for _ in range(acquired):
+                    app.state.capture_slots.release()
 
         return {"gpu": await _gpu_config(app)}
 

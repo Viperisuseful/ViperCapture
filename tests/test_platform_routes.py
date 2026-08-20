@@ -105,6 +105,109 @@ class PlatformRouteTests(unittest.TestCase):
 
 
 class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_browser_is_recycled_after_bounded_render_count(self):
+        previous = SimpleNamespace(close=AsyncMock())
+        replacement = SimpleNamespace()
+        state = SimpleNamespace(
+            browser=previous,
+            browsers={main.BrowserEngine.CHROMIUM: previous},
+            browser_render_counts={id(previous): 0},
+            browser_recycle_lock=asyncio.Lock(),
+            browser_restart_lock=asyncio.Lock(),
+            capture_slots=asyncio.Semaphore(2),
+            playwright=object(),
+            gpu_mode="off",
+            gpu_hardware_active=False,
+        )
+        test_app = SimpleNamespace(state=state)
+        with (
+            patch("vipercapture.main.BROWSER_RECYCLE_RENDERS", 2),
+            patch("vipercapture.main.MAX_CONCURRENT_CAPTURES", 2),
+            patch(
+                "vipercapture.main._launch_browser",
+                AsyncMock(return_value=replacement),
+            ) as launch,
+            patch(
+                "vipercapture.main._detect_hardware_gpu",
+                AsyncMock(return_value=False),
+            ),
+        ):
+            await main._record_browser_render(test_app, previous)
+            launch.assert_not_awaited()
+            await main._record_browser_render(test_app, previous)
+
+        self.assertIs(state.browser, replacement)
+        self.assertIs(state.browsers[main.BrowserEngine.CHROMIUM], replacement)
+        self.assertEqual(state.browser_render_counts, {id(replacement): 0})
+        previous.close.assert_awaited_once()
+        for _ in range(2):
+            await asyncio.wait_for(state.capture_slots.acquire(), timeout=0.1)
+
+    async def test_browser_recycle_waits_for_other_active_render(self):
+        previous = SimpleNamespace(close=AsyncMock())
+        replacement = SimpleNamespace()
+        state = SimpleNamespace(
+            browser=previous,
+            browsers={main.BrowserEngine.CHROMIUM: previous},
+            browser_render_counts={id(previous): 0},
+            browser_recycle_lock=asyncio.Lock(),
+            browser_restart_lock=asyncio.Lock(),
+            capture_slots=asyncio.Semaphore(1),
+            playwright=object(),
+            gpu_mode="off",
+            gpu_hardware_active=False,
+        )
+        test_app = SimpleNamespace(state=state)
+        with (
+            patch("vipercapture.main.BROWSER_RECYCLE_RENDERS", 1),
+            patch("vipercapture.main.MAX_CONCURRENT_CAPTURES", 2),
+            patch(
+                "vipercapture.main._launch_browser",
+                AsyncMock(return_value=replacement),
+            ) as launch,
+            patch(
+                "vipercapture.main._detect_hardware_gpu",
+                AsyncMock(return_value=False),
+            ),
+        ):
+            recycling = asyncio.create_task(
+                main._record_browser_render(test_app, previous)
+            )
+            await asyncio.sleep(0)
+            launch.assert_not_awaited()
+            previous.close.assert_not_awaited()
+            state.capture_slots.release()
+            await asyncio.wait_for(recycling, timeout=1)
+
+        launch.assert_awaited_once()
+        previous.close.assert_awaited_once()
+
+    async def test_failed_render_is_counted_for_browser_recycling(self):
+        original_slots = getattr(main.app.state, "capture_slots", None)
+        main.app.state.capture_slots = asyncio.Semaphore(1)
+        browser = SimpleNamespace(is_connected=Mock(return_value=True))
+        failure = RenderError("render_failed", "failed", 500, True)
+        engine = SimpleNamespace(render_image=AsyncMock(side_effect=failure))
+        request = SimpleNamespace(is_disconnected=AsyncMock(return_value=False))
+        try:
+            with (
+                patch(
+                    "vipercapture.main._browser_for",
+                    AsyncMock(return_value=browser),
+                ),
+                patch("vipercapture.main._render_engine", return_value=engine),
+                patch(
+                    "vipercapture.main._record_browser_render",
+                    AsyncMock(),
+                ) as record,
+                self.assertRaises(RenderError),
+            ):
+                await main._render_response(RenderRequest(html="failed"), request)
+        finally:
+            main.app.state.capture_slots = original_slots
+
+        record.assert_awaited_once_with(main.app, browser)
+
     async def test_session_import_is_normalized_before_encrypted_profile_storage(self):
         control = SimpleNamespace(put_profile=Mock(), audit=Mock())
         request = SimpleNamespace(
