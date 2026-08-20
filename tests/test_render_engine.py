@@ -1623,7 +1623,7 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
         class ImagePage(FakePage):
             async def wait_for_function(self, script, **_options):
                 if (
-                    "document.images" in script
+                    "querySelectorAll('img')" in script
                     and "image.loading = 'eager'" in script
                 ):
                     events.append("eager-images")
@@ -1673,6 +1673,25 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
             frame.wait_for_function.assert_awaited_once()
             script = frame.wait_for_function.await_args.args[0]
             self.assertIn("image.loading = 'eager'", script)
+            self.assertIn("element.shadowRoot", script)
+
+    async def test_image_readiness_ignores_detached_child_frames(self):
+        class DetachedFrame(FakePage):
+            async def wait_for_function(self, *_args, **_options):
+                raise PlaywrightError("Frame was detached")
+
+            def is_detached(self):
+                return True
+
+        page = FakePage()
+        page.frames = [page, DetachedFrame()]
+        await RenderEngine(hosted=False)._wait_for_images(
+            page,
+            RenderRequest.model_validate(
+                {"url": "https://example.com", "wait_for": {"images": True}}
+            ),
+            RenderLimits(wait_timeout_ms=100),
+        )
 
     async def test_image_readiness_timeout_is_typed(self):
         page = FakePage()
