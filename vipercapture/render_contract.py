@@ -94,10 +94,22 @@ class ReducedMotion(str, Enum):
     NO_PREFERENCE = "no-preference"
 
 
+class MediaEmulation(str, Enum):
+    SCREEN = "screen"
+    PRINT = "print"
+
+
 class WaitEvent(str, Enum):
     DOMCONTENTLOADED = "domcontentloaded"
     LOAD = "load"
     NETWORKIDLE = "networkidle"
+
+
+class WaitSelectorState(str, Enum):
+    VISIBLE = "visible"
+    ATTACHED = "attached"
+    HIDDEN = "hidden"
+    DETACHED = "detached"
 
 
 class LazyLoadMode(str, Enum):
@@ -190,6 +202,7 @@ class EnvironmentOptions(StrictModel):
     device: DevicePreset = DevicePreset.DESKTOP
     color_scheme: ColorScheme | None = None
     reduced_motion: ReducedMotion | None = None
+    media: MediaEmulation | None = None
     locale: str | None = Field(default=None, min_length=2, max_length=64)
     timezone: str | None = Field(default=None, min_length=1, max_length=64)
 
@@ -280,6 +293,7 @@ class CookieOptions(StrictModel):
 
 
 class NetworkOptions(StrictModel):
+    java_script_enabled: bool = True
     user_agent: str | None = Field(default=None, min_length=1, max_length=1_024)
     geolocation: GeolocationOptions | None = None
     proxy: ProxyOptions | None = None
@@ -434,6 +448,7 @@ class PdfOptions(StrictModel):
     paper_size: PaperSize = PaperSize.A4
     orientation: Orientation = Orientation.PORTRAIT
     print_background: bool = True
+    tagged: bool | None = None
     margins: PdfMargins = Field(default_factory=PdfMargins)
     header_template: str | None = Field(default=None, max_length=16_384)
     footer_template: str | None = Field(default=None, max_length=16_384)
@@ -496,9 +511,20 @@ class PdfOptions(StrictModel):
 class WaitOptions(StrictModel):
     event: WaitEvent = WaitEvent.LOAD
     selector: str | None = Field(default=None, min_length=1, max_length=MAX_SELECTOR_CHARS)
+    selector_state: WaitSelectorState = WaitSelectorState.VISIBLE
     text: str | None = Field(default=None, min_length=1, max_length=MAX_WAIT_TEXT_CHARS)
+    images: bool = False
     delay_ms: int = Field(default=0, ge=0, le=15_000)
     timeout_ms: int = Field(default=15_000, ge=1, le=30_000)
+
+    @model_validator(mode="after")
+    def validate_selector_state(self) -> "WaitOptions":
+        if (
+            self.selector is None
+            and self.selector_state is not WaitSelectorState.VISIBLE
+        ):
+            raise ValueError("selector_state requires wait_for.selector")
+        return self
 
 
 class CleanupOptions(StrictModel):
@@ -787,11 +813,26 @@ def canonical_render_document(
 ) -> dict[str, object]:
     """Serialize request collections deterministically across processes."""
     document = request.model_dump(mode="json", **dump_options)
+    environment = document.get("environment")
+    if isinstance(environment, dict) and environment.get("media") is None:
+        # Preserve cache and async idempotency keys created before media
+        # emulation added its compatibility-neutral default.
+        environment.pop("media", None)
+    wait_for = document.get("wait_for")
+    if isinstance(wait_for, dict):
+        if wait_for.get("selector_state") == "visible":
+            wait_for.pop("selector_state", None)
+        if wait_for.get("images") is False:
+            wait_for.pop("images", None)
+    pdf = document.get("pdf")
+    if isinstance(pdf, dict) and pdf.get("tagged") is None:
+        pdf.pop("tagged", None)
     network = document.get("network")
-    if isinstance(network, dict) and isinstance(
-        network.get("block_resource_types"), list
-    ):
-        network["block_resource_types"] = sorted(
-            network["block_resource_types"]
-        )
+    if isinstance(network, dict):
+        if network.get("java_script_enabled") is True:
+            network.pop("java_script_enabled", None)
+        if isinstance(network.get("block_resource_types"), list):
+            network["block_resource_types"] = sorted(
+                network["block_resource_types"]
+            )
     return document

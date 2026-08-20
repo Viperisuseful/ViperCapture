@@ -115,6 +115,9 @@ async def _render_pdf(
             "left": f"{options.margins.left}in",
         },
     }
+    if options.tagged is not None:
+        common["tagged"] = options.tagged
+    media = request.environment.media.value if request.environment.media else "print"
     if options.header_template is not None or options.footer_template is not None:
         common.update(
             {
@@ -126,7 +129,7 @@ async def _render_pdf(
     single_page = options.mode is PdfMode.SINGLE_PAGE
     if single_page:
         common["landscape"] = False
-        await page.emulate_media(media="print")
+        await page.emulate_media(media=media)
         dimensions = await page.evaluate("""() => ({
             width: Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth || 0),
             height: Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0)
@@ -179,7 +182,7 @@ async def _render_pdf(
         # paginate due to fragmentation rules that scroll-height preflight
         # cannot predict, but never needs to emit the full document.
         common["page_ranges"] = options.page_ranges or f"1-{MAX_PRINT_PAGES + 1}"
-        await page.emulate_media(media="print")
+        await page.emulate_media(media=media)
         dimensions = await page.evaluate("""() => {
             return {
                 width: Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth || 0),

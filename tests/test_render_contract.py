@@ -28,6 +28,88 @@ class RenderContractTest(unittest.TestCase):
             ["font", "image", "script"],
         )
 
+    def test_target_javascript_control_is_canonical(self):
+        default = RenderRequest(url="https://example.com")
+        disabled = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "network": {"java_script_enabled": False},
+            }
+        )
+        self.assertTrue(default.network.java_script_enabled)
+        self.assertNotIn(
+            "java_script_enabled", canonical_render_document(default)["network"]
+        )
+        self.assertFalse(disabled.network.java_script_enabled)
+        self.assertFalse(
+            canonical_render_document(disabled)["network"]["java_script_enabled"]
+        )
+
+    def test_tagged_pdf_control_is_explicit_and_canonical(self):
+        default = RenderRequest.model_validate(
+            {"url": "https://example.com", "output": "pdf"}
+        )
+        tagged = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "output": "pdf",
+                "pdf": {"tagged": True},
+            }
+        )
+        self.assertIsNone(default.pdf.tagged)
+        self.assertNotIn("tagged", canonical_render_document(default)["pdf"])
+        self.assertTrue(tagged.pdf.tagged)
+        self.assertTrue(canonical_render_document(tagged)["pdf"]["tagged"])
+
+    def test_media_emulation_is_explicit_and_canonical(self):
+        default = RenderRequest(url="https://example.com")
+        screen = RenderRequest.model_validate(
+            {"url": "https://example.com", "environment": {"media": "screen"}}
+        )
+        print_media = RenderRequest.model_validate(
+            {"url": "https://example.com", "environment": {"media": "print"}}
+        )
+        self.assertNotIn("media", canonical_render_document(default)["environment"])
+        self.assertEqual(screen.environment.media.value, "screen")
+        self.assertEqual(print_media.environment.media.value, "print")
+        with self.assertRaises(ValidationError):
+            RenderRequest.model_validate(
+                {"url": "https://example.com", "environment": {"media": "speech"}}
+            )
+
+    def test_rich_readiness_is_validated_and_canonical(self):
+        default = canonical_render_document(RenderRequest(url="https://example.com"))
+        self.assertNotIn("selector_state", default["wait_for"])
+        self.assertNotIn("images", default["wait_for"])
+        for state in ("visible", "attached", "hidden", "detached"):
+            request = RenderRequest.model_validate(
+                {
+                    "url": "https://example.com",
+                    "wait_for": {
+                        "selector": ".ready",
+                        "selector_state": state,
+                        "images": True,
+                    },
+                }
+            )
+            self.assertEqual(request.wait_for.selector_state.value, state)
+            self.assertTrue(request.wait_for.images)
+        with self.assertRaises(ValidationError):
+            RenderRequest.model_validate(
+                {
+                    "url": "https://example.com",
+                    "wait_for": {"selector_state": "enabled"},
+                }
+            )
+        for state in ("attached", "hidden", "detached"):
+            with self.assertRaises(ValidationError):
+                RenderRequest.model_validate(
+                    {
+                        "url": "https://example.com",
+                        "wait_for": {"selector_state": state},
+                    }
+                )
+
     def test_url_image_request_is_supported(self):
         request = RenderRequest.model_validate(
             {

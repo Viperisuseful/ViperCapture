@@ -10,7 +10,7 @@ running, the interactive OpenAPI reference is available at `/docs`.
 | `output` | Response | Notes |
 | --- | --- | --- |
 | `png`, `jpeg`, `webp`, `avif` | image | Full page, viewport, selector, clip, resize, slices, or multi-viewport |
-| `pdf` | PDF | Print or single-page mode, paper/orientation/margins |
+| `pdf` | PDF | Print or single-page mode, paper/orientation/margins, optional tags |
 | `html` | UTF-8 HTML | Fully rendered document or article extraction |
 | `markdown` | UTF-8 Markdown | Document or readability-based article extraction |
 | `metadata` | JSON | Title, description, canonical URL, headings, links, images |
@@ -49,21 +49,32 @@ aspect ratio. HTML and Markdown requests may set `include_shadow_dom` to embed
 open shadow roots as declarative shadow DOM. PDF options include A0–A6, Legal,
 Letter, and Tabloid paper, optional page ranges, and bounded header/footer
 templates. Metadata includes icons, loaded fonts, forms, and JSON-LD samples.
+Set `pdf.tagged` explicitly to request or suppress Chromium's accessible PDF
+structure tags. Omitting it preserves Chromium's default. Tags alone do not
+guarantee PDF/UA conformance; source semantics and independent validation still
+matter.
 
 ## Configure the browser
 
-- `environment`: device preset, color scheme, reduced motion, locale, timezone.
-- `network`: user agent, geolocation, proxy, cookies, CSP/HTTPS controls, URL
-  glob blocks, and resource-type blocks.
+- `environment`: device preset, color scheme, reduced motion, CSS media, locale,
+  and timezone. Set `media` to `screen` or `print` to apply it before the target
+  loads. When omitted, screenshots keep browser screen media and PDFs use print.
+- `network`: target-page JavaScript, user agent, geolocation, proxy, cookies,
+  CSP/HTTPS controls, URL glob blocks, and resource-type blocks. Set
+  `java_script_enabled: false` to prevent target-provided scripts from running.
 - `headers`: bounded target headers. Credential-bearing headers are stripped
   from cross-origin requests.
-- `wait_for`: load event, visible selector, body text, delay, and timeout.
+- `wait_for`: load event, selector plus `visible`, `attached`, `hidden`, or
+  `detached` state, optional complete-image readiness, body text, delay, and
+  timeout. Image readiness eagerly requests current lazy images and repeats
+  after full-page lazy loading.
 - `cleanup`: consent mode and ad/tracker/chat/newsletter blocking.
 - `custom_css`: up to 64 KiB of injected CSS.
 - `stealth`: applies balanced, request-aware automation evasions by default;
   set it to `false` for debugging or strict browser-parity tests.
 - `captcha`: chooses `error` (default), `capture`, or an operator-provided
-  `external` handler when a blocking challenge is detected.
+  `external` handler when a blocking challenge is detected. `solver` is a
+  non-secret operator routing alias, never a provider credential.
 
 Self-hosted mode accepts an HTTP, HTTPS, SOCKS4, or SOCKS5 proxy in
 `network.proxy`. Credentials are separate fields and are never embedded in the
@@ -96,6 +107,17 @@ roots. An ordinary embedded widget does not fail a capture until it becomes a
 blocking challenge. Detection is heuristic and returns the provider, kind,
 confidence, and signals in the error details; ViperCapture does not solve or
 bypass CAPTCHAs.
+
+An authorized caller can also complete an access flow with an independent
+external tool, then submit a fresh render using short-lived, target-scoped
+cookies, a profile, or exact-origin headers. Keep external-service credentials
+outside render payloads. This does not invoke the operator handler or relax
+exact-origin header routing or, in hosted mode, the target-domain check for
+`network.cookies` and public-address/redirect validation. Imported profiles are
+not target-filtered. Self-host mode allows internal targets, so its operator
+must enforce private and metadata-network blocks with an egress policy.
+ViperCapture has no affiliation with or built-in integration for those tools;
+see [site access](site-access.md).
 
 Hosted mode also rejects non-public targets and subresources, cookies outside
 the target site, and unsafe redirects.

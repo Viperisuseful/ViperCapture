@@ -30,6 +30,25 @@ and cross-origin assets do not receive the secret. Persistent profiles are a
 better fit for short-lived login sessions; do not copy a person's long-lived
 session into a request.
 
+## Hand off from an external challenge tool
+
+For a target you are authorized to test, a caller may complete the site's
+access flow outside ViperCapture with a tool of its choice and then submit a
+fresh render. Pass only short-lived, target-scoped state through an encrypted
+profile, `network.cookies`, or an exact-origin header. Do not put the external
+service's API key in target cookies, headers, profiles, or render payloads;
+keep service credentials in the caller or operator integration.
+
+This caller-managed handoff is separate from the optional operator handler
+described in the [platform guide](platform.md). ViperCapture is not affiliated
+with external providers and does not bundle, call, endorse, or configure one
+for this workflow. It does not solve or bypass challenges. Same-origin header
+routing remains in force, and hosted mode keeps its target-domain check for
+`network.cookies` plus public-address and redirect validation. Imported profile
+state is not target-filtered, so create a dedicated profile containing only the
+authorized site's state. Self-hosters must enforce private and metadata-network
+blocks with the deployment's egress policy.
+
 ## Configure Cloudflare
 
 Create a WAF custom rule above the rule that blocks the renderer. Replace the

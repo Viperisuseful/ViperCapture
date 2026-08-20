@@ -23,18 +23,21 @@ the dated [compatibility matrix](docs/compatibility.md) and run the
 ## Features
 
 - Chromium, Firefox, and WebKit rendering; browsers start only when needed
-- PNG, JPEG, WebP, AVIF, PDF, HTML, Markdown, metadata, and WebM/MP4/GIF output
+- PNG, JPEG, WebP, AVIF, PDF with explicit structure-tag control, HTML,
+  Markdown, metadata, and WebM/MP4/GIF output
 - URL, raw HTML, and Markdown input; full-page, viewport, element, clip, and
   multi-viewport ZIP captures
 - Typed click, hover, fill, select, key, scroll, wait, hide, and opt-in
   JavaScript actions
-- Wait conditions, assertions, custom CSS, devices, locale/timezone,
+- Selector-state and image-readiness waits, target JavaScript control,
+  assertions, custom CSS, devices, locale/timezone,
   geolocation, cookies, user agent, proxy, resource blocking, and cleanup
 - Request-aware stealth controls, operator-controlled residential/datacenter
   proxies, and structured detection for common CAPTCHA and bot interstitials
 - Ad, tracker, chat, newsletter, and consent-banner cleanup backed by the
   vendored, license-preserved AutoConsent rule set
 - Cleanup and deterministic controls in the browser UI
+- Explicit screen or print CSS media emulation applied before page load
 - Timed, full-page GIF, WebM, and MP4 capture with higher-quality encoding,
   transparent padding where supported, and optional GPU acceleration with a
   safe software fallback
@@ -172,7 +175,10 @@ solve or bypass them. The default `captcha.action` is `error`; use `capture` to
 render the challenge as-is. Operators may configure their own approved async
 handler with `VIPERCAPTURE_CAPTCHA_HANDLER_FACTORY` and opt in per request with
 `captcha.action: "external"`. See the [API guide](docs/api.md) for the handler
-contract and timeout behavior.
+contract and timeout behavior. Alternatively, an authorized caller can use an
+external tool independently, then start a fresh render with short-lived,
+target-scoped session state. ViperCapture ships no provider integration,
+credentials, endorsement, solver, or bypass service.
 
 ## Configure storage and webhooks
 

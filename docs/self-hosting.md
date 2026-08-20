@@ -75,7 +75,8 @@ Advanced controls include deterministic device signals, color scheme, reduced
 motion, locale and timezone, selector capture, rectangular crop, lazy-content
 loading, readiness waits, exact failure statuses, same-origin headers, image
 encoding, PDF layout, extraction mode, diagnostics, and video settings. The
-API additionally exposes actions, cookies, proxies, resource patterns,
+API additionally exposes explicit screen/print CSS media, a PDF structure-tag
+setting, actions, cookies, proxies, resource patterns,
 geolocation, assertions, deterministic time/randomness, slices, profiles,
 signed delivery, and certification as documented in [API and workflows](api.md).
 
@@ -139,19 +140,31 @@ external scheduler on Windows or keep the feature disabled.
 ## Selectors and waits
 
 `selector` captures the first visible matching element and requires
-`full_page: false`. `wait_for.selector` waits for a matching element to become
-visible before capture. Both fields accept standard CSS selectors, are limited
-to 2,048 characters, and do not support pseudo-elements such as `::before`.
+`full_page: false`. `wait_for.selector` accepts `selector_state` values
+`visible` (default), `attached`, `hidden`, and `detached`. Both selector fields
+accept standard CSS selectors, are limited to 2,048 characters, and do not
+support pseudo-elements such as `::before`.
 
 Use `wait_for.event` for `load`, `domcontentloaded`, or `networkidle`.
 `wait_for.text` waits for text in the document body, `delay_ms` adds a final
-settle delay, and `timeout_ms` bounds page and selector waits. The local
+settle delay, and `timeout_ms` bounds page and selector waits. Set
+`wait_for.images: true` to eagerly request current lazy images and wait until
+all current images complete; full-page renders repeat the bounded image wait
+after lazy-content scrolling. The local
 interface displays the active wait plan and elapsed time while a render runs.
 Cancelling the interface request also cancels queued or active server work.
 
 For full-page captures of unusually wide documents, set
 `preserve_viewport_width: true` to clip horizontal overflow to the requested
 viewport while retaining the full document height.
+
+## Target-page JavaScript
+
+Set `network.java_script_enabled` to `false` to prevent scripts delivered by
+the target page from running. It defaults to `true`. This browser-context
+control is separate from `VIPERCAPTURE_ALLOW_SCRIPTS`, which gates caller-
+supplied JavaScript actions; disabling either setting does not enable the
+other.
 
 ## Custom headers
 

@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from PIL import Image
 
 from vipercapture.render_contract import LazyLoadMode, OutputFormat, RenderRequest
@@ -79,8 +80,15 @@ class FakePage:
         self.waited_text = None
         self.delay = None
         self.styles = []
+        self.frames = [self]
+
+    def is_detached(self):
+        return False
 
     def on(self, *_args):
+        return None
+
+    def remove_listener(self, *_args):
         return None
 
     async def goto(self, url, **options):
@@ -95,7 +103,7 @@ class FakePage:
     def locator(self, _selector):
         return FakeLocator(self)
 
-    async def wait_for_function(self, _script, *, arg, **_options):
+    async def wait_for_function(self, _script, *, arg=None, **_options):
         self.waited_text = arg
 
     async def wait_for_timeout(self, delay):
@@ -166,6 +174,46 @@ class FakeBrowser:
 
 
 class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
+    async def test_media_emulation_precedes_navigation(self):
+        events = []
+
+        class MediaPage(FakePage):
+            async def emulate_media(self, *, media):
+                events.append(f"media:{media}")
+
+            async def goto(self, url, **options):
+                events.append("goto")
+                return await super().goto(url, **options)
+
+        await RenderEngine(hosted=False).render_image(
+            FakeBrowser(FakeContext(MediaPage())),
+            RenderRequest.model_validate(
+                {"url": "https://example.com", "environment": {"media": "print"}}
+            ),
+            RenderLimits(max_width=1920, max_height=1080, max_pixels=2_073_600),
+        )
+        self.assertEqual(events[:2], ["media:print", "goto"])
+
+    async def test_media_emulation_precedes_inline_content(self):
+        events = []
+
+        class MediaPage(FakePage):
+            async def emulate_media(self, *, media):
+                events.append(f"media:{media}")
+
+            async def set_content(self, content, **options):
+                events.append("set_content")
+                await super().set_content(content, **options)
+
+        await RenderEngine(hosted=False).render_image(
+            FakeBrowser(FakeContext(MediaPage())),
+            RenderRequest.model_validate(
+                {"html": "<main>Hello</main>", "environment": {"media": "screen"}}
+            ),
+            RenderLimits(max_width=1920, max_height=1080, max_pixels=2_073_600),
+        )
+        self.assertEqual(events[:2], ["media:screen", "set_content"])
+
     async def test_captcha_budget_pauses_deadline_only_for_handler_runtime(self):
         async with asyncio.timeout(0.2) as deadline:
             original = deadline.when()
@@ -987,6 +1035,21 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(clipped.await_args.kwargs["clip"]["x"], 5)
         self.assertEqual(artifact.metadata["width"], 320)
 
+    async def test_target_javascript_can_be_disabled(self):
+        request = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "network": {"java_script_enabled": False},
+            }
+        )
+        browser = FakeBrowser(FakeContext(FakePage()))
+        await RenderEngine(hosted=False).render_image(
+            browser,
+            request,
+            RenderLimits(max_width=1920, max_height=1080, max_pixels=2_073_600),
+        )
+        self.assertFalse(browser.context_options["java_script_enabled"])
+
     async def test_resize_rejects_sources_above_pillow_pixel_ceiling(self):
         page = FakePage()
         request = RenderRequest.model_validate(
@@ -1276,6 +1339,7 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
                 "wait_for": {
                     "event": "networkidle",
                     "selector": "#ready",
+                    "selector_state": "attached",
                     "text": "Ready",
                     "delay_ms": 25,
                 },
@@ -1295,6 +1359,7 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(artifact.media_type, "image/webp")
         self.assertEqual(context.page.goto_options["wait_until"], "networkidle")
         self.assertEqual(context.page.waited_text, "Ready")
+        self.assertEqual(context.page.wait_options[0]["state"], "attached")
         self.assertEqual(context.page.delay, 25)
         self.assertEqual(webp.await_args.kwargs["quality"], 82)
         self.assertTrue(webp.await_args.kwargs["transparent"])
@@ -1572,6 +1637,162 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
                 ),
             )
         self.assertEqual(events, ["lazy", "assertions"])
+
+    async def test_image_readiness_wraps_actions_and_full_page_lazy_loading(self):
+        events = []
+
+        class ImagePage(FakePage):
+            async def wait_for_function(self, script, **_options):
+                if (
+                    "querySelectorAll('img')" in script
+                    and "image.loading = 'eager'" in script
+                ):
+                    events.append("eager-images")
+
+        async def actions(*_args):
+            events.append("actions")
+
+        async def lazy(*_args):
+            events.append("lazy")
+
+        engine = RenderEngine(hosted=False)
+        request = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "full_page": True,
+                "wait_for": {"images": True},
+            }
+        )
+        with (
+            patch("vipercapture.render_engine.load_lazy_content", side_effect=lazy),
+            patch.object(engine, "_run_actions", side_effect=actions),
+        ):
+            await engine.render_image(
+                FakeBrowser(FakeContext(ImagePage())),
+                request,
+                RenderLimits(max_width=1920, max_height=1080, max_pixels=2_073_600),
+            )
+        self.assertEqual(
+            events,
+            ["eager-images", "actions", "lazy", "eager-images"],
+        )
+
+    async def test_image_readiness_includes_child_frames(self):
+        page = FakePage()
+        child = FakePage()
+        page.frames = [page, child]
+        page.wait_for_function = AsyncMock()
+        child.wait_for_function = AsyncMock()
+        await RenderEngine(hosted=False)._wait_for_images(
+            page,
+            RenderRequest.model_validate(
+                {"url": "https://example.com", "wait_for": {"images": True}}
+            ),
+            RenderLimits(wait_timeout_ms=100),
+        )
+        for frame in (page, child):
+            frame.wait_for_function.assert_awaited_once()
+            script = frame.wait_for_function.await_args.args[0]
+            self.assertIn("image.loading = 'eager'", script)
+            self.assertIn("element.shadowRoot", script)
+
+    async def test_image_readiness_ignores_detached_child_frames(self):
+        class DetachedFrame(FakePage):
+            async def wait_for_function(self, *_args, **_options):
+                self.detached = True
+                raise PlaywrightError("Frame was detached")
+
+            def is_detached(self):
+                return getattr(self, "detached", False)
+
+        page = FakePage()
+        page.frames = [page, DetachedFrame()]
+        await RenderEngine(hosted=False)._wait_for_images(
+            page,
+            RenderRequest.model_validate(
+                {"url": "https://example.com", "wait_for": {"images": True}}
+            ),
+            RenderLimits(wait_timeout_ms=100),
+        )
+
+    async def test_image_readiness_rescans_frames_until_stable(self):
+        page = FakePage()
+        child = FakePage("https://example.com/frame")
+
+        async def attach_frame(*_args, **_options):
+            page.frames.append(child)
+
+        page.wait_for_function = AsyncMock(side_effect=attach_frame)
+        child.wait_for_function = AsyncMock()
+        await RenderEngine(hosted=False)._wait_for_images(
+            page,
+            RenderRequest.model_validate(
+                {"url": "https://example.com", "wait_for": {"images": True}}
+            ),
+            RenderLimits(wait_timeout_ms=100),
+        )
+        child.wait_for_function.assert_awaited_once()
+
+    async def test_image_readiness_rechecks_a_navigated_frame(self):
+        page = FakePage()
+        child = FakePage("https://example.com/old-frame")
+        page.frames = [page, child]
+
+        async def navigate_child(*_args, **_options):
+            await asyncio.sleep(0)
+            child.url = "https://example.com/new-frame"
+
+        page.wait_for_function = AsyncMock(side_effect=navigate_child)
+        child.wait_for_function = AsyncMock()
+        await RenderEngine(hosted=False)._wait_for_images(
+            page,
+            RenderRequest.model_validate(
+                {"url": "https://example.com", "wait_for": {"images": True}}
+            ),
+            RenderLimits(wait_timeout_ms=100),
+        )
+        self.assertEqual(child.wait_for_function.await_count, 2)
+
+    async def test_image_readiness_rechecks_a_same_url_reload(self):
+        class NavigationPage(FakePage):
+            def on(self, event, callback):
+                if event == "framenavigated":
+                    self.on_frame_navigated = callback
+
+        page = NavigationPage()
+        child = FakePage("https://example.com/frame")
+        page.frames = [page, child]
+
+        async def reload_child(*_args, **_options):
+            await asyncio.sleep(0)
+            page.on_frame_navigated(child)
+
+        page.wait_for_function = AsyncMock(side_effect=reload_child)
+        child.wait_for_function = AsyncMock()
+        await RenderEngine(hosted=False)._wait_for_images(
+            page,
+            RenderRequest.model_validate(
+                {"url": "https://example.com", "wait_for": {"images": True}}
+            ),
+            RenderLimits(wait_timeout_ms=100),
+        )
+        self.assertEqual(child.wait_for_function.await_count, 2)
+
+    async def test_image_readiness_timeout_is_typed(self):
+        page = FakePage()
+        page.wait_for_function = AsyncMock(
+            side_effect=PlaywrightTimeoutError("timed out")
+        )
+        with self.assertRaises(RenderError) as raised:
+            await RenderEngine(hosted=False)._wait_for_images(
+                page,
+                RenderRequest.model_validate(
+                    {"url": "https://example.com", "wait_for": {"images": True}}
+                ),
+                RenderLimits(wait_timeout_ms=100),
+            )
+        self.assertEqual(raised.exception.code, "wait_images_timeout")
+        self.assertTrue(raised.exception.retryable)
 
     async def test_failed_context_cleanup_restarts_browser(self):
         class BrokenCloseContext(FakeContext):

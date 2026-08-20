@@ -125,6 +125,20 @@ def create_handler():
 
 Requests opt in with `"captcha":{"action":"external",
 "solver":"operator-alias","timeout_ms":120000}`. The solver name is only a
-non-secret routing label. ViperCapture enforces the timeout, re-runs detection,
-and fails if the challenge remains. No solver provider, credentials, token
-injection, or challenge-solving implementation ships with the project.
+non-secret routing label, not a provider credential. Keep handler credentials
+in the operator-owned integration and out of render requests, target cookies,
+headers, and profiles. ViperCapture invokes only the configured factory's
+callable, enforces the timeout, re-runs detection, and fails if the challenge
+remains. No provider integration, provider affiliation, credentials, token
+injection, endorsement, solver, or challenge-bypass implementation ships with
+the project.
+
+Callers may instead complete an authorized access flow independently and make
+a fresh render with short-lived, target-scoped session state as documented in
+[site access](site-access.md). That caller-managed flow does not invoke the
+operator handler. Neither flow relaxes same-origin header routing, hosted
+target-domain checks for `network.cookies`, or network egress policy. Hosted
+mode also keeps public-address and redirect validation. Imported profiles are
+not target-filtered, and self-host mode permits internal targets, so operators
+must use dedicated target-scoped profiles and enforce private and metadata-
+network blocks at the egress layer.
