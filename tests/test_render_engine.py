@@ -80,6 +80,7 @@ class FakePage:
         self.waited_text = None
         self.delay = None
         self.styles = []
+        self.frames = [self]
 
     def on(self, *_args):
         return None
@@ -1620,15 +1621,12 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
         events = []
 
         class ImagePage(FakePage):
-            async def evaluate(self, script, *_args):
-                if "image.loading = 'eager'" in script:
-                    events.append("eager")
-                    return None
-                return await super().evaluate(script, *_args)
-
             async def wait_for_function(self, script, **_options):
-                if "document.images" in script:
-                    events.append("images")
+                if (
+                    "document.images" in script
+                    and "image.loading = 'eager'" in script
+                ):
+                    events.append("eager-images")
 
         async def actions(*_args):
             events.append("actions")
@@ -1655,8 +1653,26 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(
             events,
-            ["eager", "images", "actions", "lazy", "eager", "images"],
+            ["eager-images", "actions", "lazy", "eager-images"],
         )
+
+    async def test_image_readiness_includes_child_frames(self):
+        page = FakePage()
+        child = FakePage()
+        page.frames = [page, child]
+        page.wait_for_function = AsyncMock()
+        child.wait_for_function = AsyncMock()
+        await RenderEngine(hosted=False)._wait_for_images(
+            page,
+            RenderRequest.model_validate(
+                {"url": "https://example.com", "wait_for": {"images": True}}
+            ),
+            RenderLimits(wait_timeout_ms=100),
+        )
+        for frame in (page, child):
+            frame.wait_for_function.assert_awaited_once()
+            script = frame.wait_for_function.await_args.args[0]
+            self.assertIn("image.loading = 'eager'", script)
 
     async def test_image_readiness_timeout_is_typed(self):
         page = FakePage()

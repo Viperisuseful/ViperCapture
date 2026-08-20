@@ -1553,12 +1553,20 @@ class RenderEngine:
         if not request.wait_for.images:
             return
         try:
-            await page.evaluate(
-                "() => Array.from(document.images).forEach(image => { image.loading = 'eager'; })"
-            )
-            await page.wait_for_function(
-                "() => Array.from(document.images).every(image => image.complete)",
-                timeout=min(request.wait_for.timeout_ms, limits.wait_timeout_ms),
+            await asyncio.gather(
+                *(
+                    frame.wait_for_function(
+                        """() => {
+                            for (const image of document.images) image.loading = 'eager';
+                            return Array.from(document.images).every(image => image.complete);
+                        }""",
+                        timeout=min(
+                            request.wait_for.timeout_ms,
+                            limits.wait_timeout_ms,
+                        ),
+                    )
+                    for frame in page.frames
+                )
             )
         except PlaywrightTimeoutError as exc:
             raise RenderError(

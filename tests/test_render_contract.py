@@ -68,6 +68,14 @@ class RenderContractTest(unittest.TestCase):
                     "wait_for": {"selector_state": "enabled"},
                 }
             )
+        for state in ("attached", "hidden", "detached"):
+            with self.assertRaises(ValidationError):
+                RenderRequest.model_validate(
+                    {
+                        "url": "https://example.com",
+                        "wait_for": {"selector_state": state},
+                    }
+                )
 
     def test_url_image_request_is_supported(self):
         request = RenderRequest.model_validate(

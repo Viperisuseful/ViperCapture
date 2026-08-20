@@ -515,6 +515,15 @@ class WaitOptions(StrictModel):
     delay_ms: int = Field(default=0, ge=0, le=15_000)
     timeout_ms: int = Field(default=15_000, ge=1, le=30_000)
 
+    @model_validator(mode="after")
+    def validate_selector_state(self) -> "WaitOptions":
+        if (
+            self.selector is None
+            and self.selector_state is not WaitSelectorState.VISIBLE
+        ):
+            raise ValueError("selector_state requires wait_for.selector")
+        return self
+
 
 class CleanupOptions(StrictModel):
     consent_mode: ConsentMode = ConsentMode.NONE
