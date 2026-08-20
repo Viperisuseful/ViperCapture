@@ -35,6 +35,7 @@ the dated [compatibility matrix](docs/compatibility.md) and run the
 - Ad, tracker, chat, newsletter, and consent-banner cleanup backed by the
   vendored, license-preserved AutoConsent rule set
 - Cleanup and deterministic controls in the browser UI
+- Explicit screen or print CSS media emulation applied before page load
 - Timed, full-page GIF, WebM, and MP4 capture with higher-quality encoding,
   transparent padding where supported, and optional GPU acceleration with a
   safe software fallback

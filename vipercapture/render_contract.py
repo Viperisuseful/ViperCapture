@@ -94,6 +94,11 @@ class ReducedMotion(str, Enum):
     NO_PREFERENCE = "no-preference"
 
 
+class MediaEmulation(str, Enum):
+    SCREEN = "screen"
+    PRINT = "print"
+
+
 class WaitEvent(str, Enum):
     DOMCONTENTLOADED = "domcontentloaded"
     LOAD = "load"
@@ -190,6 +195,7 @@ class EnvironmentOptions(StrictModel):
     device: DevicePreset = DevicePreset.DESKTOP
     color_scheme: ColorScheme | None = None
     reduced_motion: ReducedMotion | None = None
+    media: MediaEmulation | None = None
     locale: str | None = Field(default=None, min_length=2, max_length=64)
     timezone: str | None = Field(default=None, min_length=1, max_length=64)
 
@@ -787,6 +793,11 @@ def canonical_render_document(
 ) -> dict[str, object]:
     """Serialize request collections deterministically across processes."""
     document = request.model_dump(mode="json", **dump_options)
+    environment = document.get("environment")
+    if isinstance(environment, dict) and environment.get("media") is None:
+        # Preserve cache and async idempotency keys created before media
+        # emulation added its compatibility-neutral default.
+        environment.pop("media", None)
     network = document.get("network")
     if isinstance(network, dict) and isinstance(
         network.get("block_resource_types"), list

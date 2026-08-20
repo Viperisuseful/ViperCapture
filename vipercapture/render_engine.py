@@ -2099,6 +2099,8 @@ class RenderEngine:
                     await context.route_web_socket("**/*", block_web_socket)
 
                 page = await context.new_page()
+                if request.environment.media is not None:
+                    await page.emulate_media(media=request.environment.media.value)
                 navigation_status: int | None = None
 
                 def record_navigation_response(response) -> None:

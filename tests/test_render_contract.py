@@ -28,6 +28,22 @@ class RenderContractTest(unittest.TestCase):
             ["font", "image", "script"],
         )
 
+    def test_media_emulation_is_explicit_and_canonical(self):
+        default = RenderRequest(url="https://example.com")
+        screen = RenderRequest.model_validate(
+            {"url": "https://example.com", "environment": {"media": "screen"}}
+        )
+        print_media = RenderRequest.model_validate(
+            {"url": "https://example.com", "environment": {"media": "print"}}
+        )
+        self.assertNotIn("media", canonical_render_document(default)["environment"])
+        self.assertEqual(screen.environment.media.value, "screen")
+        self.assertEqual(print_media.environment.media.value, "print")
+        with self.assertRaises(ValidationError):
+            RenderRequest.model_validate(
+                {"url": "https://example.com", "environment": {"media": "speech"}}
+            )
+
     def test_url_image_request_is_supported(self):
         request = RenderRequest.model_validate(
             {

@@ -75,7 +75,8 @@ Advanced controls include deterministic device signals, color scheme, reduced
 motion, locale and timezone, selector capture, rectangular crop, lazy-content
 loading, readiness waits, exact failure statuses, same-origin headers, image
 encoding, PDF layout, extraction mode, diagnostics, and video settings. The
-API additionally exposes actions, cookies, proxies, resource patterns,
+API additionally exposes explicit screen/print CSS media, actions, cookies,
+proxies, resource patterns,
 geolocation, assertions, deterministic time/randomness, slices, profiles,
 signed delivery, and certification as documented in [API and workflows](api.md).
 

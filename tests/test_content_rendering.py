@@ -285,6 +285,20 @@ class ContentRenderingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(single_page.pdf_options["height"], "977px")
         self.assertEqual(single_page.emulated_media, "print")
 
+        screen_page = FakePage()
+        await render_document_output(
+            screen_page,
+            RenderRequest.model_validate(
+                {
+                    "url": "https://example.com",
+                    "output": "pdf",
+                    "environment": {"media": "screen"},
+                }
+            ),
+            LIMITS,
+        )
+        self.assertEqual(screen_page.emulated_media, "screen")
+
         landscape = FakePage()
         await render_document_output(
             landscape,

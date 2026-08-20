@@ -22,6 +22,7 @@ documentation used for this comparison.
 | Waits and content/request assertions | Yes | Yes | Yes/partial depending on assertion |
 | Ad, tracker, consent, chat cleanup | Yes | Yes | Yes |
 | Headers, cookies, locale/timezone, geolocation | Yes | Yes | Yes |
+| Screen/print CSS media emulation | Yes | Yes | Yes |
 | Per-request proxy | Self-host mode | Paid option | Paid option |
 | Exact-request cache | Yes, local 15-minute default | Yes, CDN/R2 cache | Render-link cache; POST not cached |
 | Sync and durable async polling | Yes | Async callback workflow | Yes |

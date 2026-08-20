@@ -166,6 +166,46 @@ class FakeBrowser:
 
 
 class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
+    async def test_media_emulation_precedes_navigation(self):
+        events = []
+
+        class MediaPage(FakePage):
+            async def emulate_media(self, *, media):
+                events.append(f"media:{media}")
+
+            async def goto(self, url, **options):
+                events.append("goto")
+                return await super().goto(url, **options)
+
+        await RenderEngine(hosted=False).render_image(
+            FakeBrowser(FakeContext(MediaPage())),
+            RenderRequest.model_validate(
+                {"url": "https://example.com", "environment": {"media": "print"}}
+            ),
+            RenderLimits(max_width=1920, max_height=1080, max_pixels=2_073_600),
+        )
+        self.assertEqual(events[:2], ["media:print", "goto"])
+
+    async def test_media_emulation_precedes_inline_content(self):
+        events = []
+
+        class MediaPage(FakePage):
+            async def emulate_media(self, *, media):
+                events.append(f"media:{media}")
+
+            async def set_content(self, content, **options):
+                events.append("set_content")
+                await super().set_content(content, **options)
+
+        await RenderEngine(hosted=False).render_image(
+            FakeBrowser(FakeContext(MediaPage())),
+            RenderRequest.model_validate(
+                {"html": "<main>Hello</main>", "environment": {"media": "screen"}}
+            ),
+            RenderLimits(max_width=1920, max_height=1080, max_pixels=2_073_600),
+        )
+        self.assertEqual(events[:2], ["media:screen", "set_content"])
+
     async def test_captcha_budget_pauses_deadline_only_for_handler_runtime(self):
         async with asyncio.timeout(0.2) as deadline:
             original = deadline.when()

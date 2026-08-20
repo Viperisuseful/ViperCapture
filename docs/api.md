@@ -52,7 +52,9 @@ templates. Metadata includes icons, loaded fonts, forms, and JSON-LD samples.
 
 ## Configure the browser
 
-- `environment`: device preset, color scheme, reduced motion, locale, timezone.
+- `environment`: device preset, color scheme, reduced motion, CSS media, locale,
+  and timezone. Set `media` to `screen` or `print` to apply it before the target
+  loads. When omitted, screenshots keep browser screen media and PDFs use print.
 - `network`: user agent, geolocation, proxy, cookies, CSP/HTTPS controls, URL
   glob blocks, and resource-type blocks.
 - `headers`: bounded target headers. Credential-bearing headers are stripped
