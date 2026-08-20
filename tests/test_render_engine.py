@@ -88,6 +88,9 @@ class FakePage:
     def on(self, *_args):
         return None
 
+    def remove_listener(self, *_args):
+        return None
+
     async def goto(self, url, **options):
         self.url = url
         self.goto_options = options
@@ -1725,6 +1728,31 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
             child.url = "https://example.com/new-frame"
 
         page.wait_for_function = AsyncMock(side_effect=navigate_child)
+        child.wait_for_function = AsyncMock()
+        await RenderEngine(hosted=False)._wait_for_images(
+            page,
+            RenderRequest.model_validate(
+                {"url": "https://example.com", "wait_for": {"images": True}}
+            ),
+            RenderLimits(wait_timeout_ms=100),
+        )
+        self.assertEqual(child.wait_for_function.await_count, 2)
+
+    async def test_image_readiness_rechecks_a_same_url_reload(self):
+        class NavigationPage(FakePage):
+            def on(self, event, callback):
+                if event == "framenavigated":
+                    self.on_frame_navigated = callback
+
+        page = NavigationPage()
+        child = FakePage("https://example.com/frame")
+        page.frames = [page, child]
+
+        async def reload_child(*_args, **_options):
+            await asyncio.sleep(0)
+            page.on_frame_navigated(child)
+
+        page.wait_for_function = AsyncMock(side_effect=reload_child)
         child.wait_for_function = AsyncMock()
         await RenderEngine(hosted=False)._wait_for_images(
             page,

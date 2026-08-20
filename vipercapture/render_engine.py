@@ -1558,8 +1558,18 @@ class RenderEngine:
             limits.wait_timeout_ms,
         )
         deadline = asyncio.get_running_loop().time() + timeout_ms / 1_000
+        frame_generations: dict[int, int] = {}
 
-        async def wait_for_frame(frame, remaining_ms: int) -> str | None:
+        def mark_navigation(frame) -> None:
+            frame_id = id(frame)
+            frame_generations[frame_id] = frame_generations.get(frame_id, 0) + 1
+
+        page.on("framenavigated", mark_navigation)
+
+        async def wait_for_frame(
+            frame, remaining_ms: int
+        ) -> tuple[str, int, int] | None:
+            generation = frame_generations.get(id(frame), 0)
             try:
                 await frame.wait_for_function(
                     """() => {
@@ -1576,7 +1586,7 @@ class RenderEngine:
                     }""",
                     timeout=remaining_ms,
                 )
-                return frame.url
+                return frame.url, generation, frame_generations.get(id(frame), 0)
             except PlaywrightTimeoutError:
                 raise
             except PlaywrightError:
@@ -1585,13 +1595,14 @@ class RenderEngine:
                 raise
 
         try:
-            observed: dict[int, str] = {}
+            observed: dict[int, tuple[str, int]] = {}
             while True:
                 frames = [frame for frame in page.frames if not frame.is_detached()]
                 pending = [
                     frame
                     for frame in frames
-                    if observed.get(id(frame)) != frame.url
+                    if observed.get(id(frame))
+                    != (frame.url, frame_generations.get(id(frame), 0))
                 ]
                 if not pending:
                     return
@@ -1600,12 +1611,15 @@ class RenderEngine:
                 )
                 if remaining_ms <= 0:
                     raise PlaywrightTimeoutError("Image readiness timed out")
-                completed_urls = await asyncio.gather(
+                completed = await asyncio.gather(
                     *(wait_for_frame(frame, remaining_ms) for frame in pending)
                 )
-                for frame, completed_url in zip(pending, completed_urls):
-                    if completed_url is not None and not frame.is_detached():
-                        observed[id(frame)] = completed_url
+                for frame, result in zip(pending, completed):
+                    if result is None or frame.is_detached():
+                        continue
+                    completed_url, before_generation, after_generation = result
+                    if before_generation == after_generation:
+                        observed[id(frame)] = (completed_url, after_generation)
         except PlaywrightTimeoutError as exc:
             raise RenderError(
                 "wait_images_timeout",
@@ -1613,6 +1627,8 @@ class RenderEngine:
                 504,
                 True,
             ) from exc
+        finally:
+            page.remove_listener("framenavigated", mark_navigation)
 
     async def _run_actions(
         self,
