@@ -45,7 +45,7 @@ class RenderContractTest(unittest.TestCase):
             canonical_render_document(disabled)["network"]["java_script_enabled"]
         )
 
-    def test_tagged_pdf_is_opt_in_and_canonical(self):
+    def test_tagged_pdf_control_is_explicit_and_canonical(self):
         default = RenderRequest.model_validate(
             {"url": "https://example.com", "output": "pdf"}
         )
