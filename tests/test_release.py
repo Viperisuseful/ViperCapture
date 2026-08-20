@@ -174,6 +174,7 @@ class OperationalPackagingTests(unittest.TestCase):
         self.assertIn("--max-memory-growth-bytes 67108864", workflow)
         self.assertIn("--min-success-rate 0.999", workflow)
         self.assertIn("VIPERCAPTURE_BROWSER_RECYCLE_RENDERS=100", workflow)
+        self.assertIn("docker run --detach --init", workflow)
         self.assertIn(".State.OOMKilled", workflow)
 
     def test_browser_shutdown_cleanup_is_time_bounded(self):

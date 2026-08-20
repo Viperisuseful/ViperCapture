@@ -70,7 +70,7 @@ jobs:
         env:
           MEMORY_LIMIT: ${{ matrix.profile.limit }}
         run: |
-          docker run --detach --name vipercapture-stable-memory \
+          docker run --detach --init --name vipercapture-stable-memory \
             --memory="$MEMORY_LIMIT" --memory-swap="$MEMORY_LIMIT" \
             --pids-limit=512 --shm-size=256m \
             --env VIPERCAPTURE_MAX_CONCURRENCY=1 \
