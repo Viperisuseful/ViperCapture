@@ -506,6 +506,9 @@ async def _record_browser_render(app: FastAPI, browser: Browser) -> None:
         return
     browser_id = id(browser)
     counts = app.state.browser_render_counts
+    if all(active is not browser for active in app.state.browsers.values()):
+        counts.pop(browser_id, None)
+        return
     counts[browser_id] = counts.get(browser_id, 0) + 1
     if counts[browser_id] < BROWSER_RECYCLE_RENDERS:
         return
@@ -746,7 +749,7 @@ async def lifespan(app: FastAPI):
                     continue
                 closed_browser_ids.add(id(active_browser))
                 with suppress(Exception):
-                    await active_browser.close()
+                    await asyncio.wait_for(active_browser.close(), timeout=5)
             await playwright.stop()
 
 

@@ -173,7 +173,16 @@ class OperationalPackagingTests(unittest.TestCase):
             self.assertIn(f"name: {profile}", workflow)
         self.assertIn("--max-memory-growth-bytes 67108864", workflow)
         self.assertIn("--min-success-rate 0.999", workflow)
+        self.assertIn("VIPERCAPTURE_BROWSER_RECYCLE_RENDERS=100", workflow)
         self.assertIn(".State.OOMKilled", workflow)
+
+    def test_browser_shutdown_cleanup_is_time_bounded(self):
+        main = (ROOT / "vipercapture" / "main.py").read_text("utf-8")
+        shutdown = main[main.index("closed_browser_ids: set[int]") :]
+        self.assertIn(
+            "await asyncio.wait_for(active_browser.close(), timeout=5)",
+            shutdown,
+        )
 
     def test_container_waits_for_validated_packages_and_go_tag_is_prefixed(self):
         workflow = (ROOT / ".github" / "workflows" / "oss-release.yml").read_text(

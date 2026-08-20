@@ -74,6 +74,7 @@ jobs:
             --memory="$MEMORY_LIMIT" --memory-swap="$MEMORY_LIMIT" \
             --pids-limit=512 --shm-size=256m \
             --env VIPERCAPTURE_MAX_CONCURRENCY=1 \
+            --env VIPERCAPTURE_BROWSER_RECYCLE_RENDERS=100 \
             --env VIPERCAPTURE_MAX_PIXELS=12000000 \
             vipercapture:stable-linux
           for attempt in $(seq 1 160); do

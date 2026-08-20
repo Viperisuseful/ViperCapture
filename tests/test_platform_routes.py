@@ -279,6 +279,18 @@ class PlatformRouteReviewTests(unittest.IsolatedAsyncioTestCase):
 
         record.assert_awaited_once_with(main.app, browser)
 
+    async def test_replaced_browser_does_not_recreate_render_counter(self):
+        previous = SimpleNamespace()
+        replacement = SimpleNamespace()
+        state = SimpleNamespace(
+            browsers={main.BrowserEngine.CHROMIUM: replacement},
+            browser_render_counts={},
+        )
+        test_app = SimpleNamespace(state=state)
+        with patch("vipercapture.main.BROWSER_RECYCLE_RENDERS", 1):
+            await main._record_browser_render(test_app, previous)
+        self.assertEqual(state.browser_render_counts, {})
+
     async def test_session_import_is_normalized_before_encrypted_profile_storage(self):
         control = SimpleNamespace(put_profile=Mock(), audit=Mock())
         request = SimpleNamespace(
