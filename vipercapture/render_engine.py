@@ -1509,11 +1509,14 @@ class RenderEngine:
         timeout = min(wait.timeout_ms, limits.wait_timeout_ms)
         if wait.selector:
             try:
-                await page.locator(wait.selector).wait_for(state="visible", timeout=timeout)
+                await page.locator(wait.selector).wait_for(
+                    state=wait.selector_state.value,
+                    timeout=timeout,
+                )
             except PlaywrightTimeoutError as exc:
                 raise RenderError(
                     "wait_selector_timeout",
-                    "The wait selector did not become visible in time.",
+                    f"The wait selector did not become {wait.selector_state.value} in time.",
                     504,
                     True,
                 ) from exc
@@ -1540,8 +1543,30 @@ class RenderEngine:
                     504,
                     True,
                 ) from exc
+        await self._wait_for_images(page, request, limits)
         if wait.delay_ms:
             await page.wait_for_timeout(min(wait.delay_ms, limits.delay_ms))
+
+    async def _wait_for_images(
+        self, page: Page, request: RenderRequest, limits: RenderLimits
+    ) -> None:
+        if not request.wait_for.images:
+            return
+        try:
+            await page.evaluate(
+                "() => Array.from(document.images).forEach(image => { image.loading = 'eager'; })"
+            )
+            await page.wait_for_function(
+                "() => Array.from(document.images).every(image => image.complete)",
+                timeout=min(request.wait_for.timeout_ms, limits.wait_timeout_ms),
+            )
+        except PlaywrightTimeoutError as exc:
+            raise RenderError(
+                "wait_images_timeout",
+                "The page images did not finish loading in time.",
+                504,
+                True,
+            ) from exc
 
     async def _run_actions(
         self,
@@ -2292,6 +2317,7 @@ class RenderEngine:
                         await self.challenge_checker(
                             page, request, navigation_status, challenge_budget
                         )
+                    await self._wait_for_images(page, request, limits)
                 if request.deterministic.enabled and request.deterministic.wait_for_fonts:
                     await page.evaluate("() => document.fonts?.ready")
                 await self._check_assertions(

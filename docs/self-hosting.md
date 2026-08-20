@@ -140,13 +140,17 @@ external scheduler on Windows or keep the feature disabled.
 ## Selectors and waits
 
 `selector` captures the first visible matching element and requires
-`full_page: false`. `wait_for.selector` waits for a matching element to become
-visible before capture. Both fields accept standard CSS selectors, are limited
-to 2,048 characters, and do not support pseudo-elements such as `::before`.
+`full_page: false`. `wait_for.selector` accepts `selector_state` values
+`visible` (default), `attached`, `hidden`, and `detached`. Both selector fields
+accept standard CSS selectors, are limited to 2,048 characters, and do not
+support pseudo-elements such as `::before`.
 
 Use `wait_for.event` for `load`, `domcontentloaded`, or `networkidle`.
 `wait_for.text` waits for text in the document body, `delay_ms` adds a final
-settle delay, and `timeout_ms` bounds page and selector waits. The local
+settle delay, and `timeout_ms` bounds page and selector waits. Set
+`wait_for.images: true` to eagerly request current lazy images and wait until
+all current images complete; full-page renders repeat the bounded image wait
+after lazy-content scrolling. The local
 interface displays the active wait plan and elapsed time while a render runs.
 Cancelling the interface request also cancels queued or active server work.
 

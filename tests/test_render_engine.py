@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from PIL import Image
 
 from vipercapture.render_contract import LazyLoadMode, OutputFormat, RenderRequest
@@ -95,7 +96,7 @@ class FakePage:
     def locator(self, _selector):
         return FakeLocator(self)
 
-    async def wait_for_function(self, _script, *, arg, **_options):
+    async def wait_for_function(self, _script, *, arg=None, **_options):
         self.waited_text = arg
 
     async def wait_for_timeout(self, delay):
@@ -1316,6 +1317,7 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
                 "wait_for": {
                     "event": "networkidle",
                     "selector": "#ready",
+                    "selector_state": "attached",
                     "text": "Ready",
                     "delay_ms": 25,
                 },
@@ -1335,6 +1337,7 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(artifact.media_type, "image/webp")
         self.assertEqual(context.page.goto_options["wait_until"], "networkidle")
         self.assertEqual(context.page.waited_text, "Ready")
+        self.assertEqual(context.page.wait_options[0]["state"], "attached")
         self.assertEqual(context.page.delay, 25)
         self.assertEqual(webp.await_args.kwargs["quality"], 82)
         self.assertTrue(webp.await_args.kwargs["transparent"])
@@ -1612,6 +1615,64 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
                 ),
             )
         self.assertEqual(events, ["lazy", "assertions"])
+
+    async def test_image_readiness_wraps_actions_and_full_page_lazy_loading(self):
+        events = []
+
+        class ImagePage(FakePage):
+            async def evaluate(self, script, *_args):
+                if "image.loading = 'eager'" in script:
+                    events.append("eager")
+                    return None
+                return await super().evaluate(script, *_args)
+
+            async def wait_for_function(self, script, **_options):
+                if "document.images" in script:
+                    events.append("images")
+
+        async def actions(*_args):
+            events.append("actions")
+
+        async def lazy(*_args):
+            events.append("lazy")
+
+        engine = RenderEngine(hosted=False)
+        request = RenderRequest.model_validate(
+            {
+                "url": "https://example.com",
+                "full_page": True,
+                "wait_for": {"images": True},
+            }
+        )
+        with (
+            patch("vipercapture.render_engine.load_lazy_content", side_effect=lazy),
+            patch.object(engine, "_run_actions", side_effect=actions),
+        ):
+            await engine.render_image(
+                FakeBrowser(FakeContext(ImagePage())),
+                request,
+                RenderLimits(max_width=1920, max_height=1080, max_pixels=2_073_600),
+            )
+        self.assertEqual(
+            events,
+            ["eager", "images", "actions", "lazy", "eager", "images"],
+        )
+
+    async def test_image_readiness_timeout_is_typed(self):
+        page = FakePage()
+        page.wait_for_function = AsyncMock(
+            side_effect=PlaywrightTimeoutError("timed out")
+        )
+        with self.assertRaises(RenderError) as raised:
+            await RenderEngine(hosted=False)._wait_for_images(
+                page,
+                RenderRequest.model_validate(
+                    {"url": "https://example.com", "wait_for": {"images": True}}
+                ),
+                RenderLimits(wait_timeout_ms=100),
+            )
+        self.assertEqual(raised.exception.code, "wait_images_timeout")
+        self.assertTrue(raised.exception.retryable)
 
     async def test_failed_context_cleanup_restarts_browser(self):
         class BrokenCloseContext(FakeContext):

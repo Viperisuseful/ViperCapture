@@ -59,7 +59,10 @@ templates. Metadata includes icons, loaded fonts, forms, and JSON-LD samples.
   glob blocks, and resource-type blocks.
 - `headers`: bounded target headers. Credential-bearing headers are stripped
   from cross-origin requests.
-- `wait_for`: load event, visible selector, body text, delay, and timeout.
+- `wait_for`: load event, selector plus `visible`, `attached`, `hidden`, or
+  `detached` state, optional complete-image readiness, body text, delay, and
+  timeout. Image readiness eagerly requests current lazy images and repeats
+  after full-page lazy loading.
 - `cleanup`: consent mode and ad/tracker/chat/newsletter blocking.
 - `custom_css`: up to 64 KiB of injected CSS.
 - `stealth`: applies balanced, request-aware automation evasions by default;

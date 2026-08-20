@@ -44,6 +44,31 @@ class RenderContractTest(unittest.TestCase):
                 {"url": "https://example.com", "environment": {"media": "speech"}}
             )
 
+    def test_rich_readiness_is_validated_and_canonical(self):
+        default = canonical_render_document(RenderRequest(url="https://example.com"))
+        self.assertNotIn("selector_state", default["wait_for"])
+        self.assertNotIn("images", default["wait_for"])
+        for state in ("visible", "attached", "hidden", "detached"):
+            request = RenderRequest.model_validate(
+                {
+                    "url": "https://example.com",
+                    "wait_for": {
+                        "selector": ".ready",
+                        "selector_state": state,
+                        "images": True,
+                    },
+                }
+            )
+            self.assertEqual(request.wait_for.selector_state.value, state)
+            self.assertTrue(request.wait_for.images)
+        with self.assertRaises(ValidationError):
+            RenderRequest.model_validate(
+                {
+                    "url": "https://example.com",
+                    "wait_for": {"selector_state": "enabled"},
+                }
+            )
+
     def test_url_image_request_is_supported(self):
         request = RenderRequest.model_validate(
             {

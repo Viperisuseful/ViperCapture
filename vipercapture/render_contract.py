@@ -105,6 +105,13 @@ class WaitEvent(str, Enum):
     NETWORKIDLE = "networkidle"
 
 
+class WaitSelectorState(str, Enum):
+    VISIBLE = "visible"
+    ATTACHED = "attached"
+    HIDDEN = "hidden"
+    DETACHED = "detached"
+
+
 class LazyLoadMode(str, Enum):
     NONE = "none"
     ADAPTIVE = "adaptive"
@@ -502,7 +509,9 @@ class PdfOptions(StrictModel):
 class WaitOptions(StrictModel):
     event: WaitEvent = WaitEvent.LOAD
     selector: str | None = Field(default=None, min_length=1, max_length=MAX_SELECTOR_CHARS)
+    selector_state: WaitSelectorState = WaitSelectorState.VISIBLE
     text: str | None = Field(default=None, min_length=1, max_length=MAX_WAIT_TEXT_CHARS)
+    images: bool = False
     delay_ms: int = Field(default=0, ge=0, le=15_000)
     timeout_ms: int = Field(default=15_000, ge=1, le=30_000)
 
@@ -798,6 +807,12 @@ def canonical_render_document(
         # Preserve cache and async idempotency keys created before media
         # emulation added its compatibility-neutral default.
         environment.pop("media", None)
+    wait_for = document.get("wait_for")
+    if isinstance(wait_for, dict):
+        if wait_for.get("selector_state") == "visible":
+            wait_for.pop("selector_state", None)
+        if wait_for.get("images") is False:
+            wait_for.pop("images", None)
     network = document.get("network")
     if isinstance(network, dict) and isinstance(
         network.get("block_resource_types"), list
