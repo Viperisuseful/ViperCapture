@@ -40,12 +40,13 @@ jobs:
         run: >-
           python -m benchmarks.production_gate restart-recovery-matrix
           --cases-per-state "$CRASHES_PER_STATE"
+          --data-dir "${{ runner.temp }}/vipercapture-recovery-matrix"
           --output stable-linux-results/restart-recovery-matrix.json
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: stable-linux-crash-recovery
-          path: stable-linux-results/
+          path: stable-linux-results/restart-recovery-matrix.json
           if-no-files-found: error
 
   constrained-memory:
