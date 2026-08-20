@@ -23,8 +23,8 @@ the dated [compatibility matrix](docs/compatibility.md) and run the
 ## Features
 
 - Chromium, Firefox, and WebKit rendering; browsers start only when needed
-- PNG, JPEG, WebP, AVIF, optional tagged PDF, HTML, Markdown, metadata, and
-  WebM/MP4/GIF output
+- PNG, JPEG, WebP, AVIF, PDF with explicit structure-tag control, HTML,
+  Markdown, metadata, and WebM/MP4/GIF output
 - URL, raw HTML, and Markdown input; full-page, viewport, element, clip, and
   multi-viewport ZIP captures
 - Typed click, hover, fill, select, key, scroll, wait, hide, and opt-in
