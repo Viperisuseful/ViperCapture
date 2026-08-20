@@ -175,7 +175,10 @@ solve or bypass them. The default `captcha.action` is `error`; use `capture` to
 render the challenge as-is. Operators may configure their own approved async
 handler with `VIPERCAPTURE_CAPTCHA_HANDLER_FACTORY` and opt in per request with
 `captcha.action: "external"`. See the [API guide](docs/api.md) for the handler
-contract and timeout behavior.
+contract and timeout behavior. Alternatively, an authorized caller can use an
+external tool independently, then start a fresh render with short-lived,
+target-scoped session state. ViperCapture ships no provider integration,
+credentials, endorsement, solver, or bypass service.
 
 ## Configure storage and webhooks
 

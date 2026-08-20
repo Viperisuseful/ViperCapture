@@ -73,7 +73,8 @@ matter.
 - `stealth`: applies balanced, request-aware automation evasions by default;
   set it to `false` for debugging or strict browser-parity tests.
 - `captcha`: chooses `error` (default), `capture`, or an operator-provided
-  `external` handler when a blocking challenge is detected.
+  `external` handler when a blocking challenge is detected. `solver` is a
+  non-secret operator routing alias, never a provider credential.
 
 Self-hosted mode accepts an HTTP, HTTPS, SOCKS4, or SOCKS5 proxy in
 `network.proxy`. Credentials are separate fields and are never embedded in the
@@ -106,6 +107,14 @@ roots. An ordinary embedded widget does not fail a capture until it becomes a
 blocking challenge. Detection is heuristic and returns the provider, kind,
 confidence, and signals in the error details; ViperCapture does not solve or
 bypass CAPTCHAs.
+
+An authorized caller can also complete an access flow with an independent
+external tool, then submit a fresh render using short-lived, target-scoped
+cookies, a profile, or exact-origin headers. Keep external-service credentials
+outside render payloads. This does not invoke the operator handler or relax
+origin, cookie-domain, redirect, SSRF, or egress controls. ViperCapture has no
+affiliation with or built-in integration for those tools; see
+[site access](site-access.md).
 
 Hosted mode also rejects non-public targets and subresources, cookies outside
 the target site, and unsafe redirects.
