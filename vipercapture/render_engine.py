@@ -1553,7 +1553,13 @@ class RenderEngine:
         if not request.wait_for.images:
             return
 
-        async def wait_for_frame(frame) -> None:
+        timeout_ms = min(
+            request.wait_for.timeout_ms,
+            limits.wait_timeout_ms,
+        )
+        deadline = asyncio.get_running_loop().time() + timeout_ms / 1_000
+
+        async def wait_for_frame(frame, remaining_ms: int) -> str | None:
             try:
                 await frame.wait_for_function(
                     """() => {
@@ -1568,20 +1574,38 @@ class RenderEngine:
                         for (const image of images) image.loading = 'eager';
                         return images.every(image => image.complete);
                     }""",
-                    timeout=min(
-                        request.wait_for.timeout_ms,
-                        limits.wait_timeout_ms,
-                    ),
+                    timeout=remaining_ms,
                 )
+                return frame.url
             except PlaywrightTimeoutError:
                 raise
             except PlaywrightError:
                 if frame.is_detached():
-                    return
+                    return None
                 raise
 
         try:
-            await asyncio.gather(*(wait_for_frame(frame) for frame in page.frames))
+            observed: dict[int, str] = {}
+            while True:
+                frames = [frame for frame in page.frames if not frame.is_detached()]
+                pending = [
+                    frame
+                    for frame in frames
+                    if observed.get(id(frame)) != frame.url
+                ]
+                if not pending:
+                    return
+                remaining_ms = math.ceil(
+                    (deadline - asyncio.get_running_loop().time()) * 1_000
+                )
+                if remaining_ms <= 0:
+                    raise PlaywrightTimeoutError("Image readiness timed out")
+                completed_urls = await asyncio.gather(
+                    *(wait_for_frame(frame, remaining_ms) for frame in pending)
+                )
+                for frame, completed_url in zip(pending, completed_urls):
+                    if completed_url is not None and not frame.is_detached():
+                        observed[id(frame)] = completed_url
         except PlaywrightTimeoutError as exc:
             raise RenderError(
                 "wait_images_timeout",

@@ -82,6 +82,9 @@ class FakePage:
         self.styles = []
         self.frames = [self]
 
+    def is_detached(self):
+        return False
+
     def on(self, *_args):
         return None
 
@@ -1678,10 +1681,11 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
     async def test_image_readiness_ignores_detached_child_frames(self):
         class DetachedFrame(FakePage):
             async def wait_for_function(self, *_args, **_options):
+                self.detached = True
                 raise PlaywrightError("Frame was detached")
 
             def is_detached(self):
-                return True
+                return getattr(self, "detached", False)
 
         page = FakePage()
         page.frames = [page, DetachedFrame()]
@@ -1692,6 +1696,44 @@ class RenderEngineTest(unittest.IsolatedAsyncioTestCase):
             ),
             RenderLimits(wait_timeout_ms=100),
         )
+
+    async def test_image_readiness_rescans_frames_until_stable(self):
+        page = FakePage()
+        child = FakePage("https://example.com/frame")
+
+        async def attach_frame(*_args, **_options):
+            page.frames.append(child)
+
+        page.wait_for_function = AsyncMock(side_effect=attach_frame)
+        child.wait_for_function = AsyncMock()
+        await RenderEngine(hosted=False)._wait_for_images(
+            page,
+            RenderRequest.model_validate(
+                {"url": "https://example.com", "wait_for": {"images": True}}
+            ),
+            RenderLimits(wait_timeout_ms=100),
+        )
+        child.wait_for_function.assert_awaited_once()
+
+    async def test_image_readiness_rechecks_a_navigated_frame(self):
+        page = FakePage()
+        child = FakePage("https://example.com/old-frame")
+        page.frames = [page, child]
+
+        async def navigate_child(*_args, **_options):
+            await asyncio.sleep(0)
+            child.url = "https://example.com/new-frame"
+
+        page.wait_for_function = AsyncMock(side_effect=navigate_child)
+        child.wait_for_function = AsyncMock()
+        await RenderEngine(hosted=False)._wait_for_images(
+            page,
+            RenderRequest.model_validate(
+                {"url": "https://example.com", "wait_for": {"images": True}}
+            ),
+            RenderLimits(wait_timeout_ms=100),
+        )
+        self.assertEqual(child.wait_for_function.await_count, 2)
 
     async def test_image_readiness_timeout_is_typed(self):
         page = FakePage()
