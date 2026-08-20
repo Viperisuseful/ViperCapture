@@ -1,6 +1,10 @@
 name: Stable Linux qualification
 
 on:
+  pull_request:
+    paths:
+      - ".github/workflows/stable-linux-qualification.yml"
+      - "benchmarks/production_gate.py"
   workflow_dispatch:
     inputs:
       duration_seconds:
@@ -32,7 +36,7 @@ jobs:
           python -m playwright install --with-deps chromium
       - name: Run durable-state crash matrix
         env:
-          CRASHES_PER_STATE: ${{ inputs.crashes_per_state }}
+          CRASHES_PER_STATE: ${{ inputs.crashes_per_state || '4' }}
         run: >-
           python -m benchmarks.production_gate restart-recovery-matrix
           --cases-per-state "$CRASHES_PER_STATE"
@@ -81,7 +85,7 @@ jobs:
           exit 1
       - name: Run one-hour memory profile
         env:
-          DURATION_SECONDS: ${{ inputs.duration_seconds }}
+          DURATION_SECONDS: ${{ inputs.duration_seconds || '3600' }}
         run: |
           gate_status=0
           docker exec vipercapture-stable-memory \
