@@ -56,19 +56,19 @@ def _cgroup_memory_sample() -> dict[str, int] | None:
     current = _cgroup_number("memory.current")
     if current is None:
         return None
-    inactive_file = 0
+    memory_stat: dict[str, int] = {}
     try:
         for line in (Path("/sys/fs/cgroup") / "memory.stat").read_text(
             "ascii"
         ).splitlines():
             name, value = line.split(maxsplit=1)
-            if name == "inactive_file":
-                inactive_file = int(value)
-                break
+            memory_stat[name] = int(value)
     except (OSError, ValueError):
-        inactive_file = 0
+        memory_stat = {}
+    inactive_file = memory_stat.get("inactive_file", 0)
     return {
         "current_bytes": current,
+        "anonymous_bytes": memory_stat.get("anon", current),
         "inactive_file_bytes": inactive_file,
         "working_set_bytes": max(0, current - inactive_file),
     }
@@ -218,18 +218,24 @@ async def sustained_load(
     peak_working_set = (
         initial_memory["working_set_bytes"] if initial_memory is not None else None
     )
+    peak_anonymous = (
+        initial_memory["anonymous_bytes"] if initial_memory is not None else None
+    )
     memory_samples: list[dict[str, int | float]] = []
     stop_memory_sampling = asyncio.Event()
     issued = 0
 
     async def sample_memory() -> None:
-        nonlocal peak_working_set
+        nonlocal peak_anonymous, peak_working_set
         next_record = 0.0
         while not stop_memory_sampling.is_set():
             sample = _cgroup_memory_sample()
             if sample is not None:
                 peak_working_set = max(
                     peak_working_set or 0, sample["working_set_bytes"]
+                )
+                peak_anonymous = max(
+                    peak_anonymous or 0, sample["anonymous_bytes"]
                 )
                 elapsed = time.perf_counter() - started
                 if elapsed >= next_record:
@@ -286,7 +292,7 @@ async def sustained_load(
     memory_growth = None
     if len(memory_samples) >= 4:
         sample_values = [
-            int(item["working_set_bytes"]) for item in memory_samples
+            int(item["anonymous_bytes"]) for item in memory_samples
         ]
         quarter = max(1, len(sample_values) // 4)
         memory_growth = int(
@@ -320,7 +326,8 @@ async def sustained_load(
             "cgroup_limit_bytes": _cgroup_number("memory.max"),
             "peak_cgroup_bytes": cgroup_peak,
             "peak_working_set_bytes": peak_working_set,
-            "first_to_last_quarter_median_working_set_growth_bytes": memory_growth,
+            "peak_anonymous_bytes": peak_anonymous,
+            "first_to_last_quarter_median_anonymous_growth_bytes": memory_growth,
             "samples": memory_samples,
         },
     }
@@ -767,7 +774,7 @@ async def main() -> int:
         _write(report, args.output)
         memory_ok = not args.require_memory_limit or result["memory"]["cgroup_limit_bytes"] is not None
         memory_growth = result["memory"][
-            "first_to_last_quarter_median_working_set_growth_bytes"
+            "first_to_last_quarter_median_anonymous_growth_bytes"
         ]
         memory_growth_ok = args.max_memory_growth_bytes <= 0 or (
             memory_growth is not None

@@ -87,6 +87,7 @@ class SustainedLoadTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(sample, {
             "current_bytes": 1_000,
+            "anonymous_bytes": 600,
             "inactive_file_bytes": 275,
             "working_set_bytes": 725,
         })
@@ -139,6 +140,7 @@ class SustainedLoadTests(unittest.IsolatedAsyncioTestCase):
             inactive_file = 80 if state["in_flight"] else 40
             return {
                 "current_bytes": current,
+                "anonymous_bytes": 90 if state["in_flight"] else 50,
                 "inactive_file_bytes": inactive_file,
                 "working_set_bytes": current - inactive_file,
             }
@@ -163,7 +165,9 @@ class SustainedLoadTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(state["observed"])
         self.assertEqual(result["memory"]["peak_cgroup_bytes"], 250)
         self.assertEqual(result["memory"]["peak_working_set_bytes"], 120)
+        self.assertEqual(result["memory"]["peak_anonymous_bytes"], 90)
         self.assertEqual(result["memory"]["samples"][0]["current_bytes"], 100)
+        self.assertEqual(result["memory"]["samples"][0]["anonymous_bytes"], 50)
         self.assertEqual(
             result["memory"]["samples"][0]["working_set_bytes"], 60
         )
