@@ -103,6 +103,11 @@ class ChecksumTests(unittest.TestCase):
 
 
 class OperationalPackagingTests(unittest.TestCase):
+    def test_generated_frontend_assets_are_not_line_ending_normalized(self):
+        attributes = (ROOT / ".gitattributes").read_text("utf-8")
+        self.assertIn("static/app/assets/*.css -text", attributes)
+        self.assertIn("static/app/assets/*.js -text", attributes)
+
     def test_compose_forwards_browser_recycle_limit(self):
         compose = (ROOT / "docker-compose.yml").read_text("utf-8")
         self.assertIn(
