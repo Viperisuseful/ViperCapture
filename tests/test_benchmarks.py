@@ -71,6 +71,26 @@ class BenchmarkInterleaveTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SustainedLoadTests(unittest.IsolatedAsyncioTestCase):
+    def test_cgroup_working_set_excludes_reclaimable_inactive_file_cache(self):
+        with (
+            patch(
+                "benchmarks.production_gate._cgroup_number",
+                return_value=1_000,
+            ),
+            patch.object(
+                production_gate.Path,
+                "read_text",
+                return_value="anon 600\ninactive_file 275\nfile 350\n",
+            ),
+        ):
+            sample = production_gate._cgroup_memory_sample()
+
+        self.assertEqual(sample, {
+            "current_bytes": 1_000,
+            "inactive_file_bytes": 275,
+            "working_set_bytes": 725,
+        })
+
     async def test_gate_completes_at_least_the_requested_minimum(self):
         calls = 0
 
@@ -93,7 +113,7 @@ class SustainedLoadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["requests"], calls)
         self.assertEqual(result["success_rate"], 1)
 
-    async def test_memory_is_sampled_during_render_and_uses_cgroup_peak(self):
+    async def test_memory_uses_working_set_and_records_raw_cgroup_peak(self):
         state = {"in_flight": False, "observed": False}
         output = io.BytesIO()
         Image.new("RGB", (8, 8)).save(output, "PNG")
@@ -106,9 +126,6 @@ class SustainedLoadTests(unittest.IsolatedAsyncioTestCase):
                 return httpx.Response(200, content=output.getvalue())
 
         def cgroup_number(name):
-            if name == "memory.current":
-                state["observed"] = state["observed"] or state["in_flight"]
-                return 200 if state["in_flight"] else 100
             if name == "memory.peak":
                 return 250
             if name == "memory.max":
@@ -116,8 +133,26 @@ class SustainedLoadTests(unittest.IsolatedAsyncioTestCase):
             return None
 
         client = httpx.AsyncClient(transport=SlowTransport())
-        with patch("benchmarks.production_gate.httpx.AsyncClient") as client_type, patch(
-            "benchmarks.production_gate._cgroup_number", side_effect=cgroup_number
+        def memory_sample():
+            state["observed"] = state["observed"] or state["in_flight"]
+            current = 200 if state["in_flight"] else 100
+            inactive_file = 80 if state["in_flight"] else 40
+            return {
+                "current_bytes": current,
+                "inactive_file_bytes": inactive_file,
+                "working_set_bytes": current - inactive_file,
+            }
+
+        with (
+            patch("benchmarks.production_gate.httpx.AsyncClient") as client_type,
+            patch(
+                "benchmarks.production_gate._cgroup_number",
+                side_effect=cgroup_number,
+            ),
+            patch(
+                "benchmarks.production_gate._cgroup_memory_sample",
+                side_effect=memory_sample,
+            ),
         ):
             client_type.return_value.__aenter__.return_value = client
             result = await sustained_load(
@@ -127,6 +162,11 @@ class SustainedLoadTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(state["observed"])
         self.assertEqual(result["memory"]["peak_cgroup_bytes"], 250)
+        self.assertEqual(result["memory"]["peak_working_set_bytes"], 120)
+        self.assertEqual(result["memory"]["samples"][0]["current_bytes"], 100)
+        self.assertEqual(
+            result["memory"]["samples"][0]["working_set_bytes"], 60
+        )
 
 
 class BrowserlessAdapterTests(unittest.IsolatedAsyncioTestCase):

@@ -52,6 +52,28 @@ def _cgroup_number(name: str) -> int | None:
         return None
 
 
+def _cgroup_memory_sample() -> dict[str, int] | None:
+    current = _cgroup_number("memory.current")
+    if current is None:
+        return None
+    inactive_file = 0
+    try:
+        for line in (Path("/sys/fs/cgroup") / "memory.stat").read_text(
+            "ascii"
+        ).splitlines():
+            name, value = line.split(maxsplit=1)
+            if name == "inactive_file":
+                inactive_file = int(value)
+                break
+    except (OSError, ValueError):
+        inactive_file = 0
+    return {
+        "current_bytes": current,
+        "inactive_file_bytes": inactive_file,
+        "working_set_bytes": max(0, current - inactive_file),
+    }
+
+
 class LocalServer:
     def __init__(
         self,
@@ -192,23 +214,29 @@ async def sustained_load(
     dimensions: list[list[int]] = []
     started = time.perf_counter()
     deadline = started + duration_seconds
-    peak_memory = _cgroup_number("memory.current")
+    initial_memory = _cgroup_memory_sample()
+    peak_working_set = (
+        initial_memory["working_set_bytes"] if initial_memory is not None else None
+    )
     memory_samples: list[dict[str, int | float]] = []
     stop_memory_sampling = asyncio.Event()
     issued = 0
 
     async def sample_memory() -> None:
-        nonlocal peak_memory
+        nonlocal peak_working_set
         next_record = 0.0
         while not stop_memory_sampling.is_set():
-            current = _cgroup_number("memory.current")
-            if current is not None:
-                peak_memory = max(peak_memory or 0, current)
+            sample = _cgroup_memory_sample()
+            if sample is not None:
+                peak_working_set = max(
+                    peak_working_set or 0, sample["working_set_bytes"]
+                )
                 elapsed = time.perf_counter() - started
                 if elapsed >= next_record:
-                    memory_samples.append(
-                        {"elapsed_seconds": round(elapsed, 3), "bytes": current}
-                    )
+                    memory_samples.append({
+                        "elapsed_seconds": round(elapsed, 3),
+                        **sample,
+                    })
                     next_record = elapsed + 1
             try:
                 await asyncio.wait_for(stop_memory_sampling.wait(), timeout=0.01)
@@ -254,12 +282,12 @@ async def sustained_load(
         await memory_sampler
 
     cgroup_peak = _cgroup_number("memory.peak")
-    if cgroup_peak is not None:
-        peak_memory = max(peak_memory or 0, cgroup_peak)
 
     memory_growth = None
     if len(memory_samples) >= 4:
-        sample_values = [int(item["bytes"]) for item in memory_samples]
+        sample_values = [
+            int(item["working_set_bytes"]) for item in memory_samples
+        ]
         quarter = max(1, len(sample_values) // 4)
         memory_growth = int(
             statistics.median(sample_values[-quarter:])
@@ -290,8 +318,9 @@ async def sustained_load(
         "dimensions": sorted({tuple(item) for item in dimensions}),
         "memory": {
             "cgroup_limit_bytes": _cgroup_number("memory.max"),
-            "peak_cgroup_bytes": peak_memory,
-            "first_to_last_quarter_median_growth_bytes": memory_growth,
+            "peak_cgroup_bytes": cgroup_peak,
+            "peak_working_set_bytes": peak_working_set,
+            "first_to_last_quarter_median_working_set_growth_bytes": memory_growth,
             "samples": memory_samples,
         },
     }
@@ -737,7 +766,9 @@ async def main() -> int:
         report = {"schema_version": 1, "generated_at": generated_at, "gate": "sustained-load", "result": result}
         _write(report, args.output)
         memory_ok = not args.require_memory_limit or result["memory"]["cgroup_limit_bytes"] is not None
-        memory_growth = result["memory"]["first_to_last_quarter_median_growth_bytes"]
+        memory_growth = result["memory"][
+            "first_to_last_quarter_median_working_set_growth_bytes"
+        ]
         memory_growth_ok = args.max_memory_growth_bytes <= 0 or (
             memory_growth is not None
             and memory_growth <= args.max_memory_growth_bytes

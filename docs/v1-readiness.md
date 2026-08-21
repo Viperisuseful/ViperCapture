@@ -26,7 +26,9 @@ Use the operational and benchmark workflows to collect initial evidence:
   Urlbox calls from that exact runner.
 - **Stable Linux qualification**: twenty forced crashes across all five durable
   states plus parallel one-hour 768 MiB, 1 GiB, and 2 GiB cgroup profiles. Its
-  artifacts are release evidence only when run from the exact RC commit.
+  memory-growth gate uses cgroup working set (raw charge minus reclaimable
+  inactive file cache), while retaining the raw charge and peak in its evidence.
+  Its artifacts are release evidence only when run from the exact RC commit.
 
 The workflow defaults are regression checks. They are not the required
 one-hour v1 evidence.
