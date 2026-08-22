@@ -9,7 +9,7 @@ terraform {
 
 variable "image" {
   type    = string
-  default = "ghcr.io/viperisuseful/vipercapture:v0.3.0-beta.2"
+  default = "ghcr.io/viperisuseful/vipercapture:1.0.0"
 }
 
 variable "port" {

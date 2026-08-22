@@ -6,19 +6,16 @@
 
 <p align="center"><strong>Self-hosted browser rendering API.</strong></p>
 
-ViperCapture is an MIT-licensed browser renderer for your own infrastructure.
-Send a URL, HTML, or Markdown to produce screenshots,
+ViperCapture is an MIT-licensed browser renderer for infrastructure you control.
+Send a URL, HTML, or Markdown and receive screenshots,
 PDFs, AVIF images, WebM/MP4/GIF video, hydrated HTML, Markdown, or structured
 metadata through a JSON API.
 
-> [!IMPORTANT]
-> ViperCapture OSS v0.3 is beta software. You can self-host and evaluate the
-> engine and API, but the public API may change
-> before v1.
-
-The API does not implement every option from other rendering services. Check
-the dated [compatibility matrix](docs/compatibility.md) and run the
-[benchmark](benchmarks/README.md) with your own workload before migrating.
+Version 1.0 is the first stable release. The documented JSON contract follows
+semantic versioning; breaking API changes require a new major version. If you
+are moving from another rendering service, start with the
+[compatibility matrix](docs/compatibility.md) and
+[migration guide](docs/migration-screenshotone-urlbox.md).
 
 ## Features
 
@@ -61,9 +58,8 @@ the dated [compatibility matrix](docs/compatibility.md) and run the
   plus ScreenshotOne and Urlbox compatibility adapters
 - Bounded concurrency, output/pixel/deadline limits, client-disconnect
   cancellation, consistent error envelopes, and hosted-mode SSRF defenses
-- Browser UI, Docker Compose, SDKs, integrations, and a portable agent skill
-- Reproducible workflows for sustained load, forced restart recovery,
-  constrained memory, same-host competitor tests, and longer real-site runs
+- Browser UI, Docker Compose, an n8n workflow, a Terraform module, and a
+  hardened public-API deployment example
 
 ## Before you begin
 
@@ -91,6 +87,12 @@ To use Docker instead, run:
 
 ```bash
 docker compose up --build
+```
+
+Stable container images are also published to GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/viperisuseful/vipercapture:1.0.0
 ```
 
 By default, Compose binds only to loopback. It keeps durable queue state,
@@ -140,9 +142,9 @@ callback by setting `delivery.webhook_url`. Related orchestration endpoints:
 
 See the [API and workflows guide](docs/api.md), [async provider guide](docs/async-jobs.md),
 [platform/operator guide](docs/platform.md),
-[public API deployment](deploy/public-api), [stable-v1 gates](docs/v1-readiness.md),
-[release guide](docs/releasing.md), and [migration guide](docs/migration-screenshotone-urlbox.md). If a site you
-administer challenges the renderer, follow the least-privilege
+[public API deployment](deploy/public-api), and
+[migration guide](docs/migration-screenshotone-urlbox.md). If a site you
+administer challenges the renderer, use the least-privilege
 [Cloudflare/WAF authorization guide](docs/site-access.md).
 
 ## Use proxies, sessions, and CAPTCHA hooks
@@ -219,25 +221,18 @@ are AES-GCM encrypted and erased at terminal job states, but diagnostic console
 output and browser video can still record sensitive page content. Treat those
 artifacts accordingly.
 
-## Use the agent skill
-
-The portable
-[`skills/vipercapture`](skills/vipercapture) skill works with Codex, Claude Code,
-and Cursor and includes a dependency-free client.
-
-## Run development checks
+## Verify an installation
 
 ```bash
 python -m pip install -r requirements.txt
 python -m playwright install chromium firefox webkit
-python -m unittest -v
 npm ci --prefix frontend && npm run lint --prefix frontend && npm run build --prefix frontend
+python scripts/smoke.py
 ```
 
-CI runs the renderer suite and builds the web interface. Benchmarks write the
-raw samples used in their reports and do not fill in missing competitor data.
-Use your own provider credentials to compare services from the same host with
-the same scenario file.
+The smoke command starts a temporary local server and verifies Chromium,
+Firefox, WebKit, OpenAPI, health, and output dimensions. Pass
+`--base-url http://host:port` to check an existing deployment instead.
 
 ## License
 

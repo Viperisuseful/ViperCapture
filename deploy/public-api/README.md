@@ -1,6 +1,6 @@
 # Public API deployment
 
-This stack defines the supported public-beta topology. It pins the released
+This stack defines the supported public deployment topology. It pins the released
 GHCR image, excludes administrative and metrics routes from the public gateway,
 applies global connection/request limits, uses project-level API keys and
 quotas, stores results in S3-compatible storage, exports Prometheus metrics,

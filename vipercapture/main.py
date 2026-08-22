@@ -753,7 +753,11 @@ async def lifespan(app: FastAPI):
             await playwright.stop()
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    title="ViperCapture",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 TELEMETRY_ENABLED = configure_telemetry(app)
 app.add_middleware(BulkBodyLimitMiddleware)
 STATIC_DIR = BASE_DIR / "static"

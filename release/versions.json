@@ -1,6 +1,0 @@
-{
-  "oss": "0.3.0-beta.2",
-  "python_sdk": "0.3.0b2",
-  "typescript_sdk": "0.3.0-beta.2",
-  "container": "ghcr.io/viperisuseful/vipercapture:v0.3.0-beta.2"
-}
