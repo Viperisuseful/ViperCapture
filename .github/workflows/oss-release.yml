@@ -17,6 +17,9 @@ env:
 
 jobs:
   publish:
+    concurrency:
+      group: oss-release
+      cancel-in-progress: false
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
@@ -42,6 +45,7 @@ jobs:
           fi
           git fetch origin master
           test "$(git rev-parse HEAD)" = "$(git rev-parse origin/master)"
+          test "$(tr -d '\r\n' < VERSION)" = "${tag#v}"
           tag_object="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq '.object.type + ":" + .object.sha')"
           test "${tag_object%%:*}" = tag
           tag_sha="${tag_object#*:}"
@@ -58,8 +62,11 @@ jobs:
             prerelease=true
           fi
           exists=false
-          if docker buildx imagetools inspect "$IMAGE:$version" >/dev/null 2>&1; then
+          if inspection="$(docker buildx imagetools inspect "$IMAGE:$version" 2>&1)"; then
             exists=true
+          elif ! grep -Eqi 'manifest unknown|not found' <<< "$inspection"; then
+            echo "$inspection" >&2
+            exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "alias=$alias" >> "$GITHUB_OUTPUT"
@@ -98,8 +105,7 @@ jobs:
         run: |
           image_document="$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Image}}')"
           test "$(jq -r '.config.Labels["org.opencontainers.image.revision"]' <<< "$image_document")" = "$GITHUB_SHA"
-          digest="$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest.Digest}}' | jq -r .)"
-          test -n "$digest"
+          digest="$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$"))')"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - name: Smoke published image
         run: |
@@ -114,7 +120,19 @@ jobs:
         env:
           ALIAS: ${{ steps.version.outputs.alias }}
           DIGEST: ${{ steps.container.outputs.digest }}
-        run: docker buildx imagetools create --tag "$IMAGE:$ALIAS" "$IMAGE@$DIGEST"
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+        run: |
+          git fetch --force --tags origin
+          if [[ "$PRERELEASE" == true ]]; then
+            newest="$(git tag --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-' | sort -V | tail -n 1)"
+          else
+            newest="$(git tag --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)"
+          fi
+          if [[ "$GITHUB_REF_NAME" == "$newest" ]]; then
+            docker buildx imagetools create --tag "$IMAGE:$ALIAS" "$IMAGE@$DIGEST"
+          else
+            echo "Not moving $ALIAS backward from newer release $newest"
+          fi
       - name: Attest container provenance
         uses: actions/attest@v4
         with:

@@ -12,7 +12,34 @@ import sys
 import tempfile
 import time
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+
+def origin(url: str) -> tuple[str, str | None, int | None]:
+    parsed = urlsplit(url)
+    port = parsed.port or {"http": 80, "https": 443}.get(parsed.scheme)
+    return parsed.scheme, parsed.hostname, port
+
+
+class SameOriginRedirects(HTTPRedirectHandler):
+    def redirect_request(self, request, file, code, message, headers, new_url):
+        if origin(request.full_url) != origin(new_url):
+            raise HTTPError(
+                new_url,
+                code,
+                "cross-origin redirect refused",
+                headers,
+                file,
+            )
+        return super().redirect_request(
+            request,
+            file,
+            code,
+            message,
+            headers,
+            new_url,
+        )
 
 
 def fetch(
@@ -32,7 +59,7 @@ def fetch(
         method="POST" if data else "GET",
     )
     try:
-        with urlopen(request, timeout=30) as response:
+        with build_opener(SameOriginRedirects).open(request, timeout=30) as response:
             return response.read()
     except HTTPError as exc:
         raise RuntimeError(

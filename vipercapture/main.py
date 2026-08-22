@@ -95,6 +95,7 @@ if sys.platform.startswith("win"):
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+APP_VERSION = (BASE_DIR / "VERSION").read_text(encoding="utf-8").strip()
 def _load_local_env() -> None:
     """Load machine-only KEY=VALUE settings without another dependency."""
     path = BASE_DIR / ".env.local"
@@ -755,7 +756,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="ViperCapture",
-    version="1.0.0",
+    version=APP_VERSION,
     lifespan=lifespan,
 )
 TELEMETRY_ENABLED = configure_telemetry(app)
