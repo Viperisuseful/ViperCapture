@@ -17,9 +17,6 @@ env:
 
 jobs:
   publish:
-    concurrency:
-      group: oss-release
-      cancel-in-progress: false
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
@@ -39,12 +36,14 @@ jobs:
         shell: bash
         run: |
           tag="$GITHUB_REF_NAME"
-          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$'
+          if [[ ! "$tag" =~ $semver ]]; then
             echo "Unsupported release tag: $tag" >&2
             exit 1
           fi
           git fetch origin master
-          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/master)"
+          release_commit="$(git rev-parse HEAD)"
+          git merge-base --is-ancestor "$release_commit" origin/master
           test "$(tr -d '\r\n' < VERSION)" = "${tag#v}"
           tag_object="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq '.object.type + ":" + .object.sha')"
           test "${tag_object%%:*}" = tag
@@ -53,12 +52,10 @@ jobs:
           test "$(jq -r .tag <<< "$tag_document")" = "$tag"
           test "$(jq -r .verification.verified <<< "$tag_document")" = true
           test "$(jq -r .object.type <<< "$tag_document")" = commit
-          test "$(jq -r .object.sha <<< "$tag_document")" = "$GITHUB_SHA"
+          test "$(jq -r .object.sha <<< "$tag_document")" = "$release_commit"
           version="${tag#v}"
-          alias="latest"
           prerelease=false
           if [[ "$version" == *-* ]]; then
-            alias="beta"
             prerelease=true
           fi
           exists=false
@@ -69,7 +66,7 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "alias=$alias" >> "$GITHUB_OUTPUT"
+          echo "commit=$release_commit" >> "$GITHUB_OUTPUT"
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
           echo "exists=$exists" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-node@v7
@@ -92,7 +89,7 @@ jobs:
           tags: ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
           labels: |
             org.opencontainers.image.source=https://github.com/Viperisuseful/ViperCapture
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ steps.version.outputs.commit }}
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
           provenance: mode=max
           sbom: true
@@ -101,11 +98,14 @@ jobs:
       - name: Resolve version image
         id: container
         env:
+          RELEASE_COMMIT: ${{ steps.version.outputs.commit }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           image_document="$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Image}}')"
-          test "$(jq -r '.config.Labels["org.opencontainers.image.revision"]' <<< "$image_document")" = "$GITHUB_SHA"
-          digest="$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$"))')"
+          test "$(jq -r '.config.Labels["org.opencontainers.image.revision"]' <<< "$image_document")" = "$RELEASE_COMMIT"
+          inspection="$(docker buildx imagetools inspect "$IMAGE:$VERSION")"
+          digest="$(awk '$1 == "Digest:" {print $2; exit}' <<< "$inspection")"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - name: Smoke published image
         run: |
@@ -116,23 +116,6 @@ jobs:
       - name: Remove smoke container
         if: always()
         run: docker rm --force vipercapture-release-smoke 2>/dev/null || true
-      - name: Promote release alias
-        env:
-          ALIAS: ${{ steps.version.outputs.alias }}
-          DIGEST: ${{ steps.container.outputs.digest }}
-          PRERELEASE: ${{ steps.version.outputs.prerelease }}
-        run: |
-          git fetch --force --tags origin
-          if [[ "$PRERELEASE" == true ]]; then
-            newest="$(git tag --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-' | sort -V | tail -n 1)"
-          else
-            newest="$(git tag --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)"
-          fi
-          if [[ "$GITHUB_REF_NAME" == "$newest" ]]; then
-            docker buildx imagetools create --tag "$IMAGE:$ALIAS" "$IMAGE@$DIGEST"
-          else
-            echo "Not moving $ALIAS backward from newer release $newest"
-          fi
       - name: Attest container provenance
         uses: actions/attest@v4
         with:
