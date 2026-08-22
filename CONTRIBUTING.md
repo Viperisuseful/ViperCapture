@@ -1,6 +1,6 @@
 # Contributing to ViperCapture
 
-This guide explains how to submit fixes, tests, documentation updates, and
+This guide explains how to submit focused fixes, documentation updates, and
 small features to the open-source rendering engine.
 
 ## Scope
@@ -44,24 +44,26 @@ The main files are:
 - `vipercapture/main.py` — FastAPI application and local interface
 - `vipercapture/render_contract.py` — request validation
 - `vipercapture/render_engine.py` — Playwright rendering and network controls
-- `tests/` — renderer and API tests
 - `vipercapture/render_errors.py` — stable API errors
 - `vipercapture/async_jobs.py` — provider-neutral queue contracts and worker lifecycle
 - `vipercapture/async_job_providers.py` — bundled SQLite and filesystem adapters
 - `templates/` and `static/` — local browser interface
 
-## Run tests
+## Check a change
 
-Run the automated suite before submitting:
+Build the frontend and run the cross-browser smoke check before submitting:
 
 ```bash
-.venv/bin/python -m unittest -v
+npm ci --prefix frontend
+npm run lint --prefix frontend
+npm run build --prefix frontend
+.venv/bin/python -m playwright install --with-deps chromium firefox webkit
+.venv/bin/python scripts/smoke.py
 ```
 
-On Windows, use `.venv\Scripts\python -m unittest -v`.
-
-Include a regression test for behavior changes where practical. Keep tests
-deterministic and avoid relying on live third-party websites.
+On Windows, use `.venv\Scripts\python`, omit `--with-deps`, and run the same
+Playwright and smoke commands. Keep checks deterministic and avoid relying on
+live third-party websites.
 
 By submitting a contribution, you agree that it is licensed under the
 repository's [MIT License](LICENSE).
