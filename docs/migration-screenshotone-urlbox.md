@@ -59,7 +59,8 @@ Example ViperCapture request:
 3. Compare dimensions and visual differences, not only HTTP success.
 4. Validate fonts, locale/timezone, authentication, lazy content, and consent
    behavior on representative pages.
-5. Run the benchmark from the same client region with caching disabled.
+5. Replay representative traffic from the same client region with caching
+   disabled, and record success rate, latency, and output differences.
 6. Exercise async restart recovery, webhook signature verification, object
    expiry, and schedule timezone transitions.
 7. Apply reverse-proxy authentication, request limits, Chromium isolation,

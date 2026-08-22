@@ -1,4 +1,5 @@
 # Generated/vendored files are reproduced byte-for-byte by their upstream tools.
 *.html text eol=lf
-static/app/assets/*.js -whitespace
+static/app/assets/*.css -text -whitespace
+static/app/assets/*.js -text -whitespace
 vendor/autoconsent/** -whitespace

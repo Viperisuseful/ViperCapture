@@ -1,13 +1,6 @@
 name: OSS release
 
 on:
-  workflow_dispatch:
-    inputs:
-      publish:
-        description: Publish packages and the GitHub prerelease
-        required: true
-        type: boolean
-        default: false
   push:
     tags:
       - "v*"
@@ -16,175 +9,133 @@ permissions:
   contents: write
   packages: write
   id-token: write
+  attestations: write
+  artifact-metadata: write
+
+env:
+  IMAGE: ghcr.io/viperisuseful/vipercapture
 
 jobs:
-  package:
+  publish:
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
-      - name: Validate release tag
-        env:
-          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
-          MANUAL_PUBLISH: ${{ github.event_name == 'workflow_dispatch' && inputs.publish && 'true' || 'false' }}
-        run: |
-          expected="v$(python -c 'import json; print(json.load(open("release/versions.json"))["oss"])')"
-          test -z "$RELEASE_TAG" || test "$RELEASE_TAG" = "$expected"
-          if test "$RELEASE_TAG" = "$expected" || test "$MANUAL_PUBLISH" = true; then
-            remote_lines="$(git ls-remote origin "refs/tags/${expected}" "refs/tags/${expected}^{}")"
-            tagged_commit="$(printf '%s\n' "$remote_lines" | awk '/\^\{\}$/ {print $1}')"
-            test -n "$tagged_commit"
-            test "$tagged_commit" = "$GITHUB_SHA"
-          fi
-      - name: Build repository bundles
-        run: python scripts/build_release.py --output-dir dist
-      - name: Build Python SDK
-        run: |
-          python -m pip install build
-          python -m build sdk/python --outdir dist/python
-      - name: Build TypeScript SDK
-        run: |
-          npm ci --prefix sdk/typescript
-          npm pack ./sdk/typescript --pack-destination dist/typescript
-      - name: Checksums
-        run: python scripts/write_checksums.py dist
-      - uses: actions/upload-artifact@v7
-        with:
-          name: oss-release-packages
-          path: dist/
-          if-no-files-found: error
-      - name: Publish Go module tag
-        if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish)
-        run: |
-          version="$(python -c 'import json; print(json.load(open("release/versions.json"))["oss"])')"
-          go_tag="sdk/go/v${version}"
-          remote_lines="$(git ls-remote origin "refs/tags/${go_tag}" "refs/tags/${go_tag}^{}")"
-          if test -n "$remote_lines"; then
-            remote_commit="$(printf '%s\n' "$remote_lines" | awk '/\^\{\}$/ {print $1}')"
-            test -n "$remote_commit" || remote_commit="$(printf '%s\n' "$remote_lines" | head -n 1 | cut -f 1)"
-            test "$remote_commit" = "$GITHUB_SHA"
-          else
-            git config user.name github-actions[bot]
-            git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-            git tag --annotate "$go_tag" "$GITHUB_SHA" --message "ViperCapture Go SDK ${version}"
-            git push origin "refs/tags/${go_tag}"
-          fi
-      - name: Publish Python SDK with trusted publishing
-        if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish)) && vars.PUBLISH_PYPI == 'true'
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: dist/python/
-          skip-existing: true
-      - name: Publish TypeScript SDK
-        if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish)) && vars.PUBLISH_NPM == 'true'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          package="$(node -p "require('./sdk/typescript/package.json').name")"
-          version="$(node -p "require('./sdk/typescript/package.json').version")"
-          if npm view "${package}@${version}" version --json >/dev/null 2>&1; then
-            echo "${package}@${version} is already published"
-          else
-            npm publish dist/typescript/*.tgz --access public --tag beta
-          fi
-      - name: Publish GitHub prerelease
-        if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish)
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v0.3.0-beta.2' }}
-        run: |
-          mapfile -t assets < <(find dist -type f -print)
-          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            existing_assets="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-              --json assets --jq '.assets[].name')"
-            download_dir="$(mktemp -d)"
-            for asset in "${assets[@]}"; do
-              asset_name="$(basename "$asset")"
-              if grep -Fxq -- "$asset_name" <<< "$existing_assets"; then
-                gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-                  --pattern "$asset_name" --dir "$download_dir"
-                if cmp -s "$asset" "$download_dir/$asset_name"; then
-                  echo "${asset_name} is already attached with matching bytes"
-                else
-                  gh release upload "$RELEASE_TAG" "$asset" \
-                    --repo "$GITHUB_REPOSITORY" --clobber
-                fi
-              else
-                gh release upload "$RELEASE_TAG" "$asset" --repo "$GITHUB_REPOSITORY"
-              fi
-            done
-            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --prerelease \
-              --title "ViperCapture OSS ${RELEASE_TAG#v} Developer Beta" \
-              --notes-file docs/releases/v0.3.0-beta.2.md
-          else
-            gh release create "$RELEASE_TAG" "${assets[@]}" \
-              --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
-              --title "ViperCapture OSS ${RELEASE_TAG#v} Developer Beta" \
-              --notes-file docs/releases/v0.3.0-beta.2.md
-          fi
-
-  container:
-    needs: package
-    runs-on: ubuntu-22.04
-    timeout-minutes: 35
-    steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
-        if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish)
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Inspect immutable version image
-        id: version-image
-        if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish)
+      - uses: docker/setup-buildx-action@v4
+      - name: Validate reviewed release tag
+        id: version
         env:
-          VERSION_IMAGE: ghcr.io/viperisuseful/vipercapture:v0.3.0-beta.2
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
-          if docker buildx imagetools inspect "$VERSION_IMAGE" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
+          tag="$GITHUB_REF_NAME"
+          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$'
+          if [[ ! "$tag" =~ $semver ]]; then
+            echo "Unsupported release tag: $tag" >&2
+            exit 1
           fi
-      - name: Build image without publication
-        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.publish }}
-        uses: docker/build-push-action@v7
+          git fetch origin master
+          release_commit="$(git rev-parse HEAD)"
+          git merge-base --is-ancestor "$release_commit" origin/master
+          test "$(tr -d '\r\n' < VERSION)" = "${tag#v}"
+          tag_object="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq '.object.type + ":" + .object.sha')"
+          test "${tag_object%%:*}" = tag
+          tag_sha="${tag_object#*:}"
+          tag_document="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha")"
+          test "$(jq -r .tag <<< "$tag_document")" = "$tag"
+          test "$(jq -r .verification.verified <<< "$tag_document")" = true
+          test "$(jq -r .object.type <<< "$tag_document")" = commit
+          test "$(jq -r .object.sha <<< "$tag_document")" = "$release_commit"
+          version="${tag#v}"
+          prerelease=false
+          if [[ "$version" == *-* ]]; then
+            prerelease=true
+          fi
+          exists=false
+          if inspection="$(docker buildx imagetools inspect "$IMAGE:$version" 2>&1)"; then
+            exists=true
+          elif ! grep -Eqi 'manifest unknown|not found' <<< "$inspection"; then
+            echo "$inspection" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "commit=$release_commit" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "exists=$exists" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v7
         with:
-          context: .
-          push: false
-          tags: ghcr.io/viperisuseful/vipercapture:v0.3.0-beta.2
-          labels: |
-            org.opencontainers.image.source=https://github.com/Viperisuseful/ViperCapture
-            org.opencontainers.image.version=0.3.0-beta.2
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-      - name: Publish new immutable version image
-        if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish)) && steps.version-image.outputs.exists != 'true'
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build frontend
+        run: |
+          npm ci --prefix frontend
+          npm run lint --prefix frontend
+          npm run build --prefix frontend
+          git diff --exit-code -- static/app
+      - name: Publish version image
+        if: steps.version.outputs.exists != 'true'
         uses: docker/build-push-action@v7
         with:
           context: .
           push: true
-          tags: |
-            ghcr.io/viperisuseful/vipercapture:v0.3.0-beta.2
-            ghcr.io/viperisuseful/vipercapture:beta
+          tags: ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
           labels: |
             org.opencontainers.image.source=https://github.com/Viperisuseful/ViperCapture
-            org.opencontainers.image.version=0.3.0-beta.2
+            org.opencontainers.image.revision=${{ steps.version.outputs.commit }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+          provenance: mode=max
+          sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: Reuse immutable version image on rerun
-        if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish)) && steps.version-image.outputs.exists == 'true'
+      - name: Resolve version image
+        id: container
+        env:
+          RELEASE_COMMIT: ${{ steps.version.outputs.commit }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          docker buildx imagetools create \
-            --tag ghcr.io/viperisuseful/vipercapture:beta \
-            ghcr.io/viperisuseful/vipercapture:v0.3.0-beta.2
+          inspection="$(docker buildx imagetools inspect "$IMAGE:$VERSION")"
+          digest="$(awk '$1 == "Digest:" {print $2; exit}' <<< "$inspection")"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker pull "$IMAGE@$digest"
+          revision="$(docker image inspect "$IMAGE@$digest" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')"
+          test "$revision" = "$RELEASE_COMMIT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Smoke published image
+        run: |
+          docker run --detach --init --name vipercapture-release-smoke \
+            --publish 127.0.0.1:8000:8000 \
+            "$IMAGE@${{ steps.container.outputs.digest }}"
+          python scripts/smoke.py --base-url http://127.0.0.1:8000
+      - name: Remove smoke container
+        if: always()
+        run: docker rm --force vipercapture-release-smoke 2>/dev/null || true
+      - name: Attest container provenance
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.container.outputs.digest }}
+          push-to-registry: true
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+        shell: bash
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists"
+            exit 0
+          fi
+          flags=(--verify-tag --generate-notes --title "ViperCapture $VERSION")
+          if [[ "$PRERELEASE" == true ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" "${flags[@]}"

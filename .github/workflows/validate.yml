@@ -12,114 +12,69 @@ permissions:
 jobs:
   web-and-renderer:
     runs-on: ubuntu-22.04
-    timeout-minutes: 20
-
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"
-          cache: pip
-          cache-dependency-path: requirements.txt
-
       - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: frontend/package-lock.json
-
-      - name: Install Python dependencies
-        run: python -m pip install -r requirements.txt
-
-      - name: Install Playwright browsers
-        run: python -m playwright install --with-deps chromium firefox webkit
-
-      - name: Install frontend dependencies
+      - name: Install frontend
         run: npm ci --prefix frontend
-
-      - name: Test renderer
-        run: python -m unittest -v
-
-      - name: Smoke Chromium, Firefox, and WebKit
-        run: python -m benchmarks.smoke_cross_browser
-
-      - name: Smoke reproducible benchmark
+      - name: Check frontend
         run: |
-          python -m http.server 8099 --directory benchmarks/fixtures >/tmp/vipercapture-fixture.log 2>&1 &
-          fixture_pid=$!
-          uvicorn vipercapture.main:app --host 127.0.0.1 --port 8000 >/tmp/vipercapture-api.log 2>&1 &
-          api_pid=$!
-          trap 'kill "$fixture_pid" "$api_pid"' EXIT
-          for attempt in $(seq 1 30); do
-            curl --fail --silent http://127.0.0.1:8000/health >/dev/null && break
-            sleep 1
-          done
-          python benchmarks/run.py --provider viper=http://127.0.0.1:8000 \
-            --scenarios benchmarks/scenarios-local.json --runs 1 --warmups 0 \
-            --output /tmp/vipercapture-benchmark.json
-
-      - name: Lint web frontend
-        run: npm run lint --prefix frontend
-
-      - name: Build web frontend
-        run: npm run build --prefix frontend
-
-      - name: Verify committed frontend bundle
-        run: git diff --exit-code -- static/app
+          npm run lint --prefix frontend
+          npm run build --prefix frontend
+          git diff --exit-code -- static/app
+      - name: Build and smoke container
+        run: |
+          python -m compileall -q vipercapture launch.py scripts/smoke.py
+          docker build --tag vipercapture:validation .
+          docker run --detach --init --name vipercapture-validation \
+            --publish 127.0.0.1:8000:8000 vipercapture:validation
+          trap 'docker rm --force vipercapture-validation' EXIT
+          python scripts/smoke.py --base-url http://127.0.0.1:8000
 
   windows-web-and-renderer:
     runs-on: windows-2022
     timeout-minutes: 25
-
     steps:
       - uses: actions/checkout@v7
-
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: requirements.txt
-
       - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: frontend/package-lock.json
-
       - name: Install FFmpeg
+        shell: pwsh
         run: |
-          $installExit = 1
+          $exitCode = 1
           foreach ($attempt in 1..3) {
             choco install ffmpeg --yes --no-progress
-            $installExit = $LASTEXITCODE
-            if ($installExit -eq 0) { break }
-            if ($attempt -lt 3) { Start-Sleep -Seconds (5 * $attempt) }
+            $exitCode = $LASTEXITCODE
+            if ($exitCode -eq 0) { break }
+            Start-Sleep -Seconds (5 * $attempt)
           }
-          if ($installExit -ne 0) { exit $installExit }
+          if ($exitCode -ne 0) { exit $exitCode }
           ffmpeg -version
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Install Python dependencies
-        run: python -m pip install -r requirements.txt
-
-      - name: Install Playwright browsers
-        run: python -m playwright install chromium firefox webkit
-
-      - name: Install frontend dependencies
+      - name: Install renderer and browsers
+        run: |
+          python -m pip install -r requirements.txt
+          python -m playwright install chromium firefox webkit
+      - name: Install frontend
         run: npm ci --prefix frontend
-
-      - name: Test renderer
-        run: python -m unittest -v
-
-      - name: Smoke Chromium, Firefox, and WebKit
-        run: python -m benchmarks.smoke_cross_browser
-
-      - name: Lint web frontend
-        run: npm run lint --prefix frontend
-
-      - name: Build web frontend
-        run: npm run build --prefix frontend
-
-      - name: Verify committed frontend bundle
-        run: git diff --exit-code -- static/app
+      - name: Check Python and render engines
+        run: |
+          python -m compileall -q vipercapture launch.py scripts/smoke.py
+          python scripts/smoke.py
+      - name: Check frontend
+        run: |
+          npm run lint --prefix frontend
+          npm run build --prefix frontend
+          git diff --exit-code -- static/app

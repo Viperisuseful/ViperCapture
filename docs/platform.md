@@ -86,13 +86,11 @@ continues to block `/metrics` while Prometheus scrapes the internal listener.
 authenticated operator state. Set
 `OTEL_EXPORTER_OTLP_ENDPOINT` to enable batched OpenTelemetry FastAPI traces.
 
-## Use clients and integrations
+## Use integrations
 
-The dependency-free Python client is under `skills/vipercapture/scripts`, typed
-TypeScript and Go clients are under `sdk/`, and the repository includes a
-composite GitHub Action, an importable n8n workflow, and a minimal Terraform
-Docker module. Compatibility adapters reject unknown vendor
-options instead of silently changing render behavior.
+The repository includes an importable n8n workflow and a small Terraform
+Docker module. Compatibility adapters reject unknown vendor options instead of
+silently changing render behavior.
 
 ## Configure proxies, stealth, and CAPTCHA callbacks
 
