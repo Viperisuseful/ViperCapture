@@ -1353,16 +1353,14 @@ async def render_metadata(
     """Extract a bounded, predictable metadata document from the final DOM."""
     payload = await page.evaluate(
         """({maxItems, maxChars, elementSelectors}) => {
-            const clean = (value, limit = maxChars) => {
-                if (typeof value !== "string") return null;
-                const truncated = value.trim().slice(0, limit);
+            const unicodeSafe = (value) => {
                 let result = "";
-                for (let index = 0; index < truncated.length; index += 1) {
-                    const code = truncated.charCodeAt(index);
+                for (let index = 0; index < value.length; index += 1) {
+                    const code = value.charCodeAt(index);
                     if (code >= 0xD800 && code <= 0xDBFF) {
-                        const next = truncated.charCodeAt(index + 1);
+                        const next = value.charCodeAt(index + 1);
                         if (next >= 0xDC00 && next <= 0xDFFF) {
-                            result += truncated[index] + truncated[index + 1];
+                            result += value[index] + value[index + 1];
                             index += 1;
                         } else {
                             result += "\uFFFD";
@@ -1370,11 +1368,15 @@ async def render_metadata(
                     } else if (code >= 0xDC00 && code <= 0xDFFF) {
                         result += "\uFFFD";
                     } else {
-                        result += truncated[index];
+                        result += value[index];
                     }
                 }
                 return result;
             };
+            const clean = (value, limit = maxChars) =>
+                typeof value === "string"
+                    ? unicodeSafe(value.trim().slice(0, limit))
+                    : null;
             const attr = (selector, name = "content") =>
                 clean(document.querySelector(selector)?.getAttribute(name));
             const sample = (items, limit, transform) => {
@@ -1464,7 +1466,7 @@ async def render_metadata(
             if (elementSelectors.length) {
                 let remaining = maxItems;
                 result.elements = elementSelectors.map((selector) => {
-                    const safeSelector = clean(selector, 2048);
+                    const safeSelector = unicodeSafe(selector);
                     let matches;
                     try {
                         matches = document.querySelectorAll(selector);
