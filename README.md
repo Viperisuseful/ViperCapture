@@ -232,7 +232,9 @@ python scripts/smoke.py
 
 The smoke command starts a temporary local server and verifies Chromium,
 Firefox, WebKit, OpenAPI, health, and output dimensions. Pass
-`--base-url http://host:port` to check an existing deployment instead.
+`--base-url http://host:port` to check an existing deployment instead. For an
+authenticated deployment, set `VIPERCAPTURE_SMOKE_TOKEN` to an API or
+administrator token.
 
 ## License
 

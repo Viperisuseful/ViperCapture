@@ -23,6 +23,12 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v4
       - name: Validate reviewed release tag
         id: version
         env:
@@ -39,7 +45,11 @@ jobs:
           tag_object="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq '.object.type + ":" + .object.sha')"
           test "${tag_object%%:*}" = tag
           tag_sha="${tag_object#*:}"
-          test "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" --jq .verification.verified)" = true
+          tag_document="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha")"
+          test "$(jq -r .tag <<< "$tag_document")" = "$tag"
+          test "$(jq -r .verification.verified <<< "$tag_document")" = true
+          test "$(jq -r .object.type <<< "$tag_document")" = commit
+          test "$(jq -r .object.sha <<< "$tag_document")" = "$GITHUB_SHA"
           version="${tag#v}"
           alias="latest"
           prerelease=false
@@ -47,19 +57,14 @@ jobs:
             alias="beta"
             prerelease=true
           fi
-          if docker manifest inspect "$IMAGE:$version" >/dev/null 2>&1; then
-            echo "$IMAGE:$version already exists; release tags are immutable" >&2
-            exit 1
+          exists=false
+          if docker buildx imagetools inspect "$IMAGE:$version" >/dev/null 2>&1; then
+            exists=true
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "alias=$alias" >> "$GITHUB_OUTPUT"
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
-          {
-            echo "tags<<EOF"
-            echo "$IMAGE:$version"
-            echo "$IMAGE:$alias"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+          echo "exists=$exists" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-node@v7
         with:
           node-version: 22
@@ -71,30 +76,13 @@ jobs:
           npm run lint --prefix frontend
           npm run build --prefix frontend
           git diff --exit-code -- static/app
-      - name: Build release candidate
-        run: docker build --tag "$IMAGE:${{ steps.version.outputs.version }}" .
-      - name: Smoke release candidate
-        run: |
-          docker run --detach --init --name vipercapture-release-smoke \
-            --publish 127.0.0.1:8000:8000 \
-            "$IMAGE:${{ steps.version.outputs.version }}"
-          python scripts/smoke.py --base-url http://127.0.0.1:8000
-      - name: Remove smoke container
-        if: always()
-        run: docker rm --force vipercapture-release-smoke 2>/dev/null || true
-      - uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/setup-buildx-action@v4
-      - name: Publish container
-        id: container
+      - name: Publish version image
+        if: steps.version.outputs.exists != 'true'
         uses: docker/build-push-action@v7
         with:
           context: .
           push: true
-          tags: ${{ steps.version.outputs.tags }}
+          tags: ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
           labels: |
             org.opencontainers.image.source=https://github.com/Viperisuseful/ViperCapture
             org.opencontainers.image.revision=${{ github.sha }}
@@ -103,6 +91,30 @@ jobs:
           sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Resolve version image
+        id: container
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          image_document="$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Image}}')"
+          test "$(jq -r '.config.Labels["org.opencontainers.image.revision"]' <<< "$image_document")" = "$GITHUB_SHA"
+          digest="$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest.Digest}}' | jq -r .)"
+          test -n "$digest"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Smoke published image
+        run: |
+          docker run --detach --init --name vipercapture-release-smoke \
+            --publish 127.0.0.1:8000:8000 \
+            "$IMAGE@${{ steps.container.outputs.digest }}"
+          python scripts/smoke.py --base-url http://127.0.0.1:8000
+      - name: Remove smoke container
+        if: always()
+        run: docker rm --force vipercapture-release-smoke 2>/dev/null || true
+      - name: Promote release alias
+        env:
+          ALIAS: ${{ steps.version.outputs.alias }}
+          DIGEST: ${{ steps.container.outputs.digest }}
+        run: docker buildx imagetools create --tag "$IMAGE:$ALIAS" "$IMAGE@$DIGEST"
       - name: Attest container provenance
         uses: actions/attest@v4
         with:
@@ -117,8 +129,8 @@ jobs:
         shell: bash
         run: |
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $GITHUB_REF_NAME already exists; releases are immutable" >&2
-            exit 1
+            echo "Release $GITHUB_REF_NAME already exists"
+            exit 0
           fi
           flags=(--verify-tag --generate-notes --title "ViperCapture $VERSION")
           if [[ "$PRERELEASE" == true ]]; then

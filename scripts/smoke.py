@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import struct
 import subprocess
 import sys
@@ -14,12 +15,20 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-def fetch(url: str, *, body: dict[str, object] | None = None) -> bytes:
+def fetch(
+    url: str,
+    *,
+    body: dict[str, object] | None = None,
+    token: str | None = None,
+) -> bytes:
     data = json.dumps(body).encode() if body is not None else None
+    headers = {"Content-Type": "application/json"} if data else {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     request = Request(
         url,
         data=data,
-        headers={"Content-Type": "application/json"} if data else {},
+        headers=headers,
         method="POST" if data else "GET",
     )
     try:
@@ -31,11 +40,18 @@ def fetch(url: str, *, body: dict[str, object] | None = None) -> bytes:
         ) from exc
 
 
-def wait_until_ready(base_url: str) -> None:
+def wait_until_ready(
+    base_url: str,
+    *,
+    process: subprocess.Popen[bytes] | None = None,
+    token: str | None = None,
+) -> None:
     deadline = time.monotonic() + 90
     while time.monotonic() < deadline:
+        if process is not None and process.poll() is not None:
+            raise RuntimeError(f"ViperCapture exited with status {process.returncode}")
         try:
-            document = json.loads(fetch(f"{base_url}/ready"))
+            document = json.loads(fetch(f"{base_url}/ready", token=token))
             if document.get("ready") is True:
                 return
         except (OSError, URLError, RuntimeError, json.JSONDecodeError):
@@ -44,16 +60,17 @@ def wait_until_ready(base_url: str) -> None:
     raise RuntimeError("ViperCapture did not become ready within 90 seconds")
 
 
-def check(base_url: str) -> None:
-    if json.loads(fetch(f"{base_url}/health")) != {"ready": True}:
+def check(base_url: str, *, token: str | None = None) -> None:
+    if json.loads(fetch(f"{base_url}/health", token=token)) != {"ready": True}:
         raise RuntimeError("health response is invalid")
-    schema = json.loads(fetch(f"{base_url}/openapi.json"))
+    schema = json.loads(fetch(f"{base_url}/openapi.json", token=token))
     if "/v1/render" not in schema.get("paths", {}):
         raise RuntimeError("OpenAPI does not expose POST /v1/render")
 
     for engine in ("chromium", "firefox", "webkit"):
         image = fetch(
             f"{base_url}/v1/render",
+            token=token,
             body={
                 "html": "<!doctype html><title>ViperCapture</title><h1>ready</h1>",
                 "engine": engine,
@@ -71,11 +88,16 @@ def check(base_url: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url")
+    parser.add_argument("--token", default=os.getenv("VIPERCAPTURE_SMOKE_TOKEN"))
     args = parser.parse_args()
-    base_url = (args.base_url or "http://127.0.0.1:8000").rstrip("/")
+    base_url = args.base_url.rstrip("/") if args.base_url else ""
     process: subprocess.Popen[bytes] | None = None
     data_directory: tempfile.TemporaryDirectory[str] | None = None
     if args.base_url is None:
+        with socket.socket() as available_port:
+            available_port.bind(("127.0.0.1", 0))
+            port = available_port.getsockname()[1]
+        base_url = f"http://127.0.0.1:{port}"
         data_directory = tempfile.TemporaryDirectory(prefix="vipercapture-smoke-")
         process = subprocess.Popen(
             [
@@ -86,7 +108,7 @@ def main() -> int:
                 "--host",
                 "127.0.0.1",
                 "--port",
-                "8000",
+                str(port),
             ],
             env={
                 **os.environ,
@@ -96,8 +118,8 @@ def main() -> int:
             },
         )
     try:
-        wait_until_ready(base_url)
-        check(base_url)
+        wait_until_ready(base_url, process=process, token=args.token)
+        check(base_url, token=args.token)
     finally:
         if process is not None:
             process.terminate()
