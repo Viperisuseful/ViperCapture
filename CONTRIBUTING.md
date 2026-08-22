@@ -57,11 +57,13 @@ Build the frontend and run the cross-browser smoke check before submitting:
 npm ci --prefix frontend
 npm run lint --prefix frontend
 npm run build --prefix frontend
+.venv/bin/python -m playwright install --with-deps chromium firefox webkit
 .venv/bin/python scripts/smoke.py
 ```
 
-On Windows, use `.venv\Scripts\python scripts/smoke.py`. Keep checks
-deterministic and avoid relying on live third-party websites.
+On Windows, use `.venv\Scripts\python`, omit `--with-deps`, and run the same
+Playwright and smoke commands. Keep checks deterministic and avoid relying on
+live third-party websites.
 
 By submitting a contribution, you agree that it is licensed under the
 repository's [MIT License](LICENSE).

@@ -225,11 +225,12 @@ artifacts accordingly.
 
 ```bash
 python -m pip install -r requirements.txt
-python -m playwright install chromium firefox webkit
+python -m playwright install --with-deps chromium firefox webkit
 npm ci --prefix frontend && npm run lint --prefix frontend && npm run build --prefix frontend
 python scripts/smoke.py
 ```
 
+On Windows or macOS, omit `--with-deps` from the Playwright command.
 The smoke command starts a temporary local server and verifies Chromium,
 Firefox, WebKit, OpenAPI, health, and output dimensions. Pass
 `--base-url http://host:port` to check an existing deployment instead. For an

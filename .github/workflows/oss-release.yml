@@ -136,7 +136,5 @@ jobs:
           flags=(--verify-tag --generate-notes --title "ViperCapture $VERSION")
           if [[ "$PRERELEASE" == true ]]; then
             flags+=(--prerelease)
-          else
-            flags+=(--latest)
           fi
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" "${flags[@]}"
