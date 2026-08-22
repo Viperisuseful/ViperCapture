@@ -25,6 +25,8 @@ are moving from another rendering service, start with the
   output
 - URL, raw HTML, and Markdown input; full-page, viewport, element, clip, and
   multi-viewport ZIP captures
+- One-page-load artifact bundles with the primary image, HTML, Markdown,
+  metadata, MHTML, and up to five named thumbnails
 - Typed click, hover, fill, select, key, scroll, wait, hide, and opt-in
   JavaScript actions
 - Selector-state and image-readiness waits, target JavaScript control,

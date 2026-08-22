@@ -17,6 +17,7 @@ documentation used for this comparison.
 | Video | **WebM, MP4, GIF** | GIF/WebM animations | MP4/WebM |
 | Full page / viewport / selector / clip | Yes | Yes | Yes |
 | Multiple viewports in one request | Yes, ZIP | Bulk API | Batch/API workflows |
+| Multiple artifacts from one page load | Yes: image, HTML, Markdown, metadata, MHTML, thumbnails | Partial: screenshot plus content metadata | Yes: side renders and thumbnails |
 | Typed browser actions | Yes | Scripts and page customization | Click/type/scroll and custom JS options |
 | Custom CSS / JavaScript | Yes; JS operator opt-in | Yes | Yes |
 | Waits and content/request assertions | Yes | Yes | Yes/partial depending on assertion |

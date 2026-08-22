@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import socket
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -131,6 +133,47 @@ def check(base_url: str, *, token: str | None = None) -> None:
         {"name": "href", "value": "/docs"}
     ]:
         raise RuntimeError("metadata element attributes are invalid")
+
+    bundle = fetch(
+        f"{base_url}/v1/render",
+        token=token,
+        body={
+            "html": "<h1>Ready <em>now</em></h1><a href='/docs'>Docs</a>",
+            "output": "png",
+            "full_page": False,
+            "viewport": {"width": 320, "height": 240},
+            "side_outputs": ["html", "markdown", "metadata", "mhtml"],
+            "elements": [{"selector": "h1"}],
+            "image": {"thumbnails": [{"name": "small", "width": 160}]},
+        },
+    )
+    with zipfile.ZipFile(io.BytesIO(bundle)) as archive:
+        expected = {
+            "vipercapture.png",
+            "vipercapture.html",
+            "vipercapture.md",
+            "vipercapture-metadata.json",
+            "page.mhtml",
+            "thumbnails/small.png",
+            "manifest.json",
+        }
+        if set(archive.namelist()) != expected:
+            raise RuntimeError("multi-artifact bundle entries are invalid")
+        manifest = json.loads(archive.read("manifest.json"))
+        if len(manifest.get("outputs", [])) != 6:
+            raise RuntimeError("multi-artifact manifest is invalid")
+        side_metadata = json.loads(archive.read("vipercapture-metadata.json"))
+        if side_metadata["elements"][0]["results"][0]["text"] != "Ready now":
+            raise RuntimeError("multi-artifact metadata is invalid")
+        if b"Ready <em>now</em>" not in archive.read("vipercapture.html"):
+            raise RuntimeError("multi-artifact HTML is invalid")
+        if b"# Ready *now*" not in archive.read("vipercapture.md"):
+            raise RuntimeError("multi-artifact Markdown is invalid")
+        if b"MIME-Version: 1.0" not in archive.read("page.mhtml"):
+            raise RuntimeError("multi-artifact MHTML is invalid")
+        thumbnail = archive.read("thumbnails/small.png")
+        if struct.unpack(">II", thumbnail[16:24]) != (160, 120):
+            raise RuntimeError("multi-artifact thumbnail dimensions are invalid")
 
 
 def main() -> int:
