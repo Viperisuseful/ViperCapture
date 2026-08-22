@@ -101,11 +101,12 @@ jobs:
           RELEASE_COMMIT: ${{ steps.version.outputs.commit }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          image_document="$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Image}}')"
-          test "$(jq -r '.config.Labels["org.opencontainers.image.revision"]' <<< "$image_document")" = "$RELEASE_COMMIT"
           inspection="$(docker buildx imagetools inspect "$IMAGE:$VERSION")"
           digest="$(awk '$1 == "Digest:" {print $2; exit}' <<< "$inspection")"
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker pull "$IMAGE@$digest"
+          revision="$(docker image inspect "$IMAGE@$digest" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')"
+          test "$revision" = "$RELEASE_COMMIT"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - name: Smoke published image
         run: |
