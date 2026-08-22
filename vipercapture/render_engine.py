@@ -1464,11 +1464,12 @@ async def render_metadata(
             if (elementSelectors.length) {
                 let remaining = maxItems;
                 result.elements = elementSelectors.map((selector) => {
+                    const safeSelector = clean(selector, 2048);
                     let matches;
                     try {
                         matches = document.querySelectorAll(selector);
                     } catch {
-                        return {selector, error: "invalid_selector", results: []};
+                        return {selector: safeSelector, error: "invalid_selector", results: []};
                     }
                     const results = remaining > 0 ? sample(matches, remaining, (element) => {
                         const bounds = element.getBoundingClientRect();
@@ -1486,7 +1487,7 @@ async def render_metadata(
                         };
                     }) : [];
                     remaining -= results.length;
-                    return {selector, total: matches.length, results};
+                    return {selector: safeSelector, total: matches.length, results};
                 });
             }
             return result;
