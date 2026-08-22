@@ -33,6 +33,7 @@ MAX_BLOCK_PATTERNS = 64
 MAX_COOKIES = 64
 MAX_ASSERTIONS = 32
 MAX_PDF_PAGES = 50
+MAX_ELEMENT_SELECTORS = 32
 VIEWPORT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 LOCALE_PATTERN = re.compile(r"^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$")
 HEADER_NAME_PATTERN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
@@ -374,6 +375,10 @@ class AssertionOptions(StrictModel):
         return values
 
 
+class ElementExtraction(StrictModel):
+    selector: str = Field(min_length=1, max_length=MAX_SELECTOR_CHARS)
+
+
 class DeliveryOptions(StrictModel):
     webhook_url: HttpUrl | None = None
 
@@ -601,6 +606,12 @@ class RenderRequest(StrictModel):
     network: NetworkOptions = Field(default_factory=NetworkOptions)
     actions: list[Action] = Field(default_factory=list, max_length=MAX_ACTIONS)
     assertions: AssertionOptions = Field(default_factory=AssertionOptions)
+    elements: list[ElementExtraction] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=MAX_ELEMENT_SELECTORS,
+        description="CSS selectors to extract when output is metadata.",
+    )
     delivery: DeliveryOptions = Field(default_factory=DeliveryOptions)
     diagnostics: DiagnosticsOptions = Field(default_factory=DiagnosticsOptions)
     deterministic: DeterministicOptions = Field(default_factory=DeterministicOptions)
@@ -659,6 +670,12 @@ class RenderRequest(StrictModel):
             raise ValueError("preserve_viewport_width requires full_page=true")
         if self.save_profile and self.profile_id is None:
             raise ValueError("save_profile requires profile_id")
+        if self.elements is not None:
+            if self.output is not OutputFormat.METADATA:
+                raise ValueError("elements requires metadata output")
+            selectors = [element.selector for element in self.elements]
+            if len(set(selectors)) != len(selectors):
+                raise ValueError("elements selectors must be unique")
         if self.proceed_on_captcha:
             if self.captcha.action is CaptchaAction.EXTERNAL:
                 raise ValueError(

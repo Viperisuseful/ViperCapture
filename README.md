@@ -21,7 +21,8 @@ are moving from another rendering service, start with the
 
 - Chromium, Firefox, and WebKit rendering; browsers start only when needed
 - PNG, JPEG, WebP, AVIF, PDF with explicit structure-tag control, HTML,
-  Markdown, metadata, and WebM/MP4/GIF output
+  Markdown, metadata with structured CSS-selector extraction, and WebM/MP4/GIF
+  output
 - URL, raw HTML, and Markdown input; full-page, viewport, element, clip, and
   multi-viewport ZIP captures
 - Typed click, hover, fill, select, key, scroll, wait, hide, and opt-in

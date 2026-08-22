@@ -36,6 +36,7 @@ documentation used for this comparison.
 | Cron schedules | Yes | External scheduler | Product/no-code workflows documented |
 | Pixel visual diff reports | Yes | Not documented as core render API | Schedule/compare workflow documented |
 | Diagnostic bundle | Yes: artifact, manifest, console, network, HAR, redacted trace, WARC | Partial: metadata/error options | Partial: request waterfall/metadata |
+| Structured CSS-selector extraction | Yes: text, HTML, attributes, geometry | Partial: single-selector content | Partial: predefined extracted content |
 | Deterministic visual testing and baseline store | Yes | Managed service | Managed service |
 | Project API keys, quotas, ownership, audit log | Yes, operator opt-in | Managed | Managed |
 | Encrypted persistent browser profiles | Yes | Yes | Yes |

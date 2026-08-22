@@ -111,6 +111,27 @@ def check(base_url: str, *, token: str | None = None) -> None:
         if struct.unpack(">II", image[16:24]) != (320, 240):
             raise RuntimeError(f"{engine} returned unexpected dimensions")
 
+    metadata = json.loads(
+        fetch(
+            f"{base_url}/v1/render",
+            token=token,
+            body={
+                "html": "<h1 id='title'>Ready <em>now</em></h1><a href='/docs'>Docs</a>",
+                "output": "metadata",
+                "elements": [{"selector": "h1"}, {"selector": "a[href]"}],
+            },
+        )
+    )
+    extracted = metadata.get("elements")
+    if not isinstance(extracted, list) or len(extracted) != 2:
+        raise RuntimeError("metadata element extraction is missing")
+    if extracted[0]["results"][0]["text"] != "Ready now":
+        raise RuntimeError("metadata element text is invalid")
+    if extracted[1]["results"][0]["attributes"] != [
+        {"name": "href", "value": "/docs"}
+    ]:
+        raise RuntimeError("metadata element attributes are invalid")
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()

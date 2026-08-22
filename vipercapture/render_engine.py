@@ -1345,10 +1345,13 @@ async def capture_clipped_image(
             await session.detach()
 
 
-async def render_metadata(page: Page) -> RenderArtifact:
+async def render_metadata(
+    page: Page,
+    element_selectors: list[str] | None = None,
+) -> RenderArtifact:
     """Extract a bounded, predictable metadata document from the final DOM."""
     payload = await page.evaluate(
-        """({maxItems, maxChars}) => {
+        """({maxItems, maxChars, elementSelectors}) => {
             const clean = (value, limit = maxChars) =>
                 typeof value === "string" ? value.trim().slice(0, limit) : null;
             const attr = (selector, name = "content") =>
@@ -1374,7 +1377,7 @@ async def render_metadata(page: Page) -> RenderArtifact:
             };
             const links = document.querySelectorAll("a[href]");
             const images = document.images;
-            return {
+            const result = {
                 title: clean(document.title),
                 description: attr('meta[name="description"]'),
                 canonical_url: attr('link[rel="canonical"]', "href"),
@@ -1437,9 +1440,49 @@ async def render_metadata(page: Page) -> RenderArtifact:
                     (element) => clean(element.textContent)
                 )
             };
+            if (elementSelectors.length) {
+                let remaining = maxItems;
+                result.elements = elementSelectors.map((selector) => {
+                    let matches;
+                    try {
+                        matches = document.querySelectorAll(selector);
+                    } catch {
+                        return {selector, error: "invalid_selector", results: []};
+                    }
+                    const results = remaining > 0 ? sample(matches, remaining, (element) => {
+                        const bounds = element.getBoundingClientRect();
+                        return {
+                            text: clean(element.textContent),
+                            html: clean(element.innerHTML),
+                            attributes: sample(element.attributes, 32, (attribute) => ({
+                                name: clean(attribute.name, 128),
+                                value: clean(attribute.value)
+                            })),
+                            left: bounds.left,
+                            top: bounds.top,
+                            width: bounds.width,
+                            height: bounds.height
+                        };
+                    }) : [];
+                    remaining -= results.length;
+                    return {selector, total: matches.length, results};
+                });
+            }
+            return result;
         }""",
-        {"maxItems": MAX_METADATA_ITEMS, "maxChars": MAX_METADATA_VALUE_CHARS},
+        {
+            "maxItems": MAX_METADATA_ITEMS,
+            "maxChars": MAX_METADATA_VALUE_CHARS,
+            "elementSelectors": element_selectors or [],
+        },
     )
+    if any(item.get("error") for item in payload.get("elements", [])):
+        raise RenderError(
+            "invalid_selector",
+            "elements contains an invalid CSS selector.",
+            400,
+            False,
+        )
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return RenderArtifact(body, "application/json", "vipercapture-metadata.json")
 
@@ -2524,7 +2567,10 @@ class RenderEngine:
 
                 if request.output not in MEDIA_TYPES:
                     if request.output is OutputFormat.METADATA:
-                        metadata_artifact = await render_metadata(page)
+                        metadata_artifact = await render_metadata(
+                            page,
+                            [element.selector for element in request.elements or []],
+                        )
                         metadata_document = json.loads(metadata_artifact.body)
                         metadata_document.update(
                             {
