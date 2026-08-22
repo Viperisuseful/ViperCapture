@@ -17,6 +17,7 @@ documentation used for this comparison.
 | Video | **WebM, MP4, GIF** | GIF/WebM animations | MP4/WebM |
 | Full page / viewport / selector / clip | Yes | Yes | Yes |
 | Multiple viewports in one request | Yes, ZIP | Bulk API | Batch/API workflows |
+| Multiple artifacts from one page load | Yes: image, HTML, Markdown, metadata, MHTML, thumbnails | Partial: screenshot plus content metadata | Yes: side renders and thumbnails |
 | Typed browser actions | Yes | Scripts and page customization | Click/type/scroll and custom JS options |
 | Custom CSS / JavaScript | Yes; JS operator opt-in | Yes | Yes |
 | Waits and content/request assertions | Yes | Yes | Yes/partial depending on assertion |
@@ -36,6 +37,7 @@ documentation used for this comparison.
 | Cron schedules | Yes | External scheduler | Product/no-code workflows documented |
 | Pixel visual diff reports | Yes | Not documented as core render API | Schedule/compare workflow documented |
 | Diagnostic bundle | Yes: artifact, manifest, console, network, HAR, redacted trace, WARC | Partial: metadata/error options | Partial: request waterfall/metadata |
+| Structured CSS-selector extraction | Yes: text, HTML, attributes, geometry | Partial: single-selector content | Partial: predefined extracted content |
 | Deterministic visual testing and baseline store | Yes | Managed service | Managed service |
 | Project API keys, quotas, ownership, audit log | Yes, operator opt-in | Managed | Managed |
 | Encrypted persistent browser profiles | Yes | Yes | Yes |

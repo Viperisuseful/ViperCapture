@@ -13,7 +13,7 @@ running, the interactive OpenAPI reference is available at `/docs`.
 | `pdf` | PDF | Print or single-page mode, paper/orientation/margins, optional tags |
 | `html` | UTF-8 HTML | Fully rendered document or article extraction |
 | `markdown` | UTF-8 Markdown | Document or readability-based article extraction |
-| `metadata` | JSON | Title, description, canonical URL, headings, links, images |
+| `metadata` | JSON | Title, description, canonical URL, headings, links, images, and optional CSS-selector extraction |
 | `webm`, `mp4`, `gif` | video | Full-page top-to-bottom animation, or a 1–30 second viewport recording |
 
 `viewports` accepts two or three named image viewports and returns a ZIP with a
@@ -49,6 +49,49 @@ aspect ratio. HTML and Markdown requests may set `include_shadow_dom` to embed
 open shadow roots as declarative shadow DOM. PDF options include A0–A6, Legal,
 Letter, and Tabloid paper, optional page ranges, and bounded header/footer
 templates. Metadata includes icons, loaded fonts, forms, and JSON-LD samples.
+For structured extraction, set `output` to `metadata` and pass up to 32 unique
+`elements` selectors. The response reports every selector's total match count
+and includes up to 100 results across the request, with bounded text, inner
+HTML, attributes, and viewport-relative geometry:
+
+```json
+{
+  "url": "https://example.com/products",
+  "output": "metadata",
+  "elements": [
+    {"selector": "h1"},
+    {"selector": ".product-card"}
+  ]
+}
+```
+
+For several artifacts from one page load, request an image plus any unique
+`side_outputs` and up to five named `image.thumbnails`. ViperCapture returns a
+ZIP containing the primary image, requested side artifacts, thumbnails, and a
+manifest with media types, sizes, dimensions, and SHA-256 digests:
+
+```json
+{
+  "url": "https://example.com/products",
+  "output": "png",
+  "side_outputs": ["html", "markdown", "metadata", "mhtml"],
+  "elements": [{"selector": ".product-card"}],
+  "image": {
+    "thumbnails": [
+      {"name": "card", "width": 640},
+      {"name": "preview", "width": 320, "height": 180}
+    ]
+  }
+}
+```
+
+Side outputs support `html`, `markdown`, `metadata`, and Chromium-only `mhtml`.
+Thumbnail dimensions range from 10 to 2,000 pixels and preserve the primary
+image's aspect ratio within the requested bounds. Artifact bundles cannot be
+combined with viewport packs, slices, diagnostics, certification, or cache.
+MHTML may contain page resources and authenticated content; handle it with the
+same protections as the source page.
+
 Set `pdf.tagged` explicitly to request or suppress Chromium's accessible PDF
 structure tags. Omitting it preserves Chromium's default. Tags alone do not
 guarantee PDF/UA conformance; source semantics and independent validation still

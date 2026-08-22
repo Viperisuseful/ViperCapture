@@ -33,7 +33,10 @@ MAX_BLOCK_PATTERNS = 64
 MAX_COOKIES = 64
 MAX_ASSERTIONS = 32
 MAX_PDF_PAGES = 50
+MAX_ELEMENT_SELECTORS = 32
+MAX_THUMBNAILS = 5
 VIEWPORT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+ARTIFACT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 LOCALE_PATTERN = re.compile(r"^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$")
 HEADER_NAME_PATTERN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 BLOCKED_HEADER_NAMES = {
@@ -68,6 +71,13 @@ class OutputFormat(str, Enum):
     MP4 = "mp4"
     GIF = "gif"
     AVIF = "avif"
+
+
+class SideOutputFormat(str, Enum):
+    HTML = "html"
+    MARKDOWN = "markdown"
+    METADATA = "metadata"
+    MHTML = "mhtml"
 
 
 class BrowserEngine(str, Enum):
@@ -374,6 +384,10 @@ class AssertionOptions(StrictModel):
         return values
 
 
+class ElementExtraction(StrictModel):
+    selector: str = Field(min_length=1, max_length=MAX_SELECTOR_CHARS)
+
+
 class DeliveryOptions(StrictModel):
     webhook_url: HttpUrl | None = None
 
@@ -425,6 +439,18 @@ class ClipOptions(StrictModel):
     height: float = Field(gt=0, le=100_000)
 
 
+class ThumbnailOptions(StrictModel):
+    name: str = Field(pattern=ARTIFACT_NAME_PATTERN.pattern)
+    width: int | None = Field(default=None, ge=10, le=2_000)
+    height: int | None = Field(default=None, ge=10, le=2_000)
+
+    @model_validator(mode="after")
+    def validate_dimensions(self) -> "ThumbnailOptions":
+        if self.width is None and self.height is None:
+            raise ValueError("thumbnail width or height is required")
+        return self
+
+
 class ImageOptions(StrictModel):
     quality: int | None = Field(default=None, ge=1, le=100)
     width: int | None = Field(default=None, ge=1, le=65_535)
@@ -433,6 +459,11 @@ class ImageOptions(StrictModel):
     optimize_for_speed: bool = Field(
         default=False,
         description="Prefer Chromium's faster PNG or WebP encoder over output size.",
+    )
+    thumbnails: list[ThumbnailOptions] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=MAX_THUMBNAILS,
     )
 
 
@@ -601,6 +632,18 @@ class RenderRequest(StrictModel):
     network: NetworkOptions = Field(default_factory=NetworkOptions)
     actions: list[Action] = Field(default_factory=list, max_length=MAX_ACTIONS)
     assertions: AssertionOptions = Field(default_factory=AssertionOptions)
+    elements: list[ElementExtraction] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=MAX_ELEMENT_SELECTORS,
+        description="CSS selectors to extract in primary or side metadata output.",
+    )
+    side_outputs: list[SideOutputFormat] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=4,
+        description="Additional artifacts generated from the same image render.",
+    )
     delivery: DeliveryOptions = Field(default_factory=DeliveryOptions)
     diagnostics: DiagnosticsOptions = Field(default_factory=DiagnosticsOptions)
     deterministic: DeterministicOptions = Field(default_factory=DeterministicOptions)
@@ -659,6 +702,15 @@ class RenderRequest(StrictModel):
             raise ValueError("preserve_viewport_width requires full_page=true")
         if self.save_profile and self.profile_id is None:
             raise ValueError("save_profile requires profile_id")
+        if self.elements is not None:
+            if self.output is not OutputFormat.METADATA and (
+                not self.side_outputs
+                or SideOutputFormat.METADATA not in self.side_outputs
+            ):
+                raise ValueError("elements requires primary or side metadata output")
+            selectors = [element.selector for element in self.elements]
+            if len(set(selectors)) != len(selectors):
+                raise ValueError("elements selectors must be unique")
         if self.proceed_on_captcha:
             if self.captcha.action is CaptchaAction.EXTERNAL:
                 raise ValueError(
@@ -676,6 +728,34 @@ class RenderRequest(StrictModel):
             OutputFormat.AVIF,
         }
         is_video = self.output in {OutputFormat.WEBM, OutputFormat.MP4, OutputFormat.GIF}
+        has_artifact_bundle = bool(self.side_outputs or self.image.thumbnails)
+        if self.side_outputs and len(set(self.side_outputs)) != len(self.side_outputs):
+            raise ValueError("side_outputs must be unique")
+        if self.image.thumbnails:
+            names = [thumbnail.name for thumbnail in self.image.thumbnails]
+            if len(set(names)) != len(names):
+                raise ValueError("thumbnail names must be unique")
+        if has_artifact_bundle:
+            if not is_image:
+                raise ValueError("side outputs and thumbnails require an image output")
+            if any(
+                (
+                    self.viewports is not None,
+                    self.slices is not None,
+                    self.diagnostics.bundle,
+                    self.certification.enabled,
+                    self.cache,
+                )
+            ):
+                raise ValueError(
+                    "artifact bundles cannot use viewports, slices, diagnostics, certification, or cache"
+                )
+        if (
+            self.side_outputs
+            and SideOutputFormat.MHTML in self.side_outputs
+            and self.engine is not BrowserEngine.CHROMIUM
+        ):
+            raise ValueError("MHTML side output requires the Chromium engine")
         if self.preserve_viewport_width and not is_image:
             raise ValueError(
                 "preserve_viewport_width requires an image output"
@@ -770,15 +850,19 @@ class RenderRequest(StrictModel):
             raise ValueError("PDF output requires the Chromium engine")
         if self.pdf is not None and self.pdf.mode is PdfMode.SINGLE_PAGE and self.pdf.page_ranges:
             raise ValueError("single-page PDF cannot use page_ranges")
-        if self.extract_mode is not ExtractMode.DOCUMENT and self.output not in {
-            OutputFormat.HTML,
-            OutputFormat.MARKDOWN,
-        }:
+        document_outputs = {OutputFormat.HTML.value, OutputFormat.MARKDOWN.value}
+        requested_documents = {output.value for output in self.side_outputs or []}
+        if (
+            self.extract_mode is not ExtractMode.DOCUMENT
+            and self.output.value not in document_outputs
+            and not requested_documents.intersection(document_outputs)
+        ):
             raise ValueError("article extraction requires HTML or Markdown output")
-        if self.include_shadow_dom and self.output not in {
-            OutputFormat.HTML,
-            OutputFormat.MARKDOWN,
-        }:
+        if (
+            self.include_shadow_dom
+            and self.output.value not in document_outputs
+            and not requested_documents.intersection(document_outputs)
+        ):
             raise ValueError("include_shadow_dom requires HTML or Markdown output")
         self.headers = _validate_headers(self.headers)
         return self
@@ -804,6 +888,8 @@ class RenderRequest(StrictModel):
             or self.slices is not None
             or self.certification.enabled
             or self.diagnostics.bundle
+            or self.side_outputs is not None
+            or self.image.thumbnails is not None
         ) else self.output.value
 
 
@@ -813,6 +899,12 @@ def canonical_render_document(
 ) -> dict[str, object]:
     """Serialize request collections deterministically across processes."""
     document = request.model_dump(mode="json", **dump_options)
+    for name in ("elements", "side_outputs"):
+        if document.get(name) is None:
+            document.pop(name, None)
+    image = document.get("image")
+    if isinstance(image, dict) and image.get("thumbnails") is None:
+        image.pop("thumbnails", None)
     environment = document.get("environment")
     if isinstance(environment, dict) and environment.get("media") is None:
         # Preserve cache and async idempotency keys created before media

@@ -42,6 +42,7 @@ from .render_contract import (
     LazyLoadMode,
     OutputFormat,
     RenderRequest,
+    SideOutputFormat,
     Viewport,
 )
 from .render_errors import RenderError
@@ -1345,12 +1346,37 @@ async def capture_clipped_image(
             await session.detach()
 
 
-async def render_metadata(page: Page) -> RenderArtifact:
+async def render_metadata(
+    page: Page,
+    element_selectors: list[str] | None = None,
+) -> RenderArtifact:
     """Extract a bounded, predictable metadata document from the final DOM."""
     payload = await page.evaluate(
-        """({maxItems, maxChars}) => {
+        """({maxItems, maxChars, elementSelectors}) => {
+            const unicodeSafe = (value) => {
+                let result = "";
+                for (let index = 0; index < value.length; index += 1) {
+                    const code = value.charCodeAt(index);
+                    if (code >= 0xD800 && code <= 0xDBFF) {
+                        const next = value.charCodeAt(index + 1);
+                        if (next >= 0xDC00 && next <= 0xDFFF) {
+                            result += value[index] + value[index + 1];
+                            index += 1;
+                        } else {
+                            result += "\uFFFD";
+                        }
+                    } else if (code >= 0xDC00 && code <= 0xDFFF) {
+                        result += "\uFFFD";
+                    } else {
+                        result += value[index];
+                    }
+                }
+                return result;
+            };
             const clean = (value, limit = maxChars) =>
-                typeof value === "string" ? value.trim().slice(0, limit) : null;
+                typeof value === "string"
+                    ? unicodeSafe(value.trim().slice(0, limit))
+                    : null;
             const attr = (selector, name = "content") =>
                 clean(document.querySelector(selector)?.getAttribute(name));
             const sample = (items, limit, transform) => {
@@ -1374,7 +1400,7 @@ async def render_metadata(page: Page) -> RenderArtifact:
             };
             const links = document.querySelectorAll("a[href]");
             const images = document.images;
-            return {
+            const result = {
                 title: clean(document.title),
                 description: attr('meta[name="description"]'),
                 canonical_url: attr('link[rel="canonical"]', "href"),
@@ -1437,11 +1463,194 @@ async def render_metadata(page: Page) -> RenderArtifact:
                     (element) => clean(element.textContent)
                 )
             };
+            if (elementSelectors.length) {
+                let remaining = maxItems;
+                result.elements = elementSelectors.map((selector) => {
+                    const safeSelector = unicodeSafe(selector);
+                    let matches;
+                    try {
+                        matches = document.querySelectorAll(selector);
+                    } catch {
+                        return {selector: safeSelector, error: "invalid_selector", results: []};
+                    }
+                    const results = remaining > 0 ? sample(matches, remaining, (element) => {
+                        const bounds = element.getBoundingClientRect();
+                        return {
+                            text: clean(element.textContent),
+                            html: clean(element.innerHTML),
+                            attributes: sample(element.attributes, 32, (attribute) => ({
+                                name: clean(attribute.name, 128),
+                                value: clean(attribute.value)
+                            })),
+                            left: bounds.left,
+                            top: bounds.top,
+                            width: bounds.width,
+                            height: bounds.height
+                        };
+                    }) : [];
+                    remaining -= results.length;
+                    return {selector: safeSelector, total: matches.length, results};
+                });
+            }
+            return result;
         }""",
-        {"maxItems": MAX_METADATA_ITEMS, "maxChars": MAX_METADATA_VALUE_CHARS},
+        {
+            "maxItems": MAX_METADATA_ITEMS,
+            "maxChars": MAX_METADATA_VALUE_CHARS,
+            "elementSelectors": element_selectors or [],
+        },
     )
+    if any(item.get("error") for item in payload.get("elements", [])):
+        raise RenderError(
+            "invalid_selector",
+            "elements contains an invalid CSS selector.",
+            400,
+            False,
+        )
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return RenderArtifact(body, "application/json", "vipercapture-metadata.json")
+
+
+async def _render_mhtml(page: Page) -> RenderArtifact:
+    session = await page.context.new_cdp_session(page)
+    try:
+        result = await session.send("Page.captureSnapshot", {"format": "mhtml"})
+    finally:
+        with suppress(Exception):
+            await session.detach()
+    body = result["data"].encode("utf-8")
+    return RenderArtifact(body, "multipart/related", "page.mhtml")
+
+
+async def _multi_artifact_bundle(
+    page: Page,
+    request: RenderRequest,
+    primary: RenderArtifact,
+    limits: RenderLimits,
+) -> RenderArtifact:
+    from .content_rendering import render_document_output
+
+    outputs: list[tuple[str, str, RenderArtifact]] = [
+        ("primary", request.output.value, primary)
+    ]
+    for output in request.side_outputs or []:
+        if output is SideOutputFormat.METADATA:
+            artifact = await render_metadata(
+                page,
+                [element.selector for element in request.elements or []],
+            )
+            document = json.loads(artifact.body)
+            document.update(
+                {
+                    "schema_version": 1,
+                    "source_type": request.source_type,
+                    "final_url": page.url,
+                    "navigation_status": primary.metadata.get("navigation_status"),
+                    "blocked_subresources": primary.metadata.get("blocked_subresources", 0),
+                }
+            )
+            artifact = RenderArtifact(
+                json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode(),
+                artifact.media_type,
+                artifact.filename,
+            )
+        elif output is SideOutputFormat.MHTML:
+            artifact = await _render_mhtml(page)
+        else:
+            artifact = await render_document_output(
+                page,
+                request.model_copy(update={"output": OutputFormat(output.value)}),
+                limits,
+            )
+        outputs.append(("side", output.value, artifact))
+
+    for thumbnail in request.image.thumbnails or []:
+        try:
+            body, width, height = await _settled_thread(
+                _postprocess_image,
+                primary.body,
+                request.output,
+                request.image.quality,
+                thumbnail.width,
+                thumbnail.height,
+            )
+        except Exception as exc:
+            raise RenderError(
+                "image_encoder_unavailable",
+                f"This Pillow build cannot encode {request.output.value.upper()} thumbnails.",
+                503,
+                False,
+            ) from exc
+        outputs.append(
+            (
+                "thumbnail",
+                thumbnail.name,
+                RenderArtifact(
+                    body,
+                    MEDIA_TYPES[request.output],
+                    f"thumbnails/{thumbnail.name}.{EXTENSIONS[request.output]}",
+                    {"width": width, "height": height},
+                ),
+            )
+        )
+
+    total = sum(len(artifact.body) for _, _, artifact in outputs)
+    if total > limits.output_bytes:
+        raise RenderError(
+            "output_too_large",
+            "The artifact bundle exceeds the aggregate output limit.",
+            413,
+            False,
+        )
+    manifest_outputs = [
+        {
+            "role": role,
+            "name": name,
+            "filename": artifact.filename,
+            "media_type": artifact.media_type,
+            "bytes": len(artifact.body),
+            "sha256": hashlib.sha256(artifact.body).hexdigest(),
+            **(
+                {
+                    "width": artifact.metadata["width"],
+                    "height": artifact.metadata["height"],
+                }
+                if "width" in artifact.metadata and "height" in artifact.metadata
+                else {}
+            ),
+        }
+        for role, name, artifact in outputs
+    ]
+    entries = [
+        (artifact.filename, artifact.body) for _, _, artifact in outputs
+    ]
+    entries.append(
+        (
+            "manifest.json",
+            json.dumps(
+                {"schema_version": 1, "outputs": manifest_outputs},
+                separators=(",", ":"),
+            ).encode(),
+        )
+    )
+    body = await _settled_thread(_write_diagnostic_zip, entries)
+    if len(body) > limits.output_bytes:
+        raise RenderError(
+            "output_too_large",
+            "The artifact bundle exceeds the output limit.",
+            413,
+            False,
+        )
+    return RenderArtifact(
+        body,
+        "application/zip",
+        "vipercapture-artifacts.zip",
+        {
+            **primary.metadata,
+            "output_count": len(outputs),
+            "outputs": manifest_outputs,
+        },
+    )
 
 
 class RenderEngine:
@@ -2524,7 +2733,10 @@ class RenderEngine:
 
                 if request.output not in MEDIA_TYPES:
                     if request.output is OutputFormat.METADATA:
-                        metadata_artifact = await render_metadata(page)
+                        metadata_artifact = await render_metadata(
+                            page,
+                            [element.selector for element in request.elements or []],
+                        )
                         metadata_document = json.loads(metadata_artifact.body)
                         metadata_document.update(
                             {
@@ -2698,6 +2910,7 @@ class RenderEngine:
                 )
                 uses_pillow_conversion = (
                     resizing_image or screenshot_output is not request.output
+                    or bool(request.image.thumbnails)
                 )
                 if (
                     uses_pillow_conversion
@@ -2957,6 +3170,10 @@ class RenderEngine:
                         "output_count": 1,
                     },
                 )
+                if request.side_outputs or request.image.thumbnails:
+                    artifact = await _multi_artifact_bundle(
+                        page, request, artifact, limits
+                    )
                 finalized = await diagnostic_bundle(
                     artifact, request, console_events, network_events, limits,
                     page=page, context=context,
