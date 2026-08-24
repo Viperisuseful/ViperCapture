@@ -511,6 +511,29 @@ async def _launch_pooled_browser(app: FastAPI, engine: BrowserEngine) -> Browser
         ) from exc
 
 
+def _forget_grow_task(app: FastAPI, task: asyncio.Task[None], engine: BrowserEngine) -> None:
+    growing = getattr(app.state, "browser_growing", None)
+    if growing is not None:
+        growing[engine] = False
+    tasks = getattr(app.state, "browser_grow_tasks", None)
+    if tasks is None:
+        return
+    app.state.browser_grow_tasks = [
+        item for item in tasks if item is not task and not item.done()
+    ]
+
+
+def _schedule_pool_growth(app: FastAPI, engine: BrowserEngine) -> None:
+    app.state.browser_growing[engine] = True
+    task = asyncio.create_task(_grow_browser_pool(app, engine))
+    app.state.browser_grow_tasks.append(task)
+
+    def _finished(done: asyncio.Task[None], pooled: BrowserEngine = engine) -> None:
+        _forget_grow_task(app, done, pooled)
+
+    task.add_done_callback(_finished)
+
+
 async def _grow_browser_pool(app: FastAPI, engine: BrowserEngine) -> None:
     target = _pool_size_for(engine)
     try:
@@ -530,6 +553,23 @@ async def _grow_browser_pool(app: FastAPI, engine: BrowserEngine) -> None:
         return
 
 
+async def _wait_for_browser_idle(app: FastAPI, browser: Browser, timeout: float = 30) -> bool:
+    browser_id = id(browser)
+    deadline = time.monotonic() + timeout
+    while app.state.browser_in_flight.get(browser_id, 0) > 0:
+        if time.monotonic() > deadline:
+            return False
+        await asyncio.sleep(0.05)
+    return True
+
+
+def _remove_browser_from_pool(app: FastAPI, engine: BrowserEngine, browser: Browser) -> None:
+    pool = app.state.browsers.setdefault(engine, [])
+    pool[:] = [active for active in pool if active is not browser]
+    if engine is BrowserEngine.CHROMIUM:
+        _sync_primary_browser(app)
+
+
 async def _browser_for(app: FastAPI, engine: BrowserEngine) -> Browser:
     browsers = getattr(app.state, "browsers", None)
     if browsers is None:
@@ -542,14 +582,7 @@ async def _browser_for(app: FastAPI, engine: BrowserEngine) -> Browser:
             _register_browser(app, engine, browser)
             pool = _connected_pool(app, engine)
         elif len(pool) < target and not app.state.browser_growing.get(engine):
-            app.state.browser_growing[engine] = True
-            task = asyncio.create_task(_grow_browser_pool(app, engine))
-            app.state.browser_grow_tasks.append(task)
-
-            def _finished(done: asyncio.Task[None], pooled=engine) -> None:
-                app.state.browser_growing[pooled] = False
-
-            task.add_done_callback(_finished)
+            _schedule_pool_growth(app, engine)
         index = app.state.browser_rr.get(engine, 0) % len(pool)
         app.state.browser_rr[engine] = index + 1
         chosen = pool[index]
@@ -579,8 +612,6 @@ def _engine_for_browser(app: FastAPI, browser: Browser) -> BrowserEngine | None:
     for engine, pool in app.state.browsers.items():
         if any(active is browser for active in pool):
             return engine
-    if app.state.browser is browser:
-        return BrowserEngine.CHROMIUM
     return None
 
 
@@ -589,17 +620,23 @@ async def _replace_browser(app: FastAPI, failed_browser: Browser) -> None:
         engine = _engine_for_browser(app, failed_browser)
         if engine is None:
             return
-        pool = app.state.browsers.setdefault(engine, [])
-        pool[:] = [active for active in pool if active is not failed_browser]
-        if engine is BrowserEngine.CHROMIUM:
-            _sync_primary_browser(app)
-        with suppress(Exception):
-            await _close_browser(app, failed_browser)
+        _remove_browser_from_pool(app, engine, failed_browser)
         app.state.browser_render_counts.pop(id(failed_browser), None)
+    await _wait_for_browser_idle(app, failed_browser)
+    with suppress(Exception):
+        await _close_browser(app, failed_browser)
+    try:
         replacement = await asyncio.wait_for(
             _launch_browser(app.state.playwright, app.state.gpu_mode, engine),
             timeout=15,
         )
+    except Exception:
+        return
+    async with app.state.browser_restart_lock:
+        if len(_connected_pool(app, engine)) >= _pool_size_for(engine):
+            with suppress(Exception):
+                await _close_browser(app, replacement)
+            return
         _register_browser(app, engine, replacement)
         if engine is BrowserEngine.CHROMIUM:
             app.state.gpu_hardware_active = await _detect_hardware_gpu(
@@ -622,48 +659,57 @@ async def _record_browser_render(app: FastAPI, browser: Browser) -> None:
         return
 
     async with app.state.browser_recycle_lock:
-        engine = _engine_for_browser(app, browser)
-        if engine is None or counts.get(browser_id, 0) < BROWSER_RECYCLE_RENDERS:
-            counts.pop(browser_id, None)
-            return
-        pool = app.state.browsers.setdefault(engine, [])
-        pool[:] = [active for active in pool if active is not browser]
-        if engine is BrowserEngine.CHROMIUM:
-            _sync_primary_browser(app)
-        deadline = time.monotonic() + 30
-        while app.state.browser_in_flight.get(browser_id, 0) > 0:
-            if time.monotonic() > deadline:
-                pool.append(browser)
+        async with app.state.browser_restart_lock:
+            engine = _engine_for_browser(app, browser)
+            if engine is None or counts.get(browser_id, 0) < BROWSER_RECYCLE_RENDERS:
+                counts.pop(browser_id, None)
+                return
+            _remove_browser_from_pool(app, engine, browser)
+        if not await _wait_for_browser_idle(app, browser):
+            async with app.state.browser_restart_lock:
+                app.state.browsers.setdefault(engine, []).append(browser)
                 counts[browser_id] = 0
                 if engine is BrowserEngine.CHROMIUM:
                     _sync_primary_browser(app)
-                return
-            await asyncio.sleep(0.05)
-        async with app.state.browser_restart_lock:
-            pool = _connected_pool(app, engine)
-            if len(pool) < _pool_size_for(engine):
-                try:
-                    replacement = await asyncio.wait_for(
-                        _launch_browser(
-                            app.state.playwright, app.state.gpu_mode, engine
-                        ),
-                        timeout=15,
-                    )
-                except Exception:
-                    pool.append(browser)
-                    counts[browser_id] = 0
-                    return
-                _register_browser(app, engine, replacement)
+            return
+        replacement = None
+        try:
+            async with app.state.browser_restart_lock:
+                needs_replacement = (
+                    len(_connected_pool(app, engine)) < _pool_size_for(engine)
+                )
+            if needs_replacement:
+                replacement = await asyncio.wait_for(
+                    _launch_browser(
+                        app.state.playwright, app.state.gpu_mode, engine
+                    ),
+                    timeout=15,
+                )
+        except Exception:
+            async with app.state.browser_restart_lock:
+                app.state.browsers.setdefault(engine, []).append(browser)
+                counts[browser_id] = 0
                 if engine is BrowserEngine.CHROMIUM:
-                    app.state.gpu_hardware_active = await _detect_hardware_gpu(
-                        replacement,
-                        app.state.gpu_mode,
-                    )
+                    _sync_primary_browser(app)
+            return
+        async with app.state.browser_restart_lock:
+            if replacement is not None:
+                if len(_connected_pool(app, engine)) < _pool_size_for(engine):
+                    _register_browser(app, engine, replacement)
+                    if engine is BrowserEngine.CHROMIUM:
+                        app.state.gpu_hardware_active = await _detect_hardware_gpu(
+                            replacement,
+                            app.state.gpu_mode,
+                        )
+                    replacement = None
             counts.pop(browser_id, None)
-            try:
-                await _close_browser(app, browser)
-            except Exception:
-                _retain_browser_for_shutdown(app, browser)
+        if replacement is not None:
+            with suppress(Exception):
+                await _close_browser(app, replacement)
+        try:
+            await _close_browser(app, browser)
+        except Exception:
+            _retain_browser_for_shutdown(app, browser)
 
 
 @asynccontextmanager
@@ -854,8 +900,11 @@ async def lifespan(app: FastAPI):
                 await app.state.async_jobs.close()
         finally:
             closed_browser_ids: set[int] = set()
-            for task in list(getattr(app.state, "browser_grow_tasks", [])):
+            grow_tasks = list(getattr(app.state, "browser_grow_tasks", []))
+            for task in grow_tasks:
                 task.cancel()
+            if grow_tasks:
+                await asyncio.gather(*grow_tasks, return_exceptions=True)
             active_browsers = [
                 *[
                     browser
