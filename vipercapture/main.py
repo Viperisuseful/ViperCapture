@@ -553,10 +553,16 @@ async def _grow_browser_pool(app: FastAPI, engine: BrowserEngine) -> None:
         return
 
 
-async def _wait_for_browser_idle(app: FastAPI, browser: Browser, timeout: float = 30) -> bool:
+async def _wait_for_browser_idle(
+    app: FastAPI,
+    browser: Browser,
+    timeout: float = 30,
+    *,
+    reserved: int = 0,
+) -> bool:
     browser_id = id(browser)
     deadline = time.monotonic() + timeout
-    while app.state.browser_in_flight.get(browser_id, 0) > 0:
+    while app.state.browser_in_flight.get(browser_id, 0) > reserved:
         if time.monotonic() > deadline:
             return False
         await asyncio.sleep(0.05)
@@ -622,7 +628,7 @@ async def _replace_browser(app: FastAPI, failed_browser: Browser) -> None:
             return
         _remove_browser_from_pool(app, engine, failed_browser)
         app.state.browser_render_counts.pop(id(failed_browser), None)
-    await _wait_for_browser_idle(app, failed_browser)
+    await _wait_for_browser_idle(app, failed_browser, reserved=1)
     with suppress(Exception):
         await _close_browser(app, failed_browser)
     try:

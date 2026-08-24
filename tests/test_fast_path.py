@@ -131,6 +131,26 @@ def test_default_concurrency_is_cpu_sized() -> None:
             assert default_max_concurrency() == 8
 
 
+def test_replace_idle_wait_ignores_calling_render() -> None:
+    import asyncio
+
+    from vipercapture.main import _wait_for_browser_idle
+
+    class FakeBrowser:
+        pass
+
+    class FakeApp:
+        def __init__(self) -> None:
+            self.state = type("State", (), {})()
+
+    browser = FakeBrowser()
+    app = FakeApp()
+    app.state.browser_in_flight = {id(browser): 1}
+    assert asyncio.run(_wait_for_browser_idle(app, browser, timeout=0.2, reserved=1))
+    app.state.browser_in_flight = {id(browser): 2}
+    assert not asyncio.run(_wait_for_browser_idle(app, browser, timeout=0.15, reserved=1))
+
+
 def test_pool_status_inspects_each_browser() -> None:
     from vipercapture.main import _chromium_ready, _pool_connected
 
