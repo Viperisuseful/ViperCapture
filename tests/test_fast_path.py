@@ -78,6 +78,20 @@ def test_cache_key_requires_cache() -> None:
         raise AssertionError("cache_key without cache should fail")
 
 
+def test_signed_url_preserves_explicit_slow_encoder() -> None:
+    from vipercapture.signed_urls import decode_render_request, encode_render_request
+
+    request = RenderRequest.model_validate(
+        {
+            "html": "<h1>ready</h1>",
+            "output": "png",
+            "image": {"optimize_for_speed": False},
+        }
+    )
+    restored = decode_render_request(encode_render_request(request))
+    assert restored.image.optimize_for_speed is False
+
+
 def test_explicit_slow_encoder_survives_canonical_roundtrip() -> None:
     request = RenderRequest.model_validate(
         {
