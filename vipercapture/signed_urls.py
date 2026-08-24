@@ -22,7 +22,6 @@ def encode_render_request(request: RenderRequest) -> str:
         canonical_render_document(
             request,
             exclude_none=True,
-            exclude_defaults=True,
         ),
         ensure_ascii=False,
         separators=(",", ":"),

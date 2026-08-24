@@ -541,10 +541,17 @@ async def _grow_browser_pool(app: FastAPI, engine: BrowserEngine) -> None:
             async with app.state.browser_restart_lock:
                 if len(_connected_pool(app, engine)) >= target:
                     return
+                expected_mode = app.state.gpu_mode
+                expected_generation = getattr(app.state, "browser_pool_generation", 0)
             browser = await _launch_pooled_browser(app, engine)
             async with app.state.browser_restart_lock:
+                stale = (
+                    app.state.gpu_mode != expected_mode
+                    or getattr(app.state, "browser_pool_generation", 0)
+                    != expected_generation
+                )
                 pool = _connected_pool(app, engine)
-                if len(pool) >= target:
+                if stale or len(pool) >= target:
                     with suppress(Exception):
                         await _close_browser(app, browser)
                     return
@@ -756,6 +763,7 @@ async def lifespan(app: FastAPI):
     app.state.browser_in_flight = {}
     app.state.browser_growing = {}
     app.state.browser_grow_tasks = []
+    app.state.browser_pool_generation = 0
     app.state.gpu_mode = GPU_MODE
     app.state.gpu_hardware_active = await _detect_hardware_gpu(browser, GPU_MODE)
     app.state.captcha_handler = captcha_handler
@@ -2805,42 +2813,39 @@ if not HOSTED:
             return {"gpu": await _gpu_config(app)}
 
         async with app.state.browser_recycle_lock:
-            async with app.state.browser_restart_lock:
-                previous_pool = list(
-                    app.state.browsers.get(BrowserEngine.CHROMIUM, [])
-                )
-                replacements: list[Browser] = []
-                try:
-                    for _ in range(max(1, len(previous_pool) or BROWSER_POOL_SIZE)):
-                        replacements.append(
-                            await asyncio.wait_for(
-                                _launch_browser(app.state.playwright, mode),
-                                timeout=15,
-                            )
+            previous_pool = list(
+                app.state.browsers.get(BrowserEngine.CHROMIUM, [])
+            )
+            replacements: list[Browser] = []
+            try:
+                for _ in range(max(1, len(previous_pool) or BROWSER_POOL_SIZE)):
+                    replacements.append(
+                        await asyncio.wait_for(
+                            _launch_browser(app.state.playwright, mode),
+                            timeout=15,
                         )
-                except Exception:
-                    for replacement in replacements:
-                        with suppress(Exception):
-                            await _close_browser(app, replacement)
-                    raise
-                hardware_active = await _detect_hardware_gpu(replacements[0], mode)
+                    )
+            except Exception:
+                for replacement in replacements:
+                    with suppress(Exception):
+                        await _close_browser(app, replacement)
+                raise
+            hardware_active = await _detect_hardware_gpu(replacements[0], mode)
+            async with app.state.browser_restart_lock:
                 app.state.browsers[BrowserEngine.CHROMIUM] = replacements
                 app.state.browser = replacements[0]
+                app.state.browser_pool_generation = (
+                    getattr(app.state, "browser_pool_generation", 0) + 1
+                )
                 for previous in previous_pool:
                     app.state.browser_render_counts.pop(id(previous), None)
                 for replacement in replacements:
                     app.state.browser_render_counts[id(replacement)] = 0
                 app.state.gpu_mode = mode
                 app.state.gpu_hardware_active = hardware_active
-            deadline = time.monotonic() + 30
-            while any(
-                app.state.browser_in_flight.get(id(previous), 0) > 0
-                for previous in previous_pool
-            ):
-                if time.monotonic() > deadline:
-                    break
-                await asyncio.sleep(0.05)
             for previous in previous_pool:
+                while app.state.browser_in_flight.get(id(previous), 0) > 0:
+                    await asyncio.sleep(0.05)
                 with suppress(Exception):
                     await _close_browser(app, previous)
 
