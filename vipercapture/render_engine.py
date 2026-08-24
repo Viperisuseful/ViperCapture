@@ -2186,6 +2186,7 @@ class RenderEngine:
         context = None
         page = None
         cdp_session = None
+        cdp_prepared = False
         video_directory = None
         blocked_subresources = 0
         blocked_private_subresources = False
@@ -2629,6 +2630,7 @@ class RenderEngine:
                 )
                 if uses_cdp_capture:
                     cdp_session = await open_cdp_capture_session(page)
+                    cdp_prepared = True
                 stabilizes_full_page = (
                     request.full_page
                     and request.selector is None
@@ -3090,6 +3092,10 @@ class RenderEngine:
                             "encode_ms": round((time.perf_counter() - encode_started) * 1000),
                         },
                     )
+                    if cdp_prepared and page is not None:
+                        with suppress(Exception):
+                            await page.evaluate(CDP_CAPTURE_CLEANUP_SCRIPT)
+                        cdp_prepared = False
                     finalized_request = request.model_copy(update={"slices": None})
                     finalized = await diagnostic_bundle(
                         artifact,
@@ -3133,7 +3139,7 @@ class RenderEngine:
                         "height": float(height),
                         "scale": request.viewport.device_scale_factor,
                     }
-                    if request.output is OutputFormat.WEBP:
+                    if screenshot_output is OutputFormat.WEBP:
                         image = await capture_webp(
                             page,
                             clip=clip,
@@ -3271,6 +3277,10 @@ class RenderEngine:
                         "encode_ms": encode_ms,
                     },
                 )
+                if cdp_prepared and page is not None:
+                    with suppress(Exception):
+                        await page.evaluate(CDP_CAPTURE_CLEANUP_SCRIPT)
+                    cdp_prepared = False
                 if request.side_outputs or request.image.thumbnails:
                     artifact = await _multi_artifact_bundle(
                         page, request, artifact, limits
@@ -3296,7 +3306,9 @@ class RenderEngine:
             raise RenderError("render_failed", "The image render failed.", 500, True) from exc
         finally:
             if cdp_session is not None and page is not None:
-                await _close_cdp_capture_session(page, cdp_session, prepared=True)
+                await _close_cdp_capture_session(
+                    page, cdp_session, prepared=cdp_prepared
+                )
             if context is not None:
                 cleanup_failed = False
                 try:

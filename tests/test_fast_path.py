@@ -78,6 +78,18 @@ def test_cache_key_requires_cache() -> None:
         raise AssertionError("cache_key without cache should fail")
 
 
+def test_explicit_slow_encoder_survives_canonical_roundtrip() -> None:
+    request = RenderRequest.model_validate(
+        {
+            "html": "<h1>ready</h1>",
+            "output": "png",
+            "image": {"optimize_for_speed": False},
+        }
+    )
+    restored = RenderRequest.model_validate(canonical_render_document(request))
+    assert restored.image.optimize_for_speed is False
+
+
 def test_cache_key_is_part_of_fingerprint() -> None:
     first = RenderRequest.model_validate(
         {
@@ -117,6 +129,32 @@ def test_default_concurrency_is_cpu_sized() -> None:
             assert default_max_concurrency() == 4
         with mock.patch("os.cpu_count", return_value=16):
             assert default_max_concurrency() == 8
+
+
+def test_pool_status_inspects_each_browser() -> None:
+    from vipercapture.main import _chromium_ready, _pool_connected
+
+    class FakeBrowser:
+        def __init__(self, connected: bool) -> None:
+            self._connected = connected
+
+        def is_connected(self) -> bool:
+            return self._connected
+
+    class FakeApp:
+        def __init__(self) -> None:
+            self.state = type("State", (), {})()
+
+    from vipercapture.render_contract import BrowserEngine
+
+    app = FakeApp()
+    app.state.browser = FakeBrowser(False)
+    app.state.browsers = {
+        BrowserEngine.CHROMIUM: [FakeBrowser(False), FakeBrowser(True)]
+    }
+    assert _chromium_ready(app) is True
+    assert _pool_connected(app.state.browsers[BrowserEngine.CHROMIUM]) is True
+    assert _pool_connected(FakeBrowser(True)) is True
 
 
 def test_browser_pool_size_is_half_of_concurrency() -> None:

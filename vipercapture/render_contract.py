@@ -964,11 +964,8 @@ def canonical_render_document(
         if document.get(name) is None:
             document.pop(name, None)
     image = document.get("image")
-    if isinstance(image, dict):
-        if image.get("thumbnails") is None:
-            image.pop("thumbnails", None)
-        if image.get("optimize_for_speed") is False:
-            image.pop("optimize_for_speed", None)
+    if isinstance(image, dict) and image.get("thumbnails") is None:
+        image.pop("thumbnails", None)
     environment = document.get("environment")
     if isinstance(environment, dict) and environment.get("media") is None:
         # Preserve cache and async idempotency keys created before media
