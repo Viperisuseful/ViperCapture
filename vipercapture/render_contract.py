@@ -128,6 +128,11 @@ class LazyLoadMode(str, Enum):
     THOROUGH = "thorough"
 
 
+class CaptureProfile(str, Enum):
+    PREVIEW = "preview"
+    ACCURATE = "accurate"
+
+
 class ActionType(str, Enum):
     CLICK = "click"
     HOVER = "hover"
@@ -458,7 +463,10 @@ class ImageOptions(StrictModel):
     transparent_background: bool = False
     optimize_for_speed: bool = Field(
         default=False,
-        description="Prefer Chromium's faster PNG or WebP encoder over output size.",
+        description=(
+            "Prefer Chromium's faster PNG or WebP encoder over output size. "
+            "Capture profile preview enables this for Chromium PNG/WebP."
+        ),
     )
     thumbnails: list[ThumbnailOptions] | None = Field(
         default=None,
@@ -660,7 +668,21 @@ class RenderRequest(StrictModel):
             "viewport width while preserving the full document height."
         ),
     )
-    lazy_load: LazyLoadMode = LazyLoadMode.THOROUGH
+    lazy_load: LazyLoadMode = LazyLoadMode.ADAPTIVE
+    profile: CaptureProfile = Field(
+        default=CaptureProfile.PREVIEW,
+        description=(
+            "preview favors encode and lazy-load speed; accurate restores "
+            "thorough full-page scrolling and the slower lossless encoder."
+        ),
+    )
+    cache_key: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9._:-]{1,128}$",
+        description="Optional cache variant for an otherwise identical cached image request.",
+    )
     selector: str | None = Field(default=None, min_length=1, max_length=MAX_SELECTOR_CHARS)
     clip: ClipOptions | None = None
     custom_css: str | None = None
@@ -680,14 +702,51 @@ class RenderRequest(StrictModel):
     cache: bool = Field(
         default=False,
         description=(
-            "Reuse an exact account-scoped API image render for up to 15 minutes. "
-            "Cached hits bypass Chromium and are metered at two hits per credit."
+            "Reuse an exact account-scoped API image render for the configured "
+            "cache TTL (24 hours by default). Cached hits bypass Chromium."
         ),
     )
     proceed_on_captcha: bool = Field(
         default=False,
         description="Capture a detected page-level CAPTCHA instead of returning captcha_detected.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def apply_capture_profile(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        profile = data.get("profile", CaptureProfile.PREVIEW.value)
+        image = data.get("image")
+        if image is None:
+            image = {}
+            data["image"] = image
+        elif not isinstance(image, dict):
+            return data
+        output = data.get("output", OutputFormat.PNG.value)
+        if hasattr(output, "value"):
+            output = output.value
+        engine = data.get("engine", BrowserEngine.CHROMIUM.value)
+        if hasattr(engine, "value"):
+            engine = engine.value
+        deterministic = data.get("deterministic") or {}
+        deterministic_enabled = bool(
+            deterministic.get("enabled") if isinstance(deterministic, dict) else False
+        )
+        if profile == CaptureProfile.PREVIEW.value:
+            if "lazy_load" not in data:
+                data["lazy_load"] = LazyLoadMode.ADAPTIVE.value
+            if (
+                "optimize_for_speed" not in image
+                and output in {OutputFormat.PNG.value, OutputFormat.WEBP.value}
+                and engine == BrowserEngine.CHROMIUM.value
+                and not deterministic_enabled
+            ):
+                image["optimize_for_speed"] = True
+        elif profile == CaptureProfile.ACCURATE.value:
+            if "lazy_load" not in data:
+                data["lazy_load"] = LazyLoadMode.THOROUGH.value
+        return data
 
     @model_validator(mode="after")
     def validate_contract(self) -> "RenderRequest":
@@ -814,6 +873,8 @@ class RenderRequest(StrictModel):
             raise ValueError("cache cannot be combined with a diagnostic bundle")
         if self.cache and self.profile_id is not None:
             raise ValueError("cache cannot be combined with a persistent profile")
+        if self.cache_key is not None and not self.cache:
+            raise ValueError("cache_key requires cache=true")
         if self.image.quality is not None and self.output not in {
             OutputFormat.JPEG,
             OutputFormat.WEBP,
@@ -903,13 +964,20 @@ def canonical_render_document(
         if document.get(name) is None:
             document.pop(name, None)
     image = document.get("image")
-    if isinstance(image, dict) and image.get("thumbnails") is None:
-        image.pop("thumbnails", None)
+    if isinstance(image, dict):
+        if image.get("thumbnails") is None:
+            image.pop("thumbnails", None)
+        if image.get("optimize_for_speed") is False:
+            image.pop("optimize_for_speed", None)
     environment = document.get("environment")
     if isinstance(environment, dict) and environment.get("media") is None:
         # Preserve cache and async idempotency keys created before media
         # emulation added its compatibility-neutral default.
         environment.pop("media", None)
+    if document.get("cache_key") is None:
+        document.pop("cache_key", None)
+    if document.get("profile") == CaptureProfile.PREVIEW.value:
+        document.pop("profile", None)
     wait_for = document.get("wait_for")
     if isinstance(wait_for, dict):
         if wait_for.get("selector_state") == "visible":

@@ -44,6 +44,18 @@ first use and each request still receives a fresh isolated context. PDF and
 validation instead of silently changing engines. WebP and AVIF on Firefox or
 WebKit are captured losslessly and converted by the bounded image pipeline.
 
+`profile` selects speed versus completeness defaults. `preview` (default)
+uses adaptive full-page lazy loading and Chromium's faster PNG/WebP encoder.
+`accurate` restores thorough lazy scrolling and the slower lossless encoder.
+Explicit `lazy_load` and `image.optimize_for_speed` values always win.
+Deterministic captures do not enable the fast encoder unless you set it.
+Successful image responses include `X-ViperCapture-Encode-Ms` and
+`X-ViperCapture-Profile`.
+
+Cached image hits (`cache: true`) reuse an exact request fingerprint for
+`VIPERCAPTURE_CACHE_TTL_SECONDS` (24 hours by default). Set `cache_key` to
+keep multiple variants of the same request in cache.
+
 `image.width` and `image.height` constrain the final image while preserving its
 aspect ratio. HTML and Markdown requests may set `include_shadow_dom` to embed
 open shadow roots as declarative shadow DOM. PDF options include A0–A6, Legal,
@@ -380,6 +392,7 @@ See [self-hosting](self-hosting.md) for the security boundary and
 [async jobs](async-jobs.md) for queue/provider durability. Important feature
 flags include `VIPERCAPTURE_ASYNC_JOBS`, `VIPERCAPTURE_SCHEDULES`,
 `VIPERCAPTURE_ALLOW_SCRIPTS`, `VIPERCAPTURE_WEBHOOK_SECRET`,
-`VIPERCAPTURE_SIGNING_SECRET`, `VIPERCAPTURE_CACHE_TTL_SECONDS`,
-`VIPERCAPTURE_CACHE_MAX_ENTRIES`, and `VIPERCAPTURE_CACHE_MAX_BYTES` (default
-512 MiB).
+`VIPERCAPTURE_SIGNING_SECRET`, `VIPERCAPTURE_CACHE_TTL_SECONDS` (default 86400),
+`VIPERCAPTURE_CACHE_MAX_ENTRIES`, `VIPERCAPTURE_CACHE_MAX_BYTES` (default
+512 MiB), `VIPERCAPTURE_MAX_CONCURRENCY` (CPU-sized 2–8 when unset), and
+`VIPERCAPTURE_BROWSER_POOL_SIZE` (about half of concurrency for Chromium).

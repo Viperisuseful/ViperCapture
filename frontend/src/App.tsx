@@ -144,15 +144,15 @@ const defaultSettings: PresetSettings = {
   selector: "",
   quality: 90,
   transparent: false,
-  lazyLoad: "thorough",
-  optimizePng: false,
+  lazyLoad: "adaptive",
+  optimizePng: true,
   diagnostics: false,
   videoDuration: 5,
   videoFps: 60,
   videoBitrate: 20,
   videoScroll: false,
   waitEvent: "load",
-  waitDelay: 1,
+  waitDelay: 0,
   waitSelector: "",
   waitText: "",
   waitTimeout: 15,
@@ -327,15 +327,15 @@ export default function App() {
   const [selector, setSelector] = useState("")
   const [quality, setQuality] = useState(90)
   const [transparent, setTransparent] = useState(false)
-  const [lazyLoad, setLazyLoad] = useState("thorough")
-  const [optimizePng, setOptimizePng] = useState(false)
+  const [lazyLoad, setLazyLoad] = useState("adaptive")
+  const [optimizePng, setOptimizePng] = useState(true)
   const [diagnostics, setDiagnostics] = useState(false)
   const [videoDuration, setVideoDuration] = useState(5)
   const [videoFps, setVideoFps] = useState(60)
   const [videoBitrate, setVideoBitrate] = useState(20)
   const [videoScroll, setVideoScroll] = useState(false)
   const [waitEvent, setWaitEvent] = useState("load")
-  const [waitDelay, setWaitDelay] = useState(1)
+  const [waitDelay, setWaitDelay] = useState(0)
   const [waitSelector, setWaitSelector] = useState("")
   const [waitText, setWaitText] = useState("")
   const [waitTimeout, setWaitTimeout] = useState(15)
@@ -963,7 +963,7 @@ export default function App() {
                       </FieldSet>
                       <Field><FieldLabel htmlFor="custom-css">Custom CSS</FieldLabel><InputGroup><InputGroupTextarea id="custom-css" rows={4} value={customCss} onChange={(event) => setCustomCss(event.target.value)} placeholder="header, .cookie-banner { display: none !important; }" /></InputGroup><FieldDescription>Applied to the main document for this render; maximum 64 KiB.</FieldDescription></Field>
                       <Field><FieldLabel htmlFor="fail-statuses">Fail on HTTP status</FieldLabel><Input id="fail-statuses" value={failStatuses} onChange={(event) => setFailStatuses(event.target.value)} placeholder="404,429,500,502,503" /><FieldDescription>Comma-separated exact status codes.</FieldDescription></Field>
-                      <Field><FieldLabel>Lazy content loading</FieldLabel><Select value={lazyLoad} onValueChange={setLazyLoad}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="thorough">Thorough (default)</SelectItem><SelectItem value="adaptive">Adaptive (faster)</SelectItem><SelectItem value="none">None (fastest)</SelectItem></SelectGroup></SelectContent></Select></Field>
+                      <Field><FieldLabel>Lazy content loading</FieldLabel><Select value={lazyLoad} onValueChange={setLazyLoad}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="adaptive">Adaptive (default)</SelectItem><SelectItem value="thorough">Thorough (more complete)</SelectItem><SelectItem value="none">None (fastest)</SelectItem></SelectGroup></SelectContent></Select></Field>
                       <FieldSet>
                         <FieldLegend className="flex items-center gap-2"><TimerIcon data-title-icon="wait-conditions" size={16} className="shrink-0 text-primary" aria-hidden="true" />Wait conditions</FieldLegend>
                         <div className="grid grid-cols-3 gap-3">
