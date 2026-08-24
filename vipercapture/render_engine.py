@@ -582,6 +582,33 @@ def _convert_image(body: bytes, output: OutputFormat, quality: int | None) -> by
     return destination.getvalue()
 
 
+def _render_thumbnails(
+    body: bytes,
+    output: OutputFormat,
+    quality: int | None,
+    thumbnails: tuple[tuple[str, int | None, int | None], ...],
+) -> list[tuple[str, bytes, int, int]]:
+    """Resize the primary image once for every named thumbnail."""
+    rendered: list[tuple[str, bytes, int, int]] = []
+    with Image.open(io.BytesIO(body)) as source:
+        for name, width, height in thumbnails:
+            image = source.copy()
+            if width is not None or height is not None:
+                target_width = width or max(
+                    1, round(image.width * (height or image.height) / image.height)
+                )
+                target_height = height or max(
+                    1, round(image.height * (width or image.width) / image.width)
+                )
+                image.thumbnail((target_width, target_height), Image.Resampling.LANCZOS)
+            destination = io.BytesIO()
+            if output is OutputFormat.JPEG and image.mode not in {"RGB", "L"}:
+                image = image.convert("RGB")
+            image.save(destination, format=output.value.upper(), quality=quality or 80)
+            rendered.append((name, destination.getvalue(), image.width, image.height))
+    return rendered
+
+
 def _postprocess_image(
     body: bytes,
     output: OutputFormat,
@@ -1235,47 +1262,93 @@ async def load_lazy_content(
             await asyncio.sleep(0.2)
 
 
-async def capture_cdp_image(
-    page: Page,
-    *,
+def cdp_screenshot_options(
     output: OutputFormat,
-    clip: dict[str, float],
+    *,
+    clip: dict[str, float] | None,
     quality: int | None,
-    transparent: bool,
     optimize_for_speed: bool,
-) -> bytes:
-    """Capture PNG or WebP through CDP with optional fast encoding."""
-    if output not in {OutputFormat.PNG, OutputFormat.WEBP}:
-        raise ValueError("CDP capture supports only PNG and WebP")
+    capture_beyond_viewport: bool,
+) -> dict[str, object]:
+    """Build Page.captureScreenshot arguments for Chromium CDP."""
+    options: dict[str, object] = {
+        "format": output.value,
+        "fromSurface": True,
+        "captureBeyondViewport": capture_beyond_viewport,
+    }
+    if clip is not None:
+        options["clip"] = clip
+    if optimize_for_speed and output in {OutputFormat.PNG, OutputFormat.WEBP}:
+        options["optimizeForSpeed"] = True
+    if output in {OutputFormat.JPEG, OutputFormat.WEBP}:
+        options["quality"] = quality if quality is not None else 80
+    return options
+
+
+async def _close_cdp_capture_session(page: Page, session: object, *, prepared: bool) -> None:
+    if prepared:
+        with suppress(Exception):
+            await page.evaluate(CDP_CAPTURE_CLEANUP_SCRIPT)
+    with suppress(Exception):
+        await session.detach()  # type: ignore[union-attr]
+
+
+async def open_cdp_capture_session(page: Page) -> object:
+    """Attach one CDP session and apply caret-hiding CSS for later captures."""
     session = await page.context.new_cdp_session(page)
     try:
         with suppress(Exception):
             await page.evaluate(CDP_CAPTURE_PREPARE_SCRIPT)
+        return session
+    except Exception:
+        with suppress(Exception):
+            await session.detach()
+        raise
+
+
+async def capture_cdp_image(
+    page: Page,
+    *,
+    output: OutputFormat,
+    clip: dict[str, float] | None,
+    quality: int | None,
+    transparent: bool,
+    optimize_for_speed: bool,
+    session: object | None = None,
+    capture_beyond_viewport: bool = True,
+) -> bytes:
+    """Capture PNG, JPEG, or WebP through CDP with optional fast encoding."""
+    if output not in {OutputFormat.PNG, OutputFormat.JPEG, OutputFormat.WEBP}:
+        raise ValueError("CDP capture supports PNG, JPEG, or WebP")
+    own_session = session is None
+    active = session
+    prepared = False
+    if own_session:
+        active = await open_cdp_capture_session(page)
+        prepared = True
+    try:
         if transparent:
-            await session.send(
+            await active.send(  # type: ignore[union-attr]
                 "Emulation.setDefaultBackgroundColorOverride",
                 {"color": {"r": 0, "g": 0, "b": 0, "a": 0}},
             )
-        options: dict[str, object] = {
-            "format": output.value,
-            "fromSurface": True,
-            "captureBeyondViewport": True,
-            "clip": clip,
-        }
-        if optimize_for_speed:
-            options["optimizeForSpeed"] = True
-        if output is OutputFormat.WEBP:
-            options["quality"] = quality if quality is not None else 80
-        result = await session.send("Page.captureScreenshot", options)
+        result = await active.send(  # type: ignore[union-attr]
+            "Page.captureScreenshot",
+            cdp_screenshot_options(
+                output,
+                clip=clip,
+                quality=quality,
+                optimize_for_speed=optimize_for_speed,
+                capture_beyond_viewport=capture_beyond_viewport,
+            ),
+        )
         return b64decode(result["data"])
     finally:
-        with suppress(Exception):
-            await page.evaluate(CDP_CAPTURE_CLEANUP_SCRIPT)
         if transparent:
             with suppress(Exception):
-                await session.send("Emulation.setDefaultBackgroundColorOverride")
-        with suppress(Exception):
-            await session.detach()
+                await active.send("Emulation.setDefaultBackgroundColorOverride")  # type: ignore[union-attr]
+        if own_session and active is not None:
+            await _close_cdp_capture_session(page, active, prepared=prepared)
 
 
 async def capture_webp(
@@ -1285,6 +1358,7 @@ async def capture_webp(
     quality: int | None,
     transparent: bool,
     optimize_for_speed: bool,
+    session: object | None = None,
 ) -> bytes:
     """Compatibility wrapper for the native WebP CDP encoder."""
     return await capture_cdp_image(
@@ -1294,6 +1368,7 @@ async def capture_webp(
         quality=quality,
         transparent=transparent,
         optimize_for_speed=optimize_for_speed,
+        session=session,
     )
 
 
@@ -1305,6 +1380,8 @@ async def capture_clipped_image(
     quality: int | None,
     transparent: bool,
     use_cdp: bool = True,
+    optimize_for_speed: bool = False,
+    session: object | None = None,
 ) -> bytes:
     """Capture a tall explicit clip beyond the visible viewport."""
     if not use_cdp:
@@ -1317,33 +1394,16 @@ async def capture_clipped_image(
         if output is OutputFormat.JPEG:
             options["quality"] = quality if quality is not None else 80
         return await page.screenshot(**options)
-    session = await page.context.new_cdp_session(page)
-    try:
-        with suppress(Exception):
-            await page.evaluate(CDP_CAPTURE_PREPARE_SCRIPT)
-        if transparent:
-            await session.send(
-                "Emulation.setDefaultBackgroundColorOverride",
-                {"color": {"r": 0, "g": 0, "b": 0, "a": 0}},
-            )
-        options: dict[str, object] = {
-            "format": output.value,
-            "fromSurface": True,
-            "captureBeyondViewport": True,
-            "clip": clip,
-        }
-        if output is OutputFormat.JPEG:
-            options["quality"] = quality if quality is not None else 80
-        result = await session.send("Page.captureScreenshot", options)
-        return b64decode(result["data"])
-    finally:
-        with suppress(Exception):
-            await page.evaluate(CDP_CAPTURE_CLEANUP_SCRIPT)
-        if transparent:
-            with suppress(Exception):
-                await session.send("Emulation.setDefaultBackgroundColorOverride")
-        with suppress(Exception):
-            await session.detach()
+    return await capture_cdp_image(
+        page,
+        output=output,
+        clip=clip,
+        quality=quality,
+        transparent=transparent,
+        optimize_for_speed=optimize_for_speed,
+        session=session,
+        capture_beyond_viewport=True,
+    )
 
 
 async def render_metadata(
@@ -1564,15 +1624,17 @@ async def _multi_artifact_bundle(
             )
         outputs.append(("side", output.value, artifact))
 
-    for thumbnail in request.image.thumbnails or []:
+    if request.image.thumbnails:
         try:
-            body, width, height = await _settled_thread(
-                _postprocess_image,
+            thumbnails = await _settled_thread(
+                _render_thumbnails,
                 primary.body,
                 request.output,
                 request.image.quality,
-                thumbnail.width,
-                thumbnail.height,
+                tuple(
+                    (thumbnail.name, thumbnail.width, thumbnail.height)
+                    for thumbnail in request.image.thumbnails
+                ),
             )
         except Exception as exc:
             raise RenderError(
@@ -1581,18 +1643,19 @@ async def _multi_artifact_bundle(
                 503,
                 False,
             ) from exc
-        outputs.append(
-            (
-                "thumbnail",
-                thumbnail.name,
-                RenderArtifact(
-                    body,
-                    MEDIA_TYPES[request.output],
-                    f"thumbnails/{thumbnail.name}.{EXTENSIONS[request.output]}",
-                    {"width": width, "height": height},
-                ),
+        for name, body, width, height in thumbnails:
+            outputs.append(
+                (
+                    "thumbnail",
+                    name,
+                    RenderArtifact(
+                        body,
+                        MEDIA_TYPES[request.output],
+                        f"thumbnails/{name}.{EXTENSIONS[request.output]}",
+                        {"width": width, "height": height},
+                    ),
+                )
             )
-        )
 
     total = sum(len(artifact.body) for _, _, artifact in outputs)
     if total > limits.output_bytes:
@@ -2121,6 +2184,9 @@ class RenderEngine:
             raise RenderError("delay_limit_exceeded", "The wait delay exceeds the plan limit.", 413, False)
 
         context = None
+        page = None
+        cdp_session = None
+        cdp_prepared = False
         video_directory = None
         blocked_subresources = 0
         blocked_private_subresources = False
@@ -2552,13 +2618,19 @@ class RenderEngine:
                     request.image.width is not None
                     or request.image.height is not None
                 )
-                uses_cdp_capture = request.engine.value == BrowserEngine.CHROMIUM.value and (
-                    (request.output is OutputFormat.WEBP and not resizing_image)
-                    or (
-                        request.output is OutputFormat.PNG
-                        and request.image.optimize_for_speed
-                    )
+                uses_cdp_capture = (
+                    request.engine.value == BrowserEngine.CHROMIUM.value
+                    and request.output
+                    in {
+                        OutputFormat.PNG,
+                        OutputFormat.JPEG,
+                        OutputFormat.WEBP,
+                        OutputFormat.AVIF,
+                    }
                 )
+                if uses_cdp_capture:
+                    cdp_session = await open_cdp_capture_session(page)
+                    cdp_prepared = True
                 stabilizes_full_page = (
                     request.full_page
                     and request.selector is None
@@ -2932,6 +3004,14 @@ class RenderEngine:
                         False,
                         {"max_source_pixels": pillow_pixel_limit},
                     )
+                encode_started = time.perf_counter()
+                cdp_capture = {
+                    "quality": request.image.quality,
+                    "transparent": request.image.transparent_background,
+                    "optimize_for_speed": request.image.optimize_for_speed,
+                    "session": cdp_session,
+                    "use_cdp": uses_cdp_capture,
+                }
                 if request.slices is not None:
                     slice_entries: list[tuple[str, bytes]] = []
                     slice_manifest = []
@@ -2949,9 +3029,7 @@ class RenderEngine:
                                 "height": float(bottom - top),
                                 "scale": request.viewport.device_scale_factor,
                             },
-                            quality=request.image.quality,
-                            transparent=request.image.transparent_background,
-                            use_cdp=request.engine.value == BrowserEngine.CHROMIUM.value,
+                            **cdp_capture,
                         )
                         if request.output in {OutputFormat.AVIF, OutputFormat.WEBP} and screenshot_output is OutputFormat.PNG:
                             try:
@@ -3011,8 +3089,13 @@ class RenderEngine:
                             "final_url": page.url,
                             "blocked_subresources": blocked_subresources,
                             "output_count": len(slice_manifest),
+                            "encode_ms": round((time.perf_counter() - encode_started) * 1000),
                         },
                     )
+                    if cdp_prepared and page is not None:
+                        with suppress(Exception):
+                            await page.evaluate(CDP_CAPTURE_CLEANUP_SCRIPT)
+                        cdp_prepared = False
                     finalized_request = request.model_copy(update={"slices": None})
                     finalized = await diagnostic_bundle(
                         artifact,
@@ -3056,13 +3139,14 @@ class RenderEngine:
                         "height": float(height),
                         "scale": request.viewport.device_scale_factor,
                     }
-                    if request.output is OutputFormat.WEBP:
+                    if screenshot_output is OutputFormat.WEBP:
                         image = await capture_webp(
                             page,
                             clip=clip,
                             quality=request.image.quality,
                             transparent=request.image.transparent_background,
                             optimize_for_speed=request.image.optimize_for_speed,
+                            session=cdp_session,
                         )
                     else:
                         image = await capture_cdp_image(
@@ -3072,9 +3156,24 @@ class RenderEngine:
                             quality=request.image.quality,
                             transparent=request.image.transparent_background,
                             optimize_for_speed=request.image.optimize_for_speed,
+                            session=cdp_session,
                         )
                 elif request.selector:
-                    image = await locator.screenshot(**screenshot_options)
+                    if uses_cdp_capture and box is not None:
+                        image = await capture_clipped_image(
+                            page,
+                            output=screenshot_output,
+                            clip={
+                                "x": float(box["x"]),
+                                "y": float(box["y"]),
+                                "width": float(box["width"]),
+                                "height": float(box["height"]),
+                                "scale": request.viewport.device_scale_factor,
+                            },
+                            **cdp_capture,
+                        )
+                    else:
+                        image = await locator.screenshot(**screenshot_options)
                 elif request.clip:
                     image = await capture_clipped_image(
                         page,
@@ -3086,9 +3185,7 @@ class RenderEngine:
                             "height": float(height),
                             "scale": request.viewport.device_scale_factor,
                         },
-                        quality=request.image.quality,
-                        transparent=request.image.transparent_background,
-                        use_cdp=request.engine.value == BrowserEngine.CHROMIUM.value,
+                        **cdp_capture,
                     )
                 elif request.full_page and request.preserve_viewport_width:
                     image = await capture_clipped_image(
@@ -3101,9 +3198,7 @@ class RenderEngine:
                             "height": float(height),
                             "scale": request.viewport.device_scale_factor,
                         },
-                        quality=request.image.quality,
-                        transparent=request.image.transparent_background,
-                        use_cdp=request.engine.value == BrowserEngine.CHROMIUM.value,
+                        **cdp_capture,
                     )
                 elif request.full_page and request.engine.value == BrowserEngine.CHROMIUM.value:
                     image = await capture_clipped_image(
@@ -3116,8 +3211,18 @@ class RenderEngine:
                             "height": float(height),
                             "scale": request.viewport.device_scale_factor,
                         },
+                        **cdp_capture,
+                    )
+                elif uses_cdp_capture:
+                    image = await capture_cdp_image(
+                        page,
+                        output=screenshot_output,
+                        clip=None,
                         quality=request.image.quality,
                         transparent=request.image.transparent_background,
+                        optimize_for_speed=request.image.optimize_for_speed,
+                        session=cdp_session,
+                        capture_beyond_viewport=False,
                     )
                 else:
                     image = await page.screenshot(
@@ -3155,6 +3260,7 @@ class RenderEngine:
                     ensure_dimensions(pixel_width, pixel_height, 1, limits)
                     width = pixel_width / request.viewport.device_scale_factor
                     height = pixel_height / request.viewport.device_scale_factor
+                encode_ms = round((time.perf_counter() - encode_started) * 1000)
                 if len(image) > limits.output_bytes:
                     raise RenderError("output_too_large", "The rendered image exceeds the output limit.", 413, False)
                 artifact = RenderArtifact(
@@ -3168,8 +3274,13 @@ class RenderEngine:
                         "final_url": page.url,
                         "blocked_subresources": blocked_subresources,
                         "output_count": 1,
+                        "encode_ms": encode_ms,
                     },
                 )
+                if cdp_prepared and page is not None:
+                    with suppress(Exception):
+                        await page.evaluate(CDP_CAPTURE_CLEANUP_SCRIPT)
+                    cdp_prepared = False
                 if request.side_outputs or request.image.thumbnails:
                     artifact = await _multi_artifact_bundle(
                         page, request, artifact, limits
@@ -3194,6 +3305,10 @@ class RenderEngine:
                 ) from exc
             raise RenderError("render_failed", "The image render failed.", 500, True) from exc
         finally:
+            if cdp_session is not None and page is not None:
+                await _close_cdp_capture_session(
+                    page, cdp_session, prepared=cdp_prepared
+                )
             if context is not None:
                 cleanup_failed = False
                 try:

@@ -201,6 +201,7 @@ class RenderCache:
                     "navigation_status",
                     "blocked_subresources",
                     "output_count",
+                    "encode_ms",
                 )
                 if name in artifact.metadata
             },

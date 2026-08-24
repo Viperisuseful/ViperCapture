@@ -138,9 +138,32 @@ if GPU_MODE not in {"off", "auto", "required"}:
     raise ValueError("VIPERCAPTURE_GPU_MODE must be off, auto, or required")
 if GPU_BACKEND not in {"default", "vulkan"}:
     raise ValueError("VIPERCAPTURE_GPU_BACKEND must be default or vulkan")
-MAX_CONCURRENT_CAPTURES = max(
-    1, int(os.getenv("VIPERCAPTURE_MAX_CONCURRENCY", "1"))
-)
+def _optional_env_int(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return None
+    return int(raw)
+
+
+def default_max_concurrency() -> int:
+    """CPU-sized default, or VIPERCAPTURE_MAX_CONCURRENCY when set."""
+    configured = _optional_env_int("VIPERCAPTURE_MAX_CONCURRENCY")
+    if configured is not None:
+        return max(1, configured)
+    cpus = os.cpu_count() or 2
+    return max(2, min(8, cpus))
+
+
+def default_browser_pool_size(concurrency: int) -> int:
+    """Chromium processes: about one browser per two concurrent captures."""
+    configured = _optional_env_int("VIPERCAPTURE_BROWSER_POOL_SIZE")
+    if configured is not None:
+        return max(1, min(concurrency, configured))
+    return max(1, min(concurrency, (concurrency + 1) // 2))
+
+
+MAX_CONCURRENT_CAPTURES = default_max_concurrency()
+BROWSER_POOL_SIZE = default_browser_pool_size(MAX_CONCURRENT_CAPTURES)
 BROWSER_RECYCLE_RENDERS = max(
     0, int(os.getenv("VIPERCAPTURE_BROWSER_RECYCLE_RENDERS", "1000"))
 )
@@ -230,7 +253,7 @@ CACHE_DIRECTORY = Path(
         ),
     )
 ).expanduser()
-CACHE_TTL_SECONDS = max(1, int(os.getenv("VIPERCAPTURE_CACHE_TTL_SECONDS", "900")))
+CACHE_TTL_SECONDS = max(1, int(os.getenv("VIPERCAPTURE_CACHE_TTL_SECONDS", "86400")))
 CACHE_MAX_ENTRIES = max(1, int(os.getenv("VIPERCAPTURE_CACHE_MAX_ENTRIES", "1000")))
 CACHE_MAX_BYTES = max(
     1,
@@ -416,42 +439,162 @@ async def _launch_browser(
     return browser
 
 
+def _pool_size_for(engine: BrowserEngine) -> int:
+    return BROWSER_POOL_SIZE if engine is BrowserEngine.CHROMIUM else 1
+
+
+def _connected_pool(app: FastAPI, engine: BrowserEngine) -> list[Browser]:
+    pool = app.state.browsers.setdefault(engine, [])
+    pool[:] = [browser for browser in pool if browser.is_connected()]
+    return pool
+
+
+def _register_browser(app: FastAPI, engine: BrowserEngine, browser: Browser) -> None:
+    app.state.browsers.setdefault(engine, []).append(browser)
+    app.state.browser_render_counts[id(browser)] = 0
+    if engine is BrowserEngine.CHROMIUM:
+        _sync_primary_browser(app)
+
+
+def _sync_primary_browser(app: FastAPI) -> None:
+    pool = getattr(app.state, "browsers", {}).get(BrowserEngine.CHROMIUM, [])
+    connected = [browser for browser in pool if browser.is_connected()]
+    if connected:
+        app.state.browser = connected[0]
+
+
+def _chromium_ready(app: FastAPI) -> bool:
+    pool = getattr(app.state, "browsers", {}).get(BrowserEngine.CHROMIUM)
+    if pool:
+        return any(browser.is_connected() for browser in pool)
+    browser = getattr(app.state, "browser", None)
+    return browser is not None and browser.is_connected()
+
+
+def _pool_connected(pool: object) -> bool:
+    if isinstance(pool, list):
+        return any(browser.is_connected() for browser in pool)
+    return bool(getattr(pool, "is_connected", lambda: False)())
+
+
+def _track_browser_use(app: FastAPI, browser: Browser) -> None:
+    in_flight = app.state.browser_in_flight
+    in_flight[id(browser)] = in_flight.get(id(browser), 0) + 1
+
+
+def _untrack_browser_use(app: FastAPI, browser: Browser) -> None:
+    in_flight = app.state.browser_in_flight
+    browser_id = id(browser)
+    remaining = in_flight.get(browser_id, 1) - 1
+    if remaining <= 0:
+        in_flight.pop(browser_id, None)
+    else:
+        in_flight[browser_id] = remaining
+
+
+async def _launch_pooled_browser(app: FastAPI, engine: BrowserEngine) -> Browser:
+    try:
+        return await asyncio.wait_for(
+            _launch_browser(
+                app.state.playwright,
+                app.state.gpu_mode,
+                engine,
+            ),
+            timeout=20,
+        )
+    except Exception as exc:
+        raise RenderError(
+            "browser_unavailable",
+            f"The {engine.value} browser is not installed or could not start.",
+            503,
+            False,
+        ) from exc
+
+
+def _forget_grow_task(app: FastAPI, task: asyncio.Task[None], engine: BrowserEngine) -> None:
+    growing = getattr(app.state, "browser_growing", None)
+    if growing is not None:
+        growing[engine] = False
+    tasks = getattr(app.state, "browser_grow_tasks", None)
+    if tasks is None:
+        return
+    app.state.browser_grow_tasks = [
+        item for item in tasks if item is not task and not item.done()
+    ]
+
+
+def _schedule_pool_growth(app: FastAPI, engine: BrowserEngine) -> None:
+    app.state.browser_growing[engine] = True
+    task = asyncio.create_task(_grow_browser_pool(app, engine))
+    app.state.browser_grow_tasks.append(task)
+
+    def _finished(done: asyncio.Task[None], pooled: BrowserEngine = engine) -> None:
+        _forget_grow_task(app, done, pooled)
+
+    task.add_done_callback(_finished)
+
+
+async def _grow_browser_pool(app: FastAPI, engine: BrowserEngine) -> None:
+    target = _pool_size_for(engine)
+    try:
+        while True:
+            async with app.state.browser_restart_lock:
+                if len(_connected_pool(app, engine)) >= target:
+                    return
+            browser = await _launch_pooled_browser(app, engine)
+            async with app.state.browser_restart_lock:
+                pool = _connected_pool(app, engine)
+                if len(pool) >= target:
+                    with suppress(Exception):
+                        await _close_browser(app, browser)
+                    return
+                _register_browser(app, engine, browser)
+    except Exception:
+        return
+
+
+async def _wait_for_browser_idle(
+    app: FastAPI,
+    browser: Browser,
+    timeout: float = 30,
+    *,
+    reserved: int = 0,
+) -> bool:
+    browser_id = id(browser)
+    deadline = time.monotonic() + timeout
+    while app.state.browser_in_flight.get(browser_id, 0) > reserved:
+        if time.monotonic() > deadline:
+            return False
+        await asyncio.sleep(0.05)
+    return True
+
+
+def _remove_browser_from_pool(app: FastAPI, engine: BrowserEngine, browser: Browser) -> None:
+    pool = app.state.browsers.setdefault(engine, [])
+    pool[:] = [active for active in pool if active is not browser]
+    if engine is BrowserEngine.CHROMIUM:
+        _sync_primary_browser(app)
+
+
 async def _browser_for(app: FastAPI, engine: BrowserEngine) -> Browser:
     browsers = getattr(app.state, "browsers", None)
     if browsers is None:
         return app.state.browser
-    browser = browsers.get(engine)
-    if browser is not None and browser.is_connected():
-        return browser
+    target = _pool_size_for(engine)
     async with app.state.browser_restart_lock:
-        browser = browsers.get(engine)
-        if browser is not None and browser.is_connected():
-            return browser
-        try:
-            browser = await asyncio.wait_for(
-                _launch_browser(
-                    app.state.playwright,
-                    app.state.gpu_mode,
-                    engine,
-                ),
-                timeout=20,
-            )
-        except Exception as exc:
-            raise RenderError(
-                "browser_unavailable",
-                f"The {engine.value} browser is not installed or could not start.",
-                503,
-                False,
-            ) from exc
-        previous = browsers.get(engine)
-        browsers[engine] = browser
-        counts = app.state.browser_render_counts
-        if previous is not None:
-            counts.pop(id(previous), None)
-        counts[id(browser)] = 0
-        if engine.value == BrowserEngine.CHROMIUM.value:
-            app.state.browser = browser
-        return browser
+        pool = _connected_pool(app, engine)
+        if not pool:
+            browser = await _launch_pooled_browser(app, engine)
+            _register_browser(app, engine, browser)
+            pool = _connected_pool(app, engine)
+        elif len(pool) < target and not app.state.browser_growing.get(engine):
+            _schedule_pool_growth(app, engine)
+        index = app.state.browser_rr.get(engine, 0) % len(pool)
+        app.state.browser_rr[engine] = index + 1
+        chosen = pool[index]
+        if engine is BrowserEngine.CHROMIUM:
+            _sync_primary_browser(app)
+        return chosen
 
 
 def _retain_browser_for_shutdown(app: FastAPI, browser: Browser) -> None:
@@ -471,31 +614,37 @@ async def _close_browser(app: FastAPI, browser: Browser) -> None:
     ]
 
 
+def _engine_for_browser(app: FastAPI, browser: Browser) -> BrowserEngine | None:
+    for engine, pool in app.state.browsers.items():
+        if any(active is browser for active in pool):
+            return engine
+    return None
+
+
 async def _replace_browser(app: FastAPI, failed_browser: Browser) -> None:
     async with app.state.browser_restart_lock:
-        browsers = getattr(app.state, "browsers", None)
-        engine = next(
-            (
-                name
-                for name, browser in (browsers or {}).items()
-                if browser is failed_browser
-            ),
-            BrowserEngine.CHROMIUM if app.state.browser is failed_browser else None,
-        )
+        engine = _engine_for_browser(app, failed_browser)
         if engine is None:
             return
-        with suppress(Exception):
-            await _close_browser(app, failed_browser)
+        _remove_browser_from_pool(app, engine, failed_browser)
+        app.state.browser_render_counts.pop(id(failed_browser), None)
+    await _wait_for_browser_idle(app, failed_browser, reserved=1)
+    with suppress(Exception):
+        await _close_browser(app, failed_browser)
+    try:
         replacement = await asyncio.wait_for(
             _launch_browser(app.state.playwright, app.state.gpu_mode, engine),
             timeout=15,
         )
-        if browsers is not None:
-            browsers[engine] = replacement
-        app.state.browser_render_counts.pop(id(failed_browser), None)
-        app.state.browser_render_counts[id(replacement)] = 0
-        if engine.value == BrowserEngine.CHROMIUM.value:
-            app.state.browser = replacement
+    except Exception:
+        return
+    async with app.state.browser_restart_lock:
+        if len(_connected_pool(app, engine)) >= _pool_size_for(engine):
+            with suppress(Exception):
+                await _close_browser(app, replacement)
+            return
+        _register_browser(app, engine, replacement)
+        if engine is BrowserEngine.CHROMIUM:
             app.state.gpu_hardware_active = await _detect_hardware_gpu(
                 replacement,
                 app.state.gpu_mode,
@@ -507,7 +656,8 @@ async def _record_browser_render(app: FastAPI, browser: Browser) -> None:
         return
     browser_id = id(browser)
     counts = app.state.browser_render_counts
-    if all(active is not browser for active in app.state.browsers.values()):
+    engine = _engine_for_browser(app, browser)
+    if engine is None:
         counts.pop(browser_id, None)
         return
     counts[browser_id] = counts.get(browser_id, 0) + 1
@@ -515,46 +665,57 @@ async def _record_browser_render(app: FastAPI, browser: Browser) -> None:
         return
 
     async with app.state.browser_recycle_lock:
-        browsers = app.state.browsers
-        engine = next(
-            (name for name, active in browsers.items() if active is browser),
-            None,
-        )
-        if engine is None or counts.get(browser_id, 0) < BROWSER_RECYCLE_RENDERS:
-            counts.pop(browser_id, None)
-            return
-
-        acquired = 0
-        try:
-            for _ in range(MAX_CONCURRENT_CAPTURES):
-                await app.state.capture_slots.acquire()
-                acquired += 1
-            async with app.state.browser_restart_lock:
-                if browsers.get(engine) is not browser:
-                    counts.pop(browser_id, None)
-                    return
-                try:
-                    await _close_browser(app, browser)
-                except Exception:
-                    if browser.is_connected():
-                        counts[browser_id] = 0
-                        return
+        async with app.state.browser_restart_lock:
+            engine = _engine_for_browser(app, browser)
+            if engine is None or counts.get(browser_id, 0) < BROWSER_RECYCLE_RENDERS:
                 counts.pop(browser_id, None)
+                return
+            _remove_browser_from_pool(app, engine, browser)
+        if not await _wait_for_browser_idle(app, browser):
+            async with app.state.browser_restart_lock:
+                app.state.browsers.setdefault(engine, []).append(browser)
+                counts[browser_id] = 0
+                if engine is BrowserEngine.CHROMIUM:
+                    _sync_primary_browser(app)
+            return
+        replacement = None
+        try:
+            async with app.state.browser_restart_lock:
+                needs_replacement = (
+                    len(_connected_pool(app, engine)) < _pool_size_for(engine)
+                )
+            if needs_replacement:
                 replacement = await asyncio.wait_for(
-                    _launch_browser(app.state.playwright, app.state.gpu_mode, engine),
+                    _launch_browser(
+                        app.state.playwright, app.state.gpu_mode, engine
+                    ),
                     timeout=15,
                 )
-                browsers[engine] = replacement
-                counts[id(replacement)] = 0
+        except Exception:
+            async with app.state.browser_restart_lock:
+                app.state.browsers.setdefault(engine, []).append(browser)
+                counts[browser_id] = 0
                 if engine is BrowserEngine.CHROMIUM:
-                    app.state.browser = replacement
-                    app.state.gpu_hardware_active = await _detect_hardware_gpu(
-                        replacement,
-                        app.state.gpu_mode,
-                    )
-        finally:
-            for _ in range(acquired):
-                app.state.capture_slots.release()
+                    _sync_primary_browser(app)
+            return
+        async with app.state.browser_restart_lock:
+            if replacement is not None:
+                if len(_connected_pool(app, engine)) < _pool_size_for(engine):
+                    _register_browser(app, engine, replacement)
+                    if engine is BrowserEngine.CHROMIUM:
+                        app.state.gpu_hardware_active = await _detect_hardware_gpu(
+                            replacement,
+                            app.state.gpu_mode,
+                        )
+                    replacement = None
+            counts.pop(browser_id, None)
+        if replacement is not None:
+            with suppress(Exception):
+                await _close_browser(app, replacement)
+        try:
+            await _close_browser(app, browser)
+        except Exception:
+            _retain_browser_for_shutdown(app, browser)
 
 
 @asynccontextmanager
@@ -590,7 +751,11 @@ async def lifespan(app: FastAPI):
     browser = await _launch_browser(playwright)
     app.state.playwright = playwright
     app.state.browser = browser
-    app.state.browsers = {BrowserEngine.CHROMIUM: browser}
+    app.state.browsers = {BrowserEngine.CHROMIUM: [browser]}
+    app.state.browser_rr = {BrowserEngine.CHROMIUM: 0}
+    app.state.browser_in_flight = {}
+    app.state.browser_growing = {}
+    app.state.browser_grow_tasks = []
     app.state.gpu_mode = GPU_MODE
     app.state.gpu_hardware_active = await _detect_hardware_gpu(browser, GPU_MODE)
     app.state.captcha_handler = captcha_handler
@@ -741,8 +906,17 @@ async def lifespan(app: FastAPI):
                 await app.state.async_jobs.close()
         finally:
             closed_browser_ids: set[int] = set()
+            grow_tasks = list(getattr(app.state, "browser_grow_tasks", []))
+            for task in grow_tasks:
+                task.cancel()
+            if grow_tasks:
+                await asyncio.gather(*grow_tasks, return_exceptions=True)
             active_browsers = [
-                *app.state.browsers.values(),
+                *[
+                    browser
+                    for pool in app.state.browsers.values()
+                    for browser in pool
+                ],
                 *app.state.retired_browsers,
             ]
             for active_browser in active_browsers:
@@ -919,8 +1093,7 @@ async def health() -> dict[str, bool]:
 
 @app.get("/ready")
 async def ready() -> JSONResponse:
-    browser = getattr(app.state, "browser", None)
-    is_ready = browser is not None and browser.is_connected()
+    is_ready = _chromium_ready(app)
     return JSONResponse({
         "ready": is_ready,
         "role": PROCESS_ROLE,
@@ -1109,10 +1282,10 @@ async def operator_status(
     service = getattr(app.state, "async_jobs", None)
     return {
         "role": PROCESS_ROLE,
-        "browser_connected": app.state.browser.is_connected(),
+        "browser_connected": _chromium_ready(app),
         "browsers": {
-            engine.value: browser.is_connected()
-            for engine, browser in getattr(app.state, "browsers", {}).items()
+            engine.value: _pool_connected(pool)
+            for engine, pool in getattr(app.state, "browsers", {}).items()
         },
         "async_jobs": service is not None,
         "worker_count": ASYNC_JOB_SETTINGS.worker_count if ASYNC_JOB_SETTINGS else 0,
@@ -1409,8 +1582,11 @@ async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
         )
         browser = None
         render_attempted = False
+        tracked = False
         try:
             browser = await _browser_for(app, payload.engine)
+            _track_browser_use(app, browser)
+            tracked = True
             engine = _render_engine()
             render_started = time.perf_counter()
             try:
@@ -1426,6 +1602,8 @@ async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
                 raise
         finally:
             app.state.capture_slots.release()
+            if tracked and browser is not None:
+                _untrack_browser_use(app, browser)
             if render_attempted and browser is not None:
                 with suppress(Exception):
                     await _record_browser_render(app, browser)
@@ -1527,8 +1705,11 @@ async def _render_response(payload: RenderRequest, request: Request) -> Response
         queue_ms = round((time.perf_counter() - queue_started) * 1000)
         browser = None
         render_attempted = False
+        tracked = False
         try:
             browser = await _browser_for(app, payload.engine)
+            _track_browser_use(app, browser)
+            tracked = True
             engine = _render_engine()
             try:
                 if payload.cache and cache is not None:
@@ -1565,6 +1746,8 @@ async def _render_response(payload: RenderRequest, request: Request) -> Response
                 raise
         finally:
             app.state.capture_slots.release()
+            if tracked and browser is not None:
+                _untrack_browser_use(app, browser)
             if render_attempted and browser is not None:
                 with suppress(Exception):
                     await _record_browser_render(app, browser)
@@ -1579,15 +1762,19 @@ async def _render_response(payload: RenderRequest, request: Request) -> Response
         "X-ViperCapture-Queue-Ms": str(max(0, queue_ms)),
         "X-ViperCapture-Render-Ms": str(max(0, render_ms)),
         "X-ViperCapture-Cache": "hit" if cache_hit else ("miss" if payload.cache else "disabled"),
+        "X-ViperCapture-Profile": payload.profile.value,
     }
     for key, header in (
         ("width", "X-ViperCapture-Width"),
         ("height", "X-ViperCapture-Height"),
         ("navigation_status", "X-ViperCapture-Navigation-Status"),
+        ("encode_ms", "X-ViperCapture-Encode-Ms"),
     ):
         value = metadata.get(key)
         if isinstance(value, (int, float)):
             diagnostic_headers[header] = str(round(value))
+    if "X-ViperCapture-Encode-Ms" not in diagnostic_headers:
+        diagnostic_headers["X-ViperCapture-Encode-Ms"] = "0"
     return Response(
         artifact.body,
         media_type=artifact.media_type,
@@ -2578,6 +2765,9 @@ async def app_config():
         "max_viewport_height": MAX_VIEWPORT_HEIGHT,
         "max_full_page_height": MAX_FULL_PAGE_HEIGHT,
         "max_output_bytes": MAX_OUTPUT_BYTES,
+        "max_concurrency": MAX_CONCURRENT_CAPTURES,
+        "browser_pool_size": BROWSER_POOL_SIZE,
+        "cache_ttl_seconds": CACHE_TTL_SECONDS,
         "browser_engines": [engine.value for engine in BrowserEngine],
         "output_formats": output_formats,
         "custom_proxies": ALLOW_CUSTOM_PROXIES,
@@ -2615,37 +2805,44 @@ if not HOSTED:
             return {"gpu": await _gpu_config(app)}
 
         async with app.state.browser_recycle_lock:
-            acquired = 0
-            try:
-                for _ in range(MAX_CONCURRENT_CAPTURES):
-                    await asyncio.wait_for(
-                        app.state.capture_slots.acquire(),
-                        timeout=CAPTURE_QUEUE_TIMEOUT_SECONDS,
-                    )
-                    acquired += 1
-                async with app.state.browser_restart_lock:
-                    replacement = await asyncio.wait_for(
-                        _launch_browser(app.state.playwright, mode),
-                        timeout=15,
-                    )
-                    hardware_active = await _detect_hardware_gpu(replacement, mode)
-                    previous = app.state.browser
-                    app.state.browser = replacement
-                    app.state.browsers[BrowserEngine.CHROMIUM] = replacement
+            async with app.state.browser_restart_lock:
+                previous_pool = list(
+                    app.state.browsers.get(BrowserEngine.CHROMIUM, [])
+                )
+                replacements: list[Browser] = []
+                try:
+                    for _ in range(max(1, len(previous_pool) or BROWSER_POOL_SIZE)):
+                        replacements.append(
+                            await asyncio.wait_for(
+                                _launch_browser(app.state.playwright, mode),
+                                timeout=15,
+                            )
+                        )
+                except Exception:
+                    for replacement in replacements:
+                        with suppress(Exception):
+                            await _close_browser(app, replacement)
+                    raise
+                hardware_active = await _detect_hardware_gpu(replacements[0], mode)
+                app.state.browsers[BrowserEngine.CHROMIUM] = replacements
+                app.state.browser = replacements[0]
+                for previous in previous_pool:
                     app.state.browser_render_counts.pop(id(previous), None)
+                for replacement in replacements:
                     app.state.browser_render_counts[id(replacement)] = 0
-                    app.state.gpu_mode = mode
-                    app.state.gpu_hardware_active = hardware_active
-                    with suppress(Exception):
-                        await _close_browser(app, previous)
-            except TimeoutError as exc:
-                raise HTTPException(
-                    status_code=503,
-                    detail="The renderer is busy; try the GPU switch again shortly",
-                ) from exc
-            finally:
-                for _ in range(acquired):
-                    app.state.capture_slots.release()
+                app.state.gpu_mode = mode
+                app.state.gpu_hardware_active = hardware_active
+            deadline = time.monotonic() + 30
+            while any(
+                app.state.browser_in_flight.get(id(previous), 0) > 0
+                for previous in previous_pool
+            ):
+                if time.monotonic() > deadline:
+                    break
+                await asyncio.sleep(0.05)
+            for previous in previous_pool:
+                with suppress(Exception):
+                    await _close_browser(app, previous)
 
         return {"gpu": await _gpu_config(app)}
 

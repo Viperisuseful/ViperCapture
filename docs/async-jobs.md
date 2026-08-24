@@ -98,7 +98,9 @@ therefore includes failed attempts, retry backoff, and result persistence.
 | `VIPERCAPTURE_S3_PREFIX` | `vipercapture` | Result object key prefix |
 
 Workers share `VIPERCAPTURE_MAX_CONCURRENCY` with synchronous renders. Raising
-the worker count does not bypass the Chromium semaphore.
+the worker count does not bypass the Chromium semaphore. Chromium can run as a
+small process pool (`VIPERCAPTURE_BROWSER_POOL_SIZE`); recycle replaces one
+browser at a time and does not drain the whole capture queue.
 
 ## Implement a database adapter
 

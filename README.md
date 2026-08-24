@@ -47,7 +47,7 @@ are moving from another rendering service, start with the
   bulk submission, cron schedules, and signed webhook callbacks
 - Private local result storage or built-in S3-compatible storage for AWS S3,
   Cloudflare R2, MinIO, Backblaze B2, and compatible providers
-- Expiring HMAC-signed render URLs and a 15-minute exact-request image cache
+- Expiring HMAC-signed render URLs and a 24-hour exact-request image cache
 - Visual regression ZIPs with pixel counts, pass/fail thresholds, bounds, and
   highlighted changes
 - Diagnostic ZIPs with console/network data and optional HAR,
@@ -95,7 +95,7 @@ docker compose up --build
 Stable container images are also published to GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/viperisuseful/vipercapture:1.0.0
+docker pull ghcr.io/viperisuseful/vipercapture:1.0.1
 ```
 
 By default, Compose binds only to loopback. It keeps durable queue state,
