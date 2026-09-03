@@ -115,6 +115,10 @@ full state, secret, and object-store restore drill is not release evidence.
 ## Configure abuse controls and support
 
 - Require scoped project keys; revoke a key immediately when leaked.
+- API keys travel only in the `Authorization` header: this stack sets
+  `VIPERCAPTURE_ALLOW_QUERY_AUTH: "0"` so `/take?access_key=…` is rejected.
+  If a legacy integration depends on query-string keys, change the value to
+  `"1"` and rotate any key that may have been captured in request logs.
 - Start customers at low RPM, concurrency, pixel, output, and queue limits.
 - Retain gateway request IDs, status, timing, project audit events, and abuse
   decisions without logging authorization headers or render payloads.
