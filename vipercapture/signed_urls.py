@@ -88,6 +88,8 @@ def verify_render_request(
     secret: str,
     now: int | None = None,
 ) -> RenderRequest:
+    if not secret:
+        raise ValueError("a signing secret is required")
     current = int(time.time()) if now is None else now
     if expires < current:
         raise RenderError(

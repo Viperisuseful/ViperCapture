@@ -80,7 +80,15 @@ class WebhookDispatcher:
                 422,
                 False,
             )
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        try:
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        except ValueError as exc:
+            raise RenderError(
+                "webhook_url_invalid",
+                "The webhook URL port is invalid.",
+                422,
+                False,
+            ) from exc
         try:
             await self.validation_slots.acquire()
             resolution = asyncio.create_task(

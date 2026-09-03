@@ -1070,6 +1070,14 @@ async def authenticate_request(request: Request, call_next):
 
 
 @app.middleware("http")
+async def apply_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Content-Security-Policy", "frame-ancestors 'none'")
+    return response
+
+
+@app.middleware("http")
 async def record_http_metrics(request: Request, call_next):
     started = time.perf_counter()
     status = 500
