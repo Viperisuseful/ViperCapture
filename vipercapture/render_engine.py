@@ -609,6 +609,19 @@ DIAGNOSTIC_NETWORK_PRIVACY = (
 )
 
 
+def _headers_from_source(source: object) -> object:
+    """Read headers without awaiting Playwright's async headers_array()."""
+    if source is None:
+        return None
+    headers_array = getattr(source, "headers_array", None)
+    if isinstance(headers_array, list):
+        return headers_array
+    headers = getattr(source, "headers", None)
+    if isinstance(headers, dict):
+        return [{"name": str(name), "value": str(value)} for name, value in headers.items()]
+    return None
+
+
 def _header_items(headers_array: object) -> list[tuple[str, str]]:
     items: list[tuple[str, str]] = []
     for header in headers_array or ():
@@ -723,16 +736,19 @@ def har_timings(timing: object) -> tuple[float, dict[str, float]]:
         blocked = max(0.0, float(blocked_start)) if blocked_start not in (None, -1) else -1
     except (TypeError, ValueError):
         blocked = -1
+    def rounded(value: float) -> float:
+        return -1 if value < 0 else round(value, 3)
+
     timings = {
-        "blocked": blocked,
-        "dns": dns,
-        "connect": connect,
-        "ssl": ssl,
+        "blocked": rounded(blocked),
+        "dns": rounded(dns),
+        "connect": rounded(connect),
+        "ssl": rounded(ssl),
         "send": 0,
-        "wait": wait,
-        "receive": receive,
+        "wait": rounded(wait),
+        "receive": rounded(receive),
     }
-    total = sum(value for value in timings.values() if value > 0)
+    total = round(sum(value for value in timings.values() if value > 0), 3)
     return total, timings
 
 
@@ -758,8 +774,8 @@ def collect_network_event(
 ) -> dict[str, object]:
     request = getattr(response, "request", None)
     url = str(getattr(response, "url", "") or "")
-    request_headers = getattr(request, "headers_array", None) if request is not None else None
-    response_headers_array = getattr(response, "headers_array", None)
+    request_headers = _headers_from_source(request) if request is not None else None
+    response_headers_array = _headers_from_source(response)
     response_headers = getattr(response, "headers", None)
     timing = getattr(request, "timing", None) if request is not None else None
     if timing is not None and not isinstance(timing, dict):

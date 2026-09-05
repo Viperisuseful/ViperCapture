@@ -188,6 +188,41 @@ def test_collect_network_event_redacts_query_and_keeps_safe_headers() -> None:
     assert timings["wait"] == 3
 
 
+def test_collect_network_event_uses_sync_headers_not_async_array() -> None:
+    async def headers_array():
+        raise AssertionError("headers_array is async in Playwright and must not be called")
+
+    request = SimpleNamespace(
+        method="GET",
+        resource_type="document",
+        headers={"accept": "text/html"},
+        headers_array=headers_array,
+        timing={
+            "startTime": 1_700_000_000_000,
+            "requestStart": 1,
+            "responseStart": 4,
+            "responseEnd": 8,
+            "domainLookupStart": 0,
+            "domainLookupEnd": 0,
+            "connectStart": 0,
+            "secureConnectionStart": -1,
+            "connectEnd": 1,
+        },
+    )
+    response = SimpleNamespace(
+        url="http://127.0.0.1/page",
+        status=200,
+        status_text="OK",
+        headers={"content-type": "text/html"},
+        headers_array=headers_array,
+        request=request,
+    )
+    event = collect_network_event(response, http_version="http/1.1")
+    assert event["request_headers"] == [{"name": "accept", "value": "text/html"}]
+    assert event["response_headers"] == [{"name": "content-type", "value": "text/html"}]
+    assert event["http_version"] == "HTTP/1.1"
+
+
 def test_collect_network_event_infers_http11_for_cleartext() -> None:
     request = SimpleNamespace(
         method="GET",
