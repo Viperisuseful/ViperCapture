@@ -36,7 +36,11 @@ from .async_jobs import (
     public_job_document,
     settings_from_environment,
 )
-from .bulk_jobs import BulkBodyLimitMiddleware, BulkJobRequest
+from .bulk_jobs import (
+    CLIENT_DISCONNECTED_STATE,
+    BulkBodyLimitMiddleware,
+    BulkJobRequest,
+)
 from .captcha import handle_challenge, load_captcha_handler
 from .compatibility import screenshotone_request, urlbox_request
 from .control_plane import (
@@ -1403,37 +1407,82 @@ async def delete_profile(profile_id: str, request: Request) -> Response:
     return Response(status_code=204)
 
 
+def _disconnect_event(request: Request) -> asyncio.Event | None:
+    state = getattr(request, "state", None)
+    event = getattr(state, CLIENT_DISCONNECTED_STATE, None)
+    return event if isinstance(event, asyncio.Event) else None
+
+
+def _consume_abandoned_task(task: asyncio.Task) -> None:
+    with suppress(asyncio.CancelledError, Exception):
+        task.exception()
+
+
+def _abandon_task(task: asyncio.Task) -> None:
+    """Cancel work without waiting for shielded or Playwright cleanup."""
+    if task.done():
+        _consume_abandoned_task(task)
+        return
+    task.cancel()
+    task.add_done_callback(_consume_abandoned_task)
+
+
+async def _client_disconnected(request: Request) -> bool:
+    event = _disconnect_event(request)
+    if event is not None and event.is_set():
+        return True
+    is_disconnected = getattr(request, "is_disconnected", None)
+    return callable(is_disconnected) and await is_disconnected()
+
+
+async def _watch_client_disconnect(request: Request) -> None:
+    event = _disconnect_event(request)
+    if event is not None:
+        await event.wait()
+        return
+    is_disconnected = getattr(request, "is_disconnected", None)
+    if not callable(is_disconnected):
+        await asyncio.Event().wait()
+        return
+    while True:
+        if await is_disconnected():
+            return
+        await asyncio.sleep(0.1)
+
+
 async def _await_while_connected(
     request: Request,
     operation: Awaitable[AwaitedResult],
 ) -> AwaitedResult:
     """Cancel queued or rendering work when the client disconnects."""
-    is_disconnected = getattr(request, "is_disconnected", None)
-    if not callable(is_disconnected):
-        return await operation
-
     operation_task = asyncio.ensure_future(operation)
+    if _disconnect_event(request) is None and not callable(
+        getattr(request, "is_disconnected", None)
+    ):
+        return await operation_task
+
+    disconnect_task = asyncio.create_task(_watch_client_disconnect(request))
     try:
-        while True:
-            done, _pending = await asyncio.wait({operation_task}, timeout=0.1)
-            if operation_task in done:
-                return await operation_task
-            if await is_disconnected():
-                if operation_task.done() or not operation_task.cancel():
-                    return await operation_task
-                with suppress(asyncio.CancelledError):
-                    await operation_task
-                raise RenderError(
-                    "client_disconnected",
-                    "The capture was cancelled.",
-                    499,
-                    False,
-                )
+        await asyncio.wait(
+            {operation_task, disconnect_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if operation_task.done() and not operation_task.cancelled():
+            return await operation_task
+        _abandon_task(operation_task)
+        raise RenderError(
+            "client_disconnected",
+            "The capture was cancelled.",
+            499,
+            False,
+        )
     finally:
-        if not operation_task.done():
-            operation_task.cancel()
+        if not disconnect_task.done():
+            disconnect_task.cancel()
             with suppress(asyncio.CancelledError):
-                await operation_task
+                await disconnect_task
+        if not operation_task.done():
+            _abandon_task(operation_task)
 
 
 @app.get("/")
@@ -1723,6 +1772,13 @@ async def _render_response(payload: RenderRequest, request: Request) -> Response
         render_attempted = False
         tracked = False
         try:
+            if await _client_disconnected(request):
+                raise RenderError(
+                    "client_disconnected",
+                    "The capture was cancelled.",
+                    499,
+                    False,
+                )
             browser = await _browser_for(app, payload.engine)
             _track_browser_use(app, browser)
             tracked = True
@@ -2686,8 +2742,7 @@ async def read_render_job_result(job_id: UUID, request: Request) -> Response:
     try:
         await _await_while_connected(request, acquire_task)
         acquired = True
-        is_disconnected = getattr(request, "is_disconnected", None)
-        if callable(is_disconnected) and await is_disconnected():
+        if await _client_disconnected(request):
             raise RenderError(
                 "client_disconnected",
                 "The result download was cancelled.",
