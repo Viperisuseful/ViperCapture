@@ -70,6 +70,140 @@ DEVICE_PLATFORMS = {
     DevicePreset.PIXEL_7: "Linux armv8l",
     DevicePreset.IPAD: "iPad",
 }
+# Used when Playwright's live registry is unavailable. Live descriptors win.
+DEVICE_DESCRIPTOR_FALLBACKS: dict[DevicePreset, dict[str, object]] = {
+    DevicePreset.IPHONE_14: {
+        "viewport": {"width": 390, "height": 664},
+        "screen": {"width": 390, "height": 844},
+        "device_scale_factor": 3,
+        "is_mobile": True,
+        "has_touch": True,
+    },
+    DevicePreset.PIXEL_7: {
+        "viewport": {"width": 412, "height": 839},
+        "screen": {"width": 412, "height": 915},
+        "device_scale_factor": 2.625,
+        "is_mobile": True,
+        "has_touch": True,
+    },
+    DevicePreset.IPAD: {
+        "viewport": {"width": 810, "height": 1080},
+        "screen": {"width": 810, "height": 1080},
+        "device_scale_factor": 2,
+        "is_mobile": True,
+        "has_touch": True,
+    },
+}
+
+
+def resolved_device_descriptor(
+    device: DevicePreset,
+    device_descriptors: dict[str, dict[str, object]] | None = None,
+) -> dict[str, object]:
+    """Return the Playwright device descriptor, or a built-in fallback."""
+    name = DEVICE_DESCRIPTOR_NAMES.get(device)
+    if name is None:
+        return {}
+    live = (device_descriptors or {}).get(name)
+    if live:
+        return dict(live)
+    fallback = DEVICE_DESCRIPTOR_FALLBACKS.get(device)
+    return dict(fallback) if fallback else {}
+
+
+def viewport_from_named(viewport: Viewport) -> Viewport:
+    """Copy a named viewport without treating omitted size/DSF as explicit."""
+    fields = viewport.model_fields_set
+    return Viewport(
+        **{
+            name: getattr(viewport, name)
+            for name in ("width", "height", "device_scale_factor")
+            if name in fields
+        }
+    )
+
+
+def apply_device_metrics(
+    request: RenderRequest,
+    device_descriptors: dict[str, dict[str, object]] | None = None,
+) -> RenderRequest:
+    """Fill implicit viewport/DSF from the device descriptor.
+
+    Explicit caller `viewport.width`, `viewport.height`, or
+    `viewport.device_scale_factor` values still win.
+    """
+    descriptor = resolved_device_descriptor(
+        request.environment.device, device_descriptors
+    )
+    if not descriptor:
+        return request
+    desc_viewport = descriptor.get("viewport")
+    if not isinstance(desc_viewport, dict):
+        desc_viewport = {}
+    explicit = request.viewport.model_fields_set
+    updates: dict[str, object] = {}
+    if "width" not in explicit and "width" in desc_viewport:
+        updates["width"] = desc_viewport["width"]
+    if "height" not in explicit and "height" in desc_viewport:
+        updates["height"] = desc_viewport["height"]
+    scale = descriptor.get("device_scale_factor")
+    if "device_scale_factor" not in explicit and scale is not None:
+        updates["device_scale_factor"] = scale
+    if not updates:
+        return request
+    return request.model_copy(
+        update={"viewport": request.viewport.model_copy(update=updates)}
+    )
+
+
+def _descriptor_screen(descriptor: dict[str, object]) -> dict[str, object]:
+    screen = descriptor.get("screen")
+    if isinstance(screen, dict):
+        return dict(screen)
+    viewport = descriptor.get("viewport")
+    if isinstance(viewport, dict):
+        return dict(viewport)
+    return {}
+
+
+def device_context_options(
+    request: RenderRequest,
+    device_descriptors: dict[str, dict[str, object]] | None = None,
+) -> dict[str, object]:
+    """Context options for a device preset, honoring explicit viewport/DSF."""
+    explicit = request.viewport.model_fields_set
+    descriptor = resolved_device_descriptor(
+        request.environment.device, device_descriptors
+    )
+    options: dict[str, object] = {}
+    if descriptor:
+        options.update(descriptor)
+        options.pop("default_browser_type", None)
+    resolved = apply_device_metrics(request, device_descriptors)
+    options["viewport"] = {
+        "width": resolved.viewport.width,
+        "height": resolved.viewport.height,
+    }
+    if not descriptor or "device_scale_factor" in explicit:
+        options["device_scale_factor"] = resolved.viewport.device_scale_factor
+    if descriptor:
+        screen = _descriptor_screen(descriptor)
+        if "width" in explicit:
+            screen["width"] = resolved.viewport.width
+        if "height" in explicit:
+            screen["height"] = resolved.viewport.height
+        if screen:
+            options["screen"] = screen
+    else:
+        options["screen"] = {
+            "width": resolved.viewport.width,
+            "height": resolved.viewport.height,
+        }
+    if request.environment.device is not DevicePreset.DESKTOP:
+        options.setdefault("has_touch", True)
+    return options
+
+
 MAX_METADATA_ITEMS = 100
 MAX_METADATA_VALUE_CHARS = 2_048
 DNS_RESOLUTION_TIMEOUT_SECONDS = 5
@@ -2363,11 +2497,7 @@ class RenderEngine:
                     )
                     single = request.model_copy(
                         update={
-                            "viewport": Viewport(
-                                width=viewport.width,
-                                height=viewport.height,
-                                device_scale_factor=viewport.device_scale_factor,
-                            ),
+                            "viewport": viewport_from_named(viewport),
                             "viewports": None,
                             "environment": environment,
                         }
@@ -2456,6 +2586,8 @@ class RenderEngine:
     ) -> RenderArtifact:
         from .content_rendering import input_document, render_document_output
 
+        context_device = device_context_options(request, self.device_descriptors)
+        request = apply_device_metrics(request, self.device_descriptors)
         target = str(request.url or request.base_url or "about:blank")
         public_urls = PublicUrlValidator()
         if self.hosted and target != "about:blank" and not await public_urls.is_public(target):
@@ -2527,23 +2659,12 @@ class RenderEngine:
                         "width": request.viewport.width,
                         "height": request.viewport.height,
                     }
-                descriptor_name = DEVICE_DESCRIPTOR_NAMES.get(request.environment.device)
-                if descriptor_name:
-                    context_options.update(self.device_descriptors.get(descriptor_name, {}))
-                    context_options.pop("default_browser_type", None)
+                if context_device:
+                    context_options.update(context_device)
                     if request.engine.value == BrowserEngine.FIREFOX.value:
                         context_options.pop("is_mobile", None)
                 context_options.update(
                     {
-                        "viewport": {
-                            "width": request.viewport.width,
-                            "height": request.viewport.height,
-                        },
-                        "screen": {
-                            "width": request.viewport.width,
-                            "height": request.viewport.height,
-                        },
-                        "device_scale_factor": request.viewport.device_scale_factor,
                         "java_script_enabled": request.network.java_script_enabled,
                         "service_workers": (
                             "block"
