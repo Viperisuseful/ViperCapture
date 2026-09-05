@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import suppress
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from .render_contract import RenderRequest
 from .render_errors import RenderError
+
+CLIENT_DISCONNECTED_STATE = "client_disconnected"
 
 MAX_BULK_BODY_BYTES = 6 * 1024 * 1024
 MAX_JSON_BODY_BYTES = 32 * 1024 * 1024
@@ -77,18 +82,43 @@ class BulkBodyLimitMiddleware:
             if not message.get("more_body", False):
                 break
 
+        disconnected = asyncio.Event()
+        state = scope.setdefault("state", {})
+        if isinstance(state, dict):
+            state[CLIENT_DISCONNECTED_STATE] = disconnected
+
+        async def watch_disconnect() -> None:
+            try:
+                while True:
+                    message = await receive()
+                    if message["type"] == "http.disconnect":
+                        disconnected.set()
+                        return
+            except Exception:
+                disconnected.set()
+
+        watcher = asyncio.create_task(watch_disconnect())
         delivered = False
 
         async def replay():
             nonlocal delivered
-            if delivered:
-                return {"type": "http.request", "body": b"", "more_body": False}
-            delivered = True
-            payload = bytes(body)
-            body.clear()
-            return {"type": "http.request", "body": payload, "more_body": False}
+            if disconnected.is_set():
+                return {"type": "http.disconnect"}
+            if not delivered:
+                delivered = True
+                payload = bytes(body)
+                body.clear()
+                return {"type": "http.request", "body": payload, "more_body": False}
+            await disconnected.wait()
+            return {"type": "http.disconnect"}
 
-        await self.app(scope, replay, send)
+        try:
+            await self.app(scope, replay, send)
+        finally:
+            if not watcher.done():
+                watcher.cancel()
+                with suppress(asyncio.CancelledError):
+                    await watcher
 
     def _raise_limit(self, maximum: int) -> None:
         raise RenderError(
