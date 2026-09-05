@@ -154,6 +154,79 @@ def test_disconnect_releases_capture_slot_promptly() -> None:
     asyncio.run(run())
 
 
+def test_two_abandoned_renders_do_not_block_third_slot() -> None:
+    """Match the reported VIPERCAPTURE_MAX_CONCURRENCY=2 stress case."""
+
+    async def run() -> None:
+        slots = asyncio.Semaphore(2)
+        abandoned = [asyncio.Event(), asyncio.Event()]
+        started = [asyncio.Event(), asyncio.Event()]
+
+        async def occupy(index: int) -> None:
+            request = SimpleNamespace(
+                state=SimpleNamespace(
+                    **{CLIENT_DISCONNECTED_STATE: abandoned[index]}
+                ),
+                is_disconnected=None,
+            )
+            await slots.acquire()
+            started[index].set()
+            try:
+                await _await_while_connected(request, asyncio.sleep(10))
+            except RenderError as exc:
+                assert exc.code == "client_disconnected"
+            finally:
+                slots.release()
+
+        async def third_render() -> int:
+            await started[0].wait()
+            await started[1].wait()
+            await asyncio.sleep(0.05)
+            abandoned[0].set()
+            abandoned[1].set()
+            started_at = time.perf_counter()
+            await asyncio.wait_for(slots.acquire(), timeout=1)
+            queue_ms = round((time.perf_counter() - started_at) * 1000)
+            slots.release()
+            return queue_ms
+
+        first = asyncio.create_task(occupy(0))
+        second = asyncio.create_task(occupy(1))
+        queue_ms = await third_render()
+        await asyncio.gather(first, second)
+        assert queue_ms < 750
+
+    asyncio.run(run())
+
+
+def test_await_while_connected_polls_is_disconnected_without_event() -> None:
+    async def run() -> None:
+        flags = {"gone": False}
+
+        async def is_disconnected() -> bool:
+            return flags["gone"]
+
+        request = SimpleNamespace(state=SimpleNamespace(), is_disconnected=is_disconnected)
+
+        async def drop_client() -> None:
+            await asyncio.sleep(0.05)
+            flags["gone"] = True
+
+        drop = asyncio.create_task(drop_client())
+        started = time.perf_counter()
+        try:
+            with pytest.raises(RenderError) as details:
+                await _await_while_connected(request, asyncio.sleep(5))
+        finally:
+            drop.cancel()
+            with suppress(asyncio.CancelledError):
+                await drop
+        assert details.value.status_code == 499
+        assert time.perf_counter() - started < 1.0
+
+    asyncio.run(run())
+
+
 def test_await_while_connected_returns_completed_work() -> None:
     async def run() -> None:
         request = SimpleNamespace(state=SimpleNamespace(), is_disconnected=None)
