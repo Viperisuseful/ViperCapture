@@ -954,12 +954,40 @@ class RenderRequest(StrictModel):
         ) else self.output.value
 
 
+_VIEWPORT_SIZE_FIELDS = ("width", "height", "device_scale_factor")
+
+
+def _omit_unset_viewport_size_fields(
+    dumped: dict[str, object],
+    viewport: Viewport,
+    device: DevicePreset,
+) -> None:
+    """Drop default size/DSF so a later validate() keeps them implicit."""
+    if device is DevicePreset.DESKTOP:
+        return
+    for field in _VIEWPORT_SIZE_FIELDS:
+        if field not in viewport.model_fields_set:
+            dumped.pop(field, None)
+
+
 def canonical_render_document(
     request: RenderRequest,
     **dump_options,
 ) -> dict[str, object]:
     """Serialize request collections deterministically across processes."""
     document = request.model_dump(mode="json", **dump_options)
+    viewport_document = document.get("viewport")
+    if isinstance(viewport_document, dict):
+        _omit_unset_viewport_size_fields(
+            viewport_document, request.viewport, request.environment.device
+        )
+        if request.environment.device is not DevicePreset.DESKTOP and not viewport_document:
+            document.pop("viewport", None)
+    named_documents = document.get("viewports")
+    if isinstance(named_documents, list) and request.viewports:
+        for dumped, named in zip(named_documents, request.viewports):
+            if isinstance(dumped, dict):
+                _omit_unset_viewport_size_fields(dumped, named, named.device)
     for name in ("elements", "side_outputs"):
         if document.get(name) is None:
             document.pop(name, None)
