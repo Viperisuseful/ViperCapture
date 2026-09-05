@@ -135,3 +135,264 @@ def test_hosted_mode_always_installs_request_routing() -> None:
 
     assert needs_request_routing(True, {}, False) is True
     assert needs_request_routing(False, {}, False) is False
+
+
+class _FakeRoute:
+    def __init__(self, url: str, resource_type: str = "image") -> None:
+        self.request = type(
+            "Req",
+            (),
+            {
+                "url": url,
+                "resource_type": resource_type,
+                "headers": {},
+                "frame": type("Frame", (), {"parent_frame": None})(),
+                "is_navigation_request": lambda self: False,
+            },
+        )()
+        self.aborted = False
+
+    async def abort(self, _reason: str) -> None:
+        self.aborted = True
+
+    async def continue_(self, headers=None) -> None:
+        return None
+
+
+def _fake_browser(route_urls: list[str]):
+    route_handler: dict[str, object] = {}
+
+    class FakePage:
+        url = "about:blank"
+        frames: list[object] = []
+
+        def on(self, *_args, **_kwargs) -> None:
+            return None
+
+        async def set_content(self, _document, **_kwargs) -> None:
+            handler = route_handler.get("fn")
+            if handler is None:
+                return
+            for url in route_urls:
+                await handler(_FakeRoute(url))
+
+        async def close(self) -> None:
+            return None
+
+    class FakeContext:
+        async def route(self, _pattern, handler) -> None:
+            route_handler["fn"] = handler
+
+        async def route_web_socket(self, _pattern, _handler) -> None:
+            return None
+
+        async def new_page(self) -> FakePage:
+            return FakePage()
+
+        async def close(self) -> None:
+            return None
+
+    class FakeBrowser:
+        async def new_context(self, **_kwargs) -> FakeContext:
+            return FakeContext()
+
+        def is_connected(self) -> bool:
+            return True
+
+    return FakeBrowser()
+
+
+def _run_isolated_render(engine, request, browser):
+    from unittest.mock import AsyncMock, patch
+
+    from vipercapture.render_engine import RenderArtifact, RenderLimits
+
+    async def fake_metadata(_page, _selectors):
+        return RenderArtifact(b'{"title":"h"}', "application/json", "meta.json")
+
+    async def run():
+        with (
+            patch.object(engine, "_wait", new=AsyncMock()),
+            patch.object(engine, "_wait_for_images", new=AsyncMock()),
+            patch.object(engine, "_run_actions", new=AsyncMock()),
+            patch.object(engine, "_check_assertions", new=AsyncMock()),
+            patch("vipercapture.render_engine.render_metadata", fake_metadata),
+        ):
+            return await engine._render_single(browser, request, RenderLimits())
+
+    return asyncio.run(run())
+
+
+def test_hosted_html_private_subresource_fails_on_success_path() -> None:
+    from vipercapture.render_engine import RenderEngine
+
+    engine = RenderEngine(hosted=True)
+    request = RenderRequest.model_validate(
+        {
+            "html": '<h1>h</h1><img src="http://169.254.169.254/latest/meta-data/">',
+            "output": "metadata",
+            "full_page": False,
+        }
+    )
+    with pytest.raises(RenderError) as details:
+        _run_isolated_render(
+            engine,
+            request,
+            _fake_browser(["http://169.254.169.254/latest/meta-data/"]),
+        )
+    assert details.value.code == "subresource_not_public"
+    assert details.value.status_code == 400
+    assert details.value.retryable is False
+
+
+def test_hosted_markdown_private_subresource_fails_on_success_path() -> None:
+    from vipercapture.render_engine import RenderEngine
+
+    engine = RenderEngine(hosted=True)
+    request = RenderRequest.model_validate(
+        {
+            "markdown": "![x](http://169.254.169.254/latest/meta-data/)",
+            "output": "metadata",
+            "full_page": False,
+        }
+    )
+    with pytest.raises(RenderError) as details:
+        _run_isolated_render(
+            engine,
+            request,
+            _fake_browser(["http://169.254.169.254/latest/meta-data/"]),
+        )
+    assert details.value.code == "subresource_not_public"
+    assert details.value.status_code == 400
+
+
+def test_hosted_html_without_private_subresource_succeeds() -> None:
+    from vipercapture.render_engine import RenderEngine
+
+    engine = RenderEngine(hosted=True)
+    request = RenderRequest.model_validate(
+        {
+            "html": "<h1>h</h1><img src=\"data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7\">",
+            "output": "metadata",
+            "full_page": False,
+        }
+    )
+    artifact = _run_isolated_render(
+        engine,
+        request,
+        _fake_browser(
+            [
+                "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+            ]
+        ),
+    )
+    assert artifact.media_type == "application/json"
+    assert artifact.metadata.get("blocked_subresources") == 0
+
+
+def test_hosted_private_subresource_still_wins_on_unrelated_exception() -> None:
+    from unittest.mock import AsyncMock, patch
+
+    from vipercapture.render_engine import RenderEngine, RenderLimits
+
+    engine = RenderEngine(hosted=True)
+    request = RenderRequest.model_validate(
+        {
+            "html": '<h1>h</h1><img src="http://169.254.169.254/latest/meta-data/">',
+            "output": "metadata",
+            "full_page": False,
+        }
+    )
+
+    async def boom(*_args, **_kwargs):
+        raise RuntimeError("unrelated capture failure")
+
+    async def run() -> None:
+        with (
+            patch.object(engine, "_wait", new=boom),
+            patch.object(engine, "_wait_for_images", new=AsyncMock()),
+            patch.object(engine, "_run_actions", new=AsyncMock()),
+            patch.object(engine, "_check_assertions", new=AsyncMock()),
+        ):
+            await engine._render_single(
+                _fake_browser(["http://169.254.169.254/latest/meta-data/"]),
+                request,
+                RenderLimits(),
+            )
+
+    with pytest.raises(RenderError) as details:
+        asyncio.run(run())
+    assert details.value.code == "subresource_not_public"
+    assert details.value.status_code == 400
+    assert "unrelated capture failure" in str(details.value.__cause__)
+
+
+def test_self_host_html_private_subresource_is_allowed() -> None:
+    from vipercapture.render_engine import RenderEngine
+
+    engine = RenderEngine(hosted=False)
+    request = RenderRequest.model_validate(
+        {
+            "html": '<h1>h</h1><img src="http://169.254.169.254/latest/meta-data/">',
+            "output": "metadata",
+            "full_page": False,
+        }
+    )
+    artifact = _run_isolated_render(
+        engine,
+        request,
+        _fake_browser(["http://169.254.169.254/latest/meta-data/"]),
+    )
+    assert artifact.media_type == "application/json"
+    assert artifact.metadata.get("blocked_subresources") == 0
+
+
+def test_hosted_direct_private_url_is_target_not_public() -> None:
+    from vipercapture.render_engine import RenderEngine, RenderLimits
+
+    engine = RenderEngine(hosted=True)
+    request = RenderRequest.model_validate(
+        {"url": "http://169.254.169.254/latest/meta-data/", "output": "png"}
+    )
+
+    class UnusedBrowser:
+        async def new_context(self, **_kwargs):
+            raise AssertionError("private main target must fail before a browser context")
+
+        def is_connected(self) -> bool:
+            return True
+
+    async def run() -> None:
+        await engine._render_single(UnusedBrowser(), request, RenderLimits())
+
+    with pytest.raises(RenderError) as details:
+        asyncio.run(run())
+    assert details.value.code == "target_not_public"
+    assert details.value.status_code == 400
+
+
+def test_self_host_direct_private_url_passes_public_check() -> None:
+    from vipercapture.render_engine import RenderEngine, RenderLimits
+
+    engine = RenderEngine(hosted=False)
+    request = RenderRequest.model_validate(
+        {"url": "http://127.0.0.1/", "output": "png"}
+    )
+    reached = {"context": False}
+
+    class ProbeBrowser:
+        async def new_context(self, **_kwargs):
+            reached["context"] = True
+            raise RuntimeError("self-host-allowed-private-target")
+
+        def is_connected(self) -> bool:
+            return True
+
+    async def run() -> None:
+        await engine._render_single(ProbeBrowser(), request, RenderLimits())
+
+    with pytest.raises(RenderError) as details:
+        asyncio.run(run())
+    assert reached["context"] is True
+    assert details.value.code == "render_failed"
+    assert "self-host-allowed-private-target" in str(details.value.__cause__)
