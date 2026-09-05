@@ -1105,6 +1105,26 @@ def needs_request_routing(
     return hosted or bool(custom_headers) or cleanup_enabled
 
 
+def _private_subresource_error() -> RenderError:
+    return RenderError(
+        "subresource_not_public",
+        "The page requested a private or non-public resource.",
+        400,
+        False,
+    )
+
+
+def _reject_blocked_private_subresources(blocked: bool) -> None:
+    """Fail a completed hosted render that blocked a private subresource.
+
+    Route abort is not enough: HTML/Markdown loads `about:blank`, so the
+    main-target public check never runs, and a successful capture would
+    otherwise return HTTP 200 with only a `blocked_subresources` count.
+    """
+    if blocked:
+        raise _private_subresource_error()
+
+
 def _invalid_selector_error(error: PlaywrightError) -> bool:
     message = str(error).lower()
     return any(
@@ -2801,6 +2821,7 @@ class RenderEngine:
                     await self._persist_profile_state(
                         request, pending_profile_state
                     )
+                    _reject_blocked_private_subresources(blocked_private_subresources)
                     return finalized
 
                 if request.output not in MEDIA_TYPES:
@@ -2854,6 +2875,7 @@ class RenderEngine:
                         page=page, context=context,
                     )
                     await self._persist_profile(request, context)
+                    _reject_blocked_private_subresources(blocked_private_subresources)
                     return finalized
 
                 screenshot_output = (
@@ -3107,6 +3129,7 @@ class RenderEngine:
                         context=context,
                     )
                     await self._persist_profile(request, context)
+                    _reject_blocked_private_subresources(blocked_private_subresources)
                     return finalized
                 if uses_cdp_capture:
                     scroll = {"x": 0, "y": 0}
@@ -3290,6 +3313,7 @@ class RenderEngine:
                     page=page, context=context,
                 )
                 await self._persist_profile(request, context)
+                _reject_blocked_private_subresources(blocked_private_subresources)
                 return finalized
         except TimeoutError as exc:
             raise RenderError("render_timeout", "The render exceeded its total deadline.", 504, True) from exc
@@ -3297,12 +3321,7 @@ class RenderEngine:
             raise
         except Exception as exc:
             if blocked_private_subresources:
-                raise RenderError(
-                    "subresource_not_public",
-                    "The page requested a private or non-public resource.",
-                    400,
-                    False,
-                ) from exc
+                raise _private_subresource_error() from exc
             raise RenderError("render_failed", "The image render failed.", 500, True) from exc
         finally:
             if cdp_session is not None and page is not None:
