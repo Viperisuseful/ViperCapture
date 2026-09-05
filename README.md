@@ -250,9 +250,11 @@ npm ci --prefix frontend && npm run lint --prefix frontend && npm run build --pr
 ```
 
 Without uv, use `python -m venv .venv` and
-`python -m pip install -r requirements.txt` instead, then the same Playwright,
-frontend, and smoke commands. On Windows, use `.venv\Scripts\python` and omit
-`--with-deps` from the Playwright command. On macOS, omit `--with-deps`.
+`.venv/bin/python -m pip install -r requirements.txt` instead, then the same
+Playwright, frontend, and smoke commands. On Windows, use
+`.venv\Scripts\python -m pip install -r requirements.txt` and
+`.venv\Scripts\python` for Playwright and smoke, and omit `--with-deps` from
+the Playwright command. On macOS, omit `--with-deps`.
 The smoke command starts a temporary local server and verifies Chromium,
 Firefox, WebKit, OpenAPI, health, and output dimensions. Pass
 `--base-url http://host:port` to check an existing deployment instead. For an

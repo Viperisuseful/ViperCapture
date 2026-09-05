@@ -36,6 +36,8 @@ python -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
+On Windows, use `.venv\Scripts\python -m pip install -r requirements.txt`.
+
 ## Prepare a change
 
 Keep the pull request limited to one change. Include:

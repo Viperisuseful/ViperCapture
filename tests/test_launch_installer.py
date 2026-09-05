@@ -30,23 +30,24 @@ class FindUvTests(unittest.TestCase):
 
 class InstallerCommandTests(unittest.TestCase):
     def test_venv_prefers_uv(self) -> None:
-        command = launch.venv_command("/usr/bin/python3", Path("/tmp/.venv"), "/opt/uv")
+        venv_dir = Path("/tmp/.venv")
+        command = launch.venv_command("/usr/bin/python3", venv_dir, "/opt/uv")
         self.assertEqual(
             command,
-            ["/opt/uv", "venv", "--python", "/usr/bin/python3", "/tmp/.venv"],
+            ["/opt/uv", "venv", "--python", "/usr/bin/python3", str(venv_dir)],
         )
 
     def test_venv_falls_back_to_stdlib(self) -> None:
-        command = launch.venv_command("/usr/bin/python3", Path("/tmp/.venv"), None)
+        venv_dir = Path("/tmp/.venv")
+        command = launch.venv_command("/usr/bin/python3", venv_dir, None)
         self.assertEqual(
             command,
-            ["/usr/bin/python3", "-m", "venv", "/tmp/.venv"],
+            ["/usr/bin/python3", "-m", "venv", str(venv_dir)],
         )
 
     def test_deps_prefer_uv_pip(self) -> None:
-        commands = launch.deps_commands(
-            "/venv/bin/python", Path("/app/requirements.txt"), "/opt/uv"
-        )
+        requirements = Path("/app/requirements.txt")
+        commands = launch.deps_commands("/venv/bin/python", requirements, "/opt/uv")
         self.assertEqual(
             commands,
             [(
@@ -57,16 +58,15 @@ class InstallerCommandTests(unittest.TestCase):
                     "--python",
                     "/venv/bin/python",
                     "-r",
-                    "/app/requirements.txt",
+                    str(requirements),
                 ],
                 "uv pip install",
             )],
         )
 
     def test_deps_fall_back_to_pip(self) -> None:
-        commands = launch.deps_commands(
-            "/venv/bin/python", Path("/app/requirements.txt"), None
-        )
+        requirements = Path("/app/requirements.txt")
+        commands = launch.deps_commands("/venv/bin/python", requirements, None)
         self.assertEqual(
             [label for _command, label in commands],
             ["pip upgrade", "pip install"],
@@ -79,7 +79,7 @@ class InstallerCommandTests(unittest.TestCase):
                 "pip",
                 "install",
                 "-r",
-                "/app/requirements.txt",
+                str(requirements),
             ],
         )
 
