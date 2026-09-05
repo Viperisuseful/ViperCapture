@@ -55,8 +55,10 @@ updates resize that reservation and deletion releases it.
 `deterministic.enabled` fixes `Date`, `Math.random`, Web Crypto random values
 and UUIDs, and the browser performance clock; it also waits for fonts and
 combines with the existing animation stabilization. `slices` emits a ZIP
-of bounded-height full-page sections. A diagnostic bundle can add redacted HAR,
-Playwright trace, and WARC files. `certification.enabled` produces an
+of bounded-height full-page sections. A diagnostic bundle can add a redacted
+HAR 1.2 log (real HTTP versions, safe headers, mime types, and timings; query
+strings, cookies, credentials, and bodies omitted), Playwright trace, and WARC
+files. `certification.enabled` produces an
 Ed25519-signed manifest when `VIPERCAPTURE_CERTIFICATION_SECRET` is set to at
 least 32 bytes. Certification proves bundle integrity; it does not by itself
 make a legal-admissibility claim.

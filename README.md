@@ -50,7 +50,8 @@ are moving from another rendering service, start with the
 - Expiring HMAC-signed render URLs and a 24-hour exact-request image cache
 - Visual regression ZIPs with pixel counts, pass/fail thresholds, bounds, and
   highlighted changes
-- Diagnostic ZIPs with console/network data and optional HAR,
+- Diagnostic ZIPs with console/network data and optional redacted HAR
+  (HTTP versions, safe headers, mime types, timings),
   redacted Playwright trace, and WARC; Ed25519-certified artifact bundles
 - Deterministic capture controls, sectioned slice ZIPs, project-owned visual
   baselines, and reproducible comparison reports

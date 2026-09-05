@@ -19,6 +19,9 @@ running, the interactive OpenAPI reference is available at `/docs`.
 `viewports` accepts two or three named image viewports and returns a ZIP with a
 manifest. `diagnostics.bundle` returns a ZIP containing the normal artifact,
 manifest, and optionally bounded console and network event files.
+`diagnostics.include_har=true` adds `network.har`, a redacted HAR 1.2 log with
+observed HTTP versions, safe headers, mime types, and timings. Query strings,
+cookies, credentials, and bodies are omitted.
 WebM setup/navigation frames are trimmed from the recording with Playwright's
 FFmpeg runtime, and `duration_ms` reports the verified encoded duration rather
 than merely echoing the request.
