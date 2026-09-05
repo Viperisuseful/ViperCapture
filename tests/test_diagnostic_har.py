@@ -12,12 +12,16 @@ import pytest
 
 from vipercapture.render_contract import RenderRequest
 from vipercapture.render_engine import (
+    MAX_DIAGNOSTIC_EVENTS,
     RenderArtifact,
     RenderLimits,
     apply_network_timing,
+    apply_observed_http_versions,
     collect_network_event,
+    decoded_content_size,
     diagnostic_bundle,
     diagnostic_url,
+    enqueue_bounded_protocol,
     har_http_version,
     har_timings,
     mime_type_from_headers,
@@ -43,6 +47,7 @@ def _event(**overrides: object) -> dict[str, object]:
         ],
         "mime_type": "text/html",
         "content_size": 12,
+        "body_size": 12,
         "redirect_url": "",
         "timing": {
             "startTime": 1_700_000_000_000,
@@ -65,6 +70,15 @@ def test_diagnostic_url_strips_query_tokens() -> None:
     assert (
         diagnostic_url("http://127.0.0.1/callback?access_token=secret&state=1")
         == "http://127.0.0.1/callback"
+    )
+
+
+def test_diagnostic_url_strips_matrix_session_params() -> None:
+    assert diagnostic_url("https://ex.com/a;jsessionid=SECRET") == "https://ex.com/a"
+    assert diagnostic_url("/a;jsessionid=SECRET?x=1") == "/a"
+    assert (
+        diagnostic_url("https://ex.com/a;jsessionid=SECRET/b;x=1?q=2")
+        == "https://ex.com/a/b"
     )
 
 
@@ -98,6 +112,104 @@ def test_safe_har_headers_redact_credentials_and_url_tokens() -> None:
     assert ":status" not in by_name
 
 
+def test_safe_har_headers_allowlist_custom_tokens() -> None:
+    headers = safe_har_headers(
+        [
+            {"name": "X-Shopify-Access-Token", "value": "shpat_secret"},
+            {"name": "Private-Token", "value": "glpat-secret"},
+            {"name": "X-Custom-Auth", "value": "super-secret"},
+            {"name": "Content-Type", "value": "text/html"},
+        ]
+    )
+    by_name = {item["name"].lower(): item["value"] for item in headers}
+    assert by_name["x-shopify-access-token"] == "[redacted]"
+    assert by_name["private-token"] == "[redacted]"
+    assert by_name["x-custom-auth"] == "[redacted]"
+    assert by_name["content-type"] == "text/html"
+    serialized = json.dumps(headers)
+    assert "shpat_secret" not in serialized
+    assert "glpat-secret" not in serialized
+    assert "super-secret" not in serialized
+
+
+def test_safe_har_headers_strip_relative_url_queries() -> None:
+    headers = safe_har_headers(
+        [
+            {"name": "Location", "value": "/callback?code=secret"},
+            {"name": "Content-Location", "value": "//cdn.example/app.js?token=secret"},
+            {"name": "Referer", "value": "/from?session=secret"},
+            {"name": "Refresh", "value": "0; url=/next?code=secret"},
+            {"name": "Link", "value": "</assets/app.js?token=secret>; rel=preload"},
+        ]
+    )
+    by_name = {item["name"].lower(): item["value"] for item in headers}
+    assert by_name["location"] == "/callback"
+    assert by_name["content-location"] == "//cdn.example/app.js"
+    assert by_name["referer"] == "/from"
+    assert by_name["refresh"] == "0; url=/next"
+    assert by_name["link"] == "</assets/app.js>; rel=preload"
+    serialized = json.dumps(headers)
+    assert "secret" not in serialized
+    assert "code=" not in serialized
+    assert "token=" not in serialized
+
+
+def test_safe_har_headers_sanitize_unquoted_link_and_refresh() -> None:
+    headers = safe_har_headers(
+        [
+            {"name": "Refresh", "value": "5; /callback?code=oauth_secret"},
+            {"name": "Link", "value": "https://ex.com/x?token=oauth_secret; rel=preload"},
+            {"name": "Link", "value": "/assets/app.js?token=secret; rel=preload"},
+            {"name": "Refresh", "value": "0; url=/next?a=1;b=secret"},
+        ]
+    )
+    serialized = json.dumps(headers)
+    assert "oauth_secret" not in serialized
+    assert "secret" not in serialized
+    assert "token=" not in serialized
+    assert "code=" not in serialized
+    assert "b=secret" not in serialized
+    by_name: dict[str, list[str]] = {}
+    for item in headers:
+        by_name.setdefault(item["name"].lower(), []).append(item["value"])
+    assert by_name["refresh"][0] == "5; /callback"
+    assert by_name["link"][0].startswith("https://ex.com/x")
+    assert "rel=preload" in by_name["link"][0]
+    assert by_name["link"][1].startswith("/assets/app.js")
+    assert "rel=preload" in by_name["link"][1]
+    assert by_name["refresh"][1] == "0; url=/next"
+
+
+def test_safe_har_headers_strip_matrix_params_from_location() -> None:
+    headers = safe_har_headers(
+        [
+            {"name": "Location", "value": "https://ex.com/a;jsessionid=SECRET"},
+            {"name": "Referer", "value": "/a;jsessionid=SECRET?x=1"},
+        ]
+    )
+    by_name = {item["name"].lower(): item["value"] for item in headers}
+    assert by_name["location"] == "https://ex.com/a"
+    assert by_name["referer"] == "/a"
+    assert "SECRET" not in json.dumps(headers)
+    assert "jsessionid" not in json.dumps(headers)
+
+
+def test_safe_har_headers_redact_content_disposition_filename() -> None:
+    headers = safe_har_headers(
+        [
+            {
+                "name": "Content-Disposition",
+                "value": 'attachment; filename="token=oauth_secret.txt"',
+            },
+            {"name": "ETag", "value": '"opaque-validator"'},
+        ]
+    )
+    by_name = {item["name"].lower(): item["value"] for item in headers}
+    assert "oauth_secret" not in by_name["content-disposition"]
+    assert 'filename="[redacted]"' in by_name["content-disposition"]
+    assert by_name["etag"] == '"opaque-validator"'
+
+
 def test_har_document_uses_observed_fields_instead_of_stubs() -> None:
     document = json.loads(_har_document([_event()]))
     entry = document["log"]["entries"][0]
@@ -109,6 +221,7 @@ def test_har_document_uses_observed_fields_instead_of_stubs() -> None:
     assert entry["response"]["headers"][0]["name"] == "Content-Type"
     assert entry["response"]["content"]["mimeType"] == "text/html"
     assert entry["response"]["content"]["size"] == 12
+    assert entry["response"]["bodySize"] == 12
     assert entry["time"] > 0
     assert entry["timings"]["wait"] == 7
     assert entry["timings"]["receive"] == 5
@@ -177,6 +290,7 @@ def test_collect_network_event_redacts_query_and_keeps_safe_headers() -> None:
     assert event["http_version"] == "HTTP/1.1"
     assert event["mime_type"] == "text/html"
     assert event["content_size"] == 19
+    assert event["body_size"] == 19
     assert event["status_text"] == "OK"
     assert {"name": "Accept", "value": "text/html"} in event["request_headers"]
     assert any(
@@ -287,7 +401,9 @@ def test_diagnostic_bundle_manifest_and_har_match_privacy() -> None:
         har = json.loads(archive.read("network.har"))
         network = json.loads(archive.read("network.json"))
     assert "access_token" not in manifest["artifact"]["metadata"]["final_url"]
-    assert "Safe request and response headers" in manifest["privacy"]
+    assert "allowlisted request and response header names" in manifest["privacy"]
+    assert "Firefox and WebKit" in manifest["har_completeness"]
+    assert "Resource Timing" in har["log"]["comment"]
     entry = har["log"]["entries"][0]
     assert entry["request"]["httpVersion"] == "HTTP/1.1"
     assert entry["request"]["headers"]
@@ -381,6 +497,184 @@ def test_http11_fixture_render_emits_accurate_har() -> None:
         and "text/html" in header["value"]
         for header in entry["response"]["headers"]
     )
+    assert all(
+        header["value"] == "[redacted]"
+        for header in entry["response"]["headers"]
+        if header["name"].lower() == "x-fixture"
+    )
     assert entry["response"]["content"]["mimeType"] == "text/html"
     assert entry["time"] > 0
     assert entry["timings"]["wait"] >= 0
+    if entry["timings"].get("ssl", -1) > 0:
+        assert entry["time"] == round(
+            sum(
+                value
+                for key, value in entry["timings"].items()
+                if key != "ssl" and value > 0
+            ),
+            3,
+        )
+
+
+def test_har_timings_exclude_ssl_from_total() -> None:
+    total, timings = har_timings(
+        {
+            "domainLookupStart": 0,
+            "domainLookupEnd": 1,
+            "connectStart": 1,
+            "secureConnectionStart": 2,
+            "connectEnd": 5,
+            "requestStart": 5,
+            "responseStart": 12,
+            "responseEnd": 17,
+        }
+    )
+    assert timings["ssl"] == 3
+    assert timings["connect"] == 4
+    assert timings["dns"] == 1
+    assert timings["wait"] == 7
+    assert timings["receive"] == 5
+    assert total == 17
+    assert total == round(
+        sum(value for key, value in timings.items() if key != "ssl" and value > 0),
+        3,
+    )
+
+
+def test_decoded_content_size_ignores_compressed_content_length() -> None:
+    compressed = {
+        "content-encoding": "gzip",
+        "content-length": "80",
+        "content-type": "text/html",
+    }
+    identity = {
+        "content-encoding": "identity",
+        "content-length": "19",
+        "content-type": "text/html",
+    }
+    brotli = [
+        {"name": "Content-Encoding", "value": "br"},
+        {"name": "Content-Length", "value": "40"},
+    ]
+    assert decoded_content_size(compressed) == -1
+    assert decoded_content_size(identity) == 19
+    assert decoded_content_size(brotli) == -1
+
+
+def test_collect_network_event_does_not_reuse_encoded_length_as_decoded() -> None:
+    request = SimpleNamespace(
+        method="GET",
+        resource_type="document",
+        headers={"accept": "text/html"},
+        timing={},
+    )
+    response = SimpleNamespace(
+        url="http://127.0.0.1/page",
+        status=200,
+        status_text="OK",
+        headers={
+            "content-type": "text/html",
+            "content-encoding": "gzip",
+            "content-length": "80",
+        },
+        headers_array=[
+            {"name": "Content-Type", "value": "text/html"},
+            {"name": "Content-Encoding", "value": "gzip"},
+            {"name": "Content-Length", "value": "80"},
+        ],
+        request=request,
+    )
+    event = collect_network_event(response)
+    assert event["content_size"] == -1
+    assert event["body_size"] == 80
+    document = json.loads(_har_document([event]))
+    entry = document["log"]["entries"][0]
+    assert entry["response"]["content"]["size"] == -1
+    assert entry["response"]["bodySize"] == 80
+
+
+def test_enqueue_bounded_protocol_stops_after_event_cap() -> None:
+    queue: dict[str, list[str]] = {}
+    queued = 0
+    for index in range(MAX_DIAGNOSTIC_EVENTS + 25):
+        queued = enqueue_bounded_protocol(
+            queue,
+            queued,
+            f"https://example.com/asset-{index}",
+            "h2",
+        )
+    assert queued == MAX_DIAGNOSTIC_EVENTS
+    assert sum(len(items) for items in queue.values()) == MAX_DIAGNOSTIC_EVENTS
+    queued = enqueue_bounded_protocol(queue, queued, "https://example.com/extra", "h2")
+    assert queued == MAX_DIAGNOSTIC_EVENTS
+    assert "https://example.com/extra" not in queue
+
+
+def test_apply_observed_http_versions_fills_unknown_from_resource_timing() -> None:
+    request = SimpleNamespace(url="https://example.com/page?access_token=secret")
+    events = [
+        {
+            "url": "https://example.com/page",
+            "http_version": "unknown",
+            "_request": request,
+        },
+        {
+            "url": "https://example.com/known",
+            "http_version": "HTTP/1.1",
+        },
+    ]
+    apply_observed_http_versions(
+        events,
+        {
+            "https://example.com/page?access_token=secret": "h2",
+            "https://example.com/known": "h3",
+        },
+    )
+    assert events[0]["http_version"] == "HTTP/2"
+    assert events[1]["http_version"] == "HTTP/1.1"
+
+
+def test_collect_network_event_redacts_custom_tokens_and_relative_location() -> None:
+    request = SimpleNamespace(
+        method="GET",
+        resource_type="document",
+        headers={
+            "accept": "text/html",
+            "x-shopify-access-token": "shpat_secret",
+            "private-token": "glpat-secret",
+        },
+        timing={},
+    )
+    response = SimpleNamespace(
+        url="http://127.0.0.1/start",
+        status=302,
+        status_text="Found",
+        headers={"location": "/callback?code=secret", "content-length": "0"},
+        headers_array=[
+            {"name": "Location", "value": "/callback?code=secret"},
+            {"name": "Content-Length", "value": "0"},
+        ],
+        request=request,
+    )
+    event = collect_network_event(response)
+    serialized = json.dumps(event)
+    assert "shpat_secret" not in serialized
+    assert "glpat-secret" not in serialized
+    assert "code=secret" not in serialized
+    assert event["redirect_url"] == "/callback"
+    session_response = SimpleNamespace(
+        url="https://ex.com/a;jsessionid=SECRET?x=1",
+        status=200,
+        status_text="OK",
+        headers={"content-type": "text/html"},
+        headers_array=[{"name": "Content-Type", "value": "text/html"}],
+        request=request,
+    )
+    session_event = collect_network_event(session_response)
+    assert session_event["url"] == "https://ex.com/a"
+    assert "SECRET" not in json.dumps(session_event)
+    assert "jsessionid" not in json.dumps(session_event)
+    assert any(
+        header["name"] == "Location" and header["value"] == "/callback"
+        for header in event["response_headers"]
+    )
