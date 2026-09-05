@@ -699,28 +699,103 @@ def diagnostic_url(value: str) -> str:
         return "invalid-url"
 
 
-SENSITIVE_HAR_HEADERS = frozenset(
+SAFE_HAR_HEADER_NAMES = frozenset(
     {
-        "authorization",
-        "proxy-authorization",
-        "cookie",
-        "set-cookie",
-        "set-cookie2",
-        "x-api-key",
-        "api-key",
-        "x-auth-token",
-        "x-access-token",
-        "x-csrf-token",
-        "x-xsrf-token",
-        "x-amz-security-token",
-        "www-authenticate",
-        "authentication-info",
-        "proxy-authenticate",
+        "accept",
+        "accept-ch",
+        "accept-charset",
+        "accept-encoding",
+        "accept-language",
+        "accept-ranges",
+        "access-control-allow-credentials",
+        "access-control-allow-headers",
+        "access-control-allow-methods",
+        "access-control-allow-origin",
+        "access-control-expose-headers",
+        "access-control-max-age",
+        "access-control-request-headers",
+        "access-control-request-method",
+        "age",
+        "allow",
+        "alt-svc",
+        "cache-control",
+        "connection",
+        "content-disposition",
+        "content-encoding",
+        "content-language",
+        "content-length",
+        "content-location",
+        "content-range",
+        "content-type",
+        "cross-origin-embedder-policy",
+        "cross-origin-opener-policy",
+        "cross-origin-resource-policy",
+        "date",
+        "dnt",
+        "etag",
+        "expect",
+        "expires",
+        "host",
+        "if-match",
+        "if-modified-since",
+        "if-none-match",
+        "if-range",
+        "if-unmodified-since",
+        "keep-alive",
+        "last-modified",
+        "link",
+        "location",
+        "origin",
+        "pragma",
+        "priority",
+        "range",
+        "referer",
+        "referrer-policy",
+        "refresh",
+        "retry-after",
+        "sec-ch-ua",
+        "sec-ch-ua-mobile",
+        "sec-ch-ua-platform",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "sec-fetch-user",
+        "server",
+        "strict-transport-security",
+        "te",
+        "timing-allow-origin",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "upgrade-insecure-requests",
+        "user-agent",
+        "vary",
+        "x-content-type-options",
+        "x-dns-prefetch-control",
+        "x-frame-options",
+        "x-permitted-cross-domain-policies",
+        "x-requested-with",
+        "x-robots-tag",
+        "x-ua-compatible",
+        "x-xss-protection",
     }
 )
 URL_BEARING_HAR_HEADERS = frozenset(
     {"location", "content-location", "referer", "refresh", "link"}
 )
+_REFRESH_URL_RE = re.compile(r"(url\s*=\s*)([^\s;]+)", re.IGNORECASE)
+_LINK_URL_RE = re.compile(r"<([^>]+)>")
+PERFORMANCE_PROTOCOL_SCRIPT = """() => {
+  const protocols = {};
+  for (const type of ["navigation", "resource"]) {
+    for (const entry of performance.getEntriesByType(type)) {
+      if (entry && entry.name && entry.nextHopProtocol) {
+        protocols[entry.name] = entry.nextHopProtocol;
+      }
+    }
+  }
+  return protocols;
+}"""
 HAR_HTTP_VERSIONS = {
     "h2": "HTTP/2",
     "h2c": "HTTP/2",
@@ -739,7 +814,16 @@ MAX_HAR_HEADERS = 64
 MAX_HAR_HEADER_CHARS = 4_096
 DIAGNOSTIC_NETWORK_PRIVACY = (
     "Query strings, credentials, cookies, and bodies are omitted. "
-    "Safe request and response headers, HTTP versions, mime types, and timings are retained."
+    "Only allowlisted request and response header names keep their values; "
+    "all other header values are redacted. URL-bearing header values have "
+    "query strings and fragments removed, including relative URLs. "
+    "HTTP versions, mime types, and timings are retained when observed."
+)
+DIAGNOSTIC_HAR_COMPLETENESS = (
+    "HTTP versions come from Chromium CDP Network.responseReceived when that "
+    "session starts, and are backfilled from Resource Timing nextHopProtocol "
+    "on every engine. Firefox and WebKit cannot use CDP, so HTTPS entries "
+    "without Resource Timing stay httpVersion unknown."
 )
 
 
@@ -769,12 +853,32 @@ def _header_items(headers_array: object) -> list[tuple[str, str]]:
     return items
 
 
+def _sanitize_embedded_url(url: str) -> str:
+    return diagnostic_url(url.strip().strip("\"'"))
+
+
+def _sanitize_url_bearing_header(name: str, value: str) -> str:
+    if name == "link":
+        return _LINK_URL_RE.sub(
+            lambda match: f"<{_sanitize_embedded_url(match.group(1))}>",
+            value,
+        )
+    if name == "refresh":
+        return _REFRESH_URL_RE.sub(
+            lambda match: match.group(1) + _sanitize_embedded_url(match.group(2)),
+            value,
+        )
+    return _sanitize_embedded_url(value)
+
+
 def _redact_header_value(name: str, value: str) -> str:
     lowered = name.lower()
     clipped = value[:MAX_HAR_HEADER_CHARS]
-    if lowered in SENSITIVE_HAR_HEADERS:
+    if lowered not in SAFE_HAR_HEADER_NAMES:
         return "[redacted]"
-    if lowered in URL_BEARING_HAR_HEADERS or "://" in clipped:
+    if lowered in URL_BEARING_HAR_HEADERS:
+        return _sanitize_url_bearing_header(lowered, clipped)
+    if "://" in clipped:
         return _HEADER_URL_RE.sub(lambda match: diagnostic_url(match.group(1)), clipped)
     return clipped
 
@@ -826,20 +930,43 @@ def mime_type_from_headers(headers: object) -> str:
     return str(raw).split(";", 1)[0].strip()
 
 
-def content_size_from_headers(headers: object) -> int:
+def _header_map_value(headers: object, header_name: str) -> str | None:
+    lowered = header_name.lower()
     if isinstance(headers, dict):
-        raw = headers.get("content-length") or headers.get("Content-Length")
-    else:
-        raw = None
-        for name, value in _header_items(headers):
-            if name.lower() == "content-length":
-                raw = value
-                break
+        for key, value in headers.items():
+            if str(key).lower() == lowered:
+                return str(value)
+        return None
+    for name, value in _header_items(headers):
+        if name.lower() == lowered:
+            return value
+    return None
+
+
+def content_size_from_headers(headers: object) -> int:
+    raw = _header_map_value(headers, "content-length")
     try:
         size = int(raw)
     except (TypeError, ValueError):
         return -1
     return size if size >= 0 else -1
+
+
+def content_encoding_from_headers(headers: object) -> str:
+    raw = _header_map_value(headers, "content-encoding") or ""
+    return raw.strip()
+
+
+def _content_encoding_is_compressed(encoding: str) -> bool:
+    tokens = [part.strip().lower() for part in encoding.split(",") if part.strip()]
+    return any(token not in {"identity"} for token in tokens)
+
+
+def decoded_content_size(headers: object) -> int:
+    """HAR content.size is decoded length; Content-Length is encoded when compressed."""
+    if _content_encoding_is_compressed(content_encoding_from_headers(headers)):
+        return -1
+    return content_size_from_headers(headers)
 
 
 def _har_timing_delta(end: object, start: object) -> float:
@@ -882,7 +1009,11 @@ def har_timings(timing: object) -> tuple[float, dict[str, float]]:
         "wait": rounded(wait),
         "receive": rounded(receive),
     }
-    total = round(sum(value for value in timings.values() if value > 0), 3)
+    # HAR ssl is a subset of connect; do not count TLS twice in entry.time.
+    total = round(
+        sum(value for key, value in timings.items() if key != "ssl" and value > 0),
+        3,
+    )
     return total, timings
 
 
@@ -894,9 +1025,7 @@ def public_network_events(events: list[dict[str, object]]) -> list[dict[str, obj
             item["url"] = diagnostic_url(item["url"])
         redirect = item.get("redirect_url")
         if isinstance(redirect, str) and redirect:
-            item["redirect_url"] = (
-                diagnostic_url(redirect) if "://" in redirect else redirect.split("?", 1)[0]
-            )
+            item["redirect_url"] = diagnostic_url(redirect)
         published.append(item)
     return published
 
@@ -919,8 +1048,10 @@ def collect_network_event(
             timing = {}
     combined_headers = [*(request_headers or ()), *(response_headers_array or ())]
     version = har_http_version(http_version, url, combined_headers)
-    mime_type = mime_type_from_headers(response_headers or response_headers_array)
-    content_size = content_size_from_headers(response_headers or response_headers_array)
+    size_headers = response_headers or response_headers_array
+    mime_type = mime_type_from_headers(size_headers)
+    content_size = decoded_content_size(size_headers)
+    body_size = content_size_from_headers(size_headers)
     started = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     if isinstance(timing, dict):
         start_ms = timing.get("startTime")
@@ -943,6 +1074,7 @@ def collect_network_event(
         "response_headers": safe_har_headers(response_headers_array),
         "mime_type": mime_type,
         "content_size": content_size,
+        "body_size": body_size,
         "timing": dict(timing) if isinstance(timing, dict) else {},
     }
     redirect = ""
@@ -952,6 +1084,71 @@ def collect_network_event(
             break
     event["redirect_url"] = redirect
     return event
+
+
+def enqueue_bounded_protocol(
+    queue: dict[str, list[str]],
+    queued_count: int,
+    url: object,
+    protocol: object,
+    *,
+    limit: int = MAX_DIAGNOSTIC_EVENTS,
+) -> int:
+    """Append one protocol observation if the diagnostic queue still has room."""
+    if queued_count >= limit or not protocol or not url:
+        return queued_count
+    queue.setdefault(str(url), []).append(str(protocol))
+    return queued_count + 1
+
+
+def apply_observed_http_versions(
+    events: list[dict[str, object]],
+    protocols_by_url: dict[str, str],
+) -> None:
+    """Fill unknown HTTP versions from an engine-independent URL→protocol map."""
+    if not events or not protocols_by_url:
+        return
+    indexed: dict[str, str] = {}
+    for url, protocol in protocols_by_url.items():
+        if not url or not protocol:
+            continue
+        indexed[url] = protocol
+        indexed[diagnostic_url(url)] = protocol
+    for event in events:
+        current = event.get("http_version")
+        if current and current != "unknown":
+            continue
+        candidates: list[str] = []
+        url = event.get("url")
+        if isinstance(url, str) and url:
+            candidates.append(url)
+        raw_request = event.get("_request")
+        request_url = getattr(raw_request, "url", None) if raw_request is not None else None
+        if isinstance(request_url, str) and request_url:
+            candidates.append(request_url)
+        for candidate in candidates:
+            protocol = indexed.get(candidate) or indexed.get(diagnostic_url(candidate))
+            if protocol:
+                event["http_version"] = har_http_version(protocol, candidate)
+                break
+
+
+async def collect_performance_http_versions(page: object) -> dict[str, str]:
+    """Read Resource Timing nextHopProtocol values from any Playwright engine."""
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return {}
+    try:
+        raw = await evaluate(PERFORMANCE_PROTOCOL_SCRIPT)
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(url): str(protocol)
+        for url, protocol in raw.items()
+        if url and protocol
+    }
 
 
 def apply_network_timing(event: dict[str, object], timing: object) -> None:
@@ -1117,10 +1314,15 @@ def _har_document(events: list[dict[str, object]]) -> bytes:
         http_version = str(event.get("http_version") or "unknown")
         mime_type = str(event.get("mime_type") or "")
         content_size = event.get("content_size", -1)
+        body_size = event.get("body_size", content_size)
         try:
             content_size = int(content_size)
         except (TypeError, ValueError):
             content_size = -1
+        try:
+            body_size = int(body_size)
+        except (TypeError, ValueError):
+            body_size = -1
         request_headers = event.get("request_headers")
         response_headers = event.get("response_headers")
         entries.append(
@@ -1153,7 +1355,7 @@ def _har_document(events: list[dict[str, object]]) -> bytes:
                         else ""
                     ),
                     "headersSize": -1,
-                    "bodySize": content_size,
+                    "bodySize": body_size,
                 },
                 "cache": {},
                 "timings": timings,
@@ -1163,7 +1365,7 @@ def _har_document(events: list[dict[str, object]]) -> bytes:
         "log": {
             "version": "1.2",
             "creator": {"name": "ViperCapture", "version": "1"},
-            "comment": DIAGNOSTIC_NETWORK_PRIVACY,
+            "comment": f"{DIAGNOSTIC_NETWORK_PRIVACY} {DIAGNOSTIC_HAR_COMPLETENESS}",
             "entries": entries,
         }
     }
@@ -1307,6 +1509,17 @@ async def diagnostic_bundle(
         },
         "privacy": DIAGNOSTIC_NETWORK_PRIVACY,
     }
+    if request.diagnostics.include_har:
+        manifest["har_completeness"] = DIAGNOSTIC_HAR_COMPLETENESS
+    if page is not None and (
+        request.diagnostics.include_har
+        or request.diagnostics.include_network
+        or request.diagnostics.include_warc
+    ):
+        apply_observed_http_versions(
+            network_events,
+            await collect_performance_http_versions(page),
+        )
     published_network = public_network_events(network_events)
     entries = [
         (artifact.filename, artifact.body),
@@ -2922,6 +3135,7 @@ class RenderEngine:
                     })
 
                 http_versions_by_url: dict[str, list[str]] = {}
+                cdp_protocol_queued = 0
 
                 def record_network(response) -> None:
                     if len(network_events) >= MAX_DIAGNOSTIC_EVENTS:
@@ -2954,16 +3168,17 @@ class RenderEngine:
                             await har_cdp_session.send("Network.enable")
 
                             def record_cdp_protocol(params: dict[str, object]) -> None:
+                                nonlocal cdp_protocol_queued
                                 try:
                                     payload = params.get("response")
                                     if not isinstance(payload, dict):
                                         return
-                                    protocol = payload.get("protocol")
-                                    url = payload.get("url")
-                                    if protocol and url:
-                                        http_versions_by_url.setdefault(str(url), []).append(
-                                            str(protocol)
-                                        )
+                                    cdp_protocol_queued = enqueue_bounded_protocol(
+                                        http_versions_by_url,
+                                        cdp_protocol_queued,
+                                        payload.get("url"),
+                                        payload.get("protocol"),
+                                    )
                                 except Exception:
                                     return
 
@@ -3280,7 +3495,8 @@ class RenderEngine:
                         },
                     )
                     finalized = await diagnostic_bundle(
-                        artifact, request, console_events, network_events, limits
+                        artifact, request, console_events, network_events, limits,
+                        page=page, context=context,
                     )
                     _reject_blocked_private_subresources(blocked_private_subresources)
                     await self._persist_profile_state(

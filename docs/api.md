@@ -20,8 +20,15 @@ running, the interactive OpenAPI reference is available at `/docs`.
 manifest. `diagnostics.bundle` returns a ZIP containing the normal artifact,
 manifest, and optionally bounded console and network event files.
 `diagnostics.include_har=true` adds `network.har`, a redacted HAR 1.2 log with
-observed HTTP versions, safe headers, mime types, and timings. Query strings,
-cookies, credentials, and bodies are omitted.
+observed HTTP versions, allowlisted headers, mime types, and timings. Query
+strings, cookies, credentials, and bodies are omitted. Header values are
+emitted only for an allowlist of non-credential names; URL-bearing values
+such as `Location` have query strings stripped even when they are relative.
+`entry.time` excludes the HAR `ssl` subset of `connect`. Compressed responses
+keep `Content-Length` as transferred `bodySize` and leave decoded
+`content.size` unknown. Chromium can record HTTP versions via CDP; Firefox
+and WebKit backfill `nextHopProtocol` from Resource Timing, and HTTPS entries
+without that metadata stay `httpVersion` `unknown`.
 WebM setup/navigation frames are trimmed from the recording with Playwright's
 FFmpeg runtime, and `duration_ms` reports the verified encoded duration rather
 than merely echoing the request.
