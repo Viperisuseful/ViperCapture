@@ -9,7 +9,13 @@ import pytest
 from starlette.requests import Request
 
 from vipercapture.bulk_jobs import CLIENT_DISCONNECTED_STATE, BulkBodyLimitMiddleware
-from vipercapture.main import _await_while_connected
+from vipercapture.main import (
+    UNSETTLED_OPERATION_STATE,
+    _await_while_connected,
+    _finish_capture,
+    _take_unsettled_operation,
+    _track_browser_use,
+)
 from vipercapture.render_errors import RenderError
 
 
@@ -112,6 +118,10 @@ def test_await_while_connected_raises_499_without_waiting_for_shield() -> None:
         assert details.value.status_code == 499
         assert details.value.code == "client_disconnected"
         assert elapsed < 1.0
+        unsettled = details.value.unsettled_operation
+        assert isinstance(unsettled, asyncio.Task)
+        assert not unsettled.done()
+        assert getattr(request.state, UNSETTLED_OPERATION_STATE) is unsettled
 
     asyncio.run(run())
 
@@ -150,6 +160,60 @@ def test_disconnect_releases_capture_slot_promptly() -> None:
         waited = await next_acquire()
         await holder
         assert waited < 0.75
+
+    asyncio.run(run())
+
+
+def test_cancellable_disconnect_releases_slot_after_finish_capture() -> None:
+    """Cancelled waits settle immediately, so the next capture is not queued."""
+
+    async def run() -> None:
+        app = _fake_capture_app(2)
+        abandoned = [asyncio.Event(), asyncio.Event()]
+        started = [asyncio.Event(), asyncio.Event()]
+        settlers: list[asyncio.Task] = []
+
+        async def occupy(index: int) -> None:
+            request = SimpleNamespace(
+                state=SimpleNamespace(
+                    **{CLIENT_DISCONNECTED_STATE: abandoned[index]}
+                ),
+                is_disconnected=None,
+            )
+            browser = object()
+            await app.state.capture_slots.acquire()
+            _track_browser_use(app, browser)
+            started[index].set()
+            with pytest.raises(RenderError) as details:
+                await _await_while_connected(request, asyncio.sleep(10))
+            assert details.value.code == "client_disconnected"
+            settler = await _finish_capture(
+                app,
+                browser,
+                tracked=True,
+                render_attempted=False,
+                unsettled_operation=_take_unsettled_operation(request),
+            )
+            if settler is not None:
+                settlers.append(settler)
+
+        async def third_render() -> int:
+            await started[0].wait()
+            await started[1].wait()
+            await asyncio.sleep(0.05)
+            abandoned[0].set()
+            abandoned[1].set()
+            started_at = time.perf_counter()
+            await asyncio.wait_for(app.state.capture_slots.acquire(), timeout=1)
+            queue_ms = round((time.perf_counter() - started_at) * 1000)
+            app.state.capture_slots.release()
+            return queue_ms
+
+        first = asyncio.create_task(occupy(0))
+        second = asyncio.create_task(occupy(1))
+        queue_ms = await third_render()
+        await asyncio.gather(first, second, *settlers)
+        assert queue_ms < 750
 
     asyncio.run(run())
 
@@ -237,3 +301,143 @@ def test_await_while_connected_returns_completed_work() -> None:
         assert await _await_while_connected(request, quick()) == "done"
 
     asyncio.run(run())
+
+
+def _fake_capture_app(slots: int = 1):
+    return SimpleNamespace(
+        state=SimpleNamespace(
+            capture_slots=asyncio.Semaphore(slots),
+            browser_in_flight={},
+            settling_captures=set(),
+        )
+    )
+
+
+async def _shielded_work(delay: float, running: set[int] | None = None) -> str:
+    marker = id(asyncio.current_task())
+    if running is not None:
+        running.add(marker)
+    nested = asyncio.create_task(asyncio.sleep(delay))
+    try:
+        return await asyncio.shield(nested)
+    except asyncio.CancelledError:
+        with suppress(Exception):
+            await asyncio.shield(nested)
+        raise
+    finally:
+        if running is not None:
+            running.discard(marker)
+
+
+def test_disconnect_keeps_slot_until_shielded_work_settles() -> None:
+    async def run() -> None:
+        app = _fake_capture_app(1)
+        browser = object()
+        disconnected = asyncio.Event()
+        request = SimpleNamespace(
+            state=SimpleNamespace(**{CLIENT_DISCONNECTED_STATE: disconnected}),
+            is_disconnected=None,
+        )
+        await app.state.capture_slots.acquire()
+        _track_browser_use(app, browser)
+
+        drop = asyncio.create_task(_sleep_then(disconnected, 0.05))
+        started = time.perf_counter()
+        try:
+            with pytest.raises(RenderError) as details:
+                await _await_while_connected(request, _shielded_work(0.4))
+        finally:
+            drop.cancel()
+            with suppress(asyncio.CancelledError):
+                await drop
+        assert time.perf_counter() - started < 0.25
+        assert details.value.status_code == 499
+
+        settler = await _finish_capture(
+            app,
+            browser,
+            tracked=True,
+            render_attempted=True,
+            unsettled_operation=_take_unsettled_operation(request),
+        )
+        assert settler is not None
+        assert app.state.capture_slots.locked()
+        assert app.state.browser_in_flight[id(browser)] == 1
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(app.state.capture_slots.acquire(), timeout=0.05)
+
+        await asyncio.wait_for(settler, timeout=1)
+        assert not app.state.capture_slots.locked()
+        assert app.state.browser_in_flight == {}
+        await asyncio.wait_for(app.state.capture_slots.acquire(), timeout=0.2)
+        app.state.capture_slots.release()
+
+    asyncio.run(run())
+
+
+def test_disconnect_storm_does_not_exceed_concurrency() -> None:
+    async def run() -> None:
+        app = _fake_capture_app(2)
+        running: set[int] = set()
+        peak = 0
+        settlers: list[asyncio.Task] = []
+
+        async def occupy() -> None:
+            nonlocal peak
+            disconnected = asyncio.Event()
+            request = SimpleNamespace(
+                state=SimpleNamespace(**{CLIENT_DISCONNECTED_STATE: disconnected}),
+                is_disconnected=None,
+            )
+            browser = object()
+            await app.state.capture_slots.acquire()
+            _track_browser_use(app, browser)
+            drop = asyncio.create_task(_sleep_then(disconnected, 0.02))
+            try:
+                with pytest.raises(RenderError) as details:
+                    await _await_while_connected(
+                        request, _shielded_work(0.35, running)
+                    )
+                peak = max(peak, len(running))
+                assert details.value.status_code == 499
+            finally:
+                drop.cancel()
+                with suppress(asyncio.CancelledError):
+                    await drop
+            settler = await _finish_capture(
+                app,
+                browser,
+                tracked=True,
+                render_attempted=True,
+                unsettled_operation=_take_unsettled_operation(request),
+            )
+            if settler is not None:
+                settlers.append(settler)
+            peak = max(peak, len(running), len(app.state.browser_in_flight))
+
+        first = asyncio.create_task(occupy())
+        second = asyncio.create_task(occupy())
+        await asyncio.gather(first, second)
+        assert peak <= 2
+        assert app.state.capture_slots.locked()
+        assert sum(app.state.browser_in_flight.values()) == 2
+
+        third_started = time.perf_counter()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(app.state.capture_slots.acquire(), timeout=0.08)
+        assert time.perf_counter() - third_started < 0.2
+
+        await asyncio.gather(*settlers)
+        assert app.state.browser_in_flight == {}
+        await asyncio.wait_for(app.state.capture_slots.acquire(), timeout=0.2)
+        app.state.capture_slots.release()
+        await asyncio.wait_for(app.state.capture_slots.acquire(), timeout=0.2)
+        app.state.capture_slots.release()
+
+    asyncio.run(run())
+
+
+async def _sleep_then(event: asyncio.Event, delay: float) -> None:
+    await asyncio.sleep(delay)
+    event.set()
