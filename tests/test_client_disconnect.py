@@ -14,9 +14,11 @@ from vipercapture.bulk_jobs import CLIENT_DISCONNECTED_STATE, BulkBodyLimitMiddl
 from vipercapture.main import (
     UNSETTLED_OPERATION_STATE,
     _await_while_connected,
+    _cancel_settling_operations,
     _finish_capture,
     _take_unsettled_operation,
     _track_browser_use,
+    _wait_for_settling_captures,
 )
 from vipercapture.render_errors import RenderError
 
@@ -452,3 +454,44 @@ def test_disconnect_storm_does_not_exceed_concurrency() -> None:
 async def _sleep_then(event: asyncio.Event, delay: float) -> None:
     await asyncio.sleep(delay)
     event.set()
+
+
+def test_shutdown_timeout_keeps_accounting_until_operation_settles() -> None:
+    """Shutdown proceeds after a timeout without cancelling settlers early."""
+
+    async def run() -> None:
+        app = _fake_capture_app(1)
+        browser = object()
+        await app.state.capture_slots.acquire()
+        _track_browser_use(app, browser)
+
+        async def never_finishes() -> None:
+            await asyncio.Event().wait()
+
+        operation = asyncio.create_task(never_finishes())
+        settler = await _finish_capture(
+            app,
+            browser,
+            tracked=True,
+            render_attempted=False,
+            unsettled_operation=operation,
+        )
+        assert settler is not None
+
+        started = time.perf_counter()
+        leftover = await _wait_for_settling_captures(
+            app.state.settling_captures, timeout=0.1
+        )
+        assert time.perf_counter() - started < 1.0
+        assert settler in leftover
+        assert not settler.done()
+        assert app.state.capture_slots.locked()
+        assert app.state.browser_in_flight[id(browser)] == 1
+
+        _cancel_settling_operations(leftover)
+        await asyncio.gather(*leftover, return_exceptions=True)
+        assert settler.done()
+        assert not app.state.capture_slots.locked()
+        assert app.state.browser_in_flight == {}
+
+    asyncio.run(run())

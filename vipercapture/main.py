@@ -919,9 +919,10 @@ async def lifespan(app: FastAPI):
                 await app.state.async_jobs.close()
         finally:
             closed_browser_ids: set[int] = set()
+            leftover_settlers: set[asyncio.Task] = set()
             settling = list(getattr(app.state, "settling_captures", ()))
             if settling:
-                await asyncio.gather(*settling, return_exceptions=True)
+                leftover_settlers = await _wait_for_settling_captures(settling)
             grow_tasks = list(getattr(app.state, "browser_grow_tasks", []))
             for task in grow_tasks:
                 task.cancel()
@@ -942,6 +943,9 @@ async def lifespan(app: FastAPI):
                 with suppress(Exception):
                     await asyncio.wait_for(active_browser.close(), timeout=5)
             await playwright.stop()
+            if leftover_settlers:
+                _cancel_settling_operations(leftover_settlers)
+                await asyncio.gather(*leftover_settlers, return_exceptions=True)
 
 
 app = FastAPI(
@@ -1455,12 +1459,37 @@ def _client_disconnected_error(operation: asyncio.Task | None = None) -> RenderE
     return error
 
 
+SETTLING_SHUTDOWN_TIMEOUT_SECONDS = 15
+SETTLING_OPERATION_ATTR = "_vipercapture_operation"
+
+
 def _settling_captures(app: FastAPI) -> set[asyncio.Task]:
     settling = getattr(app.state, "settling_captures", None)
     if settling is None:
         settling = set()
         app.state.settling_captures = settling
     return settling
+
+
+async def _wait_for_settling_captures(
+    settling: set[asyncio.Task] | list[asyncio.Task],
+    *,
+    timeout: float = SETTLING_SHUTDOWN_TIMEOUT_SECONDS,
+) -> set[asyncio.Task]:
+    """Wait briefly for settlers, then return leftovers still holding accounting."""
+    pending = {task for task in settling if not task.done()}
+    if not pending:
+        return set()
+    _, leftover = await asyncio.wait(pending, timeout=timeout)
+    return leftover
+
+
+def _cancel_settling_operations(settlers: set[asyncio.Task]) -> None:
+    """Cancel the underlying render/cleanup tasks, not the settlers themselves."""
+    for settler in settlers:
+        operation = getattr(settler, SETTLING_OPERATION_ATTR, None)
+        if isinstance(operation, asyncio.Task) and not operation.done():
+            operation.cancel()
 
 
 async def _release_capture_resources(
@@ -1502,6 +1531,7 @@ def _schedule_capture_settle(
             )
 
     task = asyncio.create_task(settle())
+    setattr(task, SETTLING_OPERATION_ATTR, operation)
     settling = _settling_captures(app)
     settling.add(task)
 
