@@ -119,9 +119,16 @@ def test_render_single_rejects_private_subresources_before_persist_and_typed_err
             lines[index - 1]
             == "_reject_blocked_private_subresources(blocked_private_subresources)"
         ), "do not persist profile state from a rejected hosted render"
+        assert (
+            lines[index - 2]
+            == "await _await_pending_hosted_validations(pending_hosted_validations)"
+        ), "await in-flight hosted validations before inspecting the flag"
     assert "except TimeoutError as exc:" in source
     assert "except RenderError as exc:" in source
     assert source.count("if blocked_private_subresources") >= 3
+    assert source.count("await _await_pending_hosted_validations(pending_hosted_validations)") >= 14
+    assert "blocked_private_subresources = True" in source
+    assert "public_urls.is_public(web_socket.url)" in source
 
 
 def test_link_local_metadata_url_is_not_public() -> None:
@@ -131,6 +138,22 @@ def test_link_local_metadata_url_is_not_public() -> None:
         validator = PublicUrlValidator()
         assert await validator.is_public("http://169.254.169.254/latest/meta-data/") is False
         assert await validator.is_public("http://127.0.0.1/") is False
+
+    asyncio.run(check())
+
+
+def test_websocket_urls_use_the_same_publicness_policy_as_http() -> None:
+    from vipercapture.render_engine import PublicUrlValidator, normalized_origin
+
+    assert normalized_origin("ws://127.0.0.1:8080/socket") == ("ws", "127.0.0.1", 8080)
+    assert normalized_origin("wss://Example.COM/socket") == ("wss", "example.com", 443)
+    assert normalized_origin("ftp://example.com/") is None
+
+    async def check() -> None:
+        validator = PublicUrlValidator()
+        assert await validator.is_public("ws://127.0.0.1:8080") is False
+        assert await validator.is_public("wss://169.254.169.254/latest/meta-data/") is False
+        assert await validator.is_public("ws://[::1]:8080") is False
 
     asyncio.run(check())
 
@@ -164,8 +187,35 @@ class _FakeRoute:
         return None
 
 
-def _fake_browser(route_urls: list[str], handler_slot: dict | None = None):
+class _FakeWebSocket:
+    def __init__(self, url: str) -> None:
+        self.url = url
+        self.closed = False
+        self.connected = False
+
+    async def close(self, code: int = 1008, reason: str = "") -> None:
+        self.closed = True
+
+    async def connect_to_server(self) -> None:
+        self.connected = True
+
+
+def _fake_browser(
+    route_urls: list[str],
+    handler_slot: dict | None = None,
+    *,
+    websocket_urls: list[str] | None = None,
+    background_routes: bool = False,
+):
     route_handler: dict[str, object] = handler_slot if handler_slot is not None else {}
+    socket_urls = list(websocket_urls or [])
+
+    async def _dispatch(handler, target) -> None:
+        started = handler(target)
+        if background_routes:
+            asyncio.create_task(started)
+            return
+        await started
 
     class FakePage:
         url = "about:blank"
@@ -176,10 +226,13 @@ def _fake_browser(route_urls: list[str], handler_slot: dict | None = None):
 
         async def set_content(self, _document, **_kwargs) -> None:
             handler = route_handler.get("fn")
-            if handler is None:
-                return
-            for url in route_urls:
-                await handler(_FakeRoute(url))
+            if handler is not None:
+                for url in route_urls:
+                    await _dispatch(handler, _FakeRoute(url))
+            ws_handler = route_handler.get("ws")
+            if ws_handler is not None:
+                for url in socket_urls:
+                    await _dispatch(ws_handler, _FakeWebSocket(url))
 
         async def close(self) -> None:
             return None
@@ -188,8 +241,8 @@ def _fake_browser(route_urls: list[str], handler_slot: dict | None = None):
         async def route(self, _pattern, handler) -> None:
             route_handler["fn"] = handler
 
-        async def route_web_socket(self, _pattern, _handler) -> None:
-            return None
+        async def route_web_socket(self, _pattern, handler) -> None:
+            route_handler["ws"] = handler
 
         async def new_page(self) -> FakePage:
             return FakePage()
@@ -625,3 +678,202 @@ def test_hosted_action_private_subresource_stops_before_encode() -> None:
         asyncio.run(run())
     assert details.value.code == "subresource_not_public"
     assert metadata_calls == []
+
+
+PRIVATE_WS = "ws://127.0.0.1:8080"
+
+
+def test_hosted_private_websocket_fails_on_success_path() -> None:
+    from vipercapture.render_engine import RenderEngine
+
+    engine = RenderEngine(hosted=True)
+    request = RenderRequest.model_validate(
+        {
+            "html": f'<h1>h</h1><script>new WebSocket("{PRIVATE_WS}")</script>',
+            "output": "metadata",
+            "full_page": False,
+        }
+    )
+    metadata_calls: list[bool] = []
+    with pytest.raises(RenderError) as details:
+        _run_isolated_render(
+            engine,
+            request,
+            _fake_browser([], websocket_urls=[PRIVATE_WS]),
+            metadata_calls=metadata_calls,
+        )
+    assert details.value.code == "subresource_not_public"
+    assert details.value.status_code == 400
+    assert details.value.retryable is False
+    assert metadata_calls == []
+
+
+def test_hosted_private_wss_link_local_fails_on_success_path() -> None:
+    from vipercapture.render_engine import RenderEngine
+
+    engine = RenderEngine(hosted=True)
+    request = RenderRequest.model_validate(
+        {
+            "html": '<h1>h</h1><script>new WebSocket("wss://169.254.169.254/socket")</script>',
+            "output": "metadata",
+            "full_page": False,
+        }
+    )
+    with pytest.raises(RenderError) as details:
+        _run_isolated_render(
+            engine,
+            request,
+            _fake_browser([], websocket_urls=["wss://169.254.169.254/socket"]),
+        )
+    assert details.value.code == "subresource_not_public"
+    assert details.value.status_code == 400
+
+
+def test_hosted_public_websocket_is_blocked_without_private_rejection() -> None:
+    from unittest.mock import patch
+    from urllib.parse import urlparse
+
+    from vipercapture.render_engine import PublicUrlValidator, RenderEngine
+
+    engine = RenderEngine(hosted=True)
+    request = RenderRequest.model_validate(
+        {
+            "html": '<h1>h</h1><script>new WebSocket("wss://example.com/socket")</script>',
+            "output": "metadata",
+            "full_page": False,
+        }
+    )
+
+    async def public_example(_self, target: str) -> bool:
+        return urlparse(target).hostname == "example.com"
+
+    with patch.object(PublicUrlValidator, "is_public", public_example):
+        artifact = _run_isolated_render(
+            engine,
+            request,
+            _fake_browser([], websocket_urls=["wss://example.com/socket"]),
+        )
+    assert artifact.media_type == "application/json"
+    assert artifact.metadata.get("blocked_subresources") == 1
+
+
+def test_hosted_private_websocket_wins_over_block_resource_types() -> None:
+    from vipercapture.render_engine import RenderEngine
+
+    engine = RenderEngine(hosted=True)
+    request = RenderRequest.model_validate(
+        {
+            "html": f'<h1>h</h1><script>new WebSocket("{PRIVATE_WS}")</script>',
+            "output": "metadata",
+            "full_page": False,
+            "network": {"block_resource_types": ["websocket"]},
+        }
+    )
+    with pytest.raises(RenderError) as details:
+        _run_isolated_render(
+            engine,
+            request,
+            _fake_browser([], websocket_urls=[PRIVATE_WS]),
+        )
+    assert details.value.code == "subresource_not_public"
+    assert details.value.status_code == 400
+
+
+def test_self_host_private_websocket_is_allowed() -> None:
+    from vipercapture.render_engine import RenderEngine
+
+    engine = RenderEngine(hosted=False)
+    request = RenderRequest.model_validate(
+        {
+            "html": f'<h1>h</h1><script>new WebSocket("{PRIVATE_WS}")</script>',
+            "output": "metadata",
+            "full_page": False,
+        }
+    )
+    artifact = _run_isolated_render(
+        engine,
+        request,
+        _fake_browser([], websocket_urls=[PRIVATE_WS]),
+    )
+    assert artifact.media_type == "application/json"
+    assert artifact.metadata.get("blocked_subresources") == 0
+
+
+def test_hosted_awaits_in_flight_private_url_validation() -> None:
+    from unittest.mock import patch
+
+    from vipercapture.render_engine import PublicUrlValidator, RenderEngine
+
+    engine = RenderEngine(hosted=True)
+    request = RenderRequest.model_validate(
+        {
+            "html": f'<h1>h</h1><img src="{PRIVATE_IMG}">',
+            "output": "metadata",
+            "full_page": False,
+            "wait_for": {"event": "domcontentloaded", "images": False},
+        }
+    )
+    original = PublicUrlValidator.is_public
+
+    async def slow_is_public(self, target: str) -> bool:
+        await asyncio.sleep(0.05)
+        return await original(self, target)
+
+    metadata_calls: list[bool] = []
+    with patch.object(PublicUrlValidator, "is_public", slow_is_public):
+        with pytest.raises(RenderError) as details:
+            _run_isolated_render(
+                engine,
+                request,
+                _fake_browser([PRIVATE_IMG], background_routes=True),
+                metadata_calls=metadata_calls,
+            )
+    assert details.value.code == "subresource_not_public"
+    assert details.value.status_code == 400
+    assert metadata_calls == []
+
+
+def test_hosted_timeout_awaits_in_flight_private_validation() -> None:
+    from unittest.mock import AsyncMock, patch
+
+    from vipercapture.render_engine import PublicUrlValidator, RenderEngine, RenderLimits
+
+    engine = RenderEngine(hosted=True)
+    request = RenderRequest.model_validate(
+        {
+            "html": "<h1>h</h1>",
+            "output": "metadata",
+            "full_page": False,
+            "wait_for": {"event": "domcontentloaded", "images": False},
+        }
+    )
+    handler_slot: dict[str, object] = {}
+    original = PublicUrlValidator.is_public
+
+    async def slow_is_public(self, target: str) -> bool:
+        await asyncio.sleep(0.05)
+        return await original(self, target)
+
+    async def timeout_after_starting_route(*_args, **_kwargs):
+        asyncio.create_task(handler_slot["fn"](_FakeRoute(PRIVATE_IMG)))
+        raise TimeoutError("render deadline")
+
+    async def run() -> None:
+        with (
+            patch.object(PublicUrlValidator, "is_public", slow_is_public),
+            patch.object(engine, "_wait", new=timeout_after_starting_route),
+            patch.object(engine, "_wait_for_images", new=AsyncMock()),
+            patch.object(engine, "_run_actions", new=AsyncMock()),
+            patch.object(engine, "_check_assertions", new=AsyncMock()),
+        ):
+            await engine._render_single(
+                _fake_browser([], handler_slot=handler_slot),
+                request,
+                RenderLimits(),
+            )
+
+    with pytest.raises(RenderError) as details:
+        asyncio.run(run())
+    assert details.value.code == "subresource_not_public"
+    assert details.value.status_code == 400
+    assert isinstance(details.value.__cause__, TimeoutError)
