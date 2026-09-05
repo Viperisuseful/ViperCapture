@@ -27,6 +27,8 @@ jobs:
           npm run lint --prefix frontend
           npm run build --prefix frontend
           git diff --exit-code -- static/app
+      - name: Check launcher installer selection
+        run: python -m unittest tests.test_launch_installer
       - name: Build and smoke container
         run: |
           python -m compileall -q vipercapture launch.py scripts/smoke.py
@@ -44,8 +46,10 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.11"
-          cache: pip
-          cache-dependency-path: requirements.txt
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.12.10"
+          enable-cache: true
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 22
@@ -65,13 +69,14 @@ jobs:
           ffmpeg -version
       - name: Install renderer and browsers
         run: |
-          python -m pip install -r requirements.txt
+          uv pip install --system -r requirements.txt
           python -m playwright install chromium firefox webkit
       - name: Install frontend
         run: npm ci --prefix frontend
       - name: Check Python and render engines
         run: |
           python -m compileall -q vipercapture launch.py scripts/smoke.py
+          python -m unittest tests.test_launch_installer
           python scripts/smoke.py
       - name: Check frontend
         run: |

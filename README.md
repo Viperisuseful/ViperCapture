@@ -74,9 +74,21 @@ package manager or the [FFmpeg download page](https://ffmpeg.org/download.html).
 Run `ffmpeg -encoders` to confirm the encoders are available. The Docker image
 already includes FFmpeg.
 
+[uv](https://docs.astral.sh/uv/) is the preferred way to install Python
+dependencies. It is optional: `python launch.py` still works with pip when uv
+is not on `PATH`.
+
 ## Install locally
 
-Run:
+Install uv first if you can
+([installation guide](https://docs.astral.sh/uv/getting-started/installation/)):
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+On Windows, use `irm https://astral.sh/uv/install.ps1 | iex` in PowerShell.
+Then run:
 
 ```bash
 git clone https://github.com/Viperisuseful/ViperCapture.git
@@ -84,8 +96,11 @@ cd ViperCapture
 python launch.py
 ```
 
-The launcher creates a virtual environment, installs Chromium, Firefox, and
-WebKit, starts the API, and opens `http://127.0.0.1:8000`.
+The launcher prefers uv when it is on `PATH`: it creates `.venv` and installs
+from `requirements.txt`. If uv is missing, it falls back to the standard
+library `venv` module and pip. Set `VIPERCAPTURE_USE_UV=0` to force that pip
+path even when uv is installed. The launcher then installs Chromium, Firefox,
+and WebKit, starts the API, and opens `http://127.0.0.1:8000`.
 
 To use Docker instead, run:
 
@@ -228,13 +243,19 @@ artifacts accordingly.
 ## Verify an installation
 
 ```bash
-python -m pip install -r requirements.txt
-python -m playwright install --with-deps chromium firefox webkit
+uv venv
+uv pip install -r requirements.txt
+.venv/bin/python -m playwright install --with-deps chromium firefox webkit
 npm ci --prefix frontend && npm run lint --prefix frontend && npm run build --prefix frontend
-python scripts/smoke.py
+.venv/bin/python scripts/smoke.py
 ```
 
-On Windows or macOS, omit `--with-deps` from the Playwright command.
+Without uv, use `python -m venv .venv` and
+`.venv/bin/python -m pip install -r requirements.txt` instead, then the same
+Playwright, frontend, and smoke commands. On Windows, use
+`.venv\Scripts\python -m pip install -r requirements.txt` and
+`.venv\Scripts\python` for Playwright and smoke, and omit `--with-deps` from
+the Playwright command. On macOS, omit `--with-deps`.
 The smoke command starts a temporary local server and verifies Chromium,
 Firefox, WebKit, OpenAPI, health, and output dimensions. Pass
 `--base-url http://host:port` to check an existing deployment instead. For an
