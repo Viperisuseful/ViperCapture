@@ -1675,10 +1675,11 @@ class CleanupHooks:
 def normalized_origin(url: str) -> tuple[str, str, int] | None:
     try:
         parsed = urlsplit(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        scheme = parsed.scheme.lower()
+        if scheme not in {"http", "https", "ws", "wss"} or not parsed.hostname:
             return None
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        return parsed.scheme.lower(), parsed.hostname.lower().rstrip("."), port
+        port = parsed.port or (443 if scheme in {"https", "wss"} else 80)
+        return scheme, parsed.hostname.lower().rstrip("."), port
     except ValueError:
         return None
 
@@ -1800,6 +1801,21 @@ def _reject_blocked_private_subresources(blocked: bool) -> None:
     """
     if blocked:
         raise _private_subresource_error()
+
+
+async def _await_pending_hosted_validations(
+    pending: set[asyncio.Task[bool]],
+) -> None:
+    """Finish in-flight hosted publicness checks before reading the flag.
+
+    Route and WebSocket handlers set `blocked_private_subresources` only
+    after `is_public` returns. With `wait_for.event=domcontentloaded` and
+    `wait_for.images=false`, that DNS work can still be running when
+    `set_content` returns.
+    """
+    await asyncio.sleep(0)
+    while pending:
+        await asyncio.gather(*tuple(pending), return_exceptions=True)
 
 
 def _invalid_selector_error(error: PlaywrightError) -> bool:
@@ -2886,6 +2902,7 @@ class RenderEngine:
         video_directory = None
         blocked_subresources = 0
         blocked_private_subresources = False
+        pending_hosted_validations: set[asyncio.Task[bool]] = set()
         failed_requests: list[dict[str, object]] = []
         matched_failure_patterns: set[str] = set()
         console_events: list[dict[str, object]] = []
@@ -3059,6 +3076,12 @@ class RenderEngine:
                 if request.diagnostics.bundle:
                     await context.add_init_script(script=BOUNDED_CONSOLE_SCRIPT)
 
+                def track_hosted_validation(check: Awaitable[bool]) -> asyncio.Task[bool]:
+                    task = asyncio.ensure_future(check)
+                    pending_hosted_validations.add(task)
+                    task.add_done_callback(pending_hosted_validations.discard)
+                    return task
+
                 async def route_request(route) -> None:
                     nonlocal blocked_private_subresources, blocked_subresources
                     request_url = route.request.url
@@ -3069,11 +3092,13 @@ class RenderEngine:
                     if scheme in ALLOWED_INTERNAL_SCHEMES:
                         await route.continue_()
                         return
-                    if self.hosted and not await public_urls.is_public(request_url):
-                        blocked_subresources += 1
-                        blocked_private_subresources = True
-                        await route.abort("blockedbyclient")
-                        return
+                    if self.hosted:
+                        public = await track_hosted_validation(public_urls.is_public(request_url))
+                        if not public:
+                            blocked_subresources += 1
+                            blocked_private_subresources = True
+                            await route.abort("blockedbyclient")
+                            return
                     blocked_by_type = route.request.resource_type in {
                         resource.value for resource in request.network.block_resource_types
                     }
@@ -3121,7 +3146,19 @@ class RenderEngine:
                     or cleanup_routing
                 ):
                     async def block_web_socket(web_socket) -> None:
-                        nonlocal blocked_subresources
+                        nonlocal blocked_private_subresources, blocked_subresources
+                        if self.hosted:
+                            public = await track_hosted_validation(
+                                public_urls.is_public(web_socket.url)
+                            )
+                            if not public:
+                                blocked_subresources += 1
+                                blocked_private_subresources = True
+                                await web_socket.close(
+                                    code=1008,
+                                    reason="Blocked by render network policy",
+                                )
+                                return
                         blocked = (
                             self.hosted
                             or block_websocket_type
@@ -3317,6 +3354,7 @@ class RenderEngine:
                             "X-ViperCapture-Navigation-Status": str(navigation_status)
                         },
                     )
+                await _await_pending_hosted_validations(pending_hosted_validations)
                 _reject_blocked_private_subresources(blocked_private_subresources)
                 if self.cleanup_hooks:
                     await self.cleanup_hooks.finish(page, cleanup_session)
@@ -3333,10 +3371,12 @@ class RenderEngine:
                             False,
                         ) from exc
                 await self._wait(page, request, limits)
+                await _await_pending_hosted_validations(pending_hosted_validations)
                 _reject_blocked_private_subresources(blocked_private_subresources)
                 if self.cleanup_hooks:
                     await self.cleanup_hooks.apply(page, request.cleanup)
                 await self._run_actions(page, request, limits)
+                await _await_pending_hosted_validations(pending_hosted_validations)
                 _reject_blocked_private_subresources(blocked_private_subresources)
                 if self.cleanup_hooks:
                     await self.cleanup_hooks.apply(page, request.cleanup)
@@ -3344,6 +3384,7 @@ class RenderEngine:
                     await self.challenge_checker(
                         page, request, navigation_status, challenge_budget
                     )
+                await _await_pending_hosted_validations(pending_hosted_validations)
                 _reject_blocked_private_subresources(blocked_private_subresources)
                 resizing_image = (
                     request.image.width is not None
@@ -3393,12 +3434,14 @@ class RenderEngine:
                             page, request, navigation_status, challenge_budget
                         )
                     await self._wait_for_images(page, request, limits)
+                    await _await_pending_hosted_validations(pending_hosted_validations)
                     _reject_blocked_private_subresources(blocked_private_subresources)
                 if request.deterministic.enabled and request.deterministic.wait_for_fonts:
                     await page.evaluate("() => document.fonts?.ready")
                 await self._check_assertions(
                     page, request, failed_requests, matched_failure_patterns
                 )
+                await _await_pending_hosted_validations(pending_hosted_validations)
                 _reject_blocked_private_subresources(blocked_private_subresources)
                 if request.output in {OutputFormat.WEBM, OutputFormat.MP4, OutputFormat.GIF}:
                     options = request.video
@@ -3451,6 +3494,7 @@ class RenderEngine:
                         failed_requests,
                         matched_failure_patterns,
                     )
+                    await _await_pending_hosted_validations(pending_hosted_validations)
                     _reject_blocked_private_subresources(blocked_private_subresources)
                     pending_profile_state = (
                         await context.storage_state()
@@ -3533,6 +3577,7 @@ class RenderEngine:
                         artifact, request, console_events, network_events, limits,
                         page=page, context=context,
                     )
+                    await _await_pending_hosted_validations(pending_hosted_validations)
                     _reject_blocked_private_subresources(blocked_private_subresources)
                     await self._persist_profile_state(
                         request, pending_profile_state
@@ -3589,6 +3634,7 @@ class RenderEngine:
                         artifact, request, console_events, network_events, limits,
                         page=page, context=context,
                     )
+                    await _await_pending_hosted_validations(pending_hosted_validations)
                     _reject_blocked_private_subresources(blocked_private_subresources)
                     await self._persist_profile(request, context)
                     return finalized
@@ -3843,6 +3889,7 @@ class RenderEngine:
                         page=page,
                         context=context,
                     )
+                    await _await_pending_hosted_validations(pending_hosted_validations)
                     _reject_blocked_private_subresources(blocked_private_subresources)
                     await self._persist_profile(request, context)
                     return finalized
@@ -4027,18 +4074,22 @@ class RenderEngine:
                     artifact, request, console_events, network_events, limits,
                     page=page, context=context,
                 )
+                await _await_pending_hosted_validations(pending_hosted_validations)
                 _reject_blocked_private_subresources(blocked_private_subresources)
                 await self._persist_profile(request, context)
                 return finalized
         except TimeoutError as exc:
+            await _await_pending_hosted_validations(pending_hosted_validations)
             if blocked_private_subresources:
                 raise _private_subresource_error() from exc
             raise RenderError("render_timeout", "The render exceeded its total deadline.", 504, True) from exc
         except RenderError as exc:
+            await _await_pending_hosted_validations(pending_hosted_validations)
             if blocked_private_subresources and exc.code != "subresource_not_public":
                 raise _private_subresource_error() from exc
             raise
         except Exception as exc:
+            await _await_pending_hosted_validations(pending_hosted_validations)
             if blocked_private_subresources:
                 raise _private_subresource_error() from exc
             raise RenderError("render_failed", "The image render failed.", 500, True) from exc
