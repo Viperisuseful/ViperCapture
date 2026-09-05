@@ -69,7 +69,7 @@ jobs:
           ffmpeg -version
       - name: Install renderer and browsers
         run: |
-          uv pip install --python python -r requirements.txt
+          uv pip install --system -r requirements.txt
           python -m playwright install chromium firefox webkit
       - name: Install frontend
         run: npm ci --prefix frontend
