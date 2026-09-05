@@ -772,6 +772,7 @@ async def lifespan(app: FastAPI):
     app.state.gpu_hardware_active = await _detect_hardware_gpu(browser, GPU_MODE)
     app.state.captcha_handler = captcha_handler
     app.state.capture_slots = asyncio.Semaphore(MAX_CONCURRENT_CAPTURES)
+    app.state.settling_captures = set()
     app.state.diff_slots = asyncio.Semaphore(MAX_DIFF_CONCURRENCY)
     app.state.async_result_slots = asyncio.Semaphore(MAX_ASYNC_RESULT_DOWNLOADS)
     app.state.browser_restart_lock = asyncio.Lock()
@@ -918,6 +919,10 @@ async def lifespan(app: FastAPI):
                 await app.state.async_jobs.close()
         finally:
             closed_browser_ids: set[int] = set()
+            leftover_settlers: set[asyncio.Task] = set()
+            settling = list(getattr(app.state, "settling_captures", ()))
+            if settling:
+                leftover_settlers = await _wait_for_settling_captures(settling)
             grow_tasks = list(getattr(app.state, "browser_grow_tasks", []))
             for task in grow_tasks:
                 task.cancel()
@@ -938,6 +943,9 @@ async def lifespan(app: FastAPI):
                 with suppress(Exception):
                     await asyncio.wait_for(active_browser.close(), timeout=5)
             await playwright.stop()
+            if leftover_settlers:
+                _cancel_settling_operations(leftover_settlers)
+                await asyncio.gather(*leftover_settlers, return_exceptions=True)
 
 
 app = FastAPI(
@@ -1413,18 +1421,152 @@ def _disconnect_event(request: Request) -> asyncio.Event | None:
     return event if isinstance(event, asyncio.Event) else None
 
 
+UNSETTLED_OPERATION_STATE = "unsettled_operation"
+
+
 def _consume_abandoned_task(task: asyncio.Task) -> None:
     with suppress(asyncio.CancelledError, Exception):
         task.exception()
 
 
-def _abandon_task(task: asyncio.Task) -> None:
-    """Cancel work without waiting for shielded or Playwright cleanup."""
-    if task.done():
-        _consume_abandoned_task(task)
+def _remember_unsettled_operation(request: Request, task: asyncio.Task) -> None:
+    state = getattr(request, "state", None)
+    if state is None:
         return
-    task.cancel()
-    task.add_done_callback(_consume_abandoned_task)
+    setattr(state, UNSETTLED_OPERATION_STATE, task)
+
+
+def _take_unsettled_operation(request: Request) -> asyncio.Task | None:
+    state = getattr(request, "state", None)
+    if state is None:
+        return None
+    task = getattr(state, UNSETTLED_OPERATION_STATE, None)
+    # Starlette State raises KeyError on missing delattr; SimpleNamespace
+    # raises AttributeError. Successful renders never set this field.
+    with suppress(AttributeError, KeyError):
+        delattr(state, UNSETTLED_OPERATION_STATE)
+    return task if isinstance(task, asyncio.Task) else None
+
+
+def _client_disconnected_error(operation: asyncio.Task | None = None) -> RenderError:
+    error = RenderError(
+        "client_disconnected",
+        "The capture was cancelled.",
+        499,
+        False,
+    )
+    error.unsettled_operation = operation
+    return error
+
+
+SETTLING_SHUTDOWN_TIMEOUT_SECONDS = 15
+SETTLING_OPERATION_ATTR = "_vipercapture_operation"
+
+
+def _settling_captures(app: FastAPI) -> set[asyncio.Task]:
+    settling = getattr(app.state, "settling_captures", None)
+    if settling is None:
+        settling = set()
+        app.state.settling_captures = settling
+    return settling
+
+
+async def _wait_for_settling_captures(
+    settling: set[asyncio.Task] | list[asyncio.Task],
+    *,
+    timeout: float = SETTLING_SHUTDOWN_TIMEOUT_SECONDS,
+) -> set[asyncio.Task]:
+    """Wait briefly for settlers, then return leftovers still holding accounting."""
+    pending = {task for task in settling if not task.done()}
+    if not pending:
+        return set()
+    _, leftover = await asyncio.wait(pending, timeout=timeout)
+    return leftover
+
+
+def _cancel_settling_operations(settlers: set[asyncio.Task]) -> None:
+    """Cancel the underlying render/cleanup tasks, not the settlers themselves."""
+    for settler in settlers:
+        operation = getattr(settler, SETTLING_OPERATION_ATTR, None)
+        if isinstance(operation, asyncio.Task) and not operation.done():
+            operation.cancel()
+
+
+async def _release_capture_resources(
+    app: FastAPI,
+    browser: Browser | None,
+    *,
+    tracked: bool,
+    render_attempted: bool,
+) -> None:
+    app.state.capture_slots.release()
+    if tracked and browser is not None:
+        _untrack_browser_use(app, browser)
+    if render_attempted and browser is not None:
+        with suppress(Exception):
+            await _record_browser_render(app, browser)
+
+
+def _schedule_capture_settle(
+    app: FastAPI,
+    operation: asyncio.Task,
+    browser: Browser | None,
+    *,
+    tracked: bool,
+    render_attempted: bool,
+) -> asyncio.Task:
+    """Hold capture accounting until abandoned render/cleanup work finishes."""
+
+    async def settle() -> None:
+        try:
+            await operation
+        except (asyncio.CancelledError, Exception):
+            pass
+        finally:
+            await _release_capture_resources(
+                app,
+                browser,
+                tracked=tracked,
+                render_attempted=render_attempted,
+            )
+
+    task = asyncio.create_task(settle())
+    setattr(task, SETTLING_OPERATION_ATTR, operation)
+    settling = _settling_captures(app)
+    settling.add(task)
+
+    def finished(done: asyncio.Task) -> None:
+        settling.discard(done)
+        _consume_abandoned_task(done)
+
+    task.add_done_callback(finished)
+    return task
+
+
+async def _finish_capture(
+    app: FastAPI,
+    browser: Browser | None,
+    *,
+    tracked: bool,
+    render_attempted: bool,
+    unsettled_operation: asyncio.Task | None = None,
+) -> asyncio.Task | None:
+    """Release capture accounting now, or after abandoned work settles."""
+    if unsettled_operation is not None and not unsettled_operation.done():
+        return _schedule_capture_settle(
+            app,
+            unsettled_operation,
+            browser,
+            tracked=tracked,
+            render_attempted=render_attempted,
+        )
+    await _release_capture_resources(
+        app,
+        browser,
+        tracked=tracked,
+        render_attempted=render_attempted,
+    )
+    return None
 
 
 async def _client_disconnected(request: Request) -> bool:
@@ -1454,7 +1596,13 @@ async def _await_while_connected(
     request: Request,
     operation: Awaitable[AwaitedResult],
 ) -> AwaitedResult:
-    """Cancel queued or rendering work when the client disconnects."""
+    """Cancel queued or rendering work when the client disconnects.
+
+    The client response is detached immediately (499). The cancelled
+    operation stays referenced on the error and request so capture-slot
+    and browser accounting can wait for shielded CPU or Playwright
+    cleanup to settle.
+    """
     operation_task = asyncio.ensure_future(operation)
     if _disconnect_event(request) is None and not callable(
         getattr(request, "is_disconnected", None)
@@ -1469,20 +1617,22 @@ async def _await_while_connected(
         )
         if operation_task.done() and not operation_task.cancelled():
             return await operation_task
-        _abandon_task(operation_task)
-        raise RenderError(
-            "client_disconnected",
-            "The capture was cancelled.",
-            499,
-            False,
-        )
+        if not operation_task.done():
+            operation_task.cancel()
+        _remember_unsettled_operation(request, operation_task)
+        operation_task.add_done_callback(_consume_abandoned_task)
+        raise _client_disconnected_error(operation_task)
+    except asyncio.CancelledError:
+        if not operation_task.done():
+            operation_task.cancel()
+            operation_task.add_done_callback(_consume_abandoned_task)
+        _remember_unsettled_operation(request, operation_task)
+        raise
     finally:
         if not disconnect_task.done():
             disconnect_task.cancel()
             with suppress(asyncio.CancelledError):
                 await disconnect_task
-        if not operation_task.done():
-            _abandon_task(operation_task)
 
 
 @app.get("/")
@@ -1773,12 +1923,7 @@ async def _render_response(payload: RenderRequest, request: Request) -> Response
         tracked = False
         try:
             if await _client_disconnected(request):
-                raise RenderError(
-                    "client_disconnected",
-                    "The capture was cancelled.",
-                    499,
-                    False,
-                )
+                raise _client_disconnected_error()
             browser = await _browser_for(app, payload.engine)
             _track_browser_use(app, browser)
             tracked = True
@@ -1811,18 +1956,22 @@ async def _render_response(payload: RenderRequest, request: Request) -> Response
                     )
                     if payload.cache and cache is not None:
                         await cache.put(payload, artifact, cache_namespace)
-            except RenderError:
-                if not browser.is_connected():
+            except RenderError as exc:
+                if (
+                    exc.code != "client_disconnected"
+                    and not browser.is_connected()
+                ):
                     with suppress(Exception):
                         await _replace_browser(app, browser)
                 raise
         finally:
-            app.state.capture_slots.release()
-            if tracked and browser is not None:
-                _untrack_browser_use(app, browser)
-            if render_attempted and browser is not None:
-                with suppress(Exception):
-                    await _record_browser_render(app, browser)
+            await _finish_capture(
+                app,
+                browser,
+                tracked=tracked,
+                render_attempted=render_attempted,
+                unsettled_operation=_take_unsettled_operation(request),
+            )
     metadata = artifact.metadata or {}
     _record_render_metrics(
         payload,
