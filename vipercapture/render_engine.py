@@ -565,6 +565,256 @@ def diagnostic_url(value: str) -> str:
         return "invalid-url"
 
 
+SENSITIVE_HAR_HEADERS = frozenset(
+    {
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "set-cookie",
+        "set-cookie2",
+        "x-api-key",
+        "api-key",
+        "x-auth-token",
+        "x-access-token",
+        "x-csrf-token",
+        "x-xsrf-token",
+        "x-amz-security-token",
+        "www-authenticate",
+        "authentication-info",
+        "proxy-authenticate",
+    }
+)
+URL_BEARING_HAR_HEADERS = frozenset(
+    {"location", "content-location", "referer", "refresh", "link"}
+)
+HAR_HTTP_VERSIONS = {
+    "h2": "HTTP/2",
+    "h2c": "HTTP/2",
+    "http/2": "HTTP/2",
+    "http/2.0": "HTTP/2",
+    "h3": "HTTP/3",
+    "http/3": "HTTP/3",
+    "quic": "HTTP/3",
+    "http/1.1": "HTTP/1.1",
+    "http/1.0": "HTTP/1.0",
+    "http/1": "HTTP/1.0",
+    "http/0.9": "HTTP/0.9",
+}
+_HEADER_URL_RE = re.compile(r"(https?://[^\s<>\"';]+)", re.IGNORECASE)
+MAX_HAR_HEADERS = 64
+MAX_HAR_HEADER_CHARS = 4_096
+DIAGNOSTIC_NETWORK_PRIVACY = (
+    "Query strings, credentials, cookies, and bodies are omitted. "
+    "Safe request and response headers, HTTP versions, mime types, and timings are retained."
+)
+
+
+def _header_items(headers_array: object) -> list[tuple[str, str]]:
+    items: list[tuple[str, str]] = []
+    for header in headers_array or ():
+        if isinstance(header, dict):
+            name = header.get("name", "")
+            value = header.get("value", "")
+        else:
+            name = getattr(header, "name", "")
+            value = getattr(header, "value", "")
+        items.append((str(name), str(value)))
+    return items
+
+
+def _redact_header_value(name: str, value: str) -> str:
+    lowered = name.lower()
+    clipped = value[:MAX_HAR_HEADER_CHARS]
+    if lowered in SENSITIVE_HAR_HEADERS:
+        return "[redacted]"
+    if lowered in URL_BEARING_HAR_HEADERS or "://" in clipped:
+        return _HEADER_URL_RE.sub(lambda match: diagnostic_url(match.group(1)), clipped)
+    return clipped
+
+
+def safe_har_headers(headers_array: object) -> list[dict[str, str]]:
+    headers = []
+    for name, value in _header_items(headers_array)[:MAX_HAR_HEADERS]:
+        if name.startswith(":"):
+            continue
+        headers.append({"name": name, "value": _redact_header_value(name, value)})
+    return headers
+
+
+def har_http_version(
+    protocol: str | None,
+    url: str = "",
+    headers_array: object = None,
+) -> str:
+    if protocol:
+        normalized = protocol.strip().lower()
+        if normalized in HAR_HTTP_VERSIONS:
+            return HAR_HTTP_VERSIONS[normalized]
+        if normalized.startswith("h3"):
+            return "HTTP/3"
+        if normalized.startswith("http/"):
+            return f"HTTP/{protocol.strip().split('/', 1)[1]}"
+        if protocol.strip().upper().startswith("HTTP/"):
+            return protocol.strip().upper()
+    if any(name.startswith(":") for name, _ in _header_items(headers_array)):
+        return "HTTP/2"
+    try:
+        scheme = urlsplit(url).scheme.lower()
+    except ValueError:
+        scheme = ""
+    if scheme == "http":
+        return "HTTP/1.1"
+    return "unknown"
+
+
+def mime_type_from_headers(headers: object) -> str:
+    if isinstance(headers, dict):
+        raw = headers.get("content-type") or headers.get("Content-Type") or ""
+    else:
+        raw = ""
+        for name, value in _header_items(headers):
+            if name.lower() == "content-type":
+                raw = value
+                break
+    return str(raw).split(";", 1)[0].strip()
+
+
+def content_size_from_headers(headers: object) -> int:
+    if isinstance(headers, dict):
+        raw = headers.get("content-length") or headers.get("Content-Length")
+    else:
+        raw = None
+        for name, value in _header_items(headers):
+            if name.lower() == "content-length":
+                raw = value
+                break
+    try:
+        size = int(raw)
+    except (TypeError, ValueError):
+        return -1
+    return size if size >= 0 else -1
+
+
+def _har_timing_delta(end: object, start: object) -> float:
+    try:
+        end_ms = float(end)
+        start_ms = float(start)
+    except (TypeError, ValueError):
+        return -1
+    if end_ms < 0 or start_ms < 0:
+        return -1
+    return max(0.0, end_ms - start_ms)
+
+
+def har_timings(timing: object) -> tuple[float, dict[str, float]]:
+    values = timing if isinstance(timing, dict) else {}
+    dns = _har_timing_delta(values.get("domainLookupEnd"), values.get("domainLookupStart"))
+    connect = _har_timing_delta(values.get("connectEnd"), values.get("connectStart"))
+    ssl_start = values.get("secureConnectionStart")
+    ssl = (
+        _har_timing_delta(values.get("connectEnd"), ssl_start)
+        if ssl_start not in (None, -1)
+        else -1
+    )
+    wait = _har_timing_delta(values.get("responseStart"), values.get("requestStart"))
+    receive = _har_timing_delta(values.get("responseEnd"), values.get("responseStart"))
+    blocked_start = values.get("domainLookupStart")
+    try:
+        blocked = max(0.0, float(blocked_start)) if blocked_start not in (None, -1) else -1
+    except (TypeError, ValueError):
+        blocked = -1
+    timings = {
+        "blocked": blocked,
+        "dns": dns,
+        "connect": connect,
+        "ssl": ssl,
+        "send": 0,
+        "wait": wait,
+        "receive": receive,
+    }
+    total = sum(value for value in timings.values() if value > 0)
+    return total, timings
+
+
+def public_network_events(events: list[dict[str, object]]) -> list[dict[str, object]]:
+    published = []
+    for event in events:
+        item = {key: value for key, value in event.items() if not str(key).startswith("_")}
+        if isinstance(item.get("url"), str):
+            item["url"] = diagnostic_url(item["url"])
+        redirect = item.get("redirect_url")
+        if isinstance(redirect, str) and redirect:
+            item["redirect_url"] = (
+                diagnostic_url(redirect) if "://" in redirect else redirect.split("?", 1)[0]
+            )
+        published.append(item)
+    return published
+
+
+def collect_network_event(
+    response: object,
+    *,
+    http_version: str | None = None,
+) -> dict[str, object]:
+    request = getattr(response, "request", None)
+    url = str(getattr(response, "url", "") or "")
+    request_headers = getattr(request, "headers_array", None) if request is not None else None
+    response_headers_array = getattr(response, "headers_array", None)
+    response_headers = getattr(response, "headers", None)
+    timing = getattr(request, "timing", None) if request is not None else None
+    if timing is not None and not isinstance(timing, dict):
+        try:
+            timing = dict(timing)
+        except (TypeError, ValueError):
+            timing = {}
+    combined_headers = [*(request_headers or ()), *(response_headers_array or ())]
+    version = har_http_version(http_version, url, combined_headers)
+    mime_type = mime_type_from_headers(response_headers or response_headers_array)
+    content_size = content_size_from_headers(response_headers or response_headers_array)
+    started = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    if isinstance(timing, dict):
+        start_ms = timing.get("startTime")
+        try:
+            if start_ms is not None and float(start_ms) > 1e11:
+                started = datetime.fromtimestamp(
+                    float(start_ms) / 1000, timezone.utc
+                ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        except (TypeError, ValueError, OSError):
+            pass
+    event = {
+        "timestamp": started,
+        "method": getattr(request, "method", None) or "GET",
+        "url": diagnostic_url(url),
+        "status": getattr(response, "status", 0) or 0,
+        "status_text": getattr(response, "status_text", None) or "",
+        "resource_type": getattr(request, "resource_type", None) or "",
+        "http_version": version,
+        "request_headers": safe_har_headers(request_headers),
+        "response_headers": safe_har_headers(response_headers_array),
+        "mime_type": mime_type,
+        "content_size": content_size,
+        "timing": dict(timing) if isinstance(timing, dict) else {},
+    }
+    redirect = ""
+    for header in event["response_headers"]:
+        if str(header["name"]).lower() == "location":
+            redirect = header["value"]
+            break
+    event["redirect_url"] = redirect
+    return event
+
+
+def apply_network_timing(event: dict[str, object], timing: object) -> None:
+    if timing is None:
+        return
+    if not isinstance(timing, dict):
+        try:
+            timing = dict(timing)
+        except (TypeError, ValueError):
+            return
+    event["timing"] = dict(timing)
+
+
 def _write_diagnostic_zip(entries: list[tuple[str, bytes]]) -> bytes:
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as archive:
@@ -711,37 +961,63 @@ def certification_public_key(secret: str) -> str:
 
 
 def _har_document(events: list[dict[str, object]]) -> bytes:
-    entries = [
-        {
-            "startedDateTime": event.get("timestamp", "1970-01-01T00:00:00.000Z"),
-            "time": 0,
-            "request": {
-                "method": event.get("method", "GET"),
-                "url": event.get("url", ""),
-                "httpVersion": "HTTP/2",
-                "headers": [],
-                "queryString": [],
-                "cookies": [],
-                "headersSize": -1,
-                "bodySize": -1,
-            },
-            "response": {
-                "status": event.get("status", 0),
-                "statusText": "",
-                "httpVersion": "HTTP/2",
-                "headers": [],
-                "cookies": [],
-                "content": {"size": 0, "mimeType": "application/octet-stream"},
-                "redirectURL": "",
-                "headersSize": -1,
-                "bodySize": -1,
-            },
-            "cache": {},
-            "timings": {"send": 0, "wait": 0, "receive": 0},
+    entries = []
+    for event in public_network_events(events):
+        total, timings = har_timings(event.get("timing"))
+        http_version = str(event.get("http_version") or "unknown")
+        mime_type = str(event.get("mime_type") or "")
+        content_size = event.get("content_size", -1)
+        try:
+            content_size = int(content_size)
+        except (TypeError, ValueError):
+            content_size = -1
+        request_headers = event.get("request_headers")
+        response_headers = event.get("response_headers")
+        entries.append(
+            {
+                "startedDateTime": event.get("timestamp", "1970-01-01T00:00:00.000Z"),
+                "time": total,
+                "request": {
+                    "method": event.get("method", "GET"),
+                    "url": diagnostic_url(str(event.get("url", ""))),
+                    "httpVersion": http_version,
+                    "headers": request_headers if isinstance(request_headers, list) else [],
+                    "queryString": [],
+                    "cookies": [],
+                    "headersSize": -1,
+                    "bodySize": -1,
+                },
+                "response": {
+                    "status": event.get("status", 0),
+                    "statusText": event.get("status_text", ""),
+                    "httpVersion": http_version,
+                    "headers": response_headers if isinstance(response_headers, list) else [],
+                    "cookies": [],
+                    "content": {
+                        "size": content_size,
+                        "mimeType": mime_type,
+                    },
+                    "redirectURL": (
+                        diagnostic_url(str(event.get("redirect_url", "")))
+                        if event.get("redirect_url")
+                        else ""
+                    ),
+                    "headersSize": -1,
+                    "bodySize": content_size,
+                },
+                "cache": {},
+                "timings": timings,
+            }
+        )
+    document = {
+        "log": {
+            "version": "1.2",
+            "creator": {"name": "ViperCapture", "version": "1"},
+            "comment": DIAGNOSTIC_NETWORK_PRIVACY,
+            "entries": entries,
         }
-        for event in events
-    ]
-    return (json.dumps({"log": {"version": "1.2", "creator": {"name": "ViperCapture", "version": "1"}, "entries": entries}}, indent=2) + "\n").encode()
+    }
+    return (json.dumps(document, indent=2) + "\n").encode()
 
 
 def _warc_document(events: list[dict[str, object]]) -> bytes:
@@ -879,8 +1155,9 @@ async def diagnostic_bundle(
             "bytes": len(artifact.body),
             "metadata": artifact_metadata,
         },
-        "privacy": "Network query strings, credentials, request headers, cookies, and bodies are omitted.",
+        "privacy": DIAGNOSTIC_NETWORK_PRIVACY,
     }
+    published_network = public_network_events(network_events)
     entries = [
         (artifact.filename, artifact.body),
         (
@@ -894,12 +1171,12 @@ async def diagnostic_bundle(
         )
     if request.diagnostics.include_network:
         entries.append(
-            ("network.json", (json.dumps(network_events, ensure_ascii=False, indent=2) + "\n").encode())
+            ("network.json", (json.dumps(published_network, ensure_ascii=False, indent=2) + "\n").encode())
         )
     if request.diagnostics.include_har:
-        entries.append(("network.har", _har_document(network_events)))
+        entries.append(("network.har", _har_document(published_network)))
     if request.diagnostics.include_warc:
-        entries.append(("network.warc", _warc_document(network_events)))
+        entries.append(("network.warc", _warc_document(published_network)))
     if request.diagnostics.include_trace and context is not None:
         with tempfile.TemporaryDirectory(prefix="vipercapture-trace-") as directory:
             trace_path = Path(directory) / "trace.zip"
@@ -2186,6 +2463,7 @@ class RenderEngine:
         context = None
         page = None
         cdp_session = None
+        har_cdp_session = None
         cdp_prepared = False
         video_directory = None
         blocked_subresources = 0
@@ -2484,20 +2762,60 @@ class RenderEngine:
                         "text": message.text[:4_096],
                     })
 
+                http_versions_by_url: dict[str, list[str]] = {}
+
                 def record_network(response) -> None:
                     if len(network_events) >= MAX_DIAGNOSTIC_EVENTS:
                         return
-                    network_events.append({
-                        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                        "method": response.request.method,
-                        "url": diagnostic_url(response.url),
-                        "status": response.status,
-                        "resource_type": response.request.resource_type,
-                    })
+                    try:
+                        queued = http_versions_by_url.get(response.url)
+                        protocol = queued.pop(0) if queued else None
+                        event = collect_network_event(response, http_version=protocol)
+                        event["_request"] = response.request
+                        network_events.append(event)
+                    except Exception:
+                        return
+
+                def record_network_finished(page_request) -> None:
+                    try:
+                        for event in reversed(network_events):
+                            if event.get("_request") is page_request:
+                                apply_network_timing(event, page_request.timing)
+                                return
+                    except Exception:
+                        return
 
                 if request.diagnostics.bundle:
                     page.on("console", record_console)
                     page.on("response", record_network)
+                    page.on("requestfinished", record_network_finished)
+                    if request.diagnostics.include_har:
+                        try:
+                            har_cdp_session = await context.new_cdp_session(page)
+                            await har_cdp_session.send("Network.enable")
+
+                            def record_cdp_protocol(params: dict[str, object]) -> None:
+                                try:
+                                    payload = params.get("response")
+                                    if not isinstance(payload, dict):
+                                        return
+                                    protocol = payload.get("protocol")
+                                    url = payload.get("url")
+                                    if protocol and url:
+                                        http_versions_by_url.setdefault(str(url), []).append(
+                                            str(protocol)
+                                        )
+                                except Exception:
+                                    return
+
+                            har_cdp_session.on(
+                                "Network.responseReceived", record_cdp_protocol
+                            )
+                        except Exception:
+                            if har_cdp_session is not None:
+                                with suppress(Exception):
+                                    await har_cdp_session.detach()
+                            har_cdp_session = None
 
                 def record_failed(page_request) -> None:
                     for pattern in request.assertions.request_failures:
@@ -3305,6 +3623,9 @@ class RenderEngine:
                 ) from exc
             raise RenderError("render_failed", "The image render failed.", 500, True) from exc
         finally:
+            if har_cdp_session is not None:
+                with suppress(Exception):
+                    await har_cdp_session.detach()
             if cdp_session is not None and page is not None:
                 await _close_cdp_capture_session(
                     page, cdp_session, prepared=cdp_prepared
