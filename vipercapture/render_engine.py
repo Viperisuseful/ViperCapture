@@ -1115,11 +1115,13 @@ def _private_subresource_error() -> RenderError:
 
 
 def _reject_blocked_private_subresources(blocked: bool) -> None:
-    """Fail a completed hosted render that blocked a private subresource.
+    """Fail a hosted render that requested a private or non-public subresource.
 
     Route abort is not enough: HTML/Markdown loads `about:blank`, so the
     main-target public check never runs, and a successful capture would
     otherwise return HTTP 200 with only a `blocked_subresources` count.
+    Call this as soon as the violation is known, before capture, encode,
+    diagnostics, or profile persistence.
     """
     if blocked:
         raise _private_subresource_error()
@@ -2404,6 +2406,11 @@ class RenderEngine:
                     if scheme in ALLOWED_INTERNAL_SCHEMES:
                         await route.continue_()
                         return
+                    if self.hosted and not await public_urls.is_public(request_url):
+                        blocked_subresources += 1
+                        blocked_private_subresources = True
+                        await route.abort("blockedbyclient")
+                        return
                     blocked_by_type = route.request.resource_type in {
                         resource.value for resource in request.network.block_resource_types
                     }
@@ -2429,11 +2436,6 @@ class RenderEngine:
                             blocked_subresources += 1
                             await route.abort("blockedbyclient")
                             return
-                    if self.hosted and not await public_urls.is_public(request_url):
-                        blocked_subresources += 1
-                        blocked_private_subresources = True
-                        await route.abort("blockedbyclient")
-                        return
                     await route.continue_(
                         headers=routed_headers(
                             request_url,
@@ -2610,6 +2612,7 @@ class RenderEngine:
                             "X-ViperCapture-Navigation-Status": str(navigation_status)
                         },
                     )
+                _reject_blocked_private_subresources(blocked_private_subresources)
                 if self.cleanup_hooks:
                     await self.cleanup_hooks.finish(page, cleanup_session)
                 if request.custom_css:
@@ -2625,15 +2628,18 @@ class RenderEngine:
                             False,
                         ) from exc
                 await self._wait(page, request, limits)
+                _reject_blocked_private_subresources(blocked_private_subresources)
                 if self.cleanup_hooks:
                     await self.cleanup_hooks.apply(page, request.cleanup)
                 await self._run_actions(page, request, limits)
+                _reject_blocked_private_subresources(blocked_private_subresources)
                 if self.cleanup_hooks:
                     await self.cleanup_hooks.apply(page, request.cleanup)
                 if self.challenge_checker:
                     await self.challenge_checker(
                         page, request, navigation_status, challenge_budget
                     )
+                _reject_blocked_private_subresources(blocked_private_subresources)
                 resizing_image = (
                     request.image.width is not None
                     or request.image.height is not None
@@ -2682,11 +2688,13 @@ class RenderEngine:
                             page, request, navigation_status, challenge_budget
                         )
                     await self._wait_for_images(page, request, limits)
+                    _reject_blocked_private_subresources(blocked_private_subresources)
                 if request.deterministic.enabled and request.deterministic.wait_for_fonts:
                     await page.evaluate("() => document.fonts?.ready")
                 await self._check_assertions(
                     page, request, failed_requests, matched_failure_patterns
                 )
+                _reject_blocked_private_subresources(blocked_private_subresources)
                 if request.output in {OutputFormat.WEBM, OutputFormat.MP4, OutputFormat.GIF}:
                     options = request.video
                     if options is None:
@@ -2738,6 +2746,7 @@ class RenderEngine:
                         failed_requests,
                         matched_failure_patterns,
                     )
+                    _reject_blocked_private_subresources(blocked_private_subresources)
                     pending_profile_state = (
                         await context.storage_state()
                         if request.save_profile and request.profile_id is not None
@@ -2818,10 +2827,10 @@ class RenderEngine:
                     finalized = await diagnostic_bundle(
                         artifact, request, console_events, network_events, limits
                     )
+                    _reject_blocked_private_subresources(blocked_private_subresources)
                     await self._persist_profile_state(
                         request, pending_profile_state
                     )
-                    _reject_blocked_private_subresources(blocked_private_subresources)
                     return finalized
 
                 if request.output not in MEDIA_TYPES:
@@ -2874,8 +2883,8 @@ class RenderEngine:
                         artifact, request, console_events, network_events, limits,
                         page=page, context=context,
                     )
-                    await self._persist_profile(request, context)
                     _reject_blocked_private_subresources(blocked_private_subresources)
+                    await self._persist_profile(request, context)
                     return finalized
 
                 screenshot_output = (
@@ -3128,8 +3137,8 @@ class RenderEngine:
                         page=page,
                         context=context,
                     )
-                    await self._persist_profile(request, context)
                     _reject_blocked_private_subresources(blocked_private_subresources)
+                    await self._persist_profile(request, context)
                     return finalized
                 if uses_cdp_capture:
                     scroll = {"x": 0, "y": 0}
@@ -3312,12 +3321,16 @@ class RenderEngine:
                     artifact, request, console_events, network_events, limits,
                     page=page, context=context,
                 )
-                await self._persist_profile(request, context)
                 _reject_blocked_private_subresources(blocked_private_subresources)
+                await self._persist_profile(request, context)
                 return finalized
         except TimeoutError as exc:
+            if blocked_private_subresources:
+                raise _private_subresource_error() from exc
             raise RenderError("render_timeout", "The render exceeded its total deadline.", 504, True) from exc
-        except RenderError:
+        except RenderError as exc:
+            if blocked_private_subresources and exc.code != "subresource_not_public":
+                raise _private_subresource_error() from exc
             raise
         except Exception as exc:
             if blocked_private_subresources:
