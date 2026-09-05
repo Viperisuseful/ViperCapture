@@ -70,6 +70,140 @@ DEVICE_PLATFORMS = {
     DevicePreset.PIXEL_7: "Linux armv8l",
     DevicePreset.IPAD: "iPad",
 }
+# Used when Playwright's live registry is unavailable. Live descriptors win.
+DEVICE_DESCRIPTOR_FALLBACKS: dict[DevicePreset, dict[str, object]] = {
+    DevicePreset.IPHONE_14: {
+        "viewport": {"width": 390, "height": 664},
+        "screen": {"width": 390, "height": 844},
+        "device_scale_factor": 3,
+        "is_mobile": True,
+        "has_touch": True,
+    },
+    DevicePreset.PIXEL_7: {
+        "viewport": {"width": 412, "height": 839},
+        "screen": {"width": 412, "height": 915},
+        "device_scale_factor": 2.625,
+        "is_mobile": True,
+        "has_touch": True,
+    },
+    DevicePreset.IPAD: {
+        "viewport": {"width": 810, "height": 1080},
+        "screen": {"width": 810, "height": 1080},
+        "device_scale_factor": 2,
+        "is_mobile": True,
+        "has_touch": True,
+    },
+}
+
+
+def resolved_device_descriptor(
+    device: DevicePreset,
+    device_descriptors: dict[str, dict[str, object]] | None = None,
+) -> dict[str, object]:
+    """Return the Playwright device descriptor, or a built-in fallback."""
+    name = DEVICE_DESCRIPTOR_NAMES.get(device)
+    if name is None:
+        return {}
+    live = (device_descriptors or {}).get(name)
+    if live:
+        return dict(live)
+    fallback = DEVICE_DESCRIPTOR_FALLBACKS.get(device)
+    return dict(fallback) if fallback else {}
+
+
+def viewport_from_named(viewport: Viewport) -> Viewport:
+    """Copy a named viewport without treating omitted size/DSF as explicit."""
+    fields = viewport.model_fields_set
+    return Viewport(
+        **{
+            name: getattr(viewport, name)
+            for name in ("width", "height", "device_scale_factor")
+            if name in fields
+        }
+    )
+
+
+def apply_device_metrics(
+    request: RenderRequest,
+    device_descriptors: dict[str, dict[str, object]] | None = None,
+) -> RenderRequest:
+    """Fill implicit viewport/DSF from the device descriptor.
+
+    Explicit caller `viewport.width`, `viewport.height`, or
+    `viewport.device_scale_factor` values still win.
+    """
+    descriptor = resolved_device_descriptor(
+        request.environment.device, device_descriptors
+    )
+    if not descriptor:
+        return request
+    desc_viewport = descriptor.get("viewport")
+    if not isinstance(desc_viewport, dict):
+        desc_viewport = {}
+    explicit = request.viewport.model_fields_set
+    updates: dict[str, object] = {}
+    if "width" not in explicit and "width" in desc_viewport:
+        updates["width"] = desc_viewport["width"]
+    if "height" not in explicit and "height" in desc_viewport:
+        updates["height"] = desc_viewport["height"]
+    scale = descriptor.get("device_scale_factor")
+    if "device_scale_factor" not in explicit and scale is not None:
+        updates["device_scale_factor"] = scale
+    if not updates:
+        return request
+    return request.model_copy(
+        update={"viewport": request.viewport.model_copy(update=updates)}
+    )
+
+
+def _descriptor_screen(descriptor: dict[str, object]) -> dict[str, object]:
+    screen = descriptor.get("screen")
+    if isinstance(screen, dict):
+        return dict(screen)
+    viewport = descriptor.get("viewport")
+    if isinstance(viewport, dict):
+        return dict(viewport)
+    return {}
+
+
+def device_context_options(
+    request: RenderRequest,
+    device_descriptors: dict[str, dict[str, object]] | None = None,
+) -> dict[str, object]:
+    """Context options for a device preset, honoring explicit viewport/DSF."""
+    explicit = request.viewport.model_fields_set
+    descriptor = resolved_device_descriptor(
+        request.environment.device, device_descriptors
+    )
+    options: dict[str, object] = {}
+    if descriptor:
+        options.update(descriptor)
+        options.pop("default_browser_type", None)
+    resolved = apply_device_metrics(request, device_descriptors)
+    options["viewport"] = {
+        "width": resolved.viewport.width,
+        "height": resolved.viewport.height,
+    }
+    if not descriptor or "device_scale_factor" in explicit:
+        options["device_scale_factor"] = resolved.viewport.device_scale_factor
+    if descriptor:
+        screen = _descriptor_screen(descriptor)
+        if "width" in explicit:
+            screen["width"] = resolved.viewport.width
+        if "height" in explicit:
+            screen["height"] = resolved.viewport.height
+        if screen:
+            options["screen"] = screen
+    else:
+        options["screen"] = {
+            "width": resolved.viewport.width,
+            "height": resolved.viewport.height,
+        }
+    if request.environment.device is not DevicePreset.DESKTOP:
+        options.setdefault("has_touch", True)
+    return options
+
+
 MAX_METADATA_ITEMS = 100
 MAX_METADATA_VALUE_CHARS = 2_048
 DNS_RESOLUTION_TIMEOUT_SECONDS = 5
@@ -565,6 +699,272 @@ def diagnostic_url(value: str) -> str:
         return "invalid-url"
 
 
+SENSITIVE_HAR_HEADERS = frozenset(
+    {
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "set-cookie",
+        "set-cookie2",
+        "x-api-key",
+        "api-key",
+        "x-auth-token",
+        "x-access-token",
+        "x-csrf-token",
+        "x-xsrf-token",
+        "x-amz-security-token",
+        "www-authenticate",
+        "authentication-info",
+        "proxy-authenticate",
+    }
+)
+URL_BEARING_HAR_HEADERS = frozenset(
+    {"location", "content-location", "referer", "refresh", "link"}
+)
+HAR_HTTP_VERSIONS = {
+    "h2": "HTTP/2",
+    "h2c": "HTTP/2",
+    "http/2": "HTTP/2",
+    "http/2.0": "HTTP/2",
+    "h3": "HTTP/3",
+    "http/3": "HTTP/3",
+    "quic": "HTTP/3",
+    "http/1.1": "HTTP/1.1",
+    "http/1.0": "HTTP/1.0",
+    "http/1": "HTTP/1.0",
+    "http/0.9": "HTTP/0.9",
+}
+_HEADER_URL_RE = re.compile(r"(https?://[^\s<>\"';]+)", re.IGNORECASE)
+MAX_HAR_HEADERS = 64
+MAX_HAR_HEADER_CHARS = 4_096
+DIAGNOSTIC_NETWORK_PRIVACY = (
+    "Query strings, credentials, cookies, and bodies are omitted. "
+    "Safe request and response headers, HTTP versions, mime types, and timings are retained."
+)
+
+
+def _headers_from_source(source: object) -> object:
+    """Read headers without awaiting Playwright's async headers_array()."""
+    if source is None:
+        return None
+    headers_array = getattr(source, "headers_array", None)
+    if isinstance(headers_array, list):
+        return headers_array
+    headers = getattr(source, "headers", None)
+    if isinstance(headers, dict):
+        return [{"name": str(name), "value": str(value)} for name, value in headers.items()]
+    return None
+
+
+def _header_items(headers_array: object) -> list[tuple[str, str]]:
+    items: list[tuple[str, str]] = []
+    for header in headers_array or ():
+        if isinstance(header, dict):
+            name = header.get("name", "")
+            value = header.get("value", "")
+        else:
+            name = getattr(header, "name", "")
+            value = getattr(header, "value", "")
+        items.append((str(name), str(value)))
+    return items
+
+
+def _redact_header_value(name: str, value: str) -> str:
+    lowered = name.lower()
+    clipped = value[:MAX_HAR_HEADER_CHARS]
+    if lowered in SENSITIVE_HAR_HEADERS:
+        return "[redacted]"
+    if lowered in URL_BEARING_HAR_HEADERS or "://" in clipped:
+        return _HEADER_URL_RE.sub(lambda match: diagnostic_url(match.group(1)), clipped)
+    return clipped
+
+
+def safe_har_headers(headers_array: object) -> list[dict[str, str]]:
+    headers = []
+    for name, value in _header_items(headers_array)[:MAX_HAR_HEADERS]:
+        if name.startswith(":"):
+            continue
+        headers.append({"name": name, "value": _redact_header_value(name, value)})
+    return headers
+
+
+def har_http_version(
+    protocol: str | None,
+    url: str = "",
+    headers_array: object = None,
+) -> str:
+    if protocol:
+        normalized = protocol.strip().lower()
+        if normalized in HAR_HTTP_VERSIONS:
+            return HAR_HTTP_VERSIONS[normalized]
+        if normalized.startswith("h3"):
+            return "HTTP/3"
+        if normalized.startswith("http/"):
+            return f"HTTP/{protocol.strip().split('/', 1)[1]}"
+        if protocol.strip().upper().startswith("HTTP/"):
+            return protocol.strip().upper()
+    if any(name.startswith(":") for name, _ in _header_items(headers_array)):
+        return "HTTP/2"
+    try:
+        scheme = urlsplit(url).scheme.lower()
+    except ValueError:
+        scheme = ""
+    if scheme == "http":
+        return "HTTP/1.1"
+    return "unknown"
+
+
+def mime_type_from_headers(headers: object) -> str:
+    if isinstance(headers, dict):
+        raw = headers.get("content-type") or headers.get("Content-Type") or ""
+    else:
+        raw = ""
+        for name, value in _header_items(headers):
+            if name.lower() == "content-type":
+                raw = value
+                break
+    return str(raw).split(";", 1)[0].strip()
+
+
+def content_size_from_headers(headers: object) -> int:
+    if isinstance(headers, dict):
+        raw = headers.get("content-length") or headers.get("Content-Length")
+    else:
+        raw = None
+        for name, value in _header_items(headers):
+            if name.lower() == "content-length":
+                raw = value
+                break
+    try:
+        size = int(raw)
+    except (TypeError, ValueError):
+        return -1
+    return size if size >= 0 else -1
+
+
+def _har_timing_delta(end: object, start: object) -> float:
+    try:
+        end_ms = float(end)
+        start_ms = float(start)
+    except (TypeError, ValueError):
+        return -1
+    if end_ms < 0 or start_ms < 0:
+        return -1
+    return max(0.0, end_ms - start_ms)
+
+
+def har_timings(timing: object) -> tuple[float, dict[str, float]]:
+    values = timing if isinstance(timing, dict) else {}
+    dns = _har_timing_delta(values.get("domainLookupEnd"), values.get("domainLookupStart"))
+    connect = _har_timing_delta(values.get("connectEnd"), values.get("connectStart"))
+    ssl_start = values.get("secureConnectionStart")
+    ssl = (
+        _har_timing_delta(values.get("connectEnd"), ssl_start)
+        if ssl_start not in (None, -1)
+        else -1
+    )
+    wait = _har_timing_delta(values.get("responseStart"), values.get("requestStart"))
+    receive = _har_timing_delta(values.get("responseEnd"), values.get("responseStart"))
+    blocked_start = values.get("domainLookupStart")
+    try:
+        blocked = max(0.0, float(blocked_start)) if blocked_start not in (None, -1) else -1
+    except (TypeError, ValueError):
+        blocked = -1
+    def rounded(value: float) -> float:
+        return -1 if value < 0 else round(value, 3)
+
+    timings = {
+        "blocked": rounded(blocked),
+        "dns": rounded(dns),
+        "connect": rounded(connect),
+        "ssl": rounded(ssl),
+        "send": 0,
+        "wait": rounded(wait),
+        "receive": rounded(receive),
+    }
+    total = round(sum(value for value in timings.values() if value > 0), 3)
+    return total, timings
+
+
+def public_network_events(events: list[dict[str, object]]) -> list[dict[str, object]]:
+    published = []
+    for event in events:
+        item = {key: value for key, value in event.items() if not str(key).startswith("_")}
+        if isinstance(item.get("url"), str):
+            item["url"] = diagnostic_url(item["url"])
+        redirect = item.get("redirect_url")
+        if isinstance(redirect, str) and redirect:
+            item["redirect_url"] = (
+                diagnostic_url(redirect) if "://" in redirect else redirect.split("?", 1)[0]
+            )
+        published.append(item)
+    return published
+
+
+def collect_network_event(
+    response: object,
+    *,
+    http_version: str | None = None,
+) -> dict[str, object]:
+    request = getattr(response, "request", None)
+    url = str(getattr(response, "url", "") or "")
+    request_headers = _headers_from_source(request) if request is not None else None
+    response_headers_array = _headers_from_source(response)
+    response_headers = getattr(response, "headers", None)
+    timing = getattr(request, "timing", None) if request is not None else None
+    if timing is not None and not isinstance(timing, dict):
+        try:
+            timing = dict(timing)
+        except (TypeError, ValueError):
+            timing = {}
+    combined_headers = [*(request_headers or ()), *(response_headers_array or ())]
+    version = har_http_version(http_version, url, combined_headers)
+    mime_type = mime_type_from_headers(response_headers or response_headers_array)
+    content_size = content_size_from_headers(response_headers or response_headers_array)
+    started = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    if isinstance(timing, dict):
+        start_ms = timing.get("startTime")
+        try:
+            if start_ms is not None and float(start_ms) > 1e11:
+                started = datetime.fromtimestamp(
+                    float(start_ms) / 1000, timezone.utc
+                ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        except (TypeError, ValueError, OSError):
+            pass
+    event = {
+        "timestamp": started,
+        "method": getattr(request, "method", None) or "GET",
+        "url": diagnostic_url(url),
+        "status": getattr(response, "status", 0) or 0,
+        "status_text": getattr(response, "status_text", None) or "",
+        "resource_type": getattr(request, "resource_type", None) or "",
+        "http_version": version,
+        "request_headers": safe_har_headers(request_headers),
+        "response_headers": safe_har_headers(response_headers_array),
+        "mime_type": mime_type,
+        "content_size": content_size,
+        "timing": dict(timing) if isinstance(timing, dict) else {},
+    }
+    redirect = ""
+    for header in event["response_headers"]:
+        if str(header["name"]).lower() == "location":
+            redirect = header["value"]
+            break
+    event["redirect_url"] = redirect
+    return event
+
+
+def apply_network_timing(event: dict[str, object], timing: object) -> None:
+    if timing is None:
+        return
+    if not isinstance(timing, dict):
+        try:
+            timing = dict(timing)
+        except (TypeError, ValueError):
+            return
+    event["timing"] = dict(timing)
+
+
 def _write_diagnostic_zip(entries: list[tuple[str, bytes]]) -> bytes:
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as archive:
@@ -711,37 +1111,63 @@ def certification_public_key(secret: str) -> str:
 
 
 def _har_document(events: list[dict[str, object]]) -> bytes:
-    entries = [
-        {
-            "startedDateTime": event.get("timestamp", "1970-01-01T00:00:00.000Z"),
-            "time": 0,
-            "request": {
-                "method": event.get("method", "GET"),
-                "url": event.get("url", ""),
-                "httpVersion": "HTTP/2",
-                "headers": [],
-                "queryString": [],
-                "cookies": [],
-                "headersSize": -1,
-                "bodySize": -1,
-            },
-            "response": {
-                "status": event.get("status", 0),
-                "statusText": "",
-                "httpVersion": "HTTP/2",
-                "headers": [],
-                "cookies": [],
-                "content": {"size": 0, "mimeType": "application/octet-stream"},
-                "redirectURL": "",
-                "headersSize": -1,
-                "bodySize": -1,
-            },
-            "cache": {},
-            "timings": {"send": 0, "wait": 0, "receive": 0},
+    entries = []
+    for event in public_network_events(events):
+        total, timings = har_timings(event.get("timing"))
+        http_version = str(event.get("http_version") or "unknown")
+        mime_type = str(event.get("mime_type") or "")
+        content_size = event.get("content_size", -1)
+        try:
+            content_size = int(content_size)
+        except (TypeError, ValueError):
+            content_size = -1
+        request_headers = event.get("request_headers")
+        response_headers = event.get("response_headers")
+        entries.append(
+            {
+                "startedDateTime": event.get("timestamp", "1970-01-01T00:00:00.000Z"),
+                "time": total,
+                "request": {
+                    "method": event.get("method", "GET"),
+                    "url": diagnostic_url(str(event.get("url", ""))),
+                    "httpVersion": http_version,
+                    "headers": request_headers if isinstance(request_headers, list) else [],
+                    "queryString": [],
+                    "cookies": [],
+                    "headersSize": -1,
+                    "bodySize": -1,
+                },
+                "response": {
+                    "status": event.get("status", 0),
+                    "statusText": event.get("status_text", ""),
+                    "httpVersion": http_version,
+                    "headers": response_headers if isinstance(response_headers, list) else [],
+                    "cookies": [],
+                    "content": {
+                        "size": content_size,
+                        "mimeType": mime_type,
+                    },
+                    "redirectURL": (
+                        diagnostic_url(str(event.get("redirect_url", "")))
+                        if event.get("redirect_url")
+                        else ""
+                    ),
+                    "headersSize": -1,
+                    "bodySize": content_size,
+                },
+                "cache": {},
+                "timings": timings,
+            }
+        )
+    document = {
+        "log": {
+            "version": "1.2",
+            "creator": {"name": "ViperCapture", "version": "1"},
+            "comment": DIAGNOSTIC_NETWORK_PRIVACY,
+            "entries": entries,
         }
-        for event in events
-    ]
-    return (json.dumps({"log": {"version": "1.2", "creator": {"name": "ViperCapture", "version": "1"}, "entries": entries}}, indent=2) + "\n").encode()
+    }
+    return (json.dumps(document, indent=2) + "\n").encode()
 
 
 def _warc_document(events: list[dict[str, object]]) -> bytes:
@@ -879,8 +1305,9 @@ async def diagnostic_bundle(
             "bytes": len(artifact.body),
             "metadata": artifact_metadata,
         },
-        "privacy": "Network query strings, credentials, request headers, cookies, and bodies are omitted.",
+        "privacy": DIAGNOSTIC_NETWORK_PRIVACY,
     }
+    published_network = public_network_events(network_events)
     entries = [
         (artifact.filename, artifact.body),
         (
@@ -894,12 +1321,12 @@ async def diagnostic_bundle(
         )
     if request.diagnostics.include_network:
         entries.append(
-            ("network.json", (json.dumps(network_events, ensure_ascii=False, indent=2) + "\n").encode())
+            ("network.json", (json.dumps(published_network, ensure_ascii=False, indent=2) + "\n").encode())
         )
     if request.diagnostics.include_har:
-        entries.append(("network.har", _har_document(network_events)))
+        entries.append(("network.har", _har_document(published_network)))
     if request.diagnostics.include_warc:
-        entries.append(("network.warc", _warc_document(network_events)))
+        entries.append(("network.warc", _warc_document(published_network)))
     if request.diagnostics.include_trace and context is not None:
         with tempfile.TemporaryDirectory(prefix="vipercapture-trace-") as directory:
             trace_path = Path(directory) / "trace.zip"
@@ -1103,6 +1530,28 @@ def needs_request_routing(
 ) -> bool:
     """Avoid Playwright interception when it provides no behavior."""
     return hosted or bool(custom_headers) or cleanup_enabled
+
+
+def _private_subresource_error() -> RenderError:
+    return RenderError(
+        "subresource_not_public",
+        "The page requested a private or non-public resource.",
+        400,
+        False,
+    )
+
+
+def _reject_blocked_private_subresources(blocked: bool) -> None:
+    """Fail a hosted render that requested a private or non-public subresource.
+
+    Route abort is not enough: HTML/Markdown loads `about:blank`, so the
+    main-target public check never runs, and a successful capture would
+    otherwise return HTTP 200 with only a `blocked_subresources` count.
+    Call this as soon as the violation is known, before capture, encode,
+    diagnostics, or profile persistence.
+    """
+    if blocked:
+        raise _private_subresource_error()
 
 
 def _invalid_selector_error(error: PlaywrightError) -> bool:
@@ -2070,11 +2519,7 @@ class RenderEngine:
                     )
                     single = request.model_copy(
                         update={
-                            "viewport": Viewport(
-                                width=viewport.width,
-                                height=viewport.height,
-                                device_scale_factor=viewport.device_scale_factor,
-                            ),
+                            "viewport": viewport_from_named(viewport),
                             "viewports": None,
                             "environment": environment,
                         }
@@ -2163,6 +2608,8 @@ class RenderEngine:
     ) -> RenderArtifact:
         from .content_rendering import input_document, render_document_output
 
+        context_device = device_context_options(request, self.device_descriptors)
+        request = apply_device_metrics(request, self.device_descriptors)
         target = str(request.url or request.base_url or "about:blank")
         public_urls = PublicUrlValidator()
         if self.hosted and target != "about:blank" and not await public_urls.is_public(target):
@@ -2186,6 +2633,7 @@ class RenderEngine:
         context = None
         page = None
         cdp_session = None
+        har_cdp_session = None
         cdp_prepared = False
         video_directory = None
         blocked_subresources = 0
@@ -2233,23 +2681,12 @@ class RenderEngine:
                         "width": request.viewport.width,
                         "height": request.viewport.height,
                     }
-                descriptor_name = DEVICE_DESCRIPTOR_NAMES.get(request.environment.device)
-                if descriptor_name:
-                    context_options.update(self.device_descriptors.get(descriptor_name, {}))
-                    context_options.pop("default_browser_type", None)
+                if context_device:
+                    context_options.update(context_device)
                     if request.engine.value == BrowserEngine.FIREFOX.value:
                         context_options.pop("is_mobile", None)
                 context_options.update(
                     {
-                        "viewport": {
-                            "width": request.viewport.width,
-                            "height": request.viewport.height,
-                        },
-                        "screen": {
-                            "width": request.viewport.width,
-                            "height": request.viewport.height,
-                        },
-                        "device_scale_factor": request.viewport.device_scale_factor,
                         "java_script_enabled": request.network.java_script_enabled,
                         "service_workers": (
                             "block"
@@ -2384,6 +2821,11 @@ class RenderEngine:
                     if scheme in ALLOWED_INTERNAL_SCHEMES:
                         await route.continue_()
                         return
+                    if self.hosted and not await public_urls.is_public(request_url):
+                        blocked_subresources += 1
+                        blocked_private_subresources = True
+                        await route.abort("blockedbyclient")
+                        return
                     blocked_by_type = route.request.resource_type in {
                         resource.value for resource in request.network.block_resource_types
                     }
@@ -2409,11 +2851,6 @@ class RenderEngine:
                             blocked_subresources += 1
                             await route.abort("blockedbyclient")
                             return
-                    if self.hosted and not await public_urls.is_public(request_url):
-                        blocked_subresources += 1
-                        blocked_private_subresources = True
-                        await route.abort("blockedbyclient")
-                        return
                     await route.continue_(
                         headers=routed_headers(
                             request_url,
@@ -2484,20 +2921,60 @@ class RenderEngine:
                         "text": message.text[:4_096],
                     })
 
+                http_versions_by_url: dict[str, list[str]] = {}
+
                 def record_network(response) -> None:
                     if len(network_events) >= MAX_DIAGNOSTIC_EVENTS:
                         return
-                    network_events.append({
-                        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                        "method": response.request.method,
-                        "url": diagnostic_url(response.url),
-                        "status": response.status,
-                        "resource_type": response.request.resource_type,
-                    })
+                    try:
+                        queued = http_versions_by_url.get(response.url)
+                        protocol = queued.pop(0) if queued else None
+                        event = collect_network_event(response, http_version=protocol)
+                        event["_request"] = response.request
+                        network_events.append(event)
+                    except Exception:
+                        return
+
+                def record_network_finished(page_request) -> None:
+                    try:
+                        for event in reversed(network_events):
+                            if event.get("_request") is page_request:
+                                apply_network_timing(event, page_request.timing)
+                                return
+                    except Exception:
+                        return
 
                 if request.diagnostics.bundle:
                     page.on("console", record_console)
                     page.on("response", record_network)
+                    page.on("requestfinished", record_network_finished)
+                    if request.diagnostics.include_har:
+                        try:
+                            har_cdp_session = await context.new_cdp_session(page)
+                            await har_cdp_session.send("Network.enable")
+
+                            def record_cdp_protocol(params: dict[str, object]) -> None:
+                                try:
+                                    payload = params.get("response")
+                                    if not isinstance(payload, dict):
+                                        return
+                                    protocol = payload.get("protocol")
+                                    url = payload.get("url")
+                                    if protocol and url:
+                                        http_versions_by_url.setdefault(str(url), []).append(
+                                            str(protocol)
+                                        )
+                                except Exception:
+                                    return
+
+                            har_cdp_session.on(
+                                "Network.responseReceived", record_cdp_protocol
+                            )
+                        except Exception:
+                            if har_cdp_session is not None:
+                                with suppress(Exception):
+                                    await har_cdp_session.detach()
+                            har_cdp_session = None
 
                 def record_failed(page_request) -> None:
                     for pattern in request.assertions.request_failures:
@@ -2590,6 +3067,7 @@ class RenderEngine:
                             "X-ViperCapture-Navigation-Status": str(navigation_status)
                         },
                     )
+                _reject_blocked_private_subresources(blocked_private_subresources)
                 if self.cleanup_hooks:
                     await self.cleanup_hooks.finish(page, cleanup_session)
                 if request.custom_css:
@@ -2605,15 +3083,18 @@ class RenderEngine:
                             False,
                         ) from exc
                 await self._wait(page, request, limits)
+                _reject_blocked_private_subresources(blocked_private_subresources)
                 if self.cleanup_hooks:
                     await self.cleanup_hooks.apply(page, request.cleanup)
                 await self._run_actions(page, request, limits)
+                _reject_blocked_private_subresources(blocked_private_subresources)
                 if self.cleanup_hooks:
                     await self.cleanup_hooks.apply(page, request.cleanup)
                 if self.challenge_checker:
                     await self.challenge_checker(
                         page, request, navigation_status, challenge_budget
                     )
+                _reject_blocked_private_subresources(blocked_private_subresources)
                 resizing_image = (
                     request.image.width is not None
                     or request.image.height is not None
@@ -2662,11 +3143,13 @@ class RenderEngine:
                             page, request, navigation_status, challenge_budget
                         )
                     await self._wait_for_images(page, request, limits)
+                    _reject_blocked_private_subresources(blocked_private_subresources)
                 if request.deterministic.enabled and request.deterministic.wait_for_fonts:
                     await page.evaluate("() => document.fonts?.ready")
                 await self._check_assertions(
                     page, request, failed_requests, matched_failure_patterns
                 )
+                _reject_blocked_private_subresources(blocked_private_subresources)
                 if request.output in {OutputFormat.WEBM, OutputFormat.MP4, OutputFormat.GIF}:
                     options = request.video
                     if options is None:
@@ -2718,6 +3201,7 @@ class RenderEngine:
                         failed_requests,
                         matched_failure_patterns,
                     )
+                    _reject_blocked_private_subresources(blocked_private_subresources)
                     pending_profile_state = (
                         await context.storage_state()
                         if request.save_profile and request.profile_id is not None
@@ -2798,6 +3282,7 @@ class RenderEngine:
                     finalized = await diagnostic_bundle(
                         artifact, request, console_events, network_events, limits
                     )
+                    _reject_blocked_private_subresources(blocked_private_subresources)
                     await self._persist_profile_state(
                         request, pending_profile_state
                     )
@@ -2853,6 +3338,7 @@ class RenderEngine:
                         artifact, request, console_events, network_events, limits,
                         page=page, context=context,
                     )
+                    _reject_blocked_private_subresources(blocked_private_subresources)
                     await self._persist_profile(request, context)
                     return finalized
 
@@ -3106,6 +3592,7 @@ class RenderEngine:
                         page=page,
                         context=context,
                     )
+                    _reject_blocked_private_subresources(blocked_private_subresources)
                     await self._persist_profile(request, context)
                     return finalized
                 if uses_cdp_capture:
@@ -3289,22 +3776,25 @@ class RenderEngine:
                     artifact, request, console_events, network_events, limits,
                     page=page, context=context,
                 )
+                _reject_blocked_private_subresources(blocked_private_subresources)
                 await self._persist_profile(request, context)
                 return finalized
         except TimeoutError as exc:
+            if blocked_private_subresources:
+                raise _private_subresource_error() from exc
             raise RenderError("render_timeout", "The render exceeded its total deadline.", 504, True) from exc
-        except RenderError:
+        except RenderError as exc:
+            if blocked_private_subresources and exc.code != "subresource_not_public":
+                raise _private_subresource_error() from exc
             raise
         except Exception as exc:
             if blocked_private_subresources:
-                raise RenderError(
-                    "subresource_not_public",
-                    "The page requested a private or non-public resource.",
-                    400,
-                    False,
-                ) from exc
+                raise _private_subresource_error() from exc
             raise RenderError("render_failed", "The image render failed.", 500, True) from exc
         finally:
+            if har_cdp_session is not None:
+                with suppress(Exception):
+                    await har_cdp_session.detach()
             if cdp_session is not None and page is not None:
                 await _close_cdp_capture_session(
                     page, cdp_session, prepared=cdp_prepared

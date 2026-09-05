@@ -19,6 +19,9 @@ running, the interactive OpenAPI reference is available at `/docs`.
 `viewports` accepts two or three named image viewports and returns a ZIP with a
 manifest. `diagnostics.bundle` returns a ZIP containing the normal artifact,
 manifest, and optionally bounded console and network event files.
+`diagnostics.include_har=true` adds `network.har`, a redacted HAR 1.2 log with
+observed HTTP versions, safe headers, mime types, and timings. Query strings,
+cookies, credentials, and bodies are omitted.
 WebM setup/navigation frames are trimmed from the recording with Playwright's
 FFmpeg runtime, and `duration_ms` reports the verified encoded duration rather
 than merely echoing the request.
@@ -112,8 +115,14 @@ matter.
 ## Configure the browser
 
 - `environment`: device preset, color scheme, reduced motion, CSS media, locale,
-  and timezone. Set `media` to `screen` or `print` to apply it before the target
-  loads. When omitted, screenshots keep browser screen media and PDFs use print.
+  and timezone. A non-desktop `device` (`iphone_14`, `pixel_7`, `ipad`) applies
+  the matching Playwright descriptor: user agent, viewport, screen,
+  `device_scale_factor`, and touch. Explicit `viewport.width`,
+  `viewport.height`, or `viewport.device_scale_factor` values override the
+  descriptor. `{"environment": {"device": "iphone_14"}}` is enough to capture
+  at iPhone 14 metrics; you do not also need a matching `viewport`. Set
+  `media` to `screen` or `print` to apply it before the target loads. When
+  omitted, screenshots keep browser screen media and PDFs use print.
 - `network`: target-page JavaScript, user agent, geolocation, proxy, cookies,
   CSP/HTTPS controls, URL glob blocks, and resource-type blocks. Set
   `java_script_enabled: false` to prevent target-provided scripts from running.
