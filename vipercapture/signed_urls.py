@@ -9,7 +9,6 @@ import json
 import time
 
 from .render_contract import RenderRequest, canonical_render_document
-from .render_engine import apply_device_metrics
 from .render_errors import RenderError
 
 
@@ -21,7 +20,7 @@ MAX_SIGNED_URL_PAYLOAD_CHARS = 32 * 1024
 def encode_render_request(request: RenderRequest) -> str:
     body = json.dumps(
         canonical_render_document(
-            apply_device_metrics(request),
+            request,
             exclude_none=True,
         ),
         ensure_ascii=False,

@@ -15,7 +15,7 @@ from pathlib import Path
 
 from .async_jobs import _ensure_private_directory, _sync_directory
 from .render_contract import RenderRequest, canonical_render_document
-from .render_engine import RenderArtifact, apply_device_metrics, certification_public_key
+from .render_engine import RenderArtifact, certification_public_key
 
 UTC = timezone.utc
 
@@ -108,7 +108,7 @@ class RenderCache:
     def key(self, request: RenderRequest, namespace: str | None = None) -> str:
         if self._fingerprint_key is None:
             raise RuntimeError("render cache is not started")
-        document = canonical_render_document(apply_device_metrics(request))
+        document = canonical_render_document(request)
         document["cache"] = False
         # Delivery affects notification, not pixels; never persist its URL in cache metadata.
         document["delivery"] = {"webhook_url": None}

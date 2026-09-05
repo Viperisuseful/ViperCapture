@@ -156,6 +156,16 @@ def apply_device_metrics(
     )
 
 
+def _descriptor_screen(descriptor: dict[str, object]) -> dict[str, object]:
+    screen = descriptor.get("screen")
+    if isinstance(screen, dict):
+        return dict(screen)
+    viewport = descriptor.get("viewport")
+    if isinstance(viewport, dict):
+        return dict(viewport)
+    return {}
+
+
 def device_context_options(
     request: RenderRequest,
     device_descriptors: dict[str, dict[str, object]] | None = None,
@@ -170,17 +180,25 @@ def device_context_options(
         options.update(descriptor)
         options.pop("default_browser_type", None)
     resolved = apply_device_metrics(request, device_descriptors)
-    if not descriptor or {"width", "height"} & explicit:
-        options["viewport"] = {
-            "width": resolved.viewport.width,
-            "height": resolved.viewport.height,
-        }
+    options["viewport"] = {
+        "width": resolved.viewport.width,
+        "height": resolved.viewport.height,
+    }
+    if not descriptor or "device_scale_factor" in explicit:
+        options["device_scale_factor"] = resolved.viewport.device_scale_factor
+    if descriptor:
+        screen = _descriptor_screen(descriptor)
+        if "width" in explicit:
+            screen["width"] = resolved.viewport.width
+        if "height" in explicit:
+            screen["height"] = resolved.viewport.height
+        if screen:
+            options["screen"] = screen
+    else:
         options["screen"] = {
             "width": resolved.viewport.width,
             "height": resolved.viewport.height,
         }
-    if not descriptor or "device_scale_factor" in explicit:
-        options["device_scale_factor"] = resolved.viewport.device_scale_factor
     if request.environment.device is not DevicePreset.DESKTOP:
         options.setdefault("has_touch", True)
     return options
