@@ -15,7 +15,9 @@ them. Report security vulnerabilities privately as described in
 
 ## Set up the repository
 
-Use Python 3.11 or newer:
+Use Python 3.11 or newer. [uv](https://docs.astral.sh/uv/) is the preferred
+installer
+([installation guide](https://docs.astral.sh/uv/getting-started/installation/)):
 
 ```bash
 git clone https://github.com/YOUR_USERNAME/ViperCapture.git
@@ -23,8 +25,16 @@ cd ViperCapture
 python launch.py
 ```
 
-`python launch.py` is the supported setup and startup method. It creates the
-virtual environment, installs dependencies and Chromium, and starts the app.
+`python launch.py` is the supported setup and startup method. It prefers uv
+when uv is on `PATH` to create `.venv` and install from `requirements.txt`,
+then installs Chromium, Firefox, and WebKit and starts the app. Without uv it
+falls back to `python -m venv` and pip. Set `VIPERCAPTURE_USE_UV=0` to force
+the pip path. Existing pip-only workflows stay valid:
+
+```bash
+python -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+```
 
 ## Prepare a change
 

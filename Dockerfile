@@ -1,16 +1,21 @@
 FROM python:3.12-slim@sha256:d657ab0ade19f404a6ccc883ab399540de667aff751748ce23c07330c5a89e64
 
+# Official uv distroless image; pin tag + index digest for reproducible builds.
+COPY --from=ghcr.io/astral-sh/uv:0.12.10@sha256:2bb3ebca0a796a155094a27773d290c4b074572e6107f171d88d086682fd2500 \
+    /uv /uvx /bin/
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    UV_SYSTEM_PYTHON=1
 
 WORKDIR /app
 COPY requirements.txt ./
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
-    && python -m pip install --no-cache-dir --upgrade pip==26.2.1 \
-    && python -m pip install --no-cache-dir -r requirements.txt \
+    && uv pip install --system --no-cache -r requirements.txt \
+    && rm -f /bin/uv /bin/uvx \
     && python -m playwright install --with-deps --no-shell chromium firefox webkit \
     && useradd --create-home --uid 10001 vipercapture \
     && mkdir -p /data \

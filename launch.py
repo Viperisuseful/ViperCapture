@@ -6,14 +6,19 @@ Run this file directly with Python.
 Handles venv setup, dependency install, browser install,
 server startup, and opening your browser automatically.
 
+Prefers uv (https://docs.astral.sh/uv/) when it is on PATH.
+Set VIPERCAPTURE_USE_UV=0 to force the stdlib venv + pip path.
+Without uv, the launcher falls back to pip.
+
 On subsequent runs, dependency checks are skipped unless
-requirements.txt has changed (hash-stamped in .venv/).
+    requirements.txt has changed (hash-stamped in .venv/).
 """
 
 from __future__ import annotations
 import hashlib
 from importlib.metadata import version
 import os
+import shutil
 import sys
 import subprocess
 import socket
@@ -62,6 +67,43 @@ def _req_hash() -> str:
     return hashlib.md5(req.read_bytes()).hexdigest() if req.exists() else ""
 
 
+def find_uv() -> str | None:
+    """Return the uv executable when it should be used, otherwise None."""
+    flag = os.environ.get("VIPERCAPTURE_USE_UV", "").strip().lower()
+    if flag in {"0", "false", "no", "off"}:
+        return None
+    return shutil.which("uv")
+
+
+def venv_command(python: str, venv_dir: Path, uv: str | None) -> list[str]:
+    if uv:
+        return [uv, "venv", "--python", python, str(venv_dir)]
+    return [python, "-m", "venv", str(venv_dir)]
+
+
+def deps_commands(
+    python: str, requirements: Path, uv: str | None
+) -> list[tuple[list[str], str]]:
+    if uv:
+        return [(
+            [uv, "pip", "install", "--python", python, "-r", str(requirements)],
+            "uv pip install",
+        )]
+    return [
+        ([python, "-m", "pip", "install", "--upgrade", "pip", "-q"], "pip upgrade"),
+        ([python, "-m", "pip", "install", "-r", str(requirements)], "pip install"),
+    ]
+
+
+def _venv_has_pip(python: str) -> bool:
+    result = subprocess.run(
+        [python, "-m", "pip", "--version"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
 # ── Setup steps ───────────────────────────────────────────────
 
 def ensure_venv() -> None:
@@ -71,8 +113,11 @@ def ensure_venv() -> None:
     all subsequent imports and subprocess calls use the right Python.
     """
     if not VENV_PYTHON.exists():
-        print("  [1/3] Creating Python environment (first run only)...")
-        run(sys.executable, "-m", "venv", ROOT / ".venv", label="venv creation")
+        uv = find_uv()
+        installer = "uv" if uv else "venv"
+        print(f"  [1/3] Creating Python environment with {installer} (first run only)...")
+        command = venv_command(sys.executable, ROOT / ".venv", uv)
+        run(*command, label=f"{installer} venv")
 
     this = Path(sys.executable).resolve()
     want = VENV_PYTHON.resolve()
@@ -86,17 +131,25 @@ def ensure_deps() -> None:
     """
     Install packages from requirements.txt.
     Skipped on subsequent runs unless requirements.txt has changed.
+    Prefers uv when available; falls back to pip.
     """
     current_hash = _req_hash()
     if DEPS_STAMP.exists() and DEPS_STAMP.read_text().strip() == current_hash:
         print("  [2/3] Python packages already up to date — skipping.")
         return
 
-    print("  [2/3] Installing Python packages...")
-    run(sys.executable, "-m", "pip", "install", "--upgrade", "pip", "-q",
-        label="pip upgrade")
-    run(sys.executable, "-m", "pip", "install", "-r", ROOT / "requirements.txt",
-        label="pip install")
+    uv = find_uv()
+    if uv:
+        print("  [2/3] Installing Python packages with uv...")
+    else:
+        if not _venv_has_pip(sys.executable):
+            print("\n  ERROR: pip is not available in .venv and uv was not found.")
+            print("  Install uv (https://docs.astral.sh/uv/) or delete .venv and rerun.")
+            wait_and_exit(1)
+        print("  [2/3] Installing Python packages...")
+
+    for command, label in deps_commands(sys.executable, ROOT / "requirements.txt", uv):
+        run(*command, label=label)
     DEPS_STAMP.write_text(current_hash)
 
 
