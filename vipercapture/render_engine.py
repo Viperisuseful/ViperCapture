@@ -70,6 +70,140 @@ DEVICE_PLATFORMS = {
     DevicePreset.PIXEL_7: "Linux armv8l",
     DevicePreset.IPAD: "iPad",
 }
+# Used when Playwright's live registry is unavailable. Live descriptors win.
+DEVICE_DESCRIPTOR_FALLBACKS: dict[DevicePreset, dict[str, object]] = {
+    DevicePreset.IPHONE_14: {
+        "viewport": {"width": 390, "height": 664},
+        "screen": {"width": 390, "height": 844},
+        "device_scale_factor": 3,
+        "is_mobile": True,
+        "has_touch": True,
+    },
+    DevicePreset.PIXEL_7: {
+        "viewport": {"width": 412, "height": 839},
+        "screen": {"width": 412, "height": 915},
+        "device_scale_factor": 2.625,
+        "is_mobile": True,
+        "has_touch": True,
+    },
+    DevicePreset.IPAD: {
+        "viewport": {"width": 810, "height": 1080},
+        "screen": {"width": 810, "height": 1080},
+        "device_scale_factor": 2,
+        "is_mobile": True,
+        "has_touch": True,
+    },
+}
+
+
+def resolved_device_descriptor(
+    device: DevicePreset,
+    device_descriptors: dict[str, dict[str, object]] | None = None,
+) -> dict[str, object]:
+    """Return the Playwright device descriptor, or a built-in fallback."""
+    name = DEVICE_DESCRIPTOR_NAMES.get(device)
+    if name is None:
+        return {}
+    live = (device_descriptors or {}).get(name)
+    if live:
+        return dict(live)
+    fallback = DEVICE_DESCRIPTOR_FALLBACKS.get(device)
+    return dict(fallback) if fallback else {}
+
+
+def viewport_from_named(viewport: Viewport) -> Viewport:
+    """Copy a named viewport without treating omitted size/DSF as explicit."""
+    fields = viewport.model_fields_set
+    return Viewport(
+        **{
+            name: getattr(viewport, name)
+            for name in ("width", "height", "device_scale_factor")
+            if name in fields
+        }
+    )
+
+
+def apply_device_metrics(
+    request: RenderRequest,
+    device_descriptors: dict[str, dict[str, object]] | None = None,
+) -> RenderRequest:
+    """Fill implicit viewport/DSF from the device descriptor.
+
+    Explicit caller `viewport.width`, `viewport.height`, or
+    `viewport.device_scale_factor` values still win.
+    """
+    descriptor = resolved_device_descriptor(
+        request.environment.device, device_descriptors
+    )
+    if not descriptor:
+        return request
+    desc_viewport = descriptor.get("viewport")
+    if not isinstance(desc_viewport, dict):
+        desc_viewport = {}
+    explicit = request.viewport.model_fields_set
+    updates: dict[str, object] = {}
+    if "width" not in explicit and "width" in desc_viewport:
+        updates["width"] = desc_viewport["width"]
+    if "height" not in explicit and "height" in desc_viewport:
+        updates["height"] = desc_viewport["height"]
+    scale = descriptor.get("device_scale_factor")
+    if "device_scale_factor" not in explicit and scale is not None:
+        updates["device_scale_factor"] = scale
+    if not updates:
+        return request
+    return request.model_copy(
+        update={"viewport": request.viewport.model_copy(update=updates)}
+    )
+
+
+def _descriptor_screen(descriptor: dict[str, object]) -> dict[str, object]:
+    screen = descriptor.get("screen")
+    if isinstance(screen, dict):
+        return dict(screen)
+    viewport = descriptor.get("viewport")
+    if isinstance(viewport, dict):
+        return dict(viewport)
+    return {}
+
+
+def device_context_options(
+    request: RenderRequest,
+    device_descriptors: dict[str, dict[str, object]] | None = None,
+) -> dict[str, object]:
+    """Context options for a device preset, honoring explicit viewport/DSF."""
+    explicit = request.viewport.model_fields_set
+    descriptor = resolved_device_descriptor(
+        request.environment.device, device_descriptors
+    )
+    options: dict[str, object] = {}
+    if descriptor:
+        options.update(descriptor)
+        options.pop("default_browser_type", None)
+    resolved = apply_device_metrics(request, device_descriptors)
+    options["viewport"] = {
+        "width": resolved.viewport.width,
+        "height": resolved.viewport.height,
+    }
+    if not descriptor or "device_scale_factor" in explicit:
+        options["device_scale_factor"] = resolved.viewport.device_scale_factor
+    if descriptor:
+        screen = _descriptor_screen(descriptor)
+        if "width" in explicit:
+            screen["width"] = resolved.viewport.width
+        if "height" in explicit:
+            screen["height"] = resolved.viewport.height
+        if screen:
+            options["screen"] = screen
+    else:
+        options["screen"] = {
+            "width": resolved.viewport.width,
+            "height": resolved.viewport.height,
+        }
+    if request.environment.device is not DevicePreset.DESKTOP:
+        options.setdefault("has_touch", True)
+    return options
+
+
 MAX_METADATA_ITEMS = 100
 MAX_METADATA_VALUE_CHARS = 2_048
 DNS_RESOLUTION_TIMEOUT_SECONDS = 5
@@ -1398,6 +1532,28 @@ def needs_request_routing(
     return hosted or bool(custom_headers) or cleanup_enabled
 
 
+def _private_subresource_error() -> RenderError:
+    return RenderError(
+        "subresource_not_public",
+        "The page requested a private or non-public resource.",
+        400,
+        False,
+    )
+
+
+def _reject_blocked_private_subresources(blocked: bool) -> None:
+    """Fail a hosted render that requested a private or non-public subresource.
+
+    Route abort is not enough: HTML/Markdown loads `about:blank`, so the
+    main-target public check never runs, and a successful capture would
+    otherwise return HTTP 200 with only a `blocked_subresources` count.
+    Call this as soon as the violation is known, before capture, encode,
+    diagnostics, or profile persistence.
+    """
+    if blocked:
+        raise _private_subresource_error()
+
+
 def _invalid_selector_error(error: PlaywrightError) -> bool:
     message = str(error).lower()
     return any(
@@ -2363,11 +2519,7 @@ class RenderEngine:
                     )
                     single = request.model_copy(
                         update={
-                            "viewport": Viewport(
-                                width=viewport.width,
-                                height=viewport.height,
-                                device_scale_factor=viewport.device_scale_factor,
-                            ),
+                            "viewport": viewport_from_named(viewport),
                             "viewports": None,
                             "environment": environment,
                         }
@@ -2456,6 +2608,8 @@ class RenderEngine:
     ) -> RenderArtifact:
         from .content_rendering import input_document, render_document_output
 
+        context_device = device_context_options(request, self.device_descriptors)
+        request = apply_device_metrics(request, self.device_descriptors)
         target = str(request.url or request.base_url or "about:blank")
         public_urls = PublicUrlValidator()
         if self.hosted and target != "about:blank" and not await public_urls.is_public(target):
@@ -2527,23 +2681,12 @@ class RenderEngine:
                         "width": request.viewport.width,
                         "height": request.viewport.height,
                     }
-                descriptor_name = DEVICE_DESCRIPTOR_NAMES.get(request.environment.device)
-                if descriptor_name:
-                    context_options.update(self.device_descriptors.get(descriptor_name, {}))
-                    context_options.pop("default_browser_type", None)
+                if context_device:
+                    context_options.update(context_device)
                     if request.engine.value == BrowserEngine.FIREFOX.value:
                         context_options.pop("is_mobile", None)
                 context_options.update(
                     {
-                        "viewport": {
-                            "width": request.viewport.width,
-                            "height": request.viewport.height,
-                        },
-                        "screen": {
-                            "width": request.viewport.width,
-                            "height": request.viewport.height,
-                        },
-                        "device_scale_factor": request.viewport.device_scale_factor,
                         "java_script_enabled": request.network.java_script_enabled,
                         "service_workers": (
                             "block"
@@ -2678,6 +2821,11 @@ class RenderEngine:
                     if scheme in ALLOWED_INTERNAL_SCHEMES:
                         await route.continue_()
                         return
+                    if self.hosted and not await public_urls.is_public(request_url):
+                        blocked_subresources += 1
+                        blocked_private_subresources = True
+                        await route.abort("blockedbyclient")
+                        return
                     blocked_by_type = route.request.resource_type in {
                         resource.value for resource in request.network.block_resource_types
                     }
@@ -2703,11 +2851,6 @@ class RenderEngine:
                             blocked_subresources += 1
                             await route.abort("blockedbyclient")
                             return
-                    if self.hosted and not await public_urls.is_public(request_url):
-                        blocked_subresources += 1
-                        blocked_private_subresources = True
-                        await route.abort("blockedbyclient")
-                        return
                     await route.continue_(
                         headers=routed_headers(
                             request_url,
@@ -2924,6 +3067,7 @@ class RenderEngine:
                             "X-ViperCapture-Navigation-Status": str(navigation_status)
                         },
                     )
+                _reject_blocked_private_subresources(blocked_private_subresources)
                 if self.cleanup_hooks:
                     await self.cleanup_hooks.finish(page, cleanup_session)
                 if request.custom_css:
@@ -2939,15 +3083,18 @@ class RenderEngine:
                             False,
                         ) from exc
                 await self._wait(page, request, limits)
+                _reject_blocked_private_subresources(blocked_private_subresources)
                 if self.cleanup_hooks:
                     await self.cleanup_hooks.apply(page, request.cleanup)
                 await self._run_actions(page, request, limits)
+                _reject_blocked_private_subresources(blocked_private_subresources)
                 if self.cleanup_hooks:
                     await self.cleanup_hooks.apply(page, request.cleanup)
                 if self.challenge_checker:
                     await self.challenge_checker(
                         page, request, navigation_status, challenge_budget
                     )
+                _reject_blocked_private_subresources(blocked_private_subresources)
                 resizing_image = (
                     request.image.width is not None
                     or request.image.height is not None
@@ -2996,11 +3143,13 @@ class RenderEngine:
                             page, request, navigation_status, challenge_budget
                         )
                     await self._wait_for_images(page, request, limits)
+                    _reject_blocked_private_subresources(blocked_private_subresources)
                 if request.deterministic.enabled and request.deterministic.wait_for_fonts:
                     await page.evaluate("() => document.fonts?.ready")
                 await self._check_assertions(
                     page, request, failed_requests, matched_failure_patterns
                 )
+                _reject_blocked_private_subresources(blocked_private_subresources)
                 if request.output in {OutputFormat.WEBM, OutputFormat.MP4, OutputFormat.GIF}:
                     options = request.video
                     if options is None:
@@ -3052,6 +3201,7 @@ class RenderEngine:
                         failed_requests,
                         matched_failure_patterns,
                     )
+                    _reject_blocked_private_subresources(blocked_private_subresources)
                     pending_profile_state = (
                         await context.storage_state()
                         if request.save_profile and request.profile_id is not None
@@ -3132,6 +3282,7 @@ class RenderEngine:
                     finalized = await diagnostic_bundle(
                         artifact, request, console_events, network_events, limits
                     )
+                    _reject_blocked_private_subresources(blocked_private_subresources)
                     await self._persist_profile_state(
                         request, pending_profile_state
                     )
@@ -3187,6 +3338,7 @@ class RenderEngine:
                         artifact, request, console_events, network_events, limits,
                         page=page, context=context,
                     )
+                    _reject_blocked_private_subresources(blocked_private_subresources)
                     await self._persist_profile(request, context)
                     return finalized
 
@@ -3440,6 +3592,7 @@ class RenderEngine:
                         page=page,
                         context=context,
                     )
+                    _reject_blocked_private_subresources(blocked_private_subresources)
                     await self._persist_profile(request, context)
                     return finalized
                 if uses_cdp_capture:
@@ -3623,20 +3776,20 @@ class RenderEngine:
                     artifact, request, console_events, network_events, limits,
                     page=page, context=context,
                 )
+                _reject_blocked_private_subresources(blocked_private_subresources)
                 await self._persist_profile(request, context)
                 return finalized
         except TimeoutError as exc:
+            if blocked_private_subresources:
+                raise _private_subresource_error() from exc
             raise RenderError("render_timeout", "The render exceeded its total deadline.", 504, True) from exc
-        except RenderError:
+        except RenderError as exc:
+            if blocked_private_subresources and exc.code != "subresource_not_public":
+                raise _private_subresource_error() from exc
             raise
         except Exception as exc:
             if blocked_private_subresources:
-                raise RenderError(
-                    "subresource_not_public",
-                    "The page requested a private or non-public resource.",
-                    400,
-                    False,
-                ) from exc
+                raise _private_subresource_error() from exc
             raise RenderError("render_failed", "The image render failed.", 500, True) from exc
         finally:
             if har_cdp_session is not None:
