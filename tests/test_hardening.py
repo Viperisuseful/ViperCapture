@@ -731,6 +731,7 @@ def test_hosted_private_wss_link_local_fails_on_success_path() -> None:
 
 def test_hosted_public_websocket_is_blocked_without_private_rejection() -> None:
     from unittest.mock import patch
+    from urllib.parse import urlparse
 
     from vipercapture.render_engine import PublicUrlValidator, RenderEngine
 
@@ -744,7 +745,7 @@ def test_hosted_public_websocket_is_blocked_without_private_rejection() -> None:
     )
 
     async def public_example(_self, target: str) -> bool:
-        return "example.com" in target
+        return urlparse(target).hostname == "example.com"
 
     with patch.object(PublicUrlValidator, "is_public", public_example):
         artifact = _run_isolated_render(
