@@ -73,6 +73,15 @@ def test_diagnostic_url_strips_query_tokens() -> None:
     )
 
 
+def test_diagnostic_url_strips_matrix_session_params() -> None:
+    assert diagnostic_url("https://ex.com/a;jsessionid=SECRET") == "https://ex.com/a"
+    assert diagnostic_url("/a;jsessionid=SECRET?x=1") == "/a"
+    assert (
+        diagnostic_url("https://ex.com/a;jsessionid=SECRET/b;x=1?q=2")
+        == "https://ex.com/a/b"
+    )
+
+
 def test_har_http_version_prefers_protocol_and_http_cleartext() -> None:
     assert har_http_version("h2", "https://example.com") == "HTTP/2"
     assert har_http_version("http/1.1", "https://example.com") == "HTTP/1.1"
@@ -143,6 +152,62 @@ def test_safe_har_headers_strip_relative_url_queries() -> None:
     assert "secret" not in serialized
     assert "code=" not in serialized
     assert "token=" not in serialized
+
+
+def test_safe_har_headers_sanitize_unquoted_link_and_refresh() -> None:
+    headers = safe_har_headers(
+        [
+            {"name": "Refresh", "value": "5; /callback?code=oauth_secret"},
+            {"name": "Link", "value": "https://ex.com/x?token=oauth_secret; rel=preload"},
+            {"name": "Link", "value": "/assets/app.js?token=secret; rel=preload"},
+            {"name": "Refresh", "value": "0; url=/next?a=1;b=secret"},
+        ]
+    )
+    serialized = json.dumps(headers)
+    assert "oauth_secret" not in serialized
+    assert "secret" not in serialized
+    assert "token=" not in serialized
+    assert "code=" not in serialized
+    assert "b=secret" not in serialized
+    by_name: dict[str, list[str]] = {}
+    for item in headers:
+        by_name.setdefault(item["name"].lower(), []).append(item["value"])
+    assert by_name["refresh"][0] == "5; /callback"
+    assert by_name["link"][0].startswith("https://ex.com/x")
+    assert "rel=preload" in by_name["link"][0]
+    assert by_name["link"][1].startswith("/assets/app.js")
+    assert "rel=preload" in by_name["link"][1]
+    assert by_name["refresh"][1] == "0; url=/next"
+
+
+def test_safe_har_headers_strip_matrix_params_from_location() -> None:
+    headers = safe_har_headers(
+        [
+            {"name": "Location", "value": "https://ex.com/a;jsessionid=SECRET"},
+            {"name": "Referer", "value": "/a;jsessionid=SECRET?x=1"},
+        ]
+    )
+    by_name = {item["name"].lower(): item["value"] for item in headers}
+    assert by_name["location"] == "https://ex.com/a"
+    assert by_name["referer"] == "/a"
+    assert "SECRET" not in json.dumps(headers)
+    assert "jsessionid" not in json.dumps(headers)
+
+
+def test_safe_har_headers_redact_content_disposition_filename() -> None:
+    headers = safe_har_headers(
+        [
+            {
+                "name": "Content-Disposition",
+                "value": 'attachment; filename="token=oauth_secret.txt"',
+            },
+            {"name": "ETag", "value": '"opaque-validator"'},
+        ]
+    )
+    by_name = {item["name"].lower(): item["value"] for item in headers}
+    assert "oauth_secret" not in by_name["content-disposition"]
+    assert 'filename="[redacted]"' in by_name["content-disposition"]
+    assert by_name["etag"] == '"opaque-validator"'
 
 
 def test_har_document_uses_observed_fields_instead_of_stubs() -> None:
@@ -597,6 +662,18 @@ def test_collect_network_event_redacts_custom_tokens_and_relative_location() -> 
     assert "glpat-secret" not in serialized
     assert "code=secret" not in serialized
     assert event["redirect_url"] == "/callback"
+    session_response = SimpleNamespace(
+        url="https://ex.com/a;jsessionid=SECRET?x=1",
+        status=200,
+        status_text="OK",
+        headers={"content-type": "text/html"},
+        headers_array=[{"name": "Content-Type", "value": "text/html"}],
+        request=request,
+    )
+    session_event = collect_network_event(session_response)
+    assert session_event["url"] == "https://ex.com/a"
+    assert "SECRET" not in json.dumps(session_event)
+    assert "jsessionid" not in json.dumps(session_event)
     assert any(
         header["name"] == "Location" and header["value"] == "/callback"
         for header in event["response_headers"]

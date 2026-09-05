@@ -23,7 +23,10 @@ manifest, and optionally bounded console and network event files.
 observed HTTP versions, allowlisted headers, mime types, and timings. Query
 strings, cookies, credentials, and bodies are omitted. Header values are
 emitted only for an allowlist of non-credential names; URL-bearing values
-such as `Location` have query strings stripped even when they are relative.
+such as `Location`, `Link`, and `Refresh` have query strings, fragments, and
+matrix/path parameters (for example `;jsessionid=`) stripped even when they
+are relative or unquoted. `Content-Disposition` filenames are redacted; `ETag`
+values are kept as opaque cache validators.
 `entry.time` excludes the HAR `ssl` subset of `connect`. Compressed responses
 keep `Content-Length` as transferred `bodySize` and leave decoded
 `content.size` unknown. Chromium can record HTTP versions via CDP; Firefox

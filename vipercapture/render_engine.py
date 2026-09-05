@@ -688,13 +688,19 @@ async def _encode_scrolling_media(
         )
 
 
+def _strip_matrix_path(path: str) -> str:
+    """Drop RFC 3986 matrix/path parameters such as ``;jsessionid=``."""
+    return "/".join(segment.split(";", 1)[0] for segment in path.split("/"))
+
+
 def diagnostic_url(value: str) -> str:
     """Retain useful routing context without leaking query strings or credentials."""
     try:
         parsed = urlsplit(value)
         hostname = parsed.hostname or ""
         port = f":{parsed.port}" if parsed.port else ""
-        return urlunsplit((parsed.scheme, f"{hostname}{port}", parsed.path[:2_048], "", ""))
+        path = _strip_matrix_path(parsed.path)[:2_048]
+        return urlunsplit((parsed.scheme, f"{hostname}{port}", path, "", ""))
     except ValueError:
         return "invalid-url"
 
@@ -783,8 +789,17 @@ SAFE_HAR_HEADER_NAMES = frozenset(
 URL_BEARING_HAR_HEADERS = frozenset(
     {"location", "content-location", "referer", "refresh", "link"}
 )
-_REFRESH_URL_RE = re.compile(r"(url\s*=\s*)([^\s;]+)", re.IGNORECASE)
+_REFRESH_URL_RE = re.compile(r"(url\s*=\s*)([^\s]+)", re.IGNORECASE)
 _LINK_URL_RE = re.compile(r"<([^>]+)>")
+_EMBEDDED_URL_RE = re.compile(
+    r"(https?://[^\s<>\"']+|//[^\s<>\"']+|/[^\s<>\"']+)",
+    re.IGNORECASE,
+)
+_DISPOSITION_FILENAME_RE = re.compile(
+    r'(filename\*?)\s*=\s*(?:utf-8\'\'[^\s;]+|"[^"]*"|[^\s;]+)',
+    re.IGNORECASE,
+)
+_REMAINING_QUERY_RE = re.compile(r"[?#]")
 PERFORMANCE_PROTOCOL_SCRIPT = """() => {
   const protocols = {};
   for (const type of ["navigation", "resource"]) {
@@ -809,14 +824,15 @@ HAR_HTTP_VERSIONS = {
     "http/1": "HTTP/1.0",
     "http/0.9": "HTTP/0.9",
 }
-_HEADER_URL_RE = re.compile(r"(https?://[^\s<>\"';]+)", re.IGNORECASE)
 MAX_HAR_HEADERS = 64
 MAX_HAR_HEADER_CHARS = 4_096
 DIAGNOSTIC_NETWORK_PRIVACY = (
     "Query strings, credentials, cookies, and bodies are omitted. "
     "Only allowlisted request and response header names keep their values; "
     "all other header values are redacted. URL-bearing header values have "
-    "query strings and fragments removed, including relative URLs. "
+    "query strings, fragments, and matrix/path parameters removed, including "
+    "relative URLs and unquoted Link/Refresh values. Content-Disposition "
+    "filenames are redacted. Opaque validators such as ETag are retained. "
     "HTTP versions, mime types, and timings are retained when observed."
 )
 DIAGNOSTIC_HAR_COMPLETENESS = (
@@ -854,21 +870,38 @@ def _header_items(headers_array: object) -> list[tuple[str, str]]:
 
 
 def _sanitize_embedded_url(url: str) -> str:
-    return diagnostic_url(url.strip().strip("\"'"))
+    cleaned = url.strip().strip("\"'").rstrip(".,;)")
+    return diagnostic_url(cleaned)
+
+
+def _replace_embedded_urls(value: str) -> str:
+    return _EMBEDDED_URL_RE.sub(
+        lambda match: _sanitize_embedded_url(match.group(0)),
+        value,
+    )
 
 
 def _sanitize_url_bearing_header(name: str, value: str) -> str:
     if name == "link":
-        return _LINK_URL_RE.sub(
+        sanitized = _LINK_URL_RE.sub(
             lambda match: f"<{_sanitize_embedded_url(match.group(1))}>",
             value,
         )
-    if name == "refresh":
-        return _REFRESH_URL_RE.sub(
+    elif name == "refresh":
+        sanitized = _REFRESH_URL_RE.sub(
             lambda match: match.group(1) + _sanitize_embedded_url(match.group(2)),
             value,
         )
-    return _sanitize_embedded_url(value)
+    else:
+        return _sanitize_embedded_url(value)
+    sanitized = _replace_embedded_urls(sanitized)
+    if _REMAINING_QUERY_RE.search(sanitized):
+        return "[redacted]"
+    return sanitized
+
+
+def _sanitize_content_disposition(value: str) -> str:
+    return _DISPOSITION_FILENAME_RE.sub(r'\1="[redacted]"', value)
 
 
 def _redact_header_value(name: str, value: str) -> str:
@@ -878,8 +911,10 @@ def _redact_header_value(name: str, value: str) -> str:
         return "[redacted]"
     if lowered in URL_BEARING_HAR_HEADERS:
         return _sanitize_url_bearing_header(lowered, clipped)
+    if lowered == "content-disposition":
+        return _sanitize_content_disposition(clipped)
     if "://" in clipped:
-        return _HEADER_URL_RE.sub(lambda match: diagnostic_url(match.group(1)), clipped)
+        return _replace_embedded_urls(clipped)
     return clipped
 
 
