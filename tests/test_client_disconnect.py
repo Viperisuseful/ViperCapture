@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import pytest
 from starlette.requests import Request
 
+from starlette.datastructures import State
+
 from vipercapture.bulk_jobs import CLIENT_DISCONNECTED_STATE, BulkBodyLimitMiddleware
 from vipercapture.main import (
     UNSETTLED_OPERATION_STATE,
@@ -289,6 +291,15 @@ def test_await_while_connected_polls_is_disconnected_without_event() -> None:
         assert time.perf_counter() - started < 1.0
 
     asyncio.run(run())
+
+
+def test_take_unsettled_operation_is_safe_on_starlette_state() -> None:
+    """Successful renders never set unsettled_operation; finally still runs."""
+    request = SimpleNamespace(state=State())
+    assert _take_unsettled_operation(request) is None
+    assert _take_unsettled_operation(SimpleNamespace(state=SimpleNamespace())) is None
+    request.state.unsettled_operation = "not-a-task"
+    assert _take_unsettled_operation(request) is None
 
 
 def test_await_while_connected_returns_completed_work() -> None:

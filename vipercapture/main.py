@@ -1437,7 +1437,9 @@ def _take_unsettled_operation(request: Request) -> asyncio.Task | None:
     if state is None:
         return None
     task = getattr(state, UNSETTLED_OPERATION_STATE, None)
-    with suppress(AttributeError):
+    # Starlette State raises KeyError on missing delattr; SimpleNamespace
+    # raises AttributeError. Successful renders never set this field.
+    with suppress(AttributeError, KeyError):
         delattr(state, UNSETTLED_OPERATION_STATE)
     return task if isinstance(task, asyncio.Task) else None
 
