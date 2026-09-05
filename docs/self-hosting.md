@@ -11,10 +11,12 @@ remain separate.
 Use Python 3.11 or newer and install a full FFmpeg build through the operating
 system package manager. Confirm `ffmpeg -encoders` lists `libvpx`, `libvpx-vp9`,
 and `libx264`; GPU video additionally requires the vendor encoder and driver.
-Then run `python launch.py`. This is the supported setup and startup method.
-The launcher creates a virtual environment, installs Playwright Chromium,
-Firefox, and WebKit, starts the application, and opens the local interface.
-The Docker image already includes FFmpeg.
+Install [uv](https://docs.astral.sh/uv/) if you can; it is the preferred
+dependency installer. Then run `python launch.py`. This is the supported setup
+and startup method. The launcher uses uv when it is on `PATH` and otherwise
+falls back to pip. It creates a virtual environment, installs Playwright
+Chromium, Firefox, and WebKit, starts the application, and opens the local
+interface. The Docker image already includes FFmpeg.
 
 ## Configure a production deployment
 
