@@ -134,7 +134,11 @@ and restart the service normally.
 The public engine implements the feature set documented in [API and workflows](api.md).
 It blocks detected page-level challenges by default. Callers may set
 `proceed_on_captcha: true` to capture the visible challenge as displayed;
-ViperCapture never solves or bypasses CAPTCHAs.
+ViperCapture never solves or bypasses CAPTCHAs. This is the standard
+Playwright product. For Patchright plus Turnstile complete-when-possible /
+harder challenge handling, use
+[ViperCapture Stealth](https://github.com/Viperisuseful/ViperCapture-Stealth)
+(0.1.0-beta); see that README for how-to. It is not a Cloudflare bypass.
 
 Polling-based jobs are enabled by default and use the same rendering contract,
 SSRF controls, concurrency semaphore, and pixel limits as `/v1/render`. The
@@ -191,7 +195,11 @@ and redirects.
 If a Cloudflare, CDN, WAF, or origin rule blocks captures of a site you
 administer, use the scoped pattern in [site access](site-access.md): fixed
 renderer address, exact host and path, and an origin-only secret header. It
-does not disable or evade challenges on third-party sites.
+does not disable or evade challenges on third-party sites. This engine does
+not claim a Cloudflare bypass. For Patchright plus Turnstile
+complete-when-possible / harder challenge handling, see
+[ViperCapture Stealth](https://github.com/Viperisuseful/ViperCapture-Stealth)
+(0.1.0-beta).
 
 ## Read diagnostic response headers
 

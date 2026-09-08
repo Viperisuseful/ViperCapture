@@ -145,7 +145,11 @@ matter.
 - `cleanup`: consent mode and ad/tracker/chat/newsletter blocking.
 - `custom_css`: up to 64 KiB of injected CSS.
 - `stealth`: applies balanced, request-aware automation evasions by default;
-  set it to `false` for debugging or strict browser-parity tests.
+  set it to `false` for debugging or strict browser-parity tests. These
+  run on standard Playwright; Patchright plus Turnstile complete-when-possible
+  / harder challenge handling is in
+  [ViperCapture Stealth](https://github.com/Viperisuseful/ViperCapture-Stealth)
+  (0.1.0-beta), not this engine.
 - `captcha`: chooses `error` (default), `capture`, or an operator-provided
   `external` handler when a blocking challenge is detected. `solver` is a
   non-secret operator routing alias, never a provider credential.
@@ -180,7 +184,10 @@ MTCaptcha, Imperva, and HUMAN/PerimeterX, including widgets inside open shadow
 roots. An ordinary embedded widget does not fail a capture until it becomes a
 blocking challenge. Detection is heuristic and returns the provider, kind,
 confidence, and signals in the error details; ViperCapture does not solve or
-bypass CAPTCHAs.
+bypass CAPTCHAs and does not claim a Cloudflare bypass. For Patchright plus
+Turnstile complete-when-possible / harder challenge handling, use
+[ViperCapture Stealth](https://github.com/Viperisuseful/ViperCapture-Stealth)
+(0.1.0-beta); see that README for how-to.
 
 An authorized caller can also complete an access flow with an independent
 external tool, then submit a fresh render using short-lived, target-scoped

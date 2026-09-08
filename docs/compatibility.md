@@ -65,7 +65,13 @@ Vendor sources:
 
 ViperCapture does not provide a managed proxy network, anti-bot bypass, legal
 admissibility opinion, SLA, or continuous render support. The operator manages
-the code version, browsers, network, data, storage, capacity, and cost.
+the code version, browsers, network, data, storage, capacity, and cost. This
+repository is the standard Playwright product and does not claim a Cloudflare
+bypass. For Patchright plus Turnstile complete-when-possible / harder
+challenge handling, see the separate
+[ViperCapture Stealth](https://github.com/Viperisuseful/ViperCapture-Stealth)
+fork (0.1.0-beta). It is not a managed stealth fleet and is not a universal
+Cloudflare bypass.
 
 For a target the operator owns, the [site access guide](site-access.md) documents
 a narrow Cloudflare/WAF exception using the renderer address, exact host and
