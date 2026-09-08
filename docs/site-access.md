@@ -3,6 +3,12 @@
 This guide is for owners and administrators authorizing captures of a site they
 control. ViperCapture detects blocking challenges and can record the page as
 shown, but it does not solve CAPTCHAs or evade another site's access controls.
+This repository uses standard Playwright and does not claim a Cloudflare
+bypass. For Patchright plus Turnstile complete-when-possible / harder
+challenge handling, use
+[ViperCapture Stealth](https://github.com/Viperisuseful/ViperCapture-Stealth)
+(0.1.0-beta). See that README for how-to; Stealth is not a universal
+Cloudflare bypass.
 
 ## Create an access rule
 
@@ -81,7 +87,9 @@ rate limits and security middleware too.
   origin limit.
 - For `captcha_detected`, remove the challenge from the authorized rule.
   `proceed_on_captcha: true` captures the challenge as displayed; it does not
-  solve it.
+  solve it. Harder Turnstile complete-when-possible handling is in the
+  [Stealth fork](https://github.com/Viperisuseful/ViperCapture-Stealth), not
+  this engine, and is not a universal bypass.
 - For missing fonts or images, inspect the diagnostic bundle for blocked
   cross-origin assets and authorize an asset host only when you control it.
 

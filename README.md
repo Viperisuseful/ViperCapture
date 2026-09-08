@@ -164,7 +164,10 @@ See the [API and workflows guide](docs/api.md), [async provider guide](docs/asyn
 [public API deployment](deploy/public-api), and
 [migration guide](docs/migration-screenshotone-urlbox.md). If a site you
 administer challenges the renderer, use the least-privilege
-[Cloudflare/WAF authorization guide](docs/site-access.md).
+[Cloudflare/WAF authorization guide](docs/site-access.md). For Patchright
+plus Turnstile complete-when-possible / harder challenge handling, use
+[ViperCapture Stealth](https://github.com/Viperisuseful/ViperCapture-Stealth)
+(0.1.0-beta); it is not a universal Cloudflare bypass.
 
 ## Use proxies, sessions, and CAPTCHA hooks
 
@@ -192,7 +195,12 @@ pasted Cookie header into an encrypted profile. Pass its returned `id` as
 cookies where the export format supports them.
 
 ViperCapture detects common blocking CAPTCHA and bot interstitials but does not
-solve or bypass them. The default `captcha.action` is `error`; use `capture` to
+solve or bypass them. This repository is the standard Playwright product. For
+Patchright plus Turnstile complete-when-possible / harder challenge handling,
+use the [ViperCapture Stealth](https://github.com/Viperisuseful/ViperCapture-Stealth)
+fork (0.1.0-beta). It is not a universal Cloudflare bypass; see that
+repository's [README](https://github.com/Viperisuseful/ViperCapture-Stealth#stealth-mode--patchright)
+for how-to. The default `captcha.action` is `error`; use `capture` to
 render the challenge as-is. Operators may configure their own approved async
 handler with `VIPERCAPTURE_CAPTCHA_HANDLER_FACTORY` and opt in per request with
 `captcha.action: "external"`. See the [API guide](docs/api.md) for the handler

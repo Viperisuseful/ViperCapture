@@ -107,10 +107,16 @@ the recommended network egress firewall.
 Stealth scripts are applied to each isolated context by default and align
 language, platform, and user-agent signals with the request. They are balanced
 evasive defaults, not a promise that a site cannot detect automation. Callers
-can set `stealth:false` for diagnosis and compatibility testing.
+can set `stealth:false` for diagnosis and compatibility testing. These scripts
+run on standard Playwright. For Patchright plus Turnstile complete-when-possible
+/ harder challenge handling, use
+[ViperCapture Stealth](https://github.com/Viperisuseful/ViperCapture-Stealth)
+(0.1.0-beta). That fork is not a universal Cloudflare bypass; see its
+README for how-to.
 
-ViperCapture only detects CAPTCHA/bot challenges. To let an operator connect
-an approved internal or third-party integration, set
+ViperCapture only detects CAPTCHA/bot challenges. It does not solve or bypass
+them. To let an operator connect an approved internal or third-party
+integration, set
 `VIPERCAPTURE_CAPTCHA_HANDLER_FACTORY=package.module:create_handler`. The
 factory is called once at startup and must return an async callable with this
 contract:
