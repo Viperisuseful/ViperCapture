@@ -138,28 +138,126 @@ def parse_rustc_version(text: str) -> tuple[int, int, int] | None:
     return int(match.group(1)), int(match.group(2)), int(match.group(3))
 
 
+def _run_command(
+    cmd: list[str],
+    run: Callable[..., subprocess.CompletedProcess[str]],
+    timeout: int = 15,
+) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
 def _command_stdout(
     cmd: list[str],
     run: Callable[..., subprocess.CompletedProcess[str]],
 ) -> str | None:
-    try:
-        result = run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0:
+    result = _run_command(cmd, run)
+    if result is None or result.returncode != 0:
         return None
     return (result.stdout or "").strip()
 
 
-def _openssl_prefix_if_present(prefix: str) -> str | None:
-    if prefix and (Path(prefix) / "include" / "openssl" / "ssl.h").is_file():
-        return prefix
+def _command_succeeded(
+    cmd: list[str],
+    run: Callable[..., subprocess.CompletedProcess[str]],
+    *,
+    needles: tuple[str, ...] = (),
+) -> bool:
+    result = _run_command(cmd, run)
+    if result is None or result.returncode != 0:
+        return False
+    if not needles:
+        return True
+    text = f"{result.stdout or ''}{result.stderr or ''}".lower()
+    return any(needle.lower() in text for needle in needles)
+
+
+def _working_compiler(
+    which: Callable[[str], str | None],
+    run: Callable[..., subprocess.CompletedProcess[str]],
+) -> str | None:
+    """Return a compiler that actually runs. Apple CLT stubs exist as /usr/bin/cc."""
+    candidates: list[str] = []
+    for name in ("cc", "clang"):
+        found = which(name)
+        if found and found not in candidates:
+            candidates.append(found)
+    developer_dir = _command_stdout(["xcode-select", "-p"], run)
+    if developer_dir:
+        for rel in ("usr/bin/clang", "usr/bin/cc"):
+            nested = str(Path(developer_dir) / rel)
+            if nested not in candidates:
+                candidates.append(nested)
+    for compiler in candidates:
+        if _command_succeeded(
+            [compiler, "-v"], run, needles=("clang", "gcc", "Apple LLVM")
+        ):
+            return compiler
     return None
+
+
+def _has_openssl_libs(prefix: Path) -> bool:
+    lib = prefix / "lib"
+    if not lib.is_dir():
+        return False
+    names = {path.name for path in lib.iterdir()}
+
+    def present(stem: str) -> bool:
+        return any(
+            name == f"lib{stem}.dylib"
+            or name == f"lib{stem}.a"
+            or name == f"lib{stem}.so"
+            or name.startswith(f"lib{stem}.")
+            and name.endswith(".dylib")
+            for name in names
+        )
+
+    return present("crypto") and present("ssl")
+
+
+def openssl_headers_are_usable(opensslv_h: str) -> bool:
+    """Accept OpenSSL 3+; reject LibreSSL and older OpenSSL."""
+    if re.search(r"^\s*#\s*define\s+LIBRESSL_VERSION_NUMBER\b", opensslv_h, re.M):
+        return False
+    major = re.search(
+        r"^\s*#\s*define\s+OPENSSL_VERSION_MAJOR\s+(\d+)", opensslv_h, re.M
+    )
+    if major:
+        return int(major.group(1)) >= 3
+    number = re.search(
+        r"^\s*#\s*define\s+OPENSSL_VERSION_NUMBER\s+(0x[0-9a-fA-F]+)",
+        opensslv_h,
+        re.M,
+    )
+    if number:
+        return int(number.group(1), 16) >= 0x30000000
+    return False
+
+
+def _openssl_prefix_if_present(prefix: str) -> str | None:
+    if not prefix:
+        return None
+    root = Path(prefix)
+    header = root / "include" / "openssl" / "ssl.h"
+    version_header = root / "include" / "openssl" / "opensslv.h"
+    if not header.is_file() or not version_header.is_file():
+        return None
+    if not _has_openssl_libs(root):
+        return None
+    try:
+        opensslv = version_header.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if not openssl_headers_are_usable(opensslv):
+        return None
+    return prefix
 
 
 def probe_intel_macos_cryptography_toolchain(
@@ -168,17 +266,19 @@ def probe_intel_macos_cryptography_toolchain(
     run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     environ: dict[str, str] | None = None,
 ) -> dict[str, object]:
-    """Discover compiler, rustc, and a non-Apple OpenSSL prefix for a source build."""
+    """Discover a working compiler, rustc+cargo, and non-Apple OpenSSL 3 prefix."""
     env = os.environ if environ is None else environ
-    compiler = which("cc") or which("clang")
-    if compiler is None and _command_stdout(["xcode-select", "-p"], run):
-        compiler = "xcode-select"
+    compiler = _working_compiler(which, run)
     rustc = which("rustc")
+    cargo = which("cargo")
     rust_version = None
     if rustc:
         rust_version = parse_rustc_version(
             _command_stdout([rustc, "--version"], run) or ""
         )
+    cargo_ok = bool(
+        cargo and _command_succeeded([cargo, "--version"], run, needles=("cargo",))
+    )
     openssl_dir = _openssl_prefix_if_present(env.get("OPENSSL_DIR", "").strip())
     brew = which("brew")
     if openssl_dir is None and brew:
@@ -200,6 +300,7 @@ def probe_intel_macos_cryptography_toolchain(
         "compiler": compiler,
         "rustc": rustc,
         "rust_version": rust_version,
+        "cargo": cargo if cargo_ok else None,
         "openssl_dir": openssl_dir,
     }
 
@@ -209,8 +310,15 @@ def intel_macos_cryptography_missing(toolchain: dict[str, object]) -> list[str]:
     if not toolchain.get("compiler"):
         missing.append("Xcode command line tools (clang)")
     rust_version = toolchain.get("rust_version")
-    if not isinstance(rust_version, tuple) or rust_version < MIN_RUSTC:
-        missing.append(f"Rust {MIN_RUSTC[0]}.{MIN_RUSTC[1]}.{MIN_RUSTC[2]}+ (rustc)")
+    rust_ok = (
+        isinstance(rust_version, tuple)
+        and rust_version >= MIN_RUSTC
+        and toolchain.get("cargo")
+    )
+    if not rust_ok:
+        missing.append(
+            f"Rust {MIN_RUSTC[0]}.{MIN_RUSTC[1]}.{MIN_RUSTC[2]}+ (rustc and cargo)"
+        )
     if not toolchain.get("openssl_dir"):
         missing.append("Homebrew/MacPorts OpenSSL 3 (not Apple LibreSSL)")
     return missing
