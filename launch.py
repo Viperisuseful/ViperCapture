@@ -18,6 +18,8 @@ from __future__ import annotations
 import hashlib
 from importlib.metadata import version
 import os
+import platform
+import re
 import shutil
 import sys
 import subprocess
@@ -25,6 +27,7 @@ import socket
 import time
 import webbrowser
 from pathlib import Path
+from typing import Callable
 
 ROOT             = Path(__file__).parent.resolve()
 VENV_PYTHON      = ROOT / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
@@ -33,6 +36,15 @@ PORT             = 8000
 URL              = f"http://{HOST}:{PORT}/"
 DEPS_STAMP       = ROOT / ".venv" / ".deps_stamp"
 PLAYWRIGHT_STAMP = ROOT / ".venv" / ".playwright_stamp"
+# PyCA 49.0.0 dropped Intel macOS wheels. Source builds need Rust 1.83+.
+# https://cryptography.io/en/latest/installation/#building-cryptography-on-macos
+MIN_RUSTC        = (1, 83, 0)
+INTEL_MACOS_CRYPTOGRAPHY_DOCS = (
+    "https://cryptography.io/en/latest/installation/#building-cryptography-on-macos"
+)
+INTEL_MACOS_CRYPTOGRAPHY_CHANGELOG = (
+    "https://cryptography.io/en/latest/changelog/#v49-0-0"
+)
 
 
 # ── Helpers ───────────────────────────────────────────────────
@@ -82,17 +94,189 @@ def venv_command(python: str, venv_dir: Path, uv: str | None) -> list[str]:
 
 
 def deps_commands(
-    python: str, requirements: Path, uv: str | None
+    python: str,
+    requirements: Path,
+    uv: str | None,
+    *,
+    intel_macos: bool = False,
 ) -> list[tuple[list[str], str]]:
+    source_build = ["--no-binary", "cryptography"] if intel_macos else []
     if uv:
         return [(
-            [uv, "pip", "install", "--python", python, "-r", str(requirements)],
+            [
+                uv,
+                "pip",
+                "install",
+                "--python",
+                python,
+                "-r",
+                str(requirements),
+                *source_build,
+            ],
             "uv pip install",
         )]
     return [
         ([python, "-m", "pip", "install", "--upgrade", "pip", "-q"], "pip upgrade"),
-        ([python, "-m", "pip", "install", "-r", str(requirements)], "pip install"),
+        (
+            [python, "-m", "pip", "install", "-r", str(requirements), *source_build],
+            "pip install",
+        ),
     ]
+
+
+def is_intel_macos(
+    sys_platform: str = sys.platform,
+    machine: str | None = None,
+) -> bool:
+    return sys_platform == "darwin" and (machine or platform.machine()) == "x86_64"
+
+
+def parse_rustc_version(text: str) -> tuple[int, int, int] | None:
+    match = re.search(r"rustc\s+(\d+)\.(\d+)\.(\d+)", text)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
+def _command_stdout(
+    cmd: list[str],
+    run: Callable[..., subprocess.CompletedProcess[str]],
+) -> str | None:
+    try:
+        result = run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return (result.stdout or "").strip()
+
+
+def _openssl_prefix_if_present(prefix: str) -> str | None:
+    if prefix and (Path(prefix) / "include" / "openssl" / "ssl.h").is_file():
+        return prefix
+    return None
+
+
+def probe_intel_macos_cryptography_toolchain(
+    *,
+    which: Callable[[str], str | None] = shutil.which,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    environ: dict[str, str] | None = None,
+) -> dict[str, object]:
+    """Discover compiler, rustc, and a non-Apple OpenSSL prefix for a source build."""
+    env = os.environ if environ is None else environ
+    compiler = which("cc") or which("clang")
+    if compiler is None and _command_stdout(["xcode-select", "-p"], run):
+        compiler = "xcode-select"
+    rustc = which("rustc")
+    rust_version = None
+    if rustc:
+        rust_version = parse_rustc_version(
+            _command_stdout([rustc, "--version"], run) or ""
+        )
+    openssl_dir = _openssl_prefix_if_present(env.get("OPENSSL_DIR", "").strip())
+    brew = which("brew")
+    if openssl_dir is None and brew:
+        for formula in ("openssl@3", "openssl"):
+            prefix = _command_stdout([brew, "--prefix", formula], run)
+            openssl_dir = _openssl_prefix_if_present(prefix or "")
+            if openssl_dir:
+                break
+    if openssl_dir is None:
+        openssl_dir = _openssl_prefix_if_present("/opt/local")
+    if openssl_dir is None:
+        pkg_config = which("pkg-config") or which("pkgconf")
+        if pkg_config:
+            prefix = _command_stdout(
+                [pkg_config, "--variable=prefix", "libcrypto"], run
+            )
+            openssl_dir = _openssl_prefix_if_present(prefix or "")
+    return {
+        "compiler": compiler,
+        "rustc": rustc,
+        "rust_version": rust_version,
+        "openssl_dir": openssl_dir,
+    }
+
+
+def intel_macos_cryptography_missing(toolchain: dict[str, object]) -> list[str]:
+    missing: list[str] = []
+    if not toolchain.get("compiler"):
+        missing.append("Xcode command line tools (clang)")
+    rust_version = toolchain.get("rust_version")
+    if not isinstance(rust_version, tuple) or rust_version < MIN_RUSTC:
+        missing.append(f"Rust {MIN_RUSTC[0]}.{MIN_RUSTC[1]}.{MIN_RUSTC[2]}+ (rustc)")
+    if not toolchain.get("openssl_dir"):
+        missing.append("Homebrew/MacPorts OpenSSL 3 (not Apple LibreSSL)")
+    return missing
+
+
+def apply_intel_macos_cryptography_env(
+    environ: dict[str, str], openssl_dir: str
+) -> dict[str, str]:
+    """Point the cryptography sdist at a real OpenSSL prefix (PyCA OPENSSL_DIR)."""
+    environ["OPENSSL_DIR"] = openssl_dir
+    pkgconfig = Path(openssl_dir) / "lib" / "pkgconfig"
+    if pkgconfig.is_dir():
+        current = environ.get("PKG_CONFIG_PATH", "")
+        prefix = str(pkgconfig)
+        parts = [part for part in current.split(":") if part]
+        if prefix not in parts:
+            environ["PKG_CONFIG_PATH"] = ":".join([prefix, *parts])
+    return environ
+
+
+def format_intel_macos_cryptography_error(missing: list[str]) -> str:
+    needed = ", ".join(missing)
+    return (
+        "\n  ERROR: Intel macOS has no cryptography >=49 wheel on PyPI "
+        "(GHSA-jwv3-5hgf-82ww).\n"
+        f"  pyca removed x86_64/universal2 wheels in 49.0.0: "
+        f"{INTEL_MACOS_CRYPTOGRAPHY_CHANGELOG}\n"
+        f"  Source-build tools missing: {needed}\n"
+        "\n  Install the official PyCA macOS build dependencies, then rerun:\n"
+        "    xcode-select --install\n"
+        "    brew install openssl@3 rust\n"
+        "    # or: sudo port install openssl rust\n"
+        f"  {INTEL_MACOS_CRYPTOGRAPHY_DOCS}\n"
+        "  Do not pin cryptography <=48; those releases are vulnerable.\n"
+    )
+
+
+def prepare_intel_macos_cryptography_build(
+    *,
+    sys_platform: str = sys.platform,
+    machine: str | None = None,
+    which: Callable[[str], str | None] = shutil.which,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    environ: dict[str, str] | None = None,
+) -> list[str]:
+    """
+    On Intel Macs, refuse to pip-install until a source build can succeed.
+    Returns missing-tool messages (empty when ready). Exits from ensure_deps.
+    """
+    if not is_intel_macos(sys_platform, machine):
+        return []
+    env = os.environ if environ is None else environ
+    toolchain = probe_intel_macos_cryptography_toolchain(
+        which=which, run=run, environ=env
+    )
+    missing = intel_macos_cryptography_missing(toolchain)
+    if missing:
+        return missing
+    openssl_dir = toolchain.get("openssl_dir")
+    if isinstance(openssl_dir, str) and openssl_dir:
+        apply_intel_macos_cryptography_env(env, openssl_dir)
+    print(
+        "  Intel macOS: building cryptography from the official sdist "
+        "(no PyPI x86_64 wheel for 49+)."
+    )
+    return []
 
 
 def _venv_has_pip(python: str) -> bool:
@@ -148,7 +332,15 @@ def ensure_deps() -> None:
             wait_and_exit(1)
         print("  [2/3] Installing Python packages...")
 
-    for command, label in deps_commands(sys.executable, ROOT / "requirements.txt", uv):
+    intel_macos = is_intel_macos()
+    missing = prepare_intel_macos_cryptography_build()
+    if missing:
+        print(format_intel_macos_cryptography_error(missing))
+        wait_and_exit(1)
+
+    for command, label in deps_commands(
+        sys.executable, ROOT / "requirements.txt", uv, intel_macos=intel_macos
+    ):
         run(*command, label=label)
     DEPS_STAMP.write_text(current_hash)
 

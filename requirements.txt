@@ -3,8 +3,9 @@ uvicorn[standard]>=0.52.1
 playwright>=1.62.0
 playwright-stealth==2.0.3
 python-multipart>=0.0.9
-# GHSA-jwv3-5hgf-82ww is patched in 49.0.0. pyca dropped Intel macOS wheels in 49
-# (arm64-only); darwin x86_64 installs from sdist and needs a Rust toolchain.
+# GHSA-jwv3-5hgf-82ww is patched in 49.0.0. No 49+/50+ macOS x86_64 or
+# universal2 wheel exists on PyPI (arm64-only). Intel Macs build the official
+# sdist; launch.py preflights Xcode CLT, Rust 1.83+, and Homebrew/MacPorts OpenSSL.
 cryptography>=49.0.0; sys_platform == "darwin" and platform_machine == "x86_64"
 cryptography>=50.0.0; sys_platform != "darwin" or platform_machine != "x86_64"
 httpx>=0.28.1

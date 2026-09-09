@@ -102,6 +102,15 @@ library `venv` module and pip. Set `VIPERCAPTURE_USE_UV=0` to force that pip
 path even when uv is installed. The launcher then installs Chromium, Firefox,
 and WebKit, starts the API, and opens `http://127.0.0.1:8000`.
 
+On Intel Macs (`darwin`/`x86_64`) the launcher builds `cryptography` from the
+official sdist. PyCA removed x86_64 and universal2 wheels in 49.0.0, and
+releases through 48.0.1 are vulnerable
+([GHSA-jwv3-5hgf-82ww](https://github.com/advisories/GHSA-jwv3-5hgf-82ww)).
+Install Xcode command line tools, Rust 1.83+, and Homebrew or MacPorts OpenSSL
+before the first run; see
+[Intel macOS](docs/self-hosting.md#intel-macos-x86_64). The launcher exits
+with those commands if the toolchain is missing instead of failing inside pip.
+
 To use Docker instead, run:
 
 ```bash
