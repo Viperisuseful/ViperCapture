@@ -18,6 +18,33 @@ falls back to pip. It creates a virtual environment, installs Playwright
 Chromium, Firefox, and WebKit, starts the application, and opens the local
 interface. The Docker image already includes FFmpeg.
 
+### Intel macOS (x86_64)
+
+[GHSA-jwv3-5hgf-82ww](https://github.com/advisories/GHSA-jwv3-5hgf-82ww) is
+fixed in `cryptography` 49.0.0. PyCA dropped Intel macOS wheels in that
+release ([changelog](https://cryptography.io/en/latest/changelog/#v49-0-0)).
+PyPI file lists for
+[49.0.0](https://pypi.org/project/cryptography/49.0.0/#files),
+[50.0.0](https://pypi.org/project/cryptography/50.0.0/#files), and
+[50.0.1](https://pypi.org/project/cryptography/50.0.1/#files) publish
+`macosx_11_0_arm64` wheels and an sdist only — no `x86_64` or `universal2`
+wheel for CPython 3.11+. The last Intel/universal2 wheels are on vulnerable
+48.0.1; do not use them.
+
+`launch.py` therefore source-builds the official sdist on Intel Macs. Before
+installing dependencies it checks for a C compiler, Rust 1.83.0 or newer, and
+a non-Apple OpenSSL prefix, then sets `OPENSSL_DIR` / `PKG_CONFIG_PATH` from
+Homebrew or MacPorts. If anything is missing it exits with the
+[PyCA macOS build steps](https://cryptography.io/en/latest/installation/#building-cryptography-on-macos):
+
+```bash
+xcode-select --install
+brew install openssl@3 rust
+```
+
+MacPorts: `sudo port install openssl rust`. Rust is only needed at build time.
+Linux, Windows, and Apple Silicon keep binary wheels (`cryptography>=50.0.0`).
+
 ## Configure a production deployment
 
 - Put hosted mode behind a rate-limited reverse proxy.
