@@ -1933,30 +1933,175 @@ def ensure_page_width(
     )
 
 
-LAZY_LOAD_SETTLE_SCRIPT = """() => {
+# Legacy lazy-load envelope: max_steps * delay + tail. Readiness waits,
+# stability sleeps, and the return-to-top settle share this budget so a
+# hung image cannot stack a 5s/12s readiness phase on top of the old sleeps.
+LAZY_LOAD_LEGACY_TAIL_S = 0.2
+LAZY_LOAD_TAIL_SETTLE_S = 0.25
+
+LAZY_LOAD_SETTLE_HELPERS = r"""
+    const isSourceLessLazyCandidate = (image) => {
+        if (image.currentSrc) return false;
+        if (image.loading === 'lazy') return true;
+        const attrs = image.attributes || [];
+        for (const attr of attrs) {
+            if (/^data-(src|srcset|original|lazy|bg)/i.test(attr.name)) return true;
+        }
+        const cls = typeof image.className === 'string' ? image.className : '';
+        return /(?:^|\s)(?:lazy(?:-?load)?|lozad)(?:\s|$)/i.test(cls);
+    };
+    const iframeHasStarted = (frame) => {
+        try {
+            const doc = frame.contentDocument;
+            if (doc) {
+                const url = doc.URL || '';
+                if (url && url !== 'about:blank') return true;
+                const intended = frame.src || (frame.getAttribute && frame.getAttribute('src')) || '';
+                return !intended || intended === 'about:blank' || !!frame.srcdoc;
+            }
+        } catch (e) {}
+        try {
+            const href = frame.contentWindow && frame.contentWindow.location.href;
+            if (!href || href === 'about:blank') {
+                const intended = frame.src
+                    || (frame.getAttribute && frame.getAttribute('src'))
+                    || (frame.dataset && frame.dataset.src)
+                    || '';
+                return !intended || intended === 'about:blank';
+            }
+            return true;
+        } catch (e) {
+            return true;
+        }
+    };
+"""
+
+LAZY_LOAD_SETTLE_SCRIPT = (
+    "() => {"
+    + LAZY_LOAD_SETTLE_HELPERS
+    + r"""
     if (document.readyState !== 'complete') return false;
     const limit = window.scrollY + window.innerHeight;
     for (const image of document.images) {
         if (!image.getClientRects().length) continue;
         const started = !!image.currentSrc;
-        if (!started && image.complete) continue;
+        if (!started && image.complete && !isSourceLessLazyCandidate(image)) continue;
         if (image.getBoundingClientRect().top + window.scrollY < limit) {
             if (!started) return false;
             if (!image.complete) return false;
         }
     }
     for (const frame of document.querySelectorAll('iframe')) {
+        if (!frame.getClientRects().length) continue;
+        if (frame.getBoundingClientRect().top + window.scrollY >= limit) continue;
         try {
             const doc = frame.contentDocument;
-            if (!doc) continue;
-            if (doc.readyState !== 'complete') return false;
-            for (const image of doc.images) {
-                if (image.currentSrc && !image.complete) return false;
+            if (doc) {
+                if (doc.readyState !== 'complete') return false;
+                for (const image of doc.images) {
+                    if (!image.getClientRects().length) continue;
+                    const started = !!image.currentSrc;
+                    if (!started && image.complete && !isSourceLessLazyCandidate(image)) continue;
+                    if (!started || !image.complete) return false;
+                }
+                continue;
             }
-        } catch {}
+        } catch (e) {}
+        if (!iframeHasStarted(frame)) return false;
     }
     return true;
 }"""
+)
+
+LAZY_LOAD_FRAME_SETTLE_SCRIPT = (
+    "() => {"
+    + LAZY_LOAD_SETTLE_HELPERS
+    + r"""
+    if (document.readyState !== 'complete') return false;
+    for (const image of document.images) {
+        if (!image.getClientRects().length) continue;
+        const started = !!image.currentSrc;
+        if (!started && image.complete && !isSourceLessLazyCandidate(image)) continue;
+        if (!started || !image.complete) return false;
+    }
+    return true;
+}"""
+)
+
+_IFRAME_ELEMENT_REVEALED_SCRIPT = """el => {
+    if (!el.getClientRects().length) return false;
+    return el.getBoundingClientRect().top + window.scrollY < window.scrollY + window.innerHeight;
+}"""
+
+
+def _lazy_load_timing(
+    mode: LazyLoadMode,
+) -> tuple[int, float, float, float, float]:
+    """Return max_steps, delay, step_ratio, settle_cap, phase_budget."""
+    if mode is LazyLoadMode.ADAPTIVE:
+        max_steps, delay, step_ratio, settle_cap = 24, 0.075, 1.0, 0.5
+    else:
+        max_steps, delay, step_ratio, settle_cap = 40, 0.2, 0.8, 1.0
+    return max_steps, delay, step_ratio, settle_cap, max_steps * delay + LAZY_LOAD_LEGACY_TAIL_S
+
+
+def _remaining_timeout_ms(deadline: float) -> float:
+    return max(0.0, (deadline - time.monotonic()) * 1000)
+
+
+async def _revealed_child_frames(page: Page) -> list[object]:
+    """Playwright frames whose iframe element is in or above the viewport."""
+    frames = getattr(page, "frames", None) or ()
+    main = getattr(page, "main_frame", None)
+    revealed: list[object] = []
+    for frame in list(frames):
+        if main is not None and frame is main:
+            continue
+        is_detached = getattr(frame, "is_detached", None)
+        if callable(is_detached):
+            try:
+                if is_detached():
+                    continue
+            except Exception:
+                continue
+        frame_element = getattr(frame, "frame_element", None)
+        if not callable(frame_element):
+            continue
+        try:
+            element = await frame_element()
+            visible = await element.evaluate(_IFRAME_ELEMENT_REVEALED_SCRIPT)
+        except Exception:
+            continue
+        if visible:
+            revealed.append(frame)
+    return revealed
+
+
+async def _settle_child_frame(frame: object, deadline: float) -> None:
+    """Wait for a (possibly cross-origin) child frame to load and paint."""
+    remaining_ms = _remaining_timeout_ms(deadline)
+    if remaining_ms <= 0:
+        return
+    wait_for_load_state = getattr(frame, "wait_for_load_state", None)
+    if callable(wait_for_load_state):
+        try:
+            await wait_for_load_state("load", timeout=remaining_ms)
+        except PlaywrightError:
+            pass
+    remaining_ms = _remaining_timeout_ms(deadline)
+    if remaining_ms <= 0:
+        return
+    wait_for_function = getattr(frame, "wait_for_function", None)
+    if not callable(wait_for_function):
+        return
+    try:
+        await wait_for_function(
+            LAZY_LOAD_FRAME_SETTLE_SCRIPT,
+            timeout=remaining_ms,
+            polling="raf",
+        )
+    except PlaywrightError:
+        pass
 
 
 async def _wait_for_visual_settle(page: Page, *, timeout_s: float) -> None:
@@ -1965,7 +2110,12 @@ async def _wait_for_visual_settle(page: Page, *, timeout_s: float) -> None:
     Polls on animation frames so each scroll position gets render frames:
     without them Chromium never delivers the intersection callbacks that
     reveal lazy-loaded images, and a fast scroll races past unseen content.
+    Revealed child frames are settled through Playwright so cross-origin
+    embeds (where contentDocument is null) still get a load/readiness path.
     """
+    if timeout_s <= 0:
+        return
+    deadline = time.monotonic() + timeout_s
     try:
         await page.wait_for_function(
             LAZY_LOAD_SETTLE_SCRIPT,
@@ -1974,6 +2124,19 @@ async def _wait_for_visual_settle(page: Page, *, timeout_s: float) -> None:
         )
     except PlaywrightError:
         pass
+    remaining_ms = _remaining_timeout_ms(deadline)
+    if remaining_ms <= 0:
+        return
+    try:
+        frames = await _revealed_child_frames(page)
+    except Exception:
+        return
+    if not frames:
+        return
+    await asyncio.gather(
+        *(_settle_child_frame(frame, deadline) for frame in frames),
+        return_exceptions=True,
+    )
 
 
 async def load_lazy_content(
@@ -1990,15 +2153,8 @@ async def load_lazy_content(
         document.body?.scrollHeight || 0,
         document.body?.offsetHeight || 0
     )"""
-    # settle_cap bounds each readiness wait; settle_budget bounds the whole
-    # phase, after which steps fall back to the fixed delay so pathological
-    # pages cannot regress past the previous worst case by much.
-    max_steps, delay, step_ratio, settle_cap, settle_budget = (
-        (24, 0.075, 1.0, 0.5, 5.0)
-        if mode is LazyLoadMode.ADAPTIVE
-        else (40, 0.2, 0.8, 1.0, 12.0)
-    )
-    settle_deadline = time.monotonic() + settle_budget
+    max_steps, delay, step_ratio, settle_cap, phase_budget = _lazy_load_timing(mode)
+    phase_deadline = time.monotonic() + phase_budget
     step = max(1, math.ceil(viewport_height * step_ratio))
     position = 0
     stable_bottom_checks = 0
@@ -2017,23 +2173,26 @@ async def load_lazy_content(
                 stable_bottom_checks = 0
                 moved = True
             await page.evaluate(scroll, position)
+            remaining = phase_deadline - time.monotonic()
+            if remaining <= 0:
+                continue
             if not moved:
                 # Keep the fixed grace window during bottom-stability checks
                 # so late document growth still extends the scroll.
-                await asyncio.sleep(delay)
+                await asyncio.sleep(min(delay, remaining))
                 continue
-            remaining = settle_deadline - time.monotonic()
-            if remaining <= 0:
-                await asyncio.sleep(delay)
-            else:
-                await _wait_for_visual_settle(
-                    page, timeout_s=min(settle_cap, remaining)
-                )
+            await _wait_for_visual_settle(
+                page, timeout_s=min(settle_cap, remaining)
+            )
     finally:
         with suppress(Exception):
             await page.evaluate(scroll, 0)
-        with suppress(Exception):
-            await _wait_for_visual_settle(page, timeout_s=0.25)
+        remaining = phase_deadline - time.monotonic()
+        if remaining > 0:
+            with suppress(Exception):
+                await _wait_for_visual_settle(
+                    page, timeout_s=min(LAZY_LOAD_TAIL_SETTLE_S, remaining)
+                )
 
 
 def cdp_screenshot_options(
