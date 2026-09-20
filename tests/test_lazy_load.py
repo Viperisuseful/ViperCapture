@@ -78,10 +78,11 @@ def test_none_mode_never_touches_the_page() -> None:
 def test_settled_tall_page_waits_for_readiness_instead_of_sleeping() -> None:
     page = FakePage(height=12000)
     elapsed = _run(page, LazyLoadMode.ADAPTIVE)
-    # 18 progress settles of the 0.5s cap plus the 0.25s tail settle replace
-    # 19 x 75ms of blind sleeping plus a 200ms tail; the step that clamps to
-    # the bottom keeps the fixed grace sleep, matching previous behavior.
-    assert page.settle_waits == [0.5] * 18 + [0.25]
+    # 18 progress settles plus the settle on the step that clamps to the
+    # bottom (where the last images get revealed) and the 0.25s tail settle
+    # replace 19 x 75ms of blind sleeping plus a 200ms tail; only the two
+    # no-movement stability re-checks keep the fixed grace sleep.
+    assert page.settle_waits == [0.5] * 19 + [0.25]
     assert page.scroll_positions[-1] == 0
     assert elapsed < 1.0
 
@@ -113,7 +114,7 @@ def test_exhausted_budget_falls_back_to_fixed_delays() -> None:
 def test_thorough_mode_also_uses_readiness_waits() -> None:
     page = FakePage(height=12000)
     elapsed = _run(page, LazyLoadMode.THOROUGH)
-    # 480px steps settle 23 times before the step that clamps to the
-    # 11400px bottom, plus the tail settle after returning to the top.
-    assert page.settle_waits == [1.0] * 23 + [0.25]
+    # 480px steps settle 23 times before the clamp-to-bottom settle, plus
+    # the tail settle after returning to the top.
+    assert page.settle_waits == [1.0] * 24 + [0.25]
     assert elapsed < 2.0

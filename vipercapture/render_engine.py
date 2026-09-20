@@ -1935,8 +1935,15 @@ def ensure_page_width(
 
 LAZY_LOAD_SETTLE_SCRIPT = """() => {
     if (document.readyState !== 'complete') return false;
+    const limit = window.scrollY + window.innerHeight;
     for (const image of document.images) {
-        if (image.currentSrc && !image.complete) return false;
+        if (!image.getClientRects().length) continue;
+        const started = !!image.currentSrc;
+        if (!started && image.complete) continue;
+        if (image.getBoundingClientRect().top + window.scrollY < limit) {
+            if (!started) return false;
+            if (!image.complete) return false;
+        }
     }
     for (const frame of document.querySelectorAll('iframe')) {
         try {
@@ -1953,12 +1960,17 @@ LAZY_LOAD_SETTLE_SCRIPT = """() => {
 
 
 async def _wait_for_visual_settle(page: Page, *, timeout_s: float) -> None:
-    """Wait until loads that already started have finished; bounded and quiet."""
+    """Wait until the revealed region has finished loading; bounded and quiet.
+
+    Polls on animation frames so each scroll position gets render frames:
+    without them Chromium never delivers the intersection callbacks that
+    reveal lazy-loaded images, and a fast scroll races past unseen content.
+    """
     try:
         await page.wait_for_function(
             LAZY_LOAD_SETTLE_SCRIPT,
             timeout=timeout_s * 1000,
-            polling=50,
+            polling="raf",
         )
     except PlaywrightError:
         pass
@@ -1995,6 +2007,7 @@ async def load_lazy_content(
         for _ in range(max_steps):
             height = math.ceil(await page.evaluate(document_height))
             bottom = max(0, height - viewport_height)
+            moved = False
             if position >= bottom:
                 stable_bottom_checks += 1
                 if stable_bottom_checks >= 2:
@@ -2002,8 +2015,9 @@ async def load_lazy_content(
             else:
                 position = min(position + step, bottom)
                 stable_bottom_checks = 0
+                moved = True
             await page.evaluate(scroll, position)
-            if position >= bottom:
+            if not moved:
                 # Keep the fixed grace window during bottom-stability checks
                 # so late document growth still extends the scroll.
                 await asyncio.sleep(delay)
