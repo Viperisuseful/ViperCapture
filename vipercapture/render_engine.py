@@ -1933,6 +1933,37 @@ def ensure_page_width(
     )
 
 
+LAZY_LOAD_SETTLE_SCRIPT = """() => {
+    if (document.readyState !== 'complete') return false;
+    for (const image of document.images) {
+        if (image.currentSrc && !image.complete) return false;
+    }
+    for (const frame of document.querySelectorAll('iframe')) {
+        try {
+            const doc = frame.contentDocument;
+            if (!doc) continue;
+            if (doc.readyState !== 'complete') return false;
+            for (const image of doc.images) {
+                if (image.currentSrc && !image.complete) return false;
+            }
+        } catch {}
+    }
+    return true;
+}"""
+
+
+async def _wait_for_visual_settle(page: Page, *, timeout_s: float) -> None:
+    """Wait until loads that already started have finished; bounded and quiet."""
+    try:
+        await page.wait_for_function(
+            LAZY_LOAD_SETTLE_SCRIPT,
+            timeout=timeout_s * 1000,
+            polling=50,
+        )
+    except PlaywrightError:
+        pass
+
+
 async def load_lazy_content(
     page: Page,
     viewport_height: int,
@@ -1947,11 +1978,15 @@ async def load_lazy_content(
         document.body?.scrollHeight || 0,
         document.body?.offsetHeight || 0
     )"""
-    max_steps, delay, step_ratio = (
-        (24, 0.075, 1.0)
+    # settle_cap bounds each readiness wait; settle_budget bounds the whole
+    # phase, after which steps fall back to the fixed delay so pathological
+    # pages cannot regress past the previous worst case by much.
+    max_steps, delay, step_ratio, settle_cap, settle_budget = (
+        (24, 0.075, 1.0, 0.5, 5.0)
         if mode is LazyLoadMode.ADAPTIVE
-        else (40, 0.2, 0.8)
+        else (40, 0.2, 0.8, 1.0, 12.0)
     )
+    settle_deadline = time.monotonic() + settle_budget
     step = max(1, math.ceil(viewport_height * step_ratio))
     position = 0
     stable_bottom_checks = 0
@@ -1968,11 +2003,23 @@ async def load_lazy_content(
                 position = min(position + step, bottom)
                 stable_bottom_checks = 0
             await page.evaluate(scroll, position)
-            await asyncio.sleep(delay)
+            if position >= bottom:
+                # Keep the fixed grace window during bottom-stability checks
+                # so late document growth still extends the scroll.
+                await asyncio.sleep(delay)
+                continue
+            remaining = settle_deadline - time.monotonic()
+            if remaining <= 0:
+                await asyncio.sleep(delay)
+            else:
+                await _wait_for_visual_settle(
+                    page, timeout_s=min(settle_cap, remaining)
+                )
     finally:
         with suppress(Exception):
             await page.evaluate(scroll, 0)
-            await asyncio.sleep(0.2)
+        with suppress(Exception):
+            await _wait_for_visual_settle(page, timeout_s=0.25)
 
 
 def cdp_screenshot_options(
