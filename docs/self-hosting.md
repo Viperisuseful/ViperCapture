@@ -35,8 +35,9 @@ vipercapture
 The command creates a virtual environment, installs Playwright Chromium,
 Firefox, and WebKit, starts the application, and opens the local interface.
 Press Esc twice or Ctrl+C to stop it. `vipercapture update` downloads the
-latest published version and keeps the virtualenv and saved jobs. It is the
-same Python command on Linux, macOS, and Windows. `vipercapture --one-window`
+latest published version and keeps the virtualenv, `.env.local`, and saved
+jobs. It is the same Python command on Linux, macOS, and Windows. On Windows,
+stop the running server before updating. `vipercapture --one-window`
 keeps the status and request log in the same terminal, for SSH or any session
 where a second window should not open. Windows always runs that way. From a git
 checkout, `python launch.py` runs that same startup path. The launcher uses uv

@@ -9,6 +9,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+import urllib.parse
 from pathlib import Path
 from typing import Callable
 from unittest import mock
@@ -870,6 +871,11 @@ OLD_SHA = "a" * 40
 NEW_SHA = "b" * 40
 
 
+def _github_api(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    return parsed.scheme == "https" and parsed.hostname == "api.github.com"
+
+
 def _archive(source: Path) -> bytes:
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
@@ -894,7 +900,7 @@ class UpdateTests(unittest.TestCase):
 
     def _fetch(self, archive: bytes, sha: str = NEW_SHA) -> Callable[[str], bytes]:
         def fetch(url: str) -> bytes:
-            if "api.github.com" in url:
+            if _github_api(url):
                 return json.dumps({"sha": sha}).encode()
             return archive
         return fetch
@@ -928,7 +934,7 @@ class UpdateTests(unittest.TestCase):
 
             def fetch(url: str) -> bytes:
                 calls.append(url)
-                if "api.github.com" not in url:
+                if not _github_api(url):
                     raise AssertionError(url)
                 return json.dumps({"sha": NEW_SHA}).encode()
 
@@ -997,6 +1003,114 @@ class UpdateTests(unittest.TestCase):
             self.assertIn("still running on http://127.0.0.1:8000", stdout.getvalue())
             self.assertFalse((home / ".vipercapture" / "app.backup").exists())
             self.assertFalse((home / ".vipercapture" / "app.updating").exists())
+
+    def test_update_keeps_env_local(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            app = self._install(home, revision=OLD_SHA)
+            secret = "VIPERCAPTURE_SIGNING_ADMIN_TOKEN=local-secret\n"
+            local = app / ".env.local"
+            local.write_text(secret, encoding="utf-8")
+            os.chmod(local, 0o600)
+            source = home / "incoming"
+            source.mkdir()
+            (source / "launch.py").write_text("print('new')\n", encoding="utf-8")
+            (source / "VERSION").write_text("1.0.5\n", encoding="utf-8")
+            (source / ".env.local").write_text("VIPERCAPTURE_SIGNING_ADMIN_TOKEN=from-archive\n", encoding="utf-8")
+            stdout = io.StringIO()
+            with mock.patch("sys.stdout", stdout):
+                code = updater.run_update(
+                    app,
+                    fetch=self._fetch(_archive(source)),
+                    home=home,
+                    path_env="",
+                    shell="/bin/bash",
+                    server_running=lambda: False,
+                    executable="/usr/bin/python3",
+                )
+            self.assertEqual(code, 0, stdout.getvalue())
+            self.assertEqual((app / ".env.local").read_text(encoding="utf-8"), secret)
+            self.assertEqual(os.stat(app / ".env.local").st_mode & 0o777, 0o600)
+
+    def test_download_is_pinned_to_the_checked_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            app = self._install(home, revision=OLD_SHA)
+            source = home / "incoming"
+            source.mkdir()
+            (source / "launch.py").write_text("print('new')\n", encoding="utf-8")
+            (source / "VERSION").write_text("1.0.5\n", encoding="utf-8")
+            calls: list[str] = []
+
+            def fetch(url: str) -> bytes:
+                calls.append(url)
+                if _github_api(url):
+                    return json.dumps({"sha": NEW_SHA}).encode()
+                return _archive(source)
+
+            stdout = io.StringIO()
+            with mock.patch("sys.stdout", stdout):
+                code = updater.run_update(
+                    app,
+                    fetch=fetch,
+                    home=home,
+                    path_env="",
+                    shell="/bin/bash",
+                    server_running=lambda: False,
+                    executable="/usr/bin/python3",
+                )
+            self.assertEqual(code, 0, stdout.getvalue())
+            self.assertIn(
+                f"https://github.com/Viperisuseful/ViperCapture/archive/{NEW_SHA}.tar.gz",
+                calls,
+            )
+            self.assertFalse(any("refs/heads" in url for url in calls))
+
+    def test_windows_update_refuses_to_rename_a_running_server(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            app = self._install(home, revision=OLD_SHA)
+            source = home / "incoming"
+            source.mkdir()
+            (source / "launch.py").write_text("print('new')\n", encoding="utf-8")
+            (source / "VERSION").write_text("1.0.5\n", encoding="utf-8")
+            stderr = io.StringIO()
+            with mock.patch("sys.stderr", stderr):
+                code = updater.run_update(
+                    app,
+                    fetch=self._fetch(_archive(source)),
+                    home=home,
+                    path_env="",
+                    platform_name="win32",
+                    shell="",
+                    server_running=lambda: True,
+                    executable=r"C:\Python\python.exe",
+                )
+            self.assertEqual(code, 1)
+            self.assertIn("still running", stderr.getvalue())
+            self.assertIn("Stop it", stderr.getvalue())
+            self.assertEqual((app / "launch.py").read_text(encoding="utf-8"), "print('old')\n")
+            self.assertFalse((home / ".vipercapture" / "app.updating").exists())
+            self.assertFalse((home / ".vipercapture" / "app.backup").exists())
+
+    def test_windows_shim_uses_the_console_code_page(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vipercapture.cmd"
+            python = "C:\\Users\\José\\python.exe"
+            launch_path = Path("C:/Users/José/ViperCapture/app/launch.py")
+            updater.write_shim(path, python, launch_path, "win32", encoding="cp1252")
+            raw = path.read_bytes()
+            self.assertIn("José".encode("cp1252"), raw)
+            self.assertNotIn("José".encode("utf-8"), raw)
+            self.assertTrue(raw.startswith(b"@echo off\r\n"))
+            with self.assertRaises(updater.UpdateError):
+                updater.write_shim(
+                    path,
+                    "C:\\Users\\你好\\python.exe",
+                    Path("C:/Users/你好/app/launch.py"),
+                    "win32",
+                    encoding="cp1252",
+                )
 
     def test_windows_shim_uses_cmd(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

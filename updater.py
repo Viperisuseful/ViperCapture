@@ -73,6 +73,13 @@ def default_archive_url(repo: str, ref: str) -> str:
     return f"https://github.com/{repo}/archive/refs/heads/{quoted}.tar.gz"
 
 
+def commit_archive_url(repo: str, sha: str) -> str:
+    """Download the exact commit that was just checked, not a branch that can move."""
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise UpdateError("Refusing to download an archive for an invalid revision.")
+    return f"https://github.com/{repo}/archive/{sha}.tar.gz"
+
+
 def commit_sha_from_api(payload: bytes) -> str:
     try:
         data = json.loads(payload.decode("utf-8"))
@@ -216,8 +223,28 @@ def copy_filtered(source: Path, dest: Path) -> None:
             shutil.copy2(entry, target)
 
 
+# Machine-only files. The GitHub archive does not contain them.
+_LOCAL_FILES = (".env.local",)
+
+
+def _preserve_local_files(backup: Path, app: Path) -> None:
+    """Copy local config into the new tree. Symlinks are left behind."""
+    if not backup.is_dir() or not app.is_dir():
+        return
+    for name in _LOCAL_FILES:
+        source = backup / name
+        if not source.exists() or source.is_symlink() or not source.is_file():
+            continue
+        target = app / name
+        if target.is_symlink():
+            target.unlink()
+        elif target.is_dir():
+            continue
+        shutil.copy2(source, target)
+
+
 def _recover_interrupted_update(app: Path, backup: Path) -> None:
-    """Put .venv back if an earlier update swapped the tree and then stopped."""
+    """Put .venv and local config back if an earlier update stopped halfway."""
     if not backup.exists():
         return
     if not app.exists():
@@ -226,6 +253,7 @@ def _recover_interrupted_update(app: Path, backup: Path) -> None:
     stray = backup / ".venv"
     if stray.exists() and not (app / ".venv").exists():
         stray.rename(app / ".venv")
+    _preserve_local_files(backup, app)
     shutil.rmtree(backup)
 
 
@@ -264,6 +292,10 @@ def replace_install_tree(source: Path, app: Path) -> None:
             if not app.exists() and backup.exists():
                 backup.rename(app)
             raise UpdateError("Could not keep the existing virtualenv.") from exc
+    try:
+        _preserve_local_files(backup, app)
+    except OSError as exc:
+        raise UpdateError("Could not keep .env.local.") from exc
     if backup.exists():
         shutil.rmtree(backup)
 
@@ -280,19 +312,57 @@ def cmd_quote(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
 
 
-def write_shim(path: Path, python: str, launch: Path, platform_name: str) -> bool:
+def cmd_encoding() -> str:
+    """The code page cmd.exe uses for a batch file that has no UTF-8 BOM."""
+    if sys.platform != "win32":
+        return "ascii"
+    import ctypes
+
+    code_page = int(ctypes.windll.kernel32.GetOEMCP())
+    return f"cp{code_page}"
+
+
+def write_shim(
+    path: Path,
+    python: str,
+    launch: Path,
+    platform_name: str,
+    *,
+    encoding: str | None = None,
+) -> bool:
     """Write the user command. Return True when the file is new."""
     created = not path.exists()
     path.parent.mkdir(parents=True, exist_ok=True)
     if platform_name == "win32":
         text = f"@echo off\r\n{cmd_quote(python)} {cmd_quote(str(launch))} %*\r\n"
+        chosen = encoding or cmd_encoding()
+        try:
+            data = text.encode(chosen)
+        except LookupError as exc:
+            raise UpdateError("This Windows install cannot encode the vipercapture command.") from exc
+        except UnicodeEncodeError as exc:
+            raise UpdateError(
+                "The Windows command path cannot be stored in the console code page. "
+                "Move the install to an ASCII path and run vipercapture update again."
+            ) from exc
+        path.write_bytes(data)
     else:
         quoted = f"{shell_single_quote(python)} {shell_single_quote(str(launch))}"
         text = f"#!/bin/sh\nexec {quoted} \"$@\"\n"
-    path.write_text(text, encoding="utf-8", newline="")
-    if platform_name != "win32":
+        path.write_text(text, encoding="utf-8", newline="")
         path.chmod(0o755)
     return created
+
+
+def read_shim_text(path: Path, platform_name: str) -> str:
+    data = path.read_bytes()
+    if platform_name == "win32":
+        for encoding in (cmd_encoding(), "utf-8"):
+            try:
+                return data.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+    return data.decode("utf-8", errors="replace")
 
 
 def shims_for_install(
@@ -318,7 +388,7 @@ def shims_for_install(
             if key in seen or not candidate.is_file():
                 continue
             try:
-                text = candidate.read_text(encoding="utf-8", errors="replace")
+                text = read_shim_text(candidate, platform_name)
             except OSError:
                 continue
             if launch in text:
@@ -526,7 +596,20 @@ def _run_update(
         print(f"  {label} is already up to date.")
         return 0
 
-    payload = fetch(archive_url or default_archive_url(repo, ref))
+    # Windows cannot rename the install tree while its Python is still running.
+    if platform_name == "win32" and server_running():
+        raise UpdateError(
+            "ViperCapture is still running on http://127.0.0.1:8000. "
+            "Stop it and run vipercapture update again."
+        )
+
+    if archive_url:
+        download_url = archive_url
+    elif remote_sha:
+        download_url = commit_archive_url(repo, remote_sha)
+    else:
+        download_url = default_archive_url(repo, ref)
+    payload = fetch(download_url)
     with tempfile.TemporaryDirectory(prefix="vipercapture-update-") as tmp:
         source = extract_archive(payload, Path(tmp))
         replace_install_tree(source, root)
