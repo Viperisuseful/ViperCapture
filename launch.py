@@ -1437,6 +1437,7 @@ def ensure_playwright() -> None:
 LAUNCH_HELP = """\
 usage: vipercapture [--one-window]
        vipercapture update [--check]
+       vipercapture --gui [--viewport WIDTH HEIGHT]
 
 Start ViperCapture in this terminal. Ghostty and Kitty open request
 logs in another window and show a full-screen status view.
@@ -1448,9 +1449,15 @@ logs in another window and show a full-screen status view.
                  Python only, on Linux, macOS, and Windows.
   update --check Print whether an update is available, then exit.
                  Exit 10 means an update is available.
+  --gui          Open a full-screen capture menu in this terminal.
+                 Type a website link, press Tab to switch png, gif, and
+                 mp4, and press Ctrl+P to switch between the full page and
+                 the viewport. Nothing else is opened. --GUI is accepted too.
+  --viewport     With --gui, set the page size in pixels. The default
+                 is 1920 1080.
   -h, --help     Show this help.
 
-Windows always uses one window.
+Windows always uses one window. --gui stays in this window on every OS.
 """
 
 
@@ -1459,6 +1466,22 @@ class CliArgs:
     one_window: bool = False
     update: bool = False
     check: bool = False
+    gui: bool = False
+    viewport: tuple[int, int] | None = None
+
+
+def _reject_arg(message: str) -> None:
+    print(f"{message}\n{LAUNCH_HELP}", end="", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def _viewport_edge(token: str) -> int:
+    if not token.isdigit() or len(token) > 5:
+        _reject_arg(f"Invalid viewport size: {token}")
+    value = int(token)
+    if value < 1 or value > 16_384:
+        _reject_arg(f"Invalid viewport size: {token}")
+    return value
 
 
 def parse_cli(argv: list[str] | None = None) -> CliArgs:
@@ -1476,17 +1499,35 @@ def parse_cli(argv: list[str] | None = None) -> CliArgs:
             print(f"Unknown argument: {arg}\n{LAUNCH_HELP}", end="", file=sys.stderr)
             raise SystemExit(2)
         return CliArgs(update=True, check=check)
+    gui = False
     one_window = False
-    for arg in args:
+    viewport: tuple[int, int] | None = None
+    index = 0
+    while index < len(args):
+        arg = args[index]
         if arg in {"-h", "--help"}:
             print(LAUNCH_HELP, end="")
             raise SystemExit(0)
+        if arg.lower() == "--gui":
+            gui = True
+            index += 1
+            continue
         if arg == "--one-window":
             one_window = True
+            index += 1
             continue
-        print(f"Unknown argument: {arg}\n{LAUNCH_HELP}", end="", file=sys.stderr)
-        raise SystemExit(2)
-    return CliArgs(one_window=one_window)
+        if arg == "--viewport":
+            if index + 2 >= len(args):
+                _reject_arg("--viewport needs a width and a height.")
+            viewport = (_viewport_edge(args[index + 1]), _viewport_edge(args[index + 2]))
+            index += 3
+            continue
+        _reject_arg(f"Unknown argument: {arg}")
+    if viewport is not None and not gui:
+        _reject_arg("--viewport is only used with --gui.")
+    if gui and one_window:
+        _reject_arg("--gui already keeps everything in this terminal.")
+    return CliArgs(one_window=one_window, gui=gui, viewport=viewport)
 
 
 def parse_launch_args(argv: list[str] | None = None) -> bool:
@@ -1509,6 +1550,11 @@ def main() -> None:
     if cli.update:
         import updater
         raise SystemExit(updater.run_update(ROOT, check_only=cli.check))
+    if cli.gui:
+        ensure_venv()
+        import gui
+        viewport = cli.viewport if cli.viewport is not None else (1920, 1080)
+        raise SystemExit(gui.run_capture_gui(viewport))
     one_window = use_one_window(cli.one_window)
     ensure_venv()    # may re-exec this script under the venv Python
 
