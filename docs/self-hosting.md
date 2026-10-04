@@ -11,12 +11,28 @@ remain separate.
 Use Python 3.11 or newer and install a full FFmpeg build through the operating
 system package manager. Confirm `ffmpeg -encoders` lists `libvpx`, `libvpx-vp9`,
 and `libx264`; GPU video additionally requires the vendor encoder and driver.
-Install [uv](https://docs.astral.sh/uv/) if you can; it is the preferred
-dependency installer. Then run `python launch.py`. This is the supported setup
-and startup method. The launcher uses uv when it is on `PATH` and otherwise
-falls back to pip. It creates a virtual environment, installs Playwright
-Chromium, Firefox, and WebKit, starts the application, and opens the local
-interface. The Docker image already includes FFmpeg.
+
+End users install the `vipercapture` command and then run it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Viperisuseful/ViperCapture/master/scripts/install.sh | bash
+vipercapture
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Viperisuseful/ViperCapture/master/scripts/install.ps1 | iex
+vipercapture
+```
+
+The command creates a virtual environment, installs Playwright Chromium,
+Firefox, and WebKit, starts the application, and opens the local interface.
+Press Esc twice or Ctrl+C to stop it. `vipercapture --one-window` keeps the
+status and request log in the same terminal, for SSH or any session where a
+second window should not open. Windows always runs that way. From a git
+checkout, `python launch.py` runs that same startup path. The launcher uses uv when it is on `PATH` and
+otherwise falls back to pip. The Docker image already includes FFmpeg.
 
 ### Intel macOS (x86_64)
 

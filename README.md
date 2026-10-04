@@ -80,7 +80,44 @@ is not on `PATH`.
 
 ## Install locally
 
-Install uv first if you can
+On Linux or macOS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Viperisuseful/ViperCapture/master/scripts/install.sh | bash
+```
+
+On Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Viperisuseful/ViperCapture/master/scripts/install.ps1 | iex
+```
+
+Then start it:
+
+```bash
+vipercapture
+```
+
+The installer puts `vipercapture` on your user `PATH`. It needs Python 3.11 or
+newer and installs [uv](https://docs.astral.sh/uv/) plus Python 3.12 when that
+interpreter is missing. The first `vipercapture` run creates a private
+environment, installs dependencies and Chromium, Firefox, and WebKit, opens
+`http://127.0.0.1:8000`, and listens for API requests on
+`http://127.0.0.1:8000/v1`. Press Esc twice or Ctrl+C to stop it, or close the
+terminal. Run the install command again to update the app files.
+
+On Linux and macOS, Ghostty and Kitty open request logs in another window and
+show a full-screen status view in this one. The logo is drawn for Kitty,
+Ghostty, iTerm2, WezTerm, foot, mlterm, Contour, and Windows Terminal. WezTerm
+uses the Kitty graphics protocol when `enable_kitty_graphics = true`, and the
+iTerm2 image protocol otherwise. `vipercapture --one-window` keeps the status
+and the request log together in this terminal, which is what you want over SSH.
+Windows always stays in that one window, with live logs in the same console.
+On Ubuntu and other apt-based systems, the first launch may ask for your
+password so Playwright can install the libraries its browsers need. Other
+Linux systems download the browsers and leave system packages alone.
+
+To work from a clone instead, install uv if you can
 ([installation guide](https://docs.astral.sh/uv/getting-started/installation/)):
 
 ```bash
@@ -96,11 +133,11 @@ cd ViperCapture
 python launch.py
 ```
 
+`python launch.py` is the same startup path the `vipercapture` command runs.
 The launcher prefers uv when it is on `PATH`: it creates `.venv` and installs
 from `requirements.txt`. If uv is missing, it falls back to the standard
 library `venv` module and pip. Set `VIPERCAPTURE_USE_UV=0` to force that pip
-path even when uv is installed. The launcher then installs Chromium, Firefox,
-and WebKit, starts the API, and opens `http://127.0.0.1:8000`.
+path even when uv is installed.
 
 On Intel Macs (`darwin`/`x86_64`) the launcher builds `cryptography` from the
 official sdist. PyCA removed x86_64 and universal2 wheels in 49.0.0, and
