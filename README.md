@@ -118,6 +118,11 @@ uses the Kitty graphics protocol when `enable_kitty_graphics = true`, and the
 iTerm2 image protocol otherwise. `vipercapture --one-window` keeps the status
 and the request log together in this terminal, which is what you want over SSH.
 Windows always stays in that one window, with live logs in the same console.
+`vipercapture --gui` opens a full-screen capture menu in this terminal.
+Type a website, press Tab to switch PNG, GIF, and MP4, and press Ctrl+P to
+switch between the full page and the viewport. The viewport is 1920x1080.
+Override it with `vipercapture --gui --viewport 1280 720`. This menu does
+not open a log window.
 On Ubuntu and other apt-based systems, the first launch may ask for your
 password so Playwright can install the libraries its browsers need. Other
 Linux systems download the browsers and leave system packages alone.

@@ -388,6 +388,36 @@ class LaunchArgsTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 2)
         self.assertIn("Unknown argument: --one-window", stderr.getvalue())
 
+    def test_gui_flag_and_viewport(self) -> None:
+        command = launch.parse_cli(["--GUI"])
+        self.assertTrue(command.gui)
+        self.assertIsNone(command.viewport)
+        sized = launch.parse_cli(["--viewport", "1280", "720", "--gui"])
+        self.assertEqual(sized.viewport, (1280, 720))
+        self.assertFalse(launch.parse_launch_args(["--gui"]))
+
+    def test_viewport_requires_gui_and_real_numbers(self) -> None:
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", stderr):
+            with self.assertRaises(SystemExit) as caught:
+                launch.parse_cli(["--viewport", "1920", "1080"])
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("only used with --gui", stderr.getvalue())
+        stderr.truncate(0)
+        stderr.seek(0)
+        with mock.patch("sys.stderr", stderr):
+            with self.assertRaises(SystemExit) as caught:
+                launch.parse_cli(["--gui", "--viewport", "0", "1080"])
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("Invalid viewport size", stderr.getvalue())
+        stderr.truncate(0)
+        stderr.seek(0)
+        with mock.patch("sys.stderr", stderr):
+            with self.assertRaises(SystemExit) as caught:
+                launch.parse_cli(["--GUI", "--one-window"])
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("already keeps everything in this terminal", stderr.getvalue())
+
     def test_windows_stays_in_one_window_without_the_flag(self) -> None:
         self.assertTrue(launch.use_one_window(False, "win32"))
         self.assertFalse(launch.use_one_window(False, "linux"))
