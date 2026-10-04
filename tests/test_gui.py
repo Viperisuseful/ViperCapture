@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import io
 import json
+import socket
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -48,6 +51,29 @@ class GuiKeyTests(TestCase):
         self.assertEqual(gui.keys_from_bytes(pending, b""), [])
         self.assertEqual(gui.keys_from_bytes(pending, b"[B"), [])
         self.assertEqual(pending, bytearray())
+
+    def test_a_lone_escape_flushes_after_the_input_wait(self) -> None:
+        pending = bytearray(b"\x1b")
+        self.assertEqual(gui.keys_from_bytes(pending, b""), [])
+        self.assertEqual(gui._input_timeout(pending, capturing=False), 0.05)
+        self.assertIsNone(gui._input_timeout(bytearray(), capturing=False))
+        self.assertEqual(gui.flush_bare_escape(pending), ["esc"])
+        self.assertEqual(pending, bytearray())
+        partial = bytearray(b"\x1b[")
+        self.assertEqual(gui.flush_bare_escape(partial), [])
+        self.assertEqual(partial, bytearray(b"\x1b["))
+
+    def test_unicode_url_bytes_stay_in_the_link(self) -> None:
+        pending = bytearray()
+        self.assertEqual(gui.keys_from_bytes(pending, "münich".encode()), ["m", "ü", "n", "i", "c", "h"])
+        split = bytearray()
+        self.assertEqual(gui.keys_from_bytes(split, b"\xc3"), [])
+        self.assertEqual(gui.keys_from_bytes(split, b"\xbc"), ["ü"])
+        state = gui.GuiState()
+        for key in gui.keys_from_bytes(bytearray(), "münich.example".encode()):
+            state, action = gui.apply_key(state, key)
+            self.assertEqual(action, "edit")
+        self.assertEqual(state.url, "münich.example")
 
 
 class GuiRequestTests(TestCase):
@@ -136,6 +162,130 @@ class GuiRequestTests(TestCase):
             self.assertEqual(cancelled.error, "Capture cancelled.")
             self.assertFalse(cancelled.saved)
             self.assertEqual(set(Path(tmp).iterdir()), before)
+
+    def test_capture_sends_the_configured_bearer_token(self) -> None:
+        seen: dict[str, str] = {}
+
+        def opener(request: object, timeout: float) -> object:
+            del timeout
+            seen["authorization"] = request.get_header("Authorization")  # type: ignore[attr-defined]
+            return _png_response(b"\x89PNG\r\n\x1a\n")
+
+        admin = "gui-admin-token-0123456789abcdef"
+        project = "gui-project-key"
+        with TemporaryDirectory() as tmp:
+            gui.perform_capture(
+                gui.GuiState(url="https://example.com", busy=True),
+                directory=Path(tmp),
+                opener=opener,
+                started_server=True,
+                authorization=admin,
+            )
+            self.assertEqual(seen["authorization"], f"Bearer {admin}")
+            gui.perform_capture(
+                gui.GuiState(url="https://example.com", busy=True),
+                directory=Path(tmp),
+                opener=opener,
+                started_server=False,
+                authorization=project,
+            )
+            self.assertEqual(seen["authorization"], f"Bearer {project}")
+        self.assertEqual(
+            gui.capture_credential(
+                started_server=True,
+                environ={
+                    "VIPERCAPTURE_ADMIN_TOKEN": admin,
+                    "VIPERCAPTURE_API_KEY": project,
+                },
+            ),
+            admin,
+        )
+        self.assertEqual(
+            gui.capture_credential(
+                started_server=False,
+                environ={
+                    "VIPERCAPTURE_ADMIN_TOKEN": admin,
+                    "VIPERCAPTURE_API_KEY": project,
+                },
+            ),
+            project,
+        )
+        self.assertEqual(
+            gui.capture_credential(started_server=False, environ={}),
+            "",
+        )
+
+    def test_a_planted_part_symlink_is_not_followed(self) -> None:
+        moment = datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc)
+        png = b"\x89PNG\r\n\x1a\n" + b"image"
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            victim = directory / "victim"
+            victim.write_text("safe", encoding="utf-8")
+            final = gui.output_path(directory, "https://example.com", "png", moment)
+            final.with_suffix(final.suffix + ".part").symlink_to(victim)
+            state = gui.perform_capture(
+                gui.GuiState(url="https://example.com", busy=True),
+                directory=directory,
+                moment=moment,
+                opener=lambda _request, timeout: _png_response(png),
+            )
+            self.assertTrue(state.saved.endswith(".png"))
+            self.assertEqual(Path(state.saved).read_bytes(), png)
+            self.assertEqual(victim.read_text(encoding="utf-8"), "safe")
+            self.assertFalse(any(path.name.startswith(".vipercapture-") for path in directory.iterdir()))
+
+    def test_cancel_closes_the_open_request(self) -> None:
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        server.settimeout(2)
+        port = server.getsockname()[1]
+        accepted: list[socket.socket] = []
+
+        def hold() -> None:
+            try:
+                conn, _addr = server.accept()
+            except OSError:
+                return
+            accepted.append(conn)
+            conn.settimeout(2)
+            try:
+                while conn.recv(4096):
+                    pass
+            except OSError:
+                return
+
+        holder = threading.Thread(target=hold, daemon=True)
+        holder.start()
+        cancel = gui.CancelFlag()
+        result: dict[str, gui.GuiState] = {}
+
+        def work() -> None:
+            with TemporaryDirectory() as tmp:
+                result["state"] = gui.perform_capture(
+                    gui.GuiState(url="https://example.com", busy=True),
+                    directory=Path(tmp),
+                    endpoint=f"http://127.0.0.1:{port}/v1/render",
+                    timeout=5,
+                    cancel=cancel,
+                    authorization="",
+                )
+
+        worker = threading.Thread(target=work)
+        worker.start()
+        deadline = time.monotonic() + 2
+        while not accepted and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(accepted)
+        cancel.abort()
+        worker.join(2)
+        server.close()
+        for conn in accepted:
+            conn.close()
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result["state"].error, "Capture cancelled.")
+        self.assertFalse(result["state"].saved)
 
 
 class GuiFrameTests(TestCase):
@@ -242,6 +392,90 @@ class GuiFrameTests(TestCase):
         self.assertNotIn("ghostty", command)
         self.assertNotIn("kitty", command)
         self.assertNotIn("tail", command)
+
+
+def _png_response(body: bytes) -> object:
+    class Response:
+        def __init__(self) -> None:
+            self.body = body
+            self.sent = False
+
+        def read(self, _size: int) -> bytes:
+            if self.sent:
+                return b""
+            self.sent = True
+            return self.body
+
+        def __enter__(self) -> "Response":
+            return self
+
+        def __exit__(self, *_args: object) -> bool:
+            return False
+
+    return Response()
+
+
+class GuiRuntimeTests(TestCase):
+    def test_windows_size_does_not_use_posix_terminal_calls(self) -> None:
+        with (
+            mock.patch.object(gui.os, "name", "nt"),
+            mock.patch.object(
+                gui.shutil,
+                "get_terminal_size",
+                return_value=os_terminal_size(100, 40),
+            ),
+            mock.patch.object(
+                gui.launch,
+                "read_window_size",
+                side_effect=AssertionError("posix"),
+            ),
+        ):
+            size = gui._window_size()
+        self.assertEqual((size.cols, size.rows), (100, 40))
+
+    def test_missing_termios_falls_back_to_the_stdlib_size(self) -> None:
+        with (
+            mock.patch.object(gui.os, "name", "posix"),
+            mock.patch.object(
+                gui.launch,
+                "read_window_size",
+                side_effect=ModuleNotFoundError("termios"),
+            ),
+            mock.patch.object(
+                gui.shutil,
+                "get_terminal_size",
+                return_value=os_terminal_size(90, 30),
+            ),
+        ):
+            size = gui._window_size()
+        self.assertEqual((size.cols, size.rows), (90, 30))
+
+    def test_dependency_hashes_are_checked_before_the_screen(self) -> None:
+        order: list[str] = []
+        with (
+            mock.patch.object(gui.sys.stdin, "isatty", return_value=True),
+            mock.patch.object(gui.sys.stdout, "isatty", return_value=True),
+            mock.patch.object(gui.launch, "ensure_deps", side_effect=lambda: order.append("deps")),
+            mock.patch.object(
+                gui.launch,
+                "ensure_playwright",
+                side_effect=lambda: order.append("browsers"),
+            ),
+            mock.patch.object(gui.launch, "port_open", return_value=True),
+            mock.patch.object(gui.launch, "choose_graphics_protocol", return_value=None),
+            mock.patch.object(gui, "_enter", side_effect=lambda: order.append("enter")),
+            mock.patch.object(gui, "_leave"),
+            mock.patch.object(gui, "_run_keys", return_value=0),
+        ):
+            code = gui.run_capture_gui((1920, 1080), directory=Path("."))
+        self.assertEqual(code, 0)
+        self.assertEqual(order, ["deps", "browsers", "enter"])
+
+
+def os_terminal_size(columns: int, lines: int) -> object:
+    import os
+
+    return os.terminal_size((columns, lines))
 
 
 class GuiHelpTests(TestCase):

@@ -122,7 +122,10 @@ Windows always stays in that one window, with live logs in the same console.
 Type a website, press Tab to switch PNG, GIF, and MP4, and press Ctrl+P to
 switch between the full page and the viewport. The viewport is 1920x1080.
 Override it with `vipercapture --gui --viewport 1280 720`. This menu does
-not open a log window.
+not open a log window. The menu sends `VIPERCAPTURE_ADMIN_TOKEN` when it
+started the server. For a server that is already running it sends
+`VIPERCAPTURE_API_KEY` when that project key is set, and the admin token
+otherwise.
 On Ubuntu and other apt-based systems, the first launch may ask for your
 password so Playwright can install the libraries its browsers need. Other
 Linux systems download the browsers and leave system packages alone.

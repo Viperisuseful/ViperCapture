@@ -40,7 +40,10 @@ jobs, and presets. It is the same Python command on Linux, macOS, and
 Windows. On Windows, stop the running server before updating. `vipercapture --gui` opens a
 full-screen capture menu in the same terminal and does not open a log
 window. Tab switches PNG, GIF, and MP4. Ctrl+P switches between the full
-page and the 1920x1080 viewport. `vipercapture --one-window` keeps the
+page and the 1920x1080 viewport. The menu sends `VIPERCAPTURE_ADMIN_TOKEN`
+when it started the server. For a server that is already running it sends
+`VIPERCAPTURE_API_KEY` when that project key is set, and the admin token
+otherwise. `vipercapture --one-window` keeps the
 status and request log in the same terminal, for SSH or any session where a
 second window should not open. Windows always runs that way. From a git
 checkout, `python launch.py` runs that same startup path. The launcher uses uv

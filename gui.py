@@ -7,17 +7,21 @@ gets an ASCII wordmark.
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -119,47 +123,112 @@ def apply_key(state: GuiState, key: str) -> tuple[GuiState, str]:
 
 
 def keys_from_bytes(pending: bytearray, data: bytes) -> list[str]:
-    """Turn terminal bytes into key names. Arrow sequences are ignored."""
+    """Turn terminal bytes into key names. Arrow sequences are ignored.
+
+    A lone Escape stays pending so it is not confused with an arrow key.
+    ``flush_bare_escape`` turns that byte into Esc after a short wait.
+    """
     pending.extend(data)
     keys: list[str] = []
     while pending:
         byte = pending[0]
         if byte == 0x1B:
-            if len(pending) == 1:
+            if not _consume_escape(pending, keys):
                 break
-            if pending[1] != 0x5B:
-                keys.append("esc")
-                del pending[0]
-                continue
-            end = 2
-            while end < len(pending) and not 0x40 <= pending[end] <= 0x7E:
-                end += 1
-                if end > 16:
-                    del pending[:end]
-                    end = -1
-                    break
-            if end < 0:
-                continue
-            if end >= len(pending):
-                break
-            del pending[: end + 1]
             continue
-        del pending[0]
-        if byte == 0x09:
-            keys.append("tab")
-        elif byte in {0x0D, 0x0A}:
-            keys.append("enter")
-        elif byte in {0x7F, 0x08}:
-            keys.append("backspace")
-        elif byte == 0x10:
-            keys.append("ctrl-p")
-        elif byte == 0x15:
-            keys.append("ctrl-u")
-        elif byte == 0x03:
-            keys.append("quit")
-        elif 0x20 <= byte <= 0x7E:
-            keys.append(chr(byte))
+        if byte < 0x20 or byte == 0x7F:
+            del pending[0]
+            name = _control_key(byte)
+            if name:
+                keys.append(name)
+            continue
+        text, size = _one_utf8(pending)
+        if size == 0:
+            break
+        if size < 0:
+            del pending[0]
+            continue
+        del pending[:size]
+        if text.isprintable():
+            keys.append(text)
     return keys
+
+
+def flush_bare_escape(pending: bytearray) -> list[str]:
+    """Treat a lone Escape as Esc once no follow-up byte arrived."""
+    if len(pending) == 1 and pending[0] == 0x1B:
+        del pending[:]
+        return ["esc"]
+    return []
+
+
+def _input_timeout(pending: bytearray, *, capturing: bool) -> float | None:
+    if len(pending) == 1 and pending[0] == 0x1B:
+        return 0.05
+    if capturing:
+        return 0.08
+    return None
+
+
+def _consume_escape(pending: bytearray, keys: list[str]) -> bool:
+    """Consume one escape sequence. False means more bytes are required."""
+    if len(pending) == 1:
+        return False
+    if pending[1] != 0x5B:
+        keys.append("esc")
+        del pending[0]
+        return True
+    end = 2
+    while end < len(pending) and not 0x40 <= pending[end] <= 0x7E:
+        end += 1
+        if end > 16:
+            del pending[:end]
+            return True
+    if end >= len(pending):
+        return False
+    del pending[: end + 1]
+    return True
+
+
+def _control_key(byte: int) -> str | None:
+    if byte == 0x09:
+        return "tab"
+    if byte in {0x0D, 0x0A}:
+        return "enter"
+    if byte in {0x7F, 0x08}:
+        return "backspace"
+    if byte == 0x10:
+        return "ctrl-p"
+    if byte == 0x15:
+        return "ctrl-u"
+    if byte == 0x03:
+        return "quit"
+    return None
+
+
+def _one_utf8(pending: bytearray) -> tuple[str, int]:
+    """Decode one UTF-8 character. Size 0 waits; size -1 drops a bad byte."""
+    lead = pending[0]
+    if lead < 0x80:
+        return chr(lead), 1
+    if 0xC2 <= lead <= 0xDF:
+        need = 2
+    elif 0xE0 <= lead <= 0xEF:
+        need = 3
+    elif 0xF0 <= lead <= 0xF4:
+        need = 4
+    else:
+        return "", -1
+    if len(pending) < need:
+        return "", 0
+    for index in range(1, need):
+        if not 0x80 <= pending[index] <= 0xBF:
+            return "", -1
+    try:
+        text = bytes(pending[:need]).decode("utf-8")
+    except UnicodeDecodeError:
+        return "", -1
+    return text, need
 
 
 def error_text(status: int, body: bytes) -> str:
@@ -440,12 +509,27 @@ def _colored_summary(state: GuiState, inner: int) -> str:
     return "".join(pieces) + " " * pad
 
 
-def read_capture(response: object, limit: int = MAX_CAPTURE_BYTES) -> bytes:
+class _Cancelled(Exception):
+    """The user pressed Esc while the render request was open."""
+
+
+def read_capture(
+    response: object,
+    limit: int = MAX_CAPTURE_BYTES,
+    cancel: "CancelFlag | None" = None,
+) -> bytes:
     chunks: list[bytes] = []
     total = 0
     read = getattr(response, "read")
     while True:
-        block = read(64 * 1024)
+        if cancel is not None and cancel.requested:
+            raise _Cancelled()
+        try:
+            block = read(64 * 1024)
+        except (TimeoutError, OSError, http.client.HTTPException):
+            if cancel is not None and cancel.requested:
+                raise _Cancelled() from None
+            raise
         if not block:
             break
         total += len(block)
@@ -458,6 +542,61 @@ def read_capture(response: object, limit: int = MAX_CAPTURE_BYTES) -> bytes:
 class CancelFlag:
     def __init__(self) -> None:
         self.requested = False
+        self._lock = threading.Lock()
+        self._close: Callable[[], None] | None = None
+
+    def bind(self, close: Callable[[], None]) -> None:
+        with self._lock:
+            self._close = close
+            requested = self.requested
+        if requested:
+            _safe_close(close)
+
+    def abort(self) -> None:
+        with self._lock:
+            self.requested = True
+            close = self._close
+        if close is not None:
+            _safe_close(close)
+
+
+def _safe_close(close: Callable[[], None]) -> None:
+    try:
+        close()
+    except OSError:
+        return
+
+
+def capture_credential(
+    *,
+    started_server: bool,
+    environ: Mapping[str, str] | None = None,
+) -> str:
+    """Bearer token for POST /v1/render.
+
+    A server this menu starts accepts ``VIPERCAPTURE_ADMIN_TOKEN``. A server
+    that is already running uses ``VIPERCAPTURE_API_KEY`` when that project
+    key is set, and the admin token otherwise.
+    """
+    env = os.environ if environ is None else environ
+    project_key = _header_token(env.get("VIPERCAPTURE_API_KEY", ""))
+    admin = _header_token(env.get("VIPERCAPTURE_ADMIN_TOKEN", ""))
+    if started_server and admin:
+        return admin
+    if project_key:
+        return project_key
+    return admin
+
+
+def _header_token(value: str) -> str:
+    token = value.strip()
+    if any(char in token for char in "\r\n\x00"):
+        return ""
+    return token
+
+
+def _cancelled_state(state: GuiState) -> GuiState:
+    return _replace(state, busy=False, cancelling=False, saved="", error="Capture cancelled.")
 
 
 def perform_capture(
@@ -469,6 +608,8 @@ def perform_capture(
     moment: datetime | None = None,
     opener: object | None = None,
     cancel: CancelFlag | None = None,
+    started_server: bool = False,
+    authorization: str | None = None,
 ) -> GuiState:
     """POST one render and save the file. Network errors stay on the panel."""
     try:
@@ -478,37 +619,49 @@ def perform_capture(
     payload = capture_payload(state, url)
     if timeout is None:
         timeout = 180 if state.output in {"gif", "mp4"} else 90
+    if authorization is None:
+        authorization = capture_credential(started_server=started_server)
+    headers = {"Content-Type": "application/json", "Accept": "*/*"}
+    if authorization:
+        headers["Authorization"] = f"Bearer {authorization}"
     data = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        endpoint,
-        data=data,
-        headers={"Content-Type": "application/json", "Accept": "*/*"},
-        method="POST",
-    )
-    open_url = urllib.request.urlopen if opener is None else opener
+    request = urllib.request.Request(endpoint, data=data, headers=headers, method="POST")
+
+    def open_url(req: urllib.request.Request, timeout: float) -> object:
+        if opener is None:
+            return _open_capture(req, timeout, cancel)
+        return opener(req, timeout=timeout)  # type: ignore[operator]
+
     try:
-        with open_url(request, timeout=timeout) as response:  # type: ignore[operator]
-            body = read_capture(response)
+        with open_url(request, timeout) as response:
+            status = getattr(response, "status", None)
+            if status is None:
+                status = getattr(response, "code", 200)
+            body = read_capture(response, cancel=cancel)
+    except _Cancelled:
+        return _cancelled_state(state)
     except urllib.error.HTTPError as exc:
         if cancel is not None and cancel.requested:
-            return _replace(state, busy=False, cancelling=False, saved="", error="Capture cancelled.")
+            return _cancelled_state(state)
         detail = error_text(exc.code, exc.read(64 * 1024))
         return _replace(state, busy=False, cancelling=False, error=detail)
     except urllib.error.URLError:
         if cancel is not None and cancel.requested:
-            return _replace(state, busy=False, cancelling=False, saved="", error="Capture cancelled.")
+            return _cancelled_state(state)
         return _replace(
             state,
             busy=False,
             cancelling=False,
             error="The local API did not answer. Stop vipercapture and start it again.",
         )
-    except (TimeoutError, OSError, ValueError) as exc:
+    except (TimeoutError, OSError, http.client.HTTPException, ValueError) as exc:
         if cancel is not None and cancel.requested:
-            return _replace(state, busy=False, cancelling=False, saved="", error="Capture cancelled.")
+            return _cancelled_state(state)
         return _replace(state, busy=False, cancelling=False, error=str(exc))
     if (cancel is not None and cancel.requested) or state.cancelling:
-        return _replace(state, busy=False, cancelling=False, saved="", error="Capture cancelled.")
+        return _cancelled_state(state)
+    if status >= 400:
+        return _replace(state, busy=False, cancelling=False, error=error_text(status, body))
     if not body or not looks_like_output(state.output, body):
         return _replace(
             state,
@@ -518,10 +671,122 @@ def perform_capture(
         )
     when = moment or datetime.now(timezone.utc)
     path = output_path(directory, url, state.output, when)
-    temporary = path.with_suffix(path.suffix + ".part")
-    temporary.write_bytes(body)
-    temporary.replace(path)
+    try:
+        _save_exclusive(directory, path, body)
+    except OSError as exc:
+        return _replace(state, busy=False, cancelling=False, error=str(exc))
     return _replace(state, busy=False, cancelling=False, error="", saved=str(path))
+
+
+def _save_exclusive(directory: Path, path: Path, body: bytes) -> None:
+    """Write the capture to a new file, then rename it into place.
+
+    The temporary name is random and created with ``O_EXCL``, so a symlink
+    planted at a predictable ``.part`` path is not followed.
+    """
+    fd, name = tempfile.mkstemp(prefix=".vipercapture-", suffix=".part", dir=directory)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(body)
+        os.replace(temporary, path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _outgoing_headers(request: urllib.request.Request) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    for key, value in request.header_items():
+        if key.lower() in {"host", "content-length"}:
+            continue
+        headers[key] = value
+    return headers
+
+
+def _close_connection(connection: http.client.HTTPConnection) -> None:
+    sock = getattr(connection, "sock", None)
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+    try:
+        connection.close()
+    except OSError:
+        return
+
+
+class _CaptureResponse:
+    def __init__(
+        self,
+        response: http.client.HTTPResponse,
+        connection: http.client.HTTPConnection,
+    ) -> None:
+        self._response = response
+        self._connection = connection
+        self.status = response.status
+        self.code = response.status
+
+    def read(self, size: int) -> bytes:
+        return self._response.read(size)
+
+    def close(self) -> None:
+        try:
+            self._response.close()
+        except OSError:
+            pass
+        _close_connection(self._connection)
+
+    def __enter__(self) -> "_CaptureResponse":
+        return self
+
+    def __exit__(self, *_args: object) -> bool:
+        self.close()
+        return False
+
+
+def _open_capture(
+    request: urllib.request.Request,
+    timeout: float,
+    cancel: CancelFlag | None,
+) -> _CaptureResponse:
+    parsed = urllib.parse.urlsplit(request.full_url)
+    if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
+        raise ValueError("The local API address is not http or https.")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    if parsed.scheme == "https":
+        connection: http.client.HTTPConnection = http.client.HTTPSConnection(
+            parsed.hostname,
+            port,
+            timeout=timeout,
+        )
+    else:
+        connection = http.client.HTTPConnection(parsed.hostname, port, timeout=timeout)
+    try:
+        connection.request(
+            request.get_method(),
+            path,
+            body=request.data,
+            headers=_outgoing_headers(request),
+        )
+        if cancel is not None:
+            cancel.bind(lambda: _close_connection(connection))
+        if cancel is not None and cancel.requested:
+            raise _Cancelled()
+        response = connection.getresponse()
+    except _Cancelled:
+        _close_connection(connection)
+        raise
+    except Exception:
+        _close_connection(connection)
+        if cancel is not None and cancel.requested:
+            raise _Cancelled() from None
+        raise
+    return _CaptureResponse(response, connection)
 
 
 def server_command() -> list[str]:
@@ -538,11 +803,13 @@ def server_command() -> list[str]:
 
 
 def _window_size() -> launch.WindowSize:
-    try:
-        return launch.read_window_size(sys.stdout.fileno())
-    except OSError:
-        size = shutil.get_terminal_size((80, 24))
-        return launch.WindowSize(size.columns, size.lines)
+    if os.name != "nt":
+        try:
+            return launch.read_window_size(sys.stdout.fileno())
+        except (OSError, ModuleNotFoundError):
+            pass
+    size = shutil.get_terminal_size((80, 24))
+    return launch.WindowSize(size.columns, size.lines)
 
 
 class _Drawer:
@@ -639,16 +906,34 @@ def _wait_until_ready(
     )
 
 
-def _run_keys(state: GuiState, directory: Path, drawer: _Drawer) -> int:
+def _run_keys(
+    state: GuiState,
+    directory: Path,
+    drawer: _Drawer,
+    *,
+    started_server: bool,
+) -> int:
     if os.name == "nt":
-        return _run_windows_keys(state, directory, drawer)
-    return _run_posix_keys(state, directory, drawer)
+        return _run_windows_keys(state, directory, drawer, started_server=started_server)
+    return _run_posix_keys(state, directory, drawer, started_server=started_server)
 
 
-def _start_capture(state: GuiState, directory: Path, cancel: CancelFlag, box: dict[str, GuiState]) -> threading.Thread:
+def _start_capture(
+    state: GuiState,
+    directory: Path,
+    cancel: CancelFlag,
+    box: dict[str, GuiState],
+    *,
+    started_server: bool,
+) -> threading.Thread:
     def work() -> None:
         try:
-            box["state"] = perform_capture(state, directory=directory, cancel=cancel)
+            box["state"] = perform_capture(
+                state,
+                directory=directory,
+                cancel=cancel,
+                started_server=started_server,
+            )
         except Exception as exc:
             box["state"] = _replace(state, busy=False, cancelling=False, error=str(exc))
 
@@ -657,7 +942,41 @@ def _start_capture(state: GuiState, directory: Path, cancel: CancelFlag, box: di
     return thread
 
 
-def _run_posix_keys(state: GuiState, directory: Path, drawer: _Drawer) -> int:
+def _handle_key(
+    state: GuiState,
+    key: str,
+    thread: threading.Thread | None,
+    cancel: CancelFlag,
+    box: dict[str, GuiState],
+    directory: Path,
+    *,
+    started_server: bool,
+) -> tuple[GuiState, threading.Thread | None, CancelFlag, dict[str, GuiState], bool]:
+    if key == "esc" and state.busy:
+        cancel.abort()
+    state, action = apply_key(state, key)
+    if action == "quit":
+        return state, thread, cancel, box, True
+    if action == "capture" and thread is None:
+        cancel = CancelFlag()
+        box = {}
+        thread = _start_capture(
+            state,
+            directory,
+            cancel,
+            box,
+            started_server=started_server,
+        )
+    return state, thread, cancel, box, False
+
+
+def _run_posix_keys(
+    state: GuiState,
+    directory: Path,
+    drawer: _Drawer,
+    *,
+    started_server: bool,
+) -> int:
     import select
     import signal
     import termios
@@ -682,27 +1001,39 @@ def _run_posix_keys(state: GuiState, directory: Path, drawer: _Drawer) -> int:
             if dirty:
                 drawer.draw(state)
                 dirty = False
-            ready, _, _ = select.select([fd, wake_r], [], [], 0.08 if thread is not None else None)
+            ready, _, _ = select.select(
+                [fd, wake_r],
+                [],
+                [],
+                _input_timeout(pending, capturing=thread is not None),
+            )
             if wake_r in ready:
                 try:
                     os.read(wake_r, 64)
                 except OSError:
                     pass
                 dirty = True
+            keys: list[str] = []
             if fd in ready:
                 data = os.read(fd, 64)
                 if not data:
                     return 0
-                for key in keys_from_bytes(pending, data):
-                    if key == "esc" and state.busy:
-                        cancel.requested = True
-                    state, action = apply_key(state, key)
-                    if action == "quit":
-                        return 0
-                    if action == "capture" and thread is None:
-                        cancel = CancelFlag()
-                        box = {}
-                        thread = _start_capture(state, directory, cancel, box)
+                keys = keys_from_bytes(pending, data)
+            elif not ready:
+                keys = flush_bare_escape(pending)
+            for key in keys:
+                state, thread, cancel, box, quit_menu = _handle_key(
+                    state,
+                    key,
+                    thread,
+                    cancel,
+                    box,
+                    directory,
+                    started_server=started_server,
+                )
+                if quit_menu:
+                    return 0
+            if keys:
                 dirty = True
             if thread is not None and not thread.is_alive():
                 state = box.get("state", state)
@@ -721,7 +1052,13 @@ def _run_posix_keys(state: GuiState, directory: Path, drawer: _Drawer) -> int:
     return 0
 
 
-def _run_windows_keys(state: GuiState, directory: Path, drawer: _Drawer) -> int:
+def _run_windows_keys(
+    state: GuiState,
+    directory: Path,
+    drawer: _Drawer,
+    *,
+    started_server: bool,
+) -> int:
     import msvcrt
 
     thread: threading.Thread | None = None
@@ -738,16 +1075,18 @@ def _run_windows_keys(state: GuiState, directory: Path, drawer: _Drawer) -> int:
                 msvcrt.getwch()
             else:
                 name = _windows_key(char)
-                if name == "esc" and state.busy:
-                    cancel.requested = True
                 if name is not None:
-                    state, action = apply_key(state, name)
-                    if action == "quit":
+                    state, thread, cancel, box, quit_menu = _handle_key(
+                        state,
+                        name,
+                        thread,
+                        cancel,
+                        box,
+                        directory,
+                        started_server=started_server,
+                    )
+                    if quit_menu:
                         return 0
-                    if action == "capture" and thread is None:
-                        cancel = CancelFlag()
-                        box = {}
-                        thread = _start_capture(state, directory, cancel, box)
                     dirty = True
         elif thread is not None:
             time.sleep(0.08)
@@ -789,9 +1128,10 @@ def run_capture_gui(viewport: tuple[int, int], directory: Path | None = None) ->
         return 1
     if directory is None:
         directory = Path.cwd()
-    if not launch.DEPS_STAMP.exists() or not launch.PLAYWRIGHT_STAMP.exists():
-        launch.ensure_deps()
-        launch.ensure_playwright()
+    # ensure_deps compares the requirements hash itself. A stamp left behind
+    # by an update is not enough.
+    launch.ensure_deps()
+    launch.ensure_playwright()
     state = GuiState(viewport=viewport)
     started: subprocess.Popen[object] | None = None
     log_handle: object | None = None
@@ -809,7 +1149,7 @@ def run_capture_gui(viewport: tuple[int, int], directory: Path | None = None) ->
                 _pause_for_quit()
                 return 1
             state = _replace(state, busy=False, progress=0)
-        return _run_keys(state, directory, drawer)
+        return _run_keys(state, directory, drawer, started_server=started is not None)
     except KeyboardInterrupt:
         return 0
     finally:
@@ -841,11 +1181,17 @@ def _pause_for_quit() -> None:
     pending = bytearray()
     try:
         while True:
-            ready, _, _ = select.select([fd], [], [], 0.5)
+            ready, _, _ = select.select(
+                [fd],
+                [],
+                [],
+                _input_timeout(pending, capturing=False),
+            )
             if not ready:
-                continue
-            for key in keys_from_bytes(pending, os.read(fd, 64)):
-                if key in {"esc", "quit", "enter"}:
-                    return
+                keys = flush_bare_escape(pending)
+            else:
+                keys = keys_from_bytes(pending, os.read(fd, 64))
+            if any(key in {"esc", "quit", "enter"} for key in keys):
+                return
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, previous)
