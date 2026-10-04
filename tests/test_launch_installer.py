@@ -294,6 +294,54 @@ class StatusScreenTests(unittest.TestCase):
         )
         self.assertEqual(launch.terminal_kind({"KITTY_WINDOW_ID": "1", "TERM": "xterm-kitty"}), "kitty")
 
+    def test_redirected_stdout_uses_the_banner(self) -> None:
+        class Stdio:
+            def __init__(self, tty: bool) -> None:
+                self.buffer = io.BytesIO()
+                self._text = io.StringIO()
+                self._tty = tty
+
+            def isatty(self) -> bool:
+                return self._tty
+
+            def write(self, data: str) -> int:
+                return self._text.write(data)
+
+            def flush(self) -> None:
+                self._text.flush()
+
+            def fileno(self) -> int:
+                raise OSError("no terminal")
+
+        log_path = Path("/tmp/vipercapture-requests.log")
+        server = mock.Mock()
+
+        def present(stdin_tty: bool, stdout_tty: bool) -> tuple[Stdio, mock.Mock]:
+            stdout = Stdio(stdout_tty)
+            with (
+                mock.patch.object(sys, "stdin", Stdio(stdin_tty)),
+                mock.patch.object(sys, "stdout", stdout),
+                mock.patch.object(sys, "platform", "linux"),
+                mock.patch.object(launch, "open_request_window", return_value=False),
+                mock.patch.object(launch, "wait_for_shutdown", return_value=False) as wait,
+            ):
+                launch.present_running_server(server, log_path)
+            return stdout, wait
+
+        redirected, banner_wait = present(True, False)
+        banner_wait.assert_called_once_with(server)
+        self.assertIn("ViperCapture is up on http://127.0.0.1:8000", redirected._text.getvalue())
+        self.assertIn(f"Requests: {log_path}", redirected._text.getvalue())
+        self.assertNotIn(b"\x1b[?1049h", redirected.buffer.getvalue())
+
+        interactive, screen_wait = present(True, True)
+        screen_wait.assert_called_once()
+        self.assertEqual(screen_wait.call_args.args, (server,))
+        self.assertFalse(screen_wait.call_args.kwargs["announce"])
+        self.assertIn(b"\x1b[?1049h", interactive.buffer.getvalue())
+        self.assertIn(b"\x1b[?1049l", interactive.buffer.getvalue())
+        self.assertNotIn("ViperCapture is up on", interactive._text.getvalue())
+
 
 class LaunchArgsTests(unittest.TestCase):
     def test_one_window_flag(self) -> None:

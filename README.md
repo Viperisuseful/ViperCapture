@@ -92,15 +92,16 @@ On Windows PowerShell:
 irm https://raw.githubusercontent.com/Viperisuseful/ViperCapture/master/scripts/install.ps1 | iex
 ```
 
-Then start it:
+Open a new terminal, then start it:
 
 ```bash
 vipercapture
 ```
 
-The installer puts `vipercapture` on your user `PATH`. It needs Python 3.11 or
-newer and installs [uv](https://docs.astral.sh/uv/) plus Python 3.12 when that
-interpreter is missing. The first `vipercapture` run creates a private
+The installer adds `vipercapture` to your user `PATH` for terminals you open
+after it finishes. It needs Python 3.11 or newer and installs
+[uv](https://docs.astral.sh/uv/) plus Python 3.12 when that interpreter is
+missing. The first `vipercapture` run creates a private
 environment, installs dependencies and Chromium, Firefox, and WebKit, opens
 `http://127.0.0.1:8000`, and listens for API requests on
 `http://127.0.0.1:8000/v1`. Press Esc twice or Ctrl+C to stop it, or close the

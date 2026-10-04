@@ -12,17 +12,23 @@ Use Python 3.11 or newer and install a full FFmpeg build through the operating
 system package manager. Confirm `ffmpeg -encoders` lists `libvpx`, `libvpx-vp9`,
 and `libx264`; GPU video additionally requires the vendor encoder and driver.
 
-End users install the `vipercapture` command and then run it:
+End users install the `vipercapture` command, open a new terminal, and then run it.
+
+Linux and macOS:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Viperisuseful/ViperCapture/master/scripts/install.sh | bash
-vipercapture
 ```
 
 Windows PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/Viperisuseful/ViperCapture/master/scripts/install.ps1 | iex
+```
+
+Open a new terminal, then start it:
+
+```bash
 vipercapture
 ```
 

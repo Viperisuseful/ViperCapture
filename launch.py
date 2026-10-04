@@ -960,7 +960,9 @@ def wait_for_shutdown(
 def present_running_server(server: subprocess.Popen[object], log_path: Path) -> None:
     """Full-screen status here, request log in another window of this terminal."""
     screen: StatusScreen | None = None
-    if sys.stdin.isatty() and sys.platform != "win32":
+    # Alternate-screen and image escapes belong on a terminal. Redirected
+    # stdout (vipercapture > startup.log) keeps the normal banner.
+    if sys.stdin.isatty() and sys.stdout.isatty() and sys.platform != "win32":
         screen = StatusScreen(URL)
     if screen is None:
         print(ready_banner())
