@@ -2,7 +2,8 @@
 
 The standard library is enough on Linux, macOS, and Windows. Nothing here
 calls sudo or a distro package manager. A git checkout is left alone; this
-replaces only the installed app directory and keeps its .venv.
+replaces only the installed app directory and keeps its .venv and
+.vipercapture data directory.
 """
 
 from __future__ import annotations
@@ -25,7 +26,22 @@ from typing import Callable
 DEFAULT_REPO = "Viperisuseful/ViperCapture"
 DEFAULT_REF = "master"
 MAX_ARCHIVE_BYTES = 80 * 1024 * 1024
-_EXCLUDE = {".git", ".venv", "node_modules", "__pycache__", ".pytest_cache"}
+_EXCLUDE = {
+    ".git",
+    ".venv",
+    ".vipercapture",
+    "node_modules",
+    "__pycache__",
+    ".pytest_cache",
+}
+# Directories that belong to this machine. .venv is the install virtualenv.
+# .vipercapture holds presets and the control-plane database when async jobs
+# are off, which is the Windows default.
+_KEPT_DIRS = (".venv", ".vipercapture")
+_KEPT_LABELS = {
+    ".venv": "the existing virtualenv",
+    ".vipercapture": "saved presets and local data",
+}
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _REF = re.compile(r"[A-Za-z0-9._/-]{1,128}\Z")
 _REPO = re.compile(r"[A-Za-z0-9_.-]{1,80}/[A-Za-z0-9_.-]{1,100}\Z")
@@ -244,17 +260,52 @@ def _preserve_local_files(backup: Path, app: Path) -> None:
 
 
 def _recover_interrupted_update(app: Path, backup: Path) -> None:
-    """Put .venv and local config back if an earlier update stopped halfway."""
+    """Put local directories and config back if an earlier update stopped halfway."""
     if not backup.exists():
         return
     if not app.exists():
         backup.rename(app)
         return
-    stray = backup / ".venv"
-    if stray.exists() and not (app / ".venv").exists():
-        stray.rename(app / ".venv")
+    for name in _KEPT_DIRS:
+        stray = backup / name
+        if stray.is_symlink() or not stray.is_dir():
+            continue
+        if (app / name).exists():
+            continue
+        stray.rename(app / name)
     _preserve_local_files(backup, app)
     shutil.rmtree(backup)
+
+
+def _move_kept_dirs(backup: Path, app: Path) -> None:
+    """Move machine-local directories from the backup into the new app tree."""
+    if not backup.is_dir():
+        return
+    moved: list[str] = []
+    current = ""
+    try:
+        for name in _KEPT_DIRS:
+            current = name
+            source = backup / name
+            if source.is_symlink() or not source.is_dir():
+                continue
+            destination = app / name
+            if destination.is_symlink():
+                destination.unlink()
+            elif destination.exists():
+                shutil.rmtree(destination)
+            source.rename(destination)
+            moved.append(name)
+    except OSError as exc:
+        for name in reversed(moved):
+            restored = app / name
+            if restored.exists() and not (backup / name).exists():
+                restored.rename(backup / name)
+        shutil.rmtree(app, ignore_errors=True)
+        if not app.exists() and backup.exists():
+            backup.rename(app)
+        label = _KEPT_LABELS.get(current, "local data")
+        raise UpdateError(f"Could not keep {label}.") from exc
 
 
 def replace_install_tree(source: Path, app: Path) -> None:
@@ -283,15 +334,7 @@ def replace_install_tree(source: Path, app: Path) -> None:
         raise UpdateError(
             "Could not replace the installed files. Stop vipercapture and run update again."
         ) from exc
-    venv = backup / ".venv" if backup.exists() else None
-    if venv is not None and venv.exists():
-        try:
-            venv.rename(app / ".venv")
-        except OSError as exc:
-            shutil.rmtree(app, ignore_errors=True)
-            if not app.exists() and backup.exists():
-                backup.rename(app)
-            raise UpdateError("Could not keep the existing virtualenv.") from exc
+    _move_kept_dirs(backup, app)
     try:
         _preserve_local_files(backup, app)
     except OSError as exc:
@@ -551,7 +594,7 @@ def _run_update(
             "This copy is a source checkout. vipercapture update refreshes the "
             "installed command, not this directory."
         )
-    if not (root / "launch.py").is_file():
+    if not (root / "launch.py").is_file() or root.name != "app":
         raise UpdateError("This directory does not look like a ViperCapture install.")
 
     repo = validate_repo(repo or os.environ.get("VIPERCAPTURE_GITHUB_REPO", DEFAULT_REPO))
@@ -621,8 +664,12 @@ def _run_update(
     ):
         if write_shim(shim, python, root / "launch.py", platform_name) and created_path is None:
             created_path = shim
-    if remote_sha:
+    # A custom archive or an API miss is not the SHA we just checked.
+    # Drop any older stamp so the next plain update does not treat it as current.
+    if remote_sha and not archive_url:
         write_revision(prefix, remote_sha)
+    else:
+        (prefix / "revision").unlink(missing_ok=True)
 
     print(f"  Updated ViperCapture {_version_phrase(local_version, new_version)}.")
     if server_running():

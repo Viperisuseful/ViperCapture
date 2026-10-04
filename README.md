@@ -107,7 +107,7 @@ environment, installs dependencies and Chromium, Firefox, and WebKit, opens
 `http://127.0.0.1:8000/v1`. Press Esc twice or Ctrl+C to stop it, or close the
 terminal. When a newer version is published, run `vipercapture update`.
 It downloads that version with Python, replaces the app files, and keeps the
-private environment and saved jobs. The same command works on Linux, macOS,
+private environment, saved jobs, and presets. The same command works on Linux, macOS,
 and Windows. On Windows, stop the running server first. The update keeps
 `.env.local`. It does not use sudo or a distro package manager.
 

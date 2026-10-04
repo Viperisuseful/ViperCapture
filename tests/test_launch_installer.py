@@ -1288,6 +1288,107 @@ class UpdateTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertFalse((app / "linked").exists())
 
+    def test_update_keeps_presets_stored_in_the_app(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            app = self._install(home, revision=OLD_SHA)
+            preset = app / ".vipercapture" / "presets" / "presets.json"
+            preset.parent.mkdir(parents=True)
+            preset.write_text('[{"name":"kept"}]\n', encoding="utf-8")
+            (app / ".vipercapture" / "control.sqlite3").write_bytes(b"db")
+            source = home / "incoming"
+            source.mkdir()
+            (source / "launch.py").write_text("print('new')\n", encoding="utf-8")
+            (source / "VERSION").write_text("1.0.5\n", encoding="utf-8")
+            planted = source / ".vipercapture" / "presets"
+            planted.mkdir(parents=True)
+            (planted / "presets.json").write_text('[{"name":"from-archive"}]\n', encoding="utf-8")
+            code = updater.run_update(
+                app,
+                fetch=self._fetch(_archive(source)),
+                home=home,
+                path_env="",
+                shell="/bin/bash",
+                server_running=lambda: False,
+                executable="/usr/bin/python3",
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(preset.read_text(encoding="utf-8"), '[{"name":"kept"}]\n')
+            self.assertEqual((app / ".vipercapture" / "control.sqlite3").read_bytes(), b"db")
+            self.assertEqual((app / ".venv" / "marker").read_text(encoding="utf-8"), "keep\n")
+
+    def test_custom_archive_does_not_record_the_upstream_sha(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            app = self._install(home, revision=OLD_SHA)
+            source = home / "incoming"
+            source.mkdir()
+            (source / "launch.py").write_text("print('fork')\n", encoding="utf-8")
+            (source / "VERSION").write_text("9.9.9\n", encoding="utf-8")
+            code = updater.run_update(
+                app,
+                fetch=self._fetch(_archive(source)),
+                archive_url="https://example.com/fork.tar.gz",
+                home=home,
+                path_env="",
+                shell="/bin/bash",
+                server_running=lambda: False,
+                executable="/usr/bin/python3",
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual((app / "launch.py").read_text(encoding="utf-8"), "print('fork')\n")
+            self.assertFalse((home / ".vipercapture" / "revision").exists())
+
+    def test_api_failure_clears_a_stale_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            app = self._install(home, revision=OLD_SHA)
+            source = home / "incoming"
+            source.mkdir()
+            (source / "launch.py").write_text("print('new')\n", encoding="utf-8")
+            (source / "VERSION").write_text("1.0.5\n", encoding="utf-8")
+
+            def fetch(url: str) -> bytes:
+                if _github_api(url):
+                    raise updater.UpdateError("offline")
+                return _archive(source)
+
+            code = updater.run_update(
+                app,
+                fetch=fetch,
+                home=home,
+                path_env="",
+                shell="/bin/bash",
+                server_running=lambda: False,
+                executable="/usr/bin/python3",
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual((app / "launch.py").read_text(encoding="utf-8"), "print('new')\n")
+            self.assertFalse((home / ".vipercapture" / "revision").exists())
+
+    def test_update_refuses_a_directory_that_is_not_named_app(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "ViperCapture-master"
+            root.mkdir()
+            (root / "launch.py").write_text("print('zip')\n", encoding="utf-8")
+            (root / "notes.txt").write_text("mine\n", encoding="utf-8")
+            calls: list[str] = []
+            stderr = io.StringIO()
+            with mock.patch("sys.stderr", stderr):
+                code = updater.run_update(
+                    root,
+                    fetch=lambda url: calls.append(url) or b"",
+                    home=Path(tmp),
+                    path_env="",
+                    server_running=lambda: False,
+                )
+            self.assertEqual(code, 1)
+            self.assertEqual(calls, [])
+            self.assertIn("does not look like a ViperCapture install", stderr.getvalue())
+            self.assertEqual((root / "launch.py").read_text(encoding="utf-8"), "print('zip')\n")
+            self.assertEqual((root / "notes.txt").read_text(encoding="utf-8"), "mine\n")
+            self.assertFalse((Path(tmp) / "revision").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
