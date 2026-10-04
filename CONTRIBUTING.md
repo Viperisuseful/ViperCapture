@@ -25,7 +25,8 @@ cd ViperCapture
 python launch.py
 ```
 
-`python launch.py` is the supported setup and startup method. It prefers uv
+`python launch.py` is the development startup path. End users install the
+`vipercapture` command from the README instead. The launcher prefers uv
 when uv is on `PATH` to create `.venv` and install from `requirements.txt`,
 then installs Chromium, Firefox, and WebKit and starts the app. Without uv it
 falls back to `python -m venv` and pip. Set `VIPERCAPTURE_USE_UV=0` to force
