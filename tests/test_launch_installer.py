@@ -1008,15 +1008,15 @@ class UpdateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             app = self._install(home, revision=OLD_SHA)
-            secret = "VIPERCAPTURE_SIGNING_ADMIN_TOKEN=local-secret\n"
+            marker = "MACHINE_LOCAL=kept\n"
             local = app / ".env.local"
-            local.write_text(secret, encoding="utf-8")
+            local.write_text(marker, encoding="utf-8")
             os.chmod(local, 0o600)
             source = home / "incoming"
             source.mkdir()
             (source / "launch.py").write_text("print('new')\n", encoding="utf-8")
             (source / "VERSION").write_text("1.0.5\n", encoding="utf-8")
-            (source / ".env.local").write_text("VIPERCAPTURE_SIGNING_ADMIN_TOKEN=from-archive\n", encoding="utf-8")
+            (source / ".env.local").write_text("MACHINE_LOCAL=from-archive\n", encoding="utf-8")
             stdout = io.StringIO()
             with mock.patch("sys.stdout", stdout):
                 code = updater.run_update(
@@ -1029,7 +1029,7 @@ class UpdateTests(unittest.TestCase):
                     executable="/usr/bin/python3",
                 )
             self.assertEqual(code, 0, stdout.getvalue())
-            self.assertEqual((app / ".env.local").read_text(encoding="utf-8"), secret)
+            self.assertEqual((app / ".env.local").read_text(encoding="utf-8"), marker)
             self.assertEqual(os.stat(app / ".env.local").st_mode & 0o777, 0o600)
 
     def test_download_is_pinned_to_the_checked_commit(self) -> None:
