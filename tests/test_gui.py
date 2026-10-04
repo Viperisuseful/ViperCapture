@@ -471,6 +471,69 @@ class GuiRuntimeTests(TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(order, ["deps", "browsers", "enter"])
 
+    def test_windows_vt_mode_is_enabled_before_the_screen_and_restored(self) -> None:
+        order: list[object] = []
+
+        def enable() -> int:
+            order.append("enable")
+            return 7
+
+        def restore(previous: int | None) -> None:
+            order.append(("restore", previous))
+
+        with (
+            mock.patch.object(gui.sys.stdin, "isatty", return_value=True),
+            mock.patch.object(gui.sys.stdout, "isatty", return_value=True),
+            mock.patch.object(gui.launch, "ensure_deps"),
+            mock.patch.object(gui.launch, "ensure_playwright"),
+            mock.patch.object(gui.launch, "port_open", return_value=True),
+            mock.patch.object(gui.launch, "choose_graphics_protocol", return_value=None),
+            mock.patch.object(gui, "_enable_windows_vt", side_effect=enable),
+            mock.patch.object(gui, "_restore_windows_vt", side_effect=restore),
+            mock.patch.object(gui, "_enter", side_effect=lambda: order.append("enter")),
+            mock.patch.object(gui, "_leave", side_effect=lambda _protocol: order.append("leave")),
+            mock.patch.object(gui, "_run_keys", return_value=0),
+        ):
+            code = gui.run_capture_gui((1920, 1080), directory=Path("."))
+        self.assertEqual(code, 0)
+        self.assertEqual(order, ["enable", "enter", "leave", ("restore", 7)])
+
+    def test_windows_vt_mode_sets_the_console_flag_and_can_restore_it(self) -> None:
+        import ctypes
+
+        modes: list[int] = []
+
+        class Kernel:
+            def GetStdHandle(self, kind: int) -> int:
+                self.kind = kind
+                return 42
+
+            def GetConsoleMode(self, handle: int, mode: object) -> int:
+                self.handle = handle
+                mode._obj.value = 0x3  # type: ignore[attr-defined]
+                return 1
+
+            def SetConsoleMode(self, handle: int, mode: int) -> int:
+                self.handle = handle
+                modes.append(mode)
+                return 1
+
+        kernel = Kernel()
+        windll = mock.Mock()
+        windll.kernel32 = kernel
+        with (
+            mock.patch.object(gui.os, "name", "nt"),
+            mock.patch.object(ctypes, "windll", windll, create=True),
+        ):
+            previous = gui._enable_windows_vt()
+            gui._restore_windows_vt(previous)
+        self.assertEqual(previous, 0x3)
+        self.assertEqual(kernel.kind, -11)
+        self.assertEqual(kernel.handle, 42)
+        self.assertEqual(modes, [0x3 | 0x0004, 0x3])
+        with mock.patch.object(gui.os, "name", "posix"):
+            self.assertIsNone(gui._enable_windows_vt())
+
 
 def os_terminal_size(columns: int, lines: int) -> object:
     import os

@@ -847,6 +847,41 @@ class _Drawer:
         sys.stdout.buffer.flush()
 
 
+_STD_OUTPUT_HANDLE = -11
+_ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+
+
+def _enable_windows_vt() -> int | None:
+    """Turn on ANSI processing for the classic Windows console.
+
+    Windows Terminal already understands these sequences. conhost, the
+    default on Windows 10, prints them as text until this mode is set.
+    """
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.GetStdHandle(_STD_OUTPUT_HANDLE)
+    mode = wintypes.DWORD()
+    if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+        return None
+    enabled = mode.value | _ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    if not kernel32.SetConsoleMode(handle, enabled):
+        return None
+    return mode.value
+
+
+def _restore_windows_vt(previous: int | None) -> None:
+    if previous is None:
+        return
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.SetConsoleMode(kernel32.GetStdHandle(_STD_OUTPUT_HANDLE), previous)
+
+
 def _enter() -> None:
     sys.stdout.buffer.write(launch.ALT_ENTER)
     sys.stdout.buffer.flush()
@@ -1138,6 +1173,7 @@ def run_capture_gui(viewport: tuple[int, int], directory: Path | None = None) ->
     protocol = launch.choose_graphics_protocol()
     entered = False
     drawer = _Drawer()
+    vt_mode = _enable_windows_vt()
     try:
         _enter()
         entered = True
@@ -1155,6 +1191,7 @@ def run_capture_gui(viewport: tuple[int, int], directory: Path | None = None) ->
     finally:
         if entered:
             _leave(protocol)
+        _restore_windows_vt(vt_mode)
         if started is not None:
             launch.stop_server(started, announce=False)
         if log_handle is not None:
