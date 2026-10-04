@@ -334,19 +334,40 @@ class GuiFrameTests(TestCase):
         first = gui.render_frame(size, gui.GuiState(), protocol="kitty", png=png)
         self.assertIn(b"\x1b_G", first)
         self.assertNotIn(gui.ASCII_LOGO[0].encode(), first)
-        logo_rows = min(6, max(1, 40 // 5))
+        logo_cols, logo_rows = launch.logo_cells(size)
         origin = gui._frame_origin(40, len(gui._frame_block(gui.GuiState(), 100, image=True)), logo_rows)
         second = gui.render_frame(
             size,
             gui.GuiState(url="https://example.com", busy=True, progress=3),
             clear=False,
             logo=b"",
+            logo_cols=logo_cols,
             logo_rows=logo_rows,
             origin=origin,
         )
         self.assertNotIn(b"\x1b[2J", second)
         self.assertNotIn(b"\x1b_G", second)
         self.assertIn(b"Capturing", second)
+
+    def test_menu_logo_uses_a_square_cell_box(self) -> None:
+        size = launch.WindowSize(120, 40, 1200, 800)
+        png = b"\x89PNG\r\n\x1a\n"
+        frame = gui.render_frame(size, gui.GuiState(), protocol="kitty", png=png)
+        logo_cols, logo_rows = launch.logo_cells(size)
+        self.assertGreater(logo_cols, logo_rows)
+        self.assertIn(f"c={logo_cols},r={logo_rows}".encode(), frame)
+        self.assertNotIn(b"c=24,r=", frame)
+        cell_w = size.xpixels / size.cols
+        cell_h = size.ypixels / size.rows
+        self.assertLess(abs(logo_cols * cell_w - logo_rows * cell_h), cell_w + cell_h)
+        col = max(1, (size.cols - logo_cols) // 2 + 1)
+        self.assertIn(f";{col}H".encode(), frame)
+
+    def test_narrow_terminal_skips_the_stretched_logo(self) -> None:
+        size = launch.WindowSize(20, 8, 200, 160)
+        frame = gui.render_frame(size, gui.GuiState(), protocol="kitty", png=b"\x89PNG\r\n\x1a\n")
+        self.assertNotIn(b"\x1b_G", frame)
+        self.assertIn(b"ViperCapture", frame)
 
     def test_logo_is_sent_once_until_the_layout_changes(self) -> None:
         png = b"\x89PNG\r\n\x1a\n" + b"x"

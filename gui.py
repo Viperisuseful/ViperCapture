@@ -388,15 +388,22 @@ def _logo_placement(
     size: launch.WindowSize,
     protocol: str | None,
     png: bytes | None,
-) -> tuple[bytes, int]:
-    _cols, rows = _screen_bounds(size)
+) -> tuple[bytes, int, int]:
+    """Place the square mark in a cell box that stays square on screen.
+
+    Terminal cells are taller than they are wide, so a fixed 24-by-6 box
+    stretches the PNG sideways. logo_cells picks columns and rows that
+    cover the same number of pixels.
+    """
     if not protocol or not png:
-        return b"", 0
-    logo_rows = min(6, max(1, rows // 5))
-    logo = launch.place_logo(png, protocol, cols=24, rows=logo_rows, size=size)
+        return b"", 0, 0
+    logo_cols, logo_rows = launch.logo_cells(size)
+    if logo_cols < 1 or logo_rows < 1:
+        return b"", 0, 0
+    logo = launch.place_logo(png, protocol, cols=logo_cols, rows=logo_rows, size=size)
     if not logo:
-        return b"", 0
-    return logo, logo_rows
+        return b"", 0, 0
+    return logo, logo_cols, logo_rows
 
 
 def _wordmark(cols: int, *, image: bool) -> tuple[str, ...]:
@@ -426,16 +433,21 @@ def render_frame(
     png: bytes | None = None,
     clear: bool = True,
     logo: bytes | None = None,
+    logo_cols: int | None = None,
     logo_rows: int | None = None,
     origin: int | None = None,
 ) -> bytes:
     cols, rows = _screen_bounds(size)
     if logo is None:
-        logo, auto_rows = _logo_placement(size, protocol, png)
+        logo, auto_cols, auto_rows = _logo_placement(size, protocol, png)
+        if logo_cols is None:
+            logo_cols = auto_cols
         if logo_rows is None:
             logo_rows = auto_rows
     if logo_rows is None:
         logo_rows = 0
+    if logo_cols is None:
+        logo_cols = 0
     logo_bytes = logo or b""
     block = _frame_block(state, cols, image=logo_rows > 0)
     if origin is None:
@@ -446,7 +458,7 @@ def render_frame(
     row = max(1, origin)
     if logo_rows:
         if clear and logo_bytes:
-            col = max(1, (cols - 24) // 2)
+            col = max(1, (cols - logo_cols) // 2 + 1)
             parts.append(f"\x1b[{row};{col}H".encode("ascii"))
             parts.append(logo_bytes)
         row += logo_rows + 1
@@ -816,19 +828,20 @@ class _Drawer:
     """Redraw the menu in place. The logo is sent again only when its position changes."""
 
     def __init__(self) -> None:
-        self._key: tuple[int, int, str | None] | None = None
+        self._key: tuple[int, int, int, int, str | None] | None = None
         self._origin: int | None = None
         self._logo = b""
+        self._logo_cols = 0
         self._logo_rows = 0
 
     def draw(self, state: GuiState) -> None:
         size = _window_size()
         protocol = launch.choose_graphics_protocol()
         png = launch._logo_png() if protocol else None
-        key = (size.cols, size.rows, protocol)
+        key = (size.cols, size.rows, size.xpixels, size.ypixels, protocol)
         size_changed = key != self._key
         if size_changed:
-            self._logo, self._logo_rows = _logo_placement(size, protocol, png)
+            self._logo, self._logo_cols, self._logo_rows = _logo_placement(size, protocol, png)
             self._key = key
         cols, rows = _screen_bounds(size)
         block_len = len(_frame_block(state, cols, image=self._logo_rows > 0))
@@ -840,6 +853,7 @@ class _Drawer:
             state,
             clear=full,
             logo=self._logo if full else b"",
+            logo_cols=self._logo_cols,
             logo_rows=self._logo_rows,
             origin=origin,
         )
