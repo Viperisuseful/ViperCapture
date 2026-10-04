@@ -726,6 +726,10 @@ class InstallScriptTests(unittest.TestCase):
                 env.pop("VIPERCAPTURE_HOME", None)
                 env.pop("VIPERCAPTURE_BIN_DIR", None)
                 env.pop("VIPERCAPTURE_PYTHON", None)
+                # ensure_python exports this after installing uv on Python < 3.11.
+                # The shim directory is on the current PATH, and the shell rc is still missing.
+                bin_dir = str(home / ".local" / "bin")
+                env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
                 return subprocess.run(
                     ["bash", str(ROOT / "scripts" / "install.sh")],
                     env=env,
@@ -745,7 +749,9 @@ class InstallScriptTests(unittest.TestCase):
             self.assertEqual((app / "keep.txt").read_text(encoding="utf-8"), "yes\n")
             self.assertFalse((app / "frontend" / "node_modules").exists())
             bashrc = home / ".bashrc"
-            self.assertEqual(bashrc.read_text(encoding="utf-8").count("# ViperCapture"), 1)
+            bashrc_text = bashrc.read_text(encoding="utf-8")
+            self.assertEqual(bashrc_text.count("# ViperCapture"), 1)
+            self.assertIn(f'export PATH="{shim.parent}:$PATH"', bashrc_text)
 
             venv = app / ".venv"
             venv.mkdir()
@@ -763,6 +769,32 @@ class InstallScriptTests(unittest.TestCase):
             )
             self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
             self.assertIn("vipercapture", ran.stdout)
+
+            fresh = os.environ.copy()
+            fresh["HOME"] = str(home)
+            fresh["PATH"] = os.pathsep.join(
+                part
+                for part in os.environ.get("PATH", "").split(os.pathsep)
+                if part and part != str(shim.parent)
+            )
+            sourced = subprocess.run(
+                [
+                    "bash",
+                    "--noprofile",
+                    "--norc",
+                    "-c",
+                    'source "$1" && command -v vipercapture && vipercapture',
+                    "bash",
+                    str(bashrc),
+                ],
+                env=fresh,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(sourced.returncode, 0, sourced.stdout + sourced.stderr)
+            self.assertIn(str(shim), sourced.stdout)
+            self.assertIn("vipercapture", sourced.stdout)
 
 
 if __name__ == "__main__":

@@ -148,9 +148,9 @@ rc_file() {
 }
 
 ensure_on_path() {
-    case ":$PATH:" in
-        *":$bin_dir:"*) return 0 ;;
-    esac
+    # Do not trust the live PATH. ensure_python prepends $HOME/.local/bin after
+    # installing uv, and that directory is also the default bin_dir. A new shell
+    # only sees vipercapture when the permanent rc file records it.
     rc=$(rc_file)
     marker="# ViperCapture"
     mkdir -p "$(dirname "$rc")"
