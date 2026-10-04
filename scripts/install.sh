@@ -202,5 +202,6 @@ ensure_on_path
 echo
 echo "  Installed the vipercapture command."
 echo "  Run: vipercapture"
+echo "  Update later with: vipercapture update"
 echo "  The first launch installs dependencies and browsers, then starts the API."
 echo

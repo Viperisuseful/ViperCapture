@@ -155,5 +155,6 @@ if ($Updated -ne $UserPath) {
 Write-Host ""
 Write-Host "  Installed the vipercapture command."
 Write-Host "  Run: vipercapture"
+Write-Host "  Update later with: vipercapture update"
 Write-Host "  The first launch installs dependencies and browsers, then starts the API."
 Write-Host ""

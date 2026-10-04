@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import os
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import launch  # noqa: E402
+import updater  # noqa: E402
 
 
 class ReadyBannerTests(unittest.TestCase):
@@ -356,6 +359,7 @@ class LaunchArgsTests(unittest.TestCase):
                 launch.parse_launch_args(["--help"])
         self.assertEqual(caught.exception.code, 0)
         self.assertIn("--one-window", stdout.getvalue())
+        self.assertIn("vipercapture update", stdout.getvalue())
         self.assertIn("Windows always uses one window.", stdout.getvalue())
 
     def test_unknown_argument_exits(self) -> None:
@@ -365,6 +369,23 @@ class LaunchArgsTests(unittest.TestCase):
                 launch.parse_launch_args(["--two-windows"])
         self.assertEqual(caught.exception.code, 2)
         self.assertIn("Unknown argument: --two-windows", stderr.getvalue())
+
+    def test_update_is_a_command(self) -> None:
+        command = launch.parse_cli(["update"])
+        self.assertTrue(command.update)
+        self.assertFalse(command.check)
+        self.assertFalse(command.one_window)
+        checked = launch.parse_cli(["update", "--check"])
+        self.assertTrue(checked.update)
+        self.assertTrue(checked.check)
+
+    def test_update_rejects_launch_flags(self) -> None:
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", stderr):
+            with self.assertRaises(SystemExit) as caught:
+                launch.parse_cli(["update", "--one-window"])
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("Unknown argument: --one-window", stderr.getvalue())
 
     def test_windows_stays_in_one_window_without_the_flag(self) -> None:
         self.assertTrue(launch.use_one_window(False, "win32"))
@@ -843,6 +864,315 @@ class InstallScriptTests(unittest.TestCase):
             self.assertEqual(sourced.returncode, 0, sourced.stdout + sourced.stderr)
             self.assertIn(str(shim), sourced.stdout)
             self.assertIn("vipercapture", sourced.stdout)
+
+
+OLD_SHA = "a" * 40
+NEW_SHA = "b" * 40
+
+
+def _archive(source: Path) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        tar.add(source, arcname="ViperCapture-master")
+    return buffer.getvalue()
+
+
+class UpdateTests(unittest.TestCase):
+    def _install(self, home: Path, version: str = "1.0.4", revision: str | None = None) -> Path:
+        app = home / ".vipercapture" / "app"
+        app.mkdir(parents=True)
+        (app / "launch.py").write_text("print('old')\n", encoding="utf-8")
+        (app / "VERSION").write_text(version + "\n", encoding="utf-8")
+        (app / "old.txt").write_text("gone\n", encoding="utf-8")
+        venv = app / ".venv"
+        venv.mkdir()
+        (venv / "marker").write_text("keep\n", encoding="utf-8")
+        (home / ".vipercapture" / "async-jobs.sqlite3").write_text("jobs\n", encoding="utf-8")
+        if revision:
+            (home / ".vipercapture" / "revision").write_text(revision + "\n", encoding="utf-8")
+        return app
+
+    def _fetch(self, archive: bytes, sha: str = NEW_SHA) -> Callable[[str], bytes]:
+        def fetch(url: str) -> bytes:
+            if "api.github.com" in url:
+                return json.dumps({"sha": sha}).encode()
+            return archive
+        return fetch
+
+    def test_check_reports_an_available_update_without_replacing_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            app = self._install(home, revision=OLD_SHA)
+            stdout = io.StringIO()
+            with mock.patch("sys.stdout", stdout):
+                code = updater.run_update(
+                    app,
+                    fetch=self._fetch(b"unused"),
+                    home=home,
+                    path_env="",
+                    shell="/bin/bash",
+                    server_running=lambda: False,
+                    executable="/usr/bin/python3",
+                    check_only=True,
+                )
+            self.assertEqual(code, 10)
+            self.assertIn("An update is available for ViperCapture 1.0.4", stdout.getvalue())
+            self.assertEqual((app / "launch.py").read_text(encoding="utf-8"), "print('old')\n")
+            self.assertFalse((home / ".local").exists())
+
+    def test_already_current_skips_the_download(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            app = self._install(home, revision=NEW_SHA)
+            calls: list[str] = []
+
+            def fetch(url: str) -> bytes:
+                calls.append(url)
+                if "api.github.com" not in url:
+                    raise AssertionError(url)
+                return json.dumps({"sha": NEW_SHA}).encode()
+
+            stdout = io.StringIO()
+            with mock.patch("sys.stdout", stdout):
+                code = updater.run_update(
+                    app,
+                    fetch=fetch,
+                    home=home,
+                    path_env="",
+                    shell="/bin/bash",
+                    server_running=lambda: False,
+                    executable="/usr/bin/python3",
+                )
+            self.assertEqual(code, 0, stdout.getvalue())
+            self.assertEqual(len(calls), 1)
+            self.assertIn("ViperCapture 1.0.4 is already up to date.", stdout.getvalue())
+            self.assertEqual((app / "old.txt").read_text(encoding="utf-8"), "gone\n")
+
+    def test_update_replaces_the_app_and_keeps_venv_and_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            app = self._install(home, revision=OLD_SHA)
+            bin_dir = home / "bin"
+            bin_dir.mkdir()
+            shim = bin_dir / "vipercapture"
+            shim.write_text(
+                "#!/bin/sh\n"
+                f"exec '/usr/bin/python3' '{app / 'launch.py'}' \"$@\"\n",
+                encoding="utf-8",
+            )
+            source = home / "incoming"
+            source.mkdir()
+            (source / "launch.py").write_text("print('new')\n", encoding="utf-8")
+            (source / "VERSION").write_text("1.0.5\n", encoding="utf-8")
+            (source / "keep.txt").write_text("yes\n", encoding="utf-8")
+            nested = source / "frontend" / "node_modules"
+            nested.mkdir(parents=True)
+            (nested / "junk.txt").write_text("nope\n", encoding="utf-8")
+            stdout = io.StringIO()
+            with mock.patch("sys.stdout", stdout):
+                code = updater.run_update(
+                    app,
+                    fetch=self._fetch(_archive(source)),
+                    home=home,
+                    path_env=str(bin_dir),
+                    shell="/bin/bash",
+                    server_running=lambda: True,
+                    executable="/usr/bin/python3",
+                )
+            self.assertEqual(code, 0, stdout.getvalue())
+            self.assertEqual((app / "launch.py").read_text(encoding="utf-8"), "print('new')\n")
+            self.assertEqual((app / "keep.txt").read_text(encoding="utf-8"), "yes\n")
+            self.assertFalse((app / "old.txt").exists())
+            self.assertFalse((app / "frontend").exists())
+            self.assertEqual((app / ".venv" / "marker").read_text(encoding="utf-8"), "keep\n")
+            jobs = home / ".vipercapture" / "async-jobs.sqlite3"
+            self.assertEqual(jobs.read_text(encoding="utf-8"), "jobs\n")
+            self.assertEqual((home / ".vipercapture" / "revision").read_text(encoding="utf-8"), NEW_SHA + "\n")
+            self.assertEqual(os.stat(home / ".vipercapture" / "revision").st_mode & 0o777, 0o600)
+            shim_text = shim.read_text(encoding="utf-8")
+            self.assertIn("#!/bin/sh", shim_text)
+            self.assertIn(str(app / "launch.py"), shim_text)
+            self.assertIn("/usr/bin/python3", shim_text)
+            self.assertIn("Updated ViperCapture from 1.0.4 to 1.0.5.", stdout.getvalue())
+            self.assertIn("still running on http://127.0.0.1:8000", stdout.getvalue())
+            self.assertFalse((home / ".vipercapture" / "app.backup").exists())
+            self.assertFalse((home / ".vipercapture" / "app.updating").exists())
+
+    def test_windows_shim_uses_cmd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            app = self._install(home)
+            bin_dir = home / "bin"
+            bin_dir.mkdir()
+            shim = bin_dir / "vipercapture.cmd"
+            shim.write_text(
+                f'@echo off\r\n"C:\\Python\\python.exe" "{app / "launch.py"}" %*\r\n',
+                encoding="utf-8",
+            )
+            source = home / "incoming"
+            source.mkdir()
+            (source / "launch.py").write_text("print('new')\n", encoding="utf-8")
+            (source / "VERSION").write_text("1.0.5\n", encoding="utf-8")
+            code = updater.run_update(
+                app,
+                fetch=self._fetch(_archive(source)),
+                home=home,
+                path_env=str(bin_dir),
+                platform_name="win32",
+                shell="",
+                server_running=lambda: False,
+                executable="C:\\Python\\python.exe",
+            )
+            self.assertEqual(code, 0)
+            raw = shim.read_bytes()
+            self.assertTrue(raw.startswith(b"@echo off\r\n"))
+            self.assertIn(b'"C:\\Python\\python.exe"', raw)
+            self.assertIn(b"%*", raw)
+            self.assertNotIn(b"#!/bin/sh", raw)
+
+    def test_new_posix_shim_records_path_without_trusting_the_live_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            app = self._install(home)
+            source = home / "incoming"
+            source.mkdir()
+            (source / "launch.py").write_text("print('new')\n", encoding="utf-8")
+            (source / "VERSION").write_text("1.0.4\n", encoding="utf-8")
+            bin_dir = home / ".local" / "bin"
+            stdout = io.StringIO()
+            with mock.patch("sys.stdout", stdout):
+                code = updater.run_update(
+                    app,
+                    fetch=self._fetch(_archive(source)),
+                    home=home,
+                    path_env=str(bin_dir),
+                    shell="/bin/bash",
+                    server_running=lambda: False,
+                    executable="/usr/bin/python3",
+                )
+            self.assertEqual(code, 0, stdout.getvalue())
+            shim = bin_dir / "vipercapture"
+            self.assertTrue(os.access(shim, os.X_OK))
+            bashrc = (home / ".bashrc").read_text(encoding="utf-8")
+            self.assertEqual(bashrc.count("# ViperCapture"), 1)
+            self.assertIn(f'export PATH="{bin_dir}:$PATH"', bashrc)
+            self.assertIn("Open a new terminal", stdout.getvalue())
+
+    def test_refuses_a_source_checkout_without_downloading(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".git").mkdir()
+            (root / "launch.py").write_text("print('checkout')\n", encoding="utf-8")
+            calls: list[str] = []
+            stderr = io.StringIO()
+            with mock.patch("sys.stderr", stderr):
+                code = updater.run_update(
+                    root,
+                    fetch=lambda url: calls.append(url) or b"",
+                    home=root,
+                    path_env="",
+                    server_running=lambda: False,
+                )
+            self.assertEqual(code, 1)
+            self.assertEqual(calls, [])
+            self.assertIn("source checkout", stderr.getvalue())
+            self.assertEqual((root / "launch.py").read_text(encoding="utf-8"), "print('checkout')\n")
+
+    def test_unsafe_archive_leaves_the_install_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            app = self._install(home, revision=OLD_SHA)
+            buffer = io.BytesIO()
+            with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+                info = tarfile.TarInfo("../escape.txt")
+                payload = b"nope\n"
+                info.size = len(payload)
+                tar.addfile(info, io.BytesIO(payload))
+            stderr = io.StringIO()
+            with mock.patch("sys.stderr", stderr):
+                code = updater.run_update(
+                    app,
+                    fetch=self._fetch(buffer.getvalue()),
+                    home=home,
+                    path_env="",
+                    server_running=lambda: False,
+                    executable="/usr/bin/python3",
+                )
+            self.assertEqual(code, 1)
+            self.assertIn("unsafe path", stderr.getvalue())
+            self.assertEqual((app / "launch.py").read_text(encoding="utf-8"), "print('old')\n")
+            self.assertFalse((home / "escape.txt").exists())
+
+    def test_http_archive_url_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            app = self._install(home)
+            stderr = io.StringIO()
+            with mock.patch("sys.stderr", stderr):
+                code = updater.run_update(
+                    app,
+                    fetch=self._fetch(b"unused"),
+                    archive_url="http://example.com/ViperCapture.tar.gz",
+                    home=home,
+                    path_env="",
+                    server_running=lambda: False,
+                    executable="/usr/bin/python3",
+                )
+            self.assertEqual(code, 1)
+            self.assertIn("Refusing non-HTTPS URL", stderr.getvalue())
+
+    def test_recovers_a_venv_left_in_the_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            app = self._install(home)
+            marker = app / ".venv" / "marker"
+            backup = home / ".vipercapture" / "app.backup"
+            marker.unlink()
+            (app / ".venv").rmdir()
+            backup.mkdir()
+            shutil_venv = backup / ".venv"
+            shutil_venv.mkdir()
+            (shutil_venv / "marker").write_text("keep\n", encoding="utf-8")
+            updater._recover_interrupted_update(app, backup)
+            self.assertEqual((app / ".venv" / "marker").read_text(encoding="utf-8"), "keep\n")
+            self.assertFalse(backup.exists())
+
+    def test_download_limit_and_windows_path_merge(self) -> None:
+        def read(size: int) -> bytes:
+            return b"x" * size
+
+        with self.assertRaises(updater.UpdateError):
+            updater.consume_limited(read, 10)
+        self.assertIsNone(updater.merge_windows_path(r"C:\already", r"C:\already"))
+        self.assertEqual(
+            updater.merge_windows_path(r"C:\Windows", r"C:\Users\viper\AppData\Local\ViperCapture\bin"),
+            r"C:\Users\viper\AppData\Local\ViperCapture\bin;C:\Windows",
+        )
+        self.assertEqual(updater.escape_posix_path('/tmp/we"ird$`'), '/tmp/we\\"ird\\$\\`')
+
+    def test_symlink_in_the_archive_is_not_extracted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            outside = home / "secret"
+            outside.write_text("hidden\n", encoding="utf-8")
+            source = home / "incoming"
+            source.mkdir()
+            (source / "launch.py").write_text("print('new')\n", encoding="utf-8")
+            (source / "VERSION").write_text("1.0.5\n", encoding="utf-8")
+            link = source / "linked"
+            link.symlink_to(outside)
+            app = self._install(home)
+            code = updater.run_update(
+                app,
+                fetch=self._fetch(_archive(source)),
+                home=home,
+                path_env=str(home / "bin"),
+                shell="/bin/bash",
+                server_running=lambda: False,
+                executable="/usr/bin/python3",
+            )
+            self.assertEqual(code, 0)
+            self.assertFalse((app / "linked").exists())
 
 
 if __name__ == "__main__":

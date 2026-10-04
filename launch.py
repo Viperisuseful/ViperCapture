@@ -5,6 +5,8 @@ ViperCapture launcher
 Run this file directly with Python.
 Handles venv setup, dependency install, browser install,
 server startup, and opening your browser automatically.
+``vipercapture update`` replaces an installed copy from GitHub and keeps its
+virtualenv. That command uses the Python standard library on every OS.
 
 Prefers uv (https://docs.astral.sh/uv/) when it is on PATH.
 Set VIPERCAPTURE_USE_UV=0 to force the stdlib venv + pip path.
@@ -1434,21 +1436,46 @@ def ensure_playwright() -> None:
 
 LAUNCH_HELP = """\
 usage: vipercapture [--one-window]
+       vipercapture update [--check]
 
 Start ViperCapture in this terminal. Ghostty and Kitty open request
 logs in another window and show a full-screen status view.
 
   --one-window   Keep the status and request log in this terminal.
                  Use this over SSH, or anywhere a second window is wrong.
+  update         Download the latest ViperCapture and replace this install.
+                 The virtualenv and saved jobs stay in place. This uses
+                 Python only, on Linux, macOS, and Windows.
+  update --check Print whether an update is available, then exit.
+                 Exit 10 means an update is available.
   -h, --help     Show this help.
 
 Windows always uses one window.
 """
 
 
-def parse_launch_args(argv: list[str] | None = None) -> bool:
-    """Return True when --one-window was passed. Help exits 0; unknown args exit 2."""
+@dataclass(frozen=True)
+class CliArgs:
+    one_window: bool = False
+    update: bool = False
+    check: bool = False
+
+
+def parse_cli(argv: list[str] | None = None) -> CliArgs:
+    """Help exits 0. Unknown arguments exit 2."""
     args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] == "update":
+        check = False
+        for arg in args[1:]:
+            if arg == "--check":
+                check = True
+                continue
+            if arg in {"-h", "--help"}:
+                print(LAUNCH_HELP, end="")
+                raise SystemExit(0)
+            print(f"Unknown argument: {arg}\n{LAUNCH_HELP}", end="", file=sys.stderr)
+            raise SystemExit(2)
+        return CliArgs(update=True, check=check)
     one_window = False
     for arg in args:
         if arg in {"-h", "--help"}:
@@ -1459,7 +1486,12 @@ def parse_launch_args(argv: list[str] | None = None) -> bool:
             continue
         print(f"Unknown argument: {arg}\n{LAUNCH_HELP}", end="", file=sys.stderr)
         raise SystemExit(2)
-    return one_window
+    return CliArgs(one_window=one_window)
+
+
+def parse_launch_args(argv: list[str] | None = None) -> bool:
+    """Return True when --one-window was passed. Help exits 0; unknown args exit 2."""
+    return parse_cli(argv).one_window
 
 
 def use_one_window(one_window: bool, platform_name: str | None = None) -> bool:
@@ -1470,9 +1502,14 @@ def use_one_window(one_window: bool, platform_name: str | None = None) -> bool:
 
 
 def main() -> None:
-    # Parsed before the venv re-exec so --help does not install anything.
-    # ensure_venv re-runs this file with the same arguments.
-    one_window = use_one_window(parse_launch_args())
+    # Parsed before the venv re-exec so --help and update do not install
+    # dependencies or start the server. ensure_venv re-runs this file with
+    # the same arguments when the command is a normal launch.
+    cli = parse_cli()
+    if cli.update:
+        import updater
+        raise SystemExit(updater.run_update(ROOT, check_only=cli.check))
+    one_window = use_one_window(cli.one_window)
     ensure_venv()    # may re-exec this script under the venv Python
 
     print()
