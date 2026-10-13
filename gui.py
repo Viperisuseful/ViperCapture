@@ -33,11 +33,49 @@ DEFAULT_VIEWPORT = (1920, 1080)
 MAX_CAPTURE_BYTES = 200 * 1024 * 1024
 VIDEO_DURATION_MS = 4_000
 ASCII_LOGO = (
-    "█ █ █ █▀█ █▀▀ █▀█   █▀▀ █▀█ █▀█ ▀█▀ █ █ █▀█ █▀▀",
-    "▀▄▀ █ █▀▀ █▀▀ █▀▄   █   █▀█ █▀▀  █  █ █ █▀▄ █▀▀",
-    " ▀  ▀ ▀   ▀▀▀ ▀ ▀   ▀▀▀ ▀ ▀ ▀   ▀▀▀ ▀▀▀ ▀ ▀ ▀▀▀",
+    "                                         █                  ",
+    "█  █  █  █▀▀█ █▀▀█ █▀▀▄  █▀▀▀ ▄▀▀█ █▀▀█ ▀█▀▀ █  █ █▀▀▄ █▀▀█ ",
+    "█__█  █  █__█ █^^^ █     █___ █__█ █__█  █   █__█ █    █^^^ ",
+    " ▀▀   ▀  █▀▀▀ ▀▀▀▀ ▀     ▀▀▀▀ ▀▀▀▀ █▀▀▀  ▀▀  ▀▀▀▀ ▀    ▀▀▀▀ ",
     "ViperCapture",
 )
+
+
+def _draw_wordmark_line(line: str, fg: str, shadow: str, bg: str) -> str:
+    reset = "\x1b[0m"
+    parts: list[str] = []
+    for char in line:
+        if char == "_":
+            parts.append(f"{bg} {reset}")
+        elif char == "^":
+            parts.append(f"{fg}{bg}▀{reset}")
+        elif char == "~":
+            parts.append(f"{shadow}▀{reset}")
+        elif char == " ":
+            parts.append(" ")
+        else:
+            parts.append(f"{fg}{char}{reset}")
+    return "".join(parts)
+
+
+def styled_ascii_logo() -> list[str]:
+    viper_fg = "\x1b[1;34m"
+    capture_fg = "\x1b[1;37m"
+    viper_shadow = "\x1b[38;2;60;66;80m"
+    viper_bg = "\x1b[48;2;60;66;80m"
+    capture_shadow = "\x1b[38;2;20;42;90m"
+    capture_bg = "\x1b[48;2;20;42;90m"
+
+    lines: list[str] = []
+    split_pos = 25
+    for raw in ASCII_LOGO[:4]:
+        left = raw[:split_pos]
+        right = raw[split_pos:]
+        left_styled = _draw_wordmark_line(left, viper_fg, viper_shadow, viper_bg)
+        right_styled = _draw_wordmark_line(right, capture_fg, capture_shadow, capture_bg)
+        lines.append(f"{left_styled}{right_styled}")
+    lines.append(f"\x1b[2m{ASCII_LOGO[4]}\x1b[0m")
+    return lines
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 _HOST = re.compile(r"[^A-Za-z0-9.-]+")
 
@@ -411,7 +449,9 @@ def _wordmark(cols: int, *, image: bool) -> tuple[str, ...]:
         return ()
     if cols < 52:
         return ("ViperCapture",)
-    return ASCII_LOGO
+    if cols < 64:
+        return ASCII_LOGO
+    return tuple(styled_ascii_logo())
 
 
 def _frame_block(state: GuiState, cols: int, *, image: bool) -> list[str]:
@@ -820,6 +860,12 @@ def _window_size() -> launch.WindowSize:
             return launch.read_window_size(sys.stdout.fileno())
         except (OSError, ModuleNotFoundError):
             pass
+    for fd in (sys.stdout.fileno(), sys.stdin.fileno()):
+        try:
+            size = os.get_terminal_size(fd)
+            return launch.WindowSize(size.columns, size.lines)
+        except (OSError, ValueError):
+            pass
     size = shutil.get_terminal_size((80, 24))
     return launch.WindowSize(size.columns, size.lines)
 
@@ -1046,7 +1092,12 @@ def _run_posix_keys(
         signal.set_wakeup_fd(wake_w)
         signal.signal(signal.SIGWINCH, lambda _signum, _frame: None)
         dirty = True
+        last_size = _window_size()
         while True:
+            current_size = _window_size()
+            if current_size != last_size:
+                last_size = current_size
+                dirty = True
             if dirty:
                 drawer.draw(state)
                 dirty = False
@@ -1114,7 +1165,12 @@ def _run_windows_keys(
     cancel = CancelFlag()
     box: dict[str, GuiState] = {}
     dirty = True
+    last_size = _window_size()
     while True:
+        current_size = _window_size()
+        if current_size != last_size:
+            last_size = current_size
+            dirty = True
         if dirty:
             drawer.draw(state)
             dirty = False

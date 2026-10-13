@@ -369,6 +369,25 @@ class GuiFrameTests(TestCase):
         self.assertNotIn(b"\x1b_G", frame)
         self.assertIn(b"ViperCapture", frame)
 
+    def test_opencode_styled_ascii_wordmark(self) -> None:
+        lines = gui.styled_ascii_logo()
+        self.assertEqual(len(lines), 5)
+        self.assertEqual(gui.visible(lines[0]), gui.ASCII_LOGO[0])
+        self.assertEqual(gui.visible(lines[4]), gui.ASCII_LOGO[4])
+        self.assertIn('ViperCapture', gui.visible(lines[4]))
+        self.assertIn("\x1b[", lines[0])
+        self.assertIn("\x1b[1;34m", lines[1])
+        self.assertIn("\x1b[1;37m", lines[1])
+        self.assertNotIn("\x1b[90m", lines[1])
+        self.assertIn("\x1b[48;2;60;66;80m", lines[2])
+        self.assertIn("\x1b[48;2;20;42;90m", lines[2])
+
+    def test_wordmark_switches_between_plain_and_styled_by_width(self) -> None:
+        self.assertEqual(gui._wordmark(40, image=False), ("ViperCapture",))
+        self.assertEqual(gui._wordmark(60, image=False), gui.ASCII_LOGO)
+        self.assertEqual(gui._wordmark(80, image=False), tuple(gui.styled_ascii_logo()))
+        self.assertEqual(gui._wordmark(80, image=True), ())
+
     def test_logo_is_sent_once_until_the_layout_changes(self) -> None:
         png = b"\x89PNG\r\n\x1a\n" + b"x"
         out = io.BytesIO()

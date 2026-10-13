@@ -108,12 +108,14 @@ environment, installs dependencies and Chromium, Firefox, and WebKit, opens
 terminal. When a newer version is published, run `vipercapture update`.
 It downloads that version with Python, replaces the app files, and keeps the
 private environment, saved jobs, and presets. The same command works on Linux, macOS,
-and Windows. On Windows, stop the running server first. The update keeps
+and Windows. On Windows, stop the running server first with `vipercapture kill`. The update keeps
 `.env.local`. It does not use sudo or a distro package manager.
 
+`vipercapture kill` stops all running instances of ViperCapture (API server, GUI menu, and background workers) on Windows, macOS, and Linux.
+
 On Linux and macOS, Ghostty and Kitty open request logs in another window and
-show a full-screen status view in this one. The logo is drawn for Kitty,
-Ghostty, iTerm2, WezTerm, foot, mlterm, Contour, and Windows Terminal. WezTerm
+show a full-screen status view in this one. The terminal graphics logo is drawn for Kitty,
+Ghostty, iTerm2, WezTerm, foot, mlterm, and Contour; terminals without graphics protocols (including Windows Terminal) display a styled two-tone block ASCII wordmark. WezTerm
 uses the Kitty graphics protocol when `enable_kitty_graphics = true`, and the
 iTerm2 image protocol otherwise. `vipercapture --one-window` keeps the status
 and the request log together in this terminal, which is what you want over SSH.

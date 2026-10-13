@@ -135,13 +135,12 @@ class TerminalLogoTests(unittest.TestCase):
             ),
             "sixel",
         )
-        self.assertEqual(
+        self.assertIsNone(
             launch.choose_graphics_protocol(
                 platform_name="win32",
                 is_tty=True,
                 environ={"WT_SESSION": "abc", "TERM": "xterm-256color"},
             ),
-            "sixel",
         )
 
     def test_wezterm_kitty_graphics_follows_the_config_flag(self) -> None:
@@ -361,6 +360,8 @@ class LaunchArgsTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 0)
         self.assertIn("--one-window", stdout.getvalue())
         self.assertIn("vipercapture update", stdout.getvalue())
+        self.assertIn("vipercapture kill", stdout.getvalue())
+        self.assertIn("Stop all running instances", stdout.getvalue())
         self.assertIn("Windows always uses one window.", stdout.getvalue())
 
     def test_unknown_argument_exits(self) -> None:
@@ -387,6 +388,40 @@ class LaunchArgsTests(unittest.TestCase):
                 launch.parse_cli(["update", "--one-window"])
         self.assertEqual(caught.exception.code, 2)
         self.assertIn("Unknown argument: --one-window", stderr.getvalue())
+
+    def test_kill_is_a_command(self) -> None:
+        command = launch.parse_cli(["kill"])
+        self.assertTrue(command.kill)
+        self.assertFalse(command.update)
+        self.assertFalse(command.gui)
+        self.assertFalse(command.one_window)
+
+    def test_kill_rejects_launch_flags(self) -> None:
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", stderr):
+            with self.assertRaises(SystemExit) as caught:
+                launch.parse_cli(["kill", "--one-window"])
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("Unknown argument: --one-window", stderr.getvalue())
+
+    def test_kill_all_instances_when_none_running(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch("launch.find_vipercapture_pids", return_value=set()):
+            with mock.patch("launch.port_open", return_value=False):
+                with mock.patch("sys.stdout", stdout):
+                    code = launch.kill_all_instances(port=8999)
+        self.assertEqual(code, 0)
+        self.assertIn("No running instances of ViperCapture found", stdout.getvalue())
+
+    def test_kill_all_instances_terminates_pids(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch("launch.find_vipercapture_pids", return_value={12345}):
+            with mock.patch("launch.port_open", side_effect=[True, False, False, False]):
+                with mock.patch("subprocess.run") as mock_run:
+                    with mock.patch("sys.stdout", stdout):
+                        code = launch.kill_all_instances(port=8999)
+        self.assertEqual(code, 0)
+        self.assertIn("All ViperCapture instances stopped", stdout.getvalue())
 
     def test_gui_flag_and_viewport(self) -> None:
         command = launch.parse_cli(["--GUI"])

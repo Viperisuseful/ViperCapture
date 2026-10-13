@@ -24,6 +24,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import sys
 import subprocess
 import socket
@@ -124,7 +125,7 @@ def _is_wezterm(environ: Mapping[str, str]) -> bool:
 
 
 def _is_sixel_terminal(environ: Mapping[str, str]) -> bool:
-    """Terminals whose normal build displays Sixel, including Windows Terminal."""
+    """Terminals whose normal build displays Sixel."""
     term = environ.get("TERM", "").lower()
     program = environ.get("TERM_PROGRAM", "").lower()
     if term == "foot" or term.startswith("foot-") or program == "foot":
@@ -135,7 +136,7 @@ def _is_sixel_terminal(environ: Mapping[str, str]) -> bool:
         return True
     if "sixel" in term:
         return True
-    return bool(environ.get("WT_SESSION") or environ.get("WT_PROFILE_ID"))
+    return False
 
 
 def _strip_lua_comments(text: str) -> str:
@@ -854,6 +855,291 @@ def stop_server(server: subprocess.Popen[object], *, announce: bool = True) -> N
         print("  Server stopped.")
 
 
+def find_vipercapture_pids(port: int = PORT) -> set[int]:
+    """Find PIDs of all running ViperCapture instances (server, GUI, launcher)."""
+    pids: set[int] = set()
+    my_pid = os.getpid()
+    exclude_pids = {my_pid}
+    try:
+        if hasattr(os, "getppid"):
+            exclude_pids.add(os.getppid())
+    except OSError:
+        pass
+
+    # 1. Port lookup for active listening server
+    listening_pids: set[int] = set()
+    if sys.platform == "win32":
+        try:
+            out = subprocess.check_output(
+                ["netstat", "-ano", "-p", "tcp"],
+                text=True,
+                errors="ignore",
+                timeout=5,
+            )
+            for line in out.splitlines():
+                line = line.strip()
+                if f":{port}" in line and "LISTENING" in line:
+                    parts = line.split()
+                    try:
+                        pid = int(parts[-1])
+                        if pid > 0 and pid not in exclude_pids:
+                            listening_pids.add(pid)
+                    except ValueError:
+                        pass
+        except (OSError, subprocess.SubprocessError):
+            pass
+    elif sys.platform == "darwin":
+        try:
+            out = subprocess.check_output(
+                ["lsof", "-ti", f":{port}"],
+                text=True,
+                errors="ignore",
+                timeout=5,
+            )
+            for line in out.splitlines():
+                try:
+                    pid = int(line.strip())
+                    if pid > 0 and pid not in exclude_pids:
+                        listening_pids.add(pid)
+                except ValueError:
+                    pass
+        except (OSError, subprocess.SubprocessError):
+            pass
+    else:
+        try:
+            out = subprocess.check_output(
+                ["ss", "-lptn", f"sport = :{port}"],
+                text=True,
+                errors="ignore",
+                timeout=5,
+            )
+            for match in re.finditer(r"pid=(\d+)", out):
+                pid = int(match.group(1))
+                if pid > 0 and pid not in exclude_pids:
+                    listening_pids.add(pid)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if not listening_pids:
+            try:
+                out = subprocess.check_output(
+                    ["lsof", "-ti", f":{port}"],
+                    text=True,
+                    errors="ignore",
+                    timeout=5,
+                )
+                for line in out.splitlines():
+                    try:
+                        pid = int(line.strip())
+                        if pid > 0 and pid not in exclude_pids:
+                            listening_pids.add(pid)
+                    except ValueError:
+                        pass
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+    pids.update(listening_pids)
+
+    # 2. Process inspection by command line and process tree
+    if sys.platform == "win32":
+        try:
+            ps_script = (
+                "Get-CimInstance Win32_Process | ForEach-Object { "
+                "$cmd = $_.CommandLine; "
+                "if ($cmd -and ($cmd -match 'vipercapture' -or $cmd -match 'launch\\.py' -or $cmd -match 'gui\\.py')) { "
+                "Write-Output \"$($_.ProcessId)|$($_.ParentProcessId)|$($cmd)\" "
+                "} }"
+            )
+            out = subprocess.check_output(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+                text=True,
+                errors="ignore",
+                timeout=10,
+            )
+            for line in out.splitlines():
+                line = line.strip()
+                if not line or "|" not in line:
+                    continue
+                parts = line.split("|", 2)
+                try:
+                    proc_id = int(parts[0])
+                    cmd = parts[2] if len(parts) > 2 else ""
+                    if proc_id not in exclude_pids and not ("kill" in cmd.lower() and proc_id == my_pid):
+                        pids.add(proc_id)
+                except ValueError:
+                    pass
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            TH32CS_SNAPPROCESS = 0x00000002
+
+            class PROCESSENTRY32(ctypes.Structure):
+                _fields_ = [
+                    ("dwSize", wintypes.DWORD),
+                    ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", wintypes.LONG),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", ctypes.c_char * 260),
+                ]
+
+            kernel32 = ctypes.windll.kernel32
+            hSnapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            if hSnapshot and hSnapshot != -1:
+                pe = PROCESSENTRY32()
+                pe.dwSize = ctypes.sizeof(PROCESSENTRY32)
+                parents: dict[int, int] = {}
+                children: dict[int, set[int]] = {}
+                exes: dict[int, str] = {}
+                success = kernel32.Process32First(hSnapshot, ctypes.byref(pe))
+                while success:
+                    pid_val = pe.th32ProcessID
+                    ppid_val = pe.th32ParentProcessID
+                    parents[pid_val] = ppid_val
+                    children.setdefault(ppid_val, set()).add(pid_val)
+                    exes[pid_val] = pe.szExeFile.decode("latin-1", errors="ignore").lower()
+                    success = kernel32.Process32Next(hSnapshot, ctypes.byref(pe))
+                kernel32.CloseHandle(hSnapshot)
+
+                for lp in list(pids):
+                    ppid = parents.get(lp)
+                    if ppid and ppid not in exclude_pids and ppid > 4:
+                        if "python" in exes.get(ppid, ""):
+                            pids.add(ppid)
+                    for cp in children.get(lp, set()):
+                        if cp not in exclude_pids and cp > 4:
+                            pids.add(cp)
+        except Exception:
+            pass
+
+    elif sys.platform == "darwin":
+        try:
+            out = subprocess.check_output(
+                ["ps", "-axo", "pid,ppid,command"],
+                text=True,
+                errors="ignore",
+                timeout=5,
+            )
+            for line in out.splitlines():
+                parts = line.strip().split(None, 2)
+                if len(parts) >= 3:
+                    try:
+                        proc_id = int(parts[0])
+                        cmd = parts[2]
+                        if ("vipercapture" in cmd or "launch.py" in cmd or "gui.py" in cmd) and "kill" not in cmd:
+                            if proc_id not in exclude_pids:
+                                pids.add(proc_id)
+                    except ValueError:
+                        pass
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    else:
+        proc_dir = Path("/proc")
+        if proc_dir.is_dir():
+            try:
+                for entry in proc_dir.iterdir():
+                    if entry.name.isdigit():
+                        proc_id = int(entry.name)
+                        if proc_id in exclude_pids:
+                            continue
+                        try:
+                            cmdline_bytes = (entry / "cmdline").read_bytes()
+                            cmdline = cmdline_bytes.decode("utf-8", errors="replace").replace("\x00", " ")
+                            if ("vipercapture" in cmdline or "launch.py" in cmdline or "gui.py" in cmdline) and "kill" not in cmdline:
+                                pids.add(proc_id)
+                        except (OSError, UnicodeError):
+                            continue
+            except OSError:
+                pass
+
+    pids.difference_update(exclude_pids)
+    return pids
+
+
+def kill_all_instances(port: int = PORT) -> int:
+    """Terminate all running ViperCapture instances."""
+    print()
+    print("  ViperCapture")
+    print("  ------------")
+    print()
+
+    pids = find_vipercapture_pids(port=port)
+    if not pids and not port_open():
+        print("  No running instances of ViperCapture found.")
+        return 0
+
+    print("  Stopping running ViperCapture instance(s)...")
+    killed: list[int] = []
+
+    permission_errors: list[int] = []
+    for pid in sorted(pids):
+        if sys.platform == "win32":
+            try:
+                proc = subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if proc.returncode == 0:
+                    killed.append(pid)
+                elif "access is denied" in proc.stderr.lower():
+                    permission_errors.append(pid)
+            except OSError:
+                pass
+        else:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                killed.append(pid)
+            except PermissionError:
+                permission_errors.append(pid)
+            except OSError:
+                pass
+
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and port_open():
+        time.sleep(0.2)
+
+    if sys.platform != "win32":
+        for pid in pids:
+            try:
+                os.kill(pid, 0)
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        try:
+            subprocess.run(
+                ["pkill", "-9", "-f", "vipercapture.main:app"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except OSError:
+            pass
+
+    if killed:
+        pids_str = ", ".join(str(p) for p in killed)
+        print(f"  Killed {len(killed)} ViperCapture process(es): {pids_str}.")
+    if permission_errors:
+        err_str = ", ".join(str(p) for p in permission_errors)
+        print(f"  Access was denied for PID(s): {err_str}.")
+        print("  If ViperCapture was started as Administrator or another user, run 'vipercapture kill' from an elevated terminal.")
+    if not port_open():
+        print("  All ViperCapture instances stopped.")
+        return 0
+    else:
+        print(f"  Warning: Port {port} is still in use.")
+        return 1
+
+
 def _wait_posix_keys(
     server: subprocess.Popen[object],
     on_resize: Callable[[], None] | None = None,
@@ -1437,6 +1723,7 @@ def ensure_playwright() -> None:
 LAUNCH_HELP = """\
 usage: vipercapture [--one-window]
        vipercapture update [--check]
+       vipercapture kill
        vipercapture --gui [--viewport WIDTH HEIGHT]
 
 Start ViperCapture in this terminal. Ghostty and Kitty open request
@@ -1449,6 +1736,8 @@ logs in another window and show a full-screen status view.
                  Python only, on Linux, macOS, and Windows.
   update --check Print whether an update is available, then exit.
                  Exit 10 means an update is available.
+  kill           Stop all running instances of ViperCapture (server, GUI,
+                 and background workers) on Windows, macOS, and Linux.
   --gui          Open a full-screen capture menu in this terminal.
                  Type a website link, press Tab to switch png, gif, and
                  mp4, and press Ctrl+P to switch between the full page and
@@ -1467,6 +1756,7 @@ class CliArgs:
     update: bool = False
     check: bool = False
     gui: bool = False
+    kill: bool = False
     viewport: tuple[int, int] | None = None
 
 
@@ -1499,6 +1789,14 @@ def parse_cli(argv: list[str] | None = None) -> CliArgs:
             print(f"Unknown argument: {arg}\n{LAUNCH_HELP}", end="", file=sys.stderr)
             raise SystemExit(2)
         return CliArgs(update=True, check=check)
+    if args and args[0] == "kill":
+        for arg in args[1:]:
+            if arg in {"-h", "--help"}:
+                print(LAUNCH_HELP, end="")
+                raise SystemExit(0)
+            print(f"Unknown argument: {arg}\n{LAUNCH_HELP}", end="", file=sys.stderr)
+            raise SystemExit(2)
+        return CliArgs(kill=True)
     gui = False
     one_window = False
     viewport: tuple[int, int] | None = None
@@ -1547,6 +1845,8 @@ def main() -> None:
     # dependencies or start the server. ensure_venv re-runs this file with
     # the same arguments when the command is a normal launch.
     cli = parse_cli()
+    if cli.kill:
+        raise SystemExit(kill_all_instances())
     if cli.update:
         import updater
         raise SystemExit(updater.run_update(ROOT, check_only=cli.check))
