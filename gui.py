@@ -447,10 +447,8 @@ def _logo_placement(
 def _wordmark(cols: int, *, image: bool) -> tuple[str, ...]:
     if image:
         return ()
-    if cols < 52:
-        return ("ViperCapture",)
     if cols < 64:
-        return ASCII_LOGO
+        return ("ViperCapture",)
     return tuple(styled_ascii_logo())
 
 
@@ -857,14 +855,16 @@ def server_command() -> list[str]:
 def _window_size() -> launch.WindowSize:
     if os.name != "nt":
         try:
-            return launch.read_window_size(sys.stdout.fileno())
-        except (OSError, ModuleNotFoundError):
+            fd = sys.stdout.fileno()
+            return launch.read_window_size(fd)
+        except (OSError, ValueError, AttributeError, ModuleNotFoundError):
             pass
-    for fd in (sys.stdout.fileno(), sys.stdin.fileno()):
+    for stream in (sys.stdout, sys.stdin):
         try:
+            fd = stream.fileno()
             size = os.get_terminal_size(fd)
             return launch.WindowSize(size.columns, size.lines)
-        except (OSError, ValueError):
+        except (OSError, ValueError, AttributeError):
             pass
     size = shutil.get_terminal_size((80, 24))
     return launch.WindowSize(size.columns, size.lines)

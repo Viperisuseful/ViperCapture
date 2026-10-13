@@ -384,7 +384,9 @@ class GuiFrameTests(TestCase):
 
     def test_wordmark_switches_between_plain_and_styled_by_width(self) -> None:
         self.assertEqual(gui._wordmark(40, image=False), ("ViperCapture",))
-        self.assertEqual(gui._wordmark(60, image=False), gui.ASCII_LOGO)
+        self.assertEqual(gui._wordmark(60, image=False), ("ViperCapture",))
+        self.assertEqual(gui._wordmark(63, image=False), ("ViperCapture",))
+        self.assertEqual(gui._wordmark(64, image=False), tuple(gui.styled_ascii_logo()))
         self.assertEqual(gui._wordmark(80, image=False), tuple(gui.styled_ascii_logo()))
         self.assertEqual(gui._wordmark(80, image=True), ())
 
@@ -489,6 +491,23 @@ class GuiRuntimeTests(TestCase):
         ):
             size = gui._window_size()
         self.assertEqual((size.cols, size.rows), (90, 30))
+
+    def test_window_size_handles_stream_without_fileno_gracefully(self) -> None:
+        broken_stream = mock.Mock()
+        broken_stream.fileno.side_effect = ValueError("I/O operation on closed file")
+        with (
+            mock.patch.object(gui.os, "name", "posix"),
+            mock.patch.object(gui.launch, "read_window_size", side_effect=OSError("not tty")),
+            mock.patch.object(gui.sys, "stdout", broken_stream),
+            mock.patch.object(gui.sys, "stdin", broken_stream),
+            mock.patch.object(
+                gui.shutil,
+                "get_terminal_size",
+                return_value=os_terminal_size(88, 22),
+            ),
+        ):
+            size = gui._window_size()
+        self.assertEqual((size.cols, size.rows), (88, 22))
 
     def test_dependency_hashes_are_checked_before_the_screen(self) -> None:
         order: list[str] = []

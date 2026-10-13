@@ -124,6 +124,41 @@ def _is_wezterm(environ: Mapping[str, str]) -> bool:
     return program == "wezterm" or bool(environ.get("WEZTERM_PANE") or environ.get("WEZTERM_EXECUTABLE"))
 
 
+def _parse_version_tuple(val: str | None) -> tuple[int, ...] | None:
+    if not val:
+        return None
+    matches = re.findall(r"\d+", str(val))
+    if matches:
+        return tuple(int(x) for x in matches[:3])
+    return None
+
+
+def _windows_terminal_supports_sixel(environ: Mapping[str, str]) -> bool:
+    if not (environ.get("WT_SESSION") or environ.get("WT_PROFILE_ID")):
+        return False
+    for key in ("WT_VERSION", "WT_BUILD_VERSION", "WINDOWS_TERMINAL_VERSION"):
+        ver_str = environ.get(key)
+        if ver_str:
+            ver = _parse_version_tuple(ver_str)
+            if ver:
+                return ver >= (1, 22)
+    if os.name == "nt" and (environ is os.environ or not isinstance(environ, dict)):
+        try:
+            import winreg
+
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\App Paths\wt.exe",
+            ) as key:
+                val, _ = winreg.QueryValueEx(key, "")
+                ver = _parse_version_tuple(val)
+                if ver:
+                    return ver >= (1, 22)
+        except OSError:
+            pass
+    return False
+
+
 def _is_sixel_terminal(environ: Mapping[str, str]) -> bool:
     """Terminals whose normal build displays Sixel."""
     term = environ.get("TERM", "").lower()
@@ -135,6 +170,8 @@ def _is_sixel_terminal(environ: Mapping[str, str]) -> bool:
     if term == "contour" or term.startswith("contour-"):
         return True
     if "sixel" in term:
+        return True
+    if _windows_terminal_supports_sixel(environ):
         return True
     return False
 
@@ -855,18 +892,188 @@ def stop_server(server: subprocess.Popen[object], *, announce: bool = True) -> N
         print("  Server stopped.")
 
 
-def find_vipercapture_pids(port: int = PORT) -> set[int]:
-    """Find PIDs of all running ViperCapture instances (server, GUI, launcher)."""
-    pids: set[int] = set()
-    my_pid = os.getpid()
-    exclude_pids = {my_pid}
-    try:
-        if hasattr(os, "getppid"):
-            exclude_pids.add(os.getppid())
-    except OSError:
-        pass
+def _get_process_ancestors() -> set[int]:
+    """Return the set of PIDs covering current process and all its ancestors."""
+    ancestors = {os.getpid()}
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
 
-    # 1. Port lookup for active listening server
+            TH32CS_SNAPPROCESS = 0x00000002
+
+            class PROCESSENTRY32(ctypes.Structure):
+                _fields_ = [
+                    ("dwSize", wintypes.DWORD),
+                    ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", wintypes.LONG),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", ctypes.c_char * 260),
+                ]
+
+            kernel32 = ctypes.windll.kernel32
+            hSnapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            if hSnapshot and hSnapshot != -1:
+                pe = PROCESSENTRY32()
+                pe.dwSize = ctypes.sizeof(PROCESSENTRY32)
+                parents: dict[int, int] = {}
+                success = kernel32.Process32First(hSnapshot, ctypes.byref(pe))
+                while success:
+                    parents[pe.th32ProcessID] = pe.th32ParentProcessID
+                    success = kernel32.Process32Next(hSnapshot, ctypes.byref(pe))
+                kernel32.CloseHandle(hSnapshot)
+
+                cur = os.getpid()
+                while cur in parents and parents[cur] > 4 and parents[cur] not in ancestors:
+                    cur = parents[cur]
+                    ancestors.add(cur)
+        except Exception:
+            pass
+    else:
+        try:
+            cur = os.getpid()
+            while cur > 1:
+                # Read /proc/<cur>/stat on Linux
+                stat_file = Path(f"/proc/{cur}/stat")
+                if stat_file.is_file():
+                    stat_text = stat_file.read_text(encoding="utf-8", errors="ignore")
+                    rparen = stat_text.rfind(")")
+                    if rparen != -1:
+                        parts = stat_text[rparen + 1 :].split()
+                        ppid = int(parts[1])
+                        if ppid in ancestors or ppid <= 1:
+                            break
+                        ancestors.add(ppid)
+                        cur = ppid
+                        continue
+                if hasattr(os, "getppid"):
+                    ppid = os.getppid()
+                    if ppid in ancestors or ppid <= 1:
+                        break
+                    ancestors.add(ppid)
+                    cur = ppid
+                break
+        except Exception:
+            pass
+    return ancestors
+
+
+def _get_process_start_time(pid: int) -> int | str | None:
+    """Return an opaque identifier for the process start time to guard against PID reuse."""
+    if pid <= 0:
+        return None
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.windll.kernel32
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if h:
+                try:
+                    creation = wintypes.FILETIME()
+                    exit_time = wintypes.FILETIME()
+                    kernel_t = wintypes.FILETIME()
+                    user_t = wintypes.FILETIME()
+                    if kernel32.GetProcessTimes(
+                        h,
+                        ctypes.byref(creation),
+                        ctypes.byref(exit_time),
+                        ctypes.byref(kernel_t),
+                        ctypes.byref(user_t),
+                    ):
+                        return (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+                finally:
+                    kernel32.CloseHandle(h)
+        except Exception:
+            pass
+    elif sys.platform == "linux":
+        try:
+            stat_file = Path(f"/proc/{pid}/stat")
+            if stat_file.is_file():
+                text = stat_file.read_text(encoding="utf-8", errors="ignore")
+                rparen = text.rfind(")")
+                if rparen != -1:
+                    parts = text[rparen + 1 :].split()
+                    if len(parts) >= 20:
+                        return parts[19]  # starttime
+        except OSError:
+            pass
+    return None
+
+
+def _matches_vipercapture_command(
+    cmdline: str,
+    root_dir: Path = ROOT,
+    venv_dir: Path | None = None,
+) -> bool:
+    """True when cmdline indicates a ViperCapture server, GUI, or launcher from this install."""
+    if not cmdline:
+        return False
+    c_norm = cmdline.replace("\\", "/")
+    c_lower = c_norm.lower()
+
+    tokens = c_lower.split()
+    if any(token == "kill" for token in tokens[1:]):
+        return False
+
+    r_str = str(root_dir).replace("\\", "/").lower()
+    v_dir = (root_dir / ".venv") if venv_dir is None else venv_dir
+    v_str = str(v_dir).replace("\\", "/").lower()
+
+    in_install = r_str in c_lower or v_str in c_lower
+
+    if "uvicorn" in c_lower and "vipercapture.main:app" in c_lower:
+        return in_install or "vipercapture" in c_lower
+
+    launch_target = f"{r_str}/launch.py"
+    gui_target = f"{r_str}/gui.py"
+
+    if launch_target in c_lower or (in_install and ("launch.py" in tokens or any(t.endswith("/launch.py") for t in tokens))):
+        return True
+    if gui_target in c_lower or (in_install and ("gui.py" in tokens or any(t.endswith("/gui.py") for t in tokens))):
+        return True
+
+    return False
+
+
+def _is_vipercapture_endpoint(host: str = HOST, port: int = PORT, timeout: float = 1.0) -> bool:
+    """Verify that the HTTP endpoint on host:port is genuinely ViperCapture."""
+    for path in ("/ready", "/health"):
+        try:
+            url = f"http://{host}:{port}{path}"
+            req = urllib.request.Request(url, headers={"User-Agent": "ViperCapture-Probe"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status in (200, 503):
+                    try:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        if path == "/ready" and ("role" in data or "ready" in data):
+                            return True
+                        if path == "/health" and data.get("ready") is True:
+                            return True
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    return False
+
+
+def find_vipercapture_pids(
+    port: int = PORT,
+    root_dir: Path = ROOT,
+    host: str = HOST,
+) -> set[int]:
+    """Find PIDs of all running ViperCapture instances (server, GUI, launcher) belonging to this install."""
+    pids: set[int] = set()
+    exclude_pids = _get_process_ancestors()
+
+    # 1. Port lookup for active listening TCP server
     listening_pids: set[int] = set()
     if sys.platform == "win32":
         try:
@@ -891,7 +1098,7 @@ def find_vipercapture_pids(port: int = PORT) -> set[int]:
     elif sys.platform == "darwin":
         try:
             out = subprocess.check_output(
-                ["lsof", "-ti", f":{port}"],
+                ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
                 text=True,
                 errors="ignore",
                 timeout=5,
@@ -922,7 +1129,7 @@ def find_vipercapture_pids(port: int = PORT) -> set[int]:
         if not listening_pids:
             try:
                 out = subprocess.check_output(
-                    ["lsof", "-ti", f":{port}"],
+                    ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
                     text=True,
                     errors="ignore",
                     timeout=5,
@@ -937,16 +1144,25 @@ def find_vipercapture_pids(port: int = PORT) -> set[int]:
             except (OSError, subprocess.SubprocessError):
                 pass
 
-    pids.update(listening_pids)
+    # Verify that the port owner is actually ViperCapture before accepting
+    if listening_pids:
+        if _is_vipercapture_endpoint(host=host, port=port):
+            pids.update(listening_pids)
+        else:
+            # Check commandline of listening PID directly
+            for pid in listening_pids:
+                cmd = _get_pid_commandline(pid)
+                if cmd and _matches_vipercapture_command(cmd, root_dir=root_dir):
+                    pids.add(pid)
 
-    # 2. Process inspection by command line and process tree
+    # 2. Process inspection by command line for this specific installation
     if sys.platform == "win32":
         try:
             ps_script = (
                 "Get-CimInstance Win32_Process | ForEach-Object { "
                 "$cmd = $_.CommandLine; "
                 "if ($cmd -and ($cmd -match 'vipercapture' -or $cmd -match 'launch\\.py' -or $cmd -match 'gui\\.py')) { "
-                "Write-Output \"$($_.ProcessId)|$($_.ParentProcessId)|$($cmd)\" "
+                'Write-Output "$($_.ProcessId)|$($cmd)" '
                 "} }"
             )
             out = subprocess.check_output(
@@ -959,83 +1175,33 @@ def find_vipercapture_pids(port: int = PORT) -> set[int]:
                 line = line.strip()
                 if not line or "|" not in line:
                     continue
-                parts = line.split("|", 2)
+                parts = line.split("|", 1)
                 try:
                     proc_id = int(parts[0])
-                    cmd = parts[2] if len(parts) > 2 else ""
-                    if proc_id not in exclude_pids and not ("kill" in cmd.lower() and proc_id == my_pid):
+                    cmd = parts[1] if len(parts) > 1 else ""
+                    if proc_id not in exclude_pids and _matches_vipercapture_command(cmd, root_dir=root_dir):
                         pids.add(proc_id)
                 except ValueError:
                     pass
         except (OSError, subprocess.SubprocessError):
             pass
 
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            TH32CS_SNAPPROCESS = 0x00000002
-
-            class PROCESSENTRY32(ctypes.Structure):
-                _fields_ = [
-                    ("dwSize", wintypes.DWORD),
-                    ("cntUsage", wintypes.DWORD),
-                    ("th32ProcessID", wintypes.DWORD),
-                    ("th32DefaultHeapID", ctypes.c_size_t),
-                    ("th32ModuleID", wintypes.DWORD),
-                    ("cntThreads", wintypes.DWORD),
-                    ("th32ParentProcessID", wintypes.DWORD),
-                    ("pcPriClassBase", wintypes.LONG),
-                    ("dwFlags", wintypes.DWORD),
-                    ("szExeFile", ctypes.c_char * 260),
-                ]
-
-            kernel32 = ctypes.windll.kernel32
-            hSnapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-            if hSnapshot and hSnapshot != -1:
-                pe = PROCESSENTRY32()
-                pe.dwSize = ctypes.sizeof(PROCESSENTRY32)
-                parents: dict[int, int] = {}
-                children: dict[int, set[int]] = {}
-                exes: dict[int, str] = {}
-                success = kernel32.Process32First(hSnapshot, ctypes.byref(pe))
-                while success:
-                    pid_val = pe.th32ProcessID
-                    ppid_val = pe.th32ParentProcessID
-                    parents[pid_val] = ppid_val
-                    children.setdefault(ppid_val, set()).add(pid_val)
-                    exes[pid_val] = pe.szExeFile.decode("latin-1", errors="ignore").lower()
-                    success = kernel32.Process32Next(hSnapshot, ctypes.byref(pe))
-                kernel32.CloseHandle(hSnapshot)
-
-                for lp in list(pids):
-                    ppid = parents.get(lp)
-                    if ppid and ppid not in exclude_pids and ppid > 4:
-                        if "python" in exes.get(ppid, ""):
-                            pids.add(ppid)
-                    for cp in children.get(lp, set()):
-                        if cp not in exclude_pids and cp > 4:
-                            pids.add(cp)
-        except Exception:
-            pass
-
     elif sys.platform == "darwin":
         try:
             out = subprocess.check_output(
-                ["ps", "-axo", "pid,ppid,command"],
+                ["ps", "-axo", "pid,command"],
                 text=True,
                 errors="ignore",
                 timeout=5,
             )
             for line in out.splitlines():
-                parts = line.strip().split(None, 2)
-                if len(parts) >= 3:
+                parts = line.strip().split(None, 1)
+                if len(parts) >= 2:
                     try:
                         proc_id = int(parts[0])
-                        cmd = parts[2]
-                        if ("vipercapture" in cmd or "launch.py" in cmd or "gui.py" in cmd) and "kill" not in cmd:
-                            if proc_id not in exclude_pids:
-                                pids.add(proc_id)
+                        cmd = parts[1]
+                        if proc_id not in exclude_pids and _matches_vipercapture_command(cmd, root_dir=root_dir):
+                            pids.add(proc_id)
                     except ValueError:
                         pass
         except (OSError, subprocess.SubprocessError):
@@ -1053,7 +1219,7 @@ def find_vipercapture_pids(port: int = PORT) -> set[int]:
                         try:
                             cmdline_bytes = (entry / "cmdline").read_bytes()
                             cmdline = cmdline_bytes.decode("utf-8", errors="replace").replace("\x00", " ")
-                            if ("vipercapture" in cmdline or "launch.py" in cmdline or "gui.py" in cmdline) and "kill" not in cmdline:
+                            if _matches_vipercapture_command(cmdline, root_dir=root_dir):
                                 pids.add(proc_id)
                         except (OSError, UnicodeError):
                             continue
@@ -1064,8 +1230,144 @@ def find_vipercapture_pids(port: int = PORT) -> set[int]:
     return pids
 
 
+def _get_pid_commandline(pid: int) -> str | None:
+    """Best-effort command line lookup for a single PID."""
+    if pid <= 0:
+        return None
+    if sys.platform == "win32":
+        try:
+            ps_script = f"(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').CommandLine"
+            out = subprocess.check_output(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+                text=True,
+                errors="ignore",
+                timeout=5,
+            )
+            return out.strip() or None
+        except (OSError, subprocess.SubprocessError):
+            return None
+    elif sys.platform == "darwin":
+        try:
+            out = subprocess.check_output(
+                ["ps", "-p", str(pid), "-o", "command="],
+                text=True,
+                errors="ignore",
+                timeout=5,
+            )
+            return out.strip() or None
+        except (OSError, subprocess.SubprocessError):
+            return None
+    else:
+        try:
+            cmd_file = Path(f"/proc/{pid}/cmdline")
+            if cmd_file.is_file():
+                return cmd_file.read_bytes().decode("utf-8", errors="replace").replace("\x00", " ").strip() or None
+        except OSError:
+            pass
+    return None
+
+
+def _is_process_alive(pid: int) -> bool:
+    """True if process exists and is alive."""
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.windll.kernel32
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                err = kernel32.GetLastError()
+                return err == 5  # ERROR_ACCESS_DENIED means process exists
+            exit_code = wintypes.DWORD()
+            if kernel32.GetExitCodeProcess(h, ctypes.byref(exit_code)):
+                kernel32.CloseHandle(h)
+                return exit_code.value == 259  # STILL_ACTIVE
+            kernel32.CloseHandle(h)
+            return False
+        except Exception:
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+
+
+def _terminate_pid(pid: int, expected_start_time: int | str | None = None) -> tuple[bool, str | None]:
+    """Gracefully request orderly shutdown, wait, and escalate only if still alive and un-reused."""
+    if not _is_process_alive(pid):
+        return True, None
+
+    # Verify PID has not been reused by comparing start time if available
+    if expected_start_time is not None:
+        current_start = _get_process_start_time(pid)
+        if current_start is not None and current_start != expected_start_time:
+            return True, None
+
+    # 1. Orderly / graceful shutdown
+    if sys.platform == "win32":
+        subprocess.run(["taskkill", "/PID", str(pid)], capture_output=True, check=False)
+    else:
+        try:
+            sigterm = getattr(signal, "SIGTERM", 15)
+            os.kill(pid, sigterm)
+        except PermissionError:
+            return False, "access_denied"
+        except OSError:
+            pass
+
+    # Wait up to 2 seconds for process to exit
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if not _is_process_alive(pid):
+            return True, None
+        time.sleep(0.1)
+
+    # Re-verify start time before force escalation
+    if expected_start_time is not None:
+        current_start = _get_process_start_time(pid)
+        if current_start is not None and current_start != expected_start_time:
+            return True, None
+
+    # 2. Force termination for survivors
+    if sys.platform == "win32":
+        proc = subprocess.run(
+            ["taskkill", "/F", "/PID", str(pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        time.sleep(0.1)
+        if not _is_process_alive(pid):
+            return True, None
+        combined = f"{proc.stdout} {proc.stderr}".lower()
+        if "access is denied" in combined or proc.returncode == 5:
+            return False, "access_denied"
+        err = proc.stderr.strip() or proc.stdout.strip()
+        return False, err or f"taskkill failed with code {proc.returncode}"
+    else:
+        try:
+            sigkill = getattr(signal, "SIGKILL", 9)
+            os.kill(pid, sigkill)
+        except PermissionError:
+            return False, "access_denied"
+        except OSError:
+            pass
+        time.sleep(0.1)
+        if not _is_process_alive(pid):
+            return True, None
+        return False, "survived_sigkill"
+
+
 def kill_all_instances(port: int = PORT) -> int:
-    """Terminate all running ViperCapture instances."""
+    """Terminate all running ViperCapture instances with orderly shutdown and verified escalation."""
     print()
     print("  ViperCapture")
     print("  ------------")
@@ -1077,67 +1379,50 @@ def kill_all_instances(port: int = PORT) -> int:
         return 0
 
     print("  Stopping running ViperCapture instance(s)...")
+
+    # Record start times to guard against PID reuse
+    start_times: dict[int, int | str | None] = {pid: _get_process_start_time(pid) for pid in pids}
+
     killed: list[int] = []
-
     permission_errors: list[int] = []
-    for pid in sorted(pids):
-        if sys.platform == "win32":
-            try:
-                proc = subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(pid)],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                if proc.returncode == 0:
-                    killed.append(pid)
-                elif "access is denied" in proc.stderr.lower():
-                    permission_errors.append(pid)
-            except OSError:
-                pass
-        else:
-            try:
-                os.kill(pid, signal.SIGTERM)
-                killed.append(pid)
-            except PermissionError:
-                permission_errors.append(pid)
-            except OSError:
-                pass
+    failed_pids: dict[int, str] = {}
 
+    for pid in sorted(pids):
+        success, reason = _terminate_pid(pid, expected_start_time=start_times.get(pid))
+        if success:
+            killed.append(pid)
+        elif reason == "access_denied":
+            permission_errors.append(pid)
+        else:
+            failed_pids[pid] = reason or "unknown error"
+
+    # Wait briefly for port to close if listening server was targeted
     deadline = time.monotonic() + 3.0
     while time.monotonic() < deadline and port_open():
         time.sleep(0.2)
 
-    if sys.platform != "win32":
-        for pid in pids:
-            try:
-                os.kill(pid, 0)
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
-        try:
-            subprocess.run(
-                ["pkill", "-9", "-f", "vipercapture.main:app"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-        except OSError:
-            pass
-
     if killed:
         pids_str = ", ".join(str(p) for p in killed)
-        print(f"  Killed {len(killed)} ViperCapture process(es): {pids_str}.")
+        print(f"  Stopped {len(killed)} ViperCapture process(es): {pids_str}.")
     if permission_errors:
         err_str = ", ".join(str(p) for p in permission_errors)
         print(f"  Access was denied for PID(s): {err_str}.")
         print("  If ViperCapture was started as Administrator or another user, run 'vipercapture kill' from an elevated terminal.")
-    if not port_open():
-        print("  All ViperCapture instances stopped.")
-        return 0
-    else:
+    if failed_pids:
+        for pid, msg in sorted(failed_pids.items()):
+            print(f"  Failed to stop PID {pid}: {msg}")
+
+    # Port still open or processes failed -> return failure
+    has_failure = bool(permission_errors or failed_pids)
+    if port_open():
         print(f"  Warning: Port {port} is still in use.")
         return 1
+
+    if has_failure:
+        return 1
+
+    print("  All ViperCapture instances stopped.")
+    return 0
 
 
 def _wait_posix_keys(

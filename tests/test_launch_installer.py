@@ -4,6 +4,7 @@ import base64
 import io
 import json
 import os
+import signal
 import subprocess
 import sys
 import tarfile
@@ -141,6 +142,14 @@ class TerminalLogoTests(unittest.TestCase):
                 is_tty=True,
                 environ={"WT_SESSION": "abc", "TERM": "xterm-256color"},
             ),
+        )
+        self.assertEqual(
+            launch.choose_graphics_protocol(
+                platform_name="win32",
+                is_tty=True,
+                environ={"WT_SESSION": "abc", "WT_VERSION": "1.22.0"},
+            ),
+            "sixel",
         )
 
     def test_wezterm_kitty_graphics_follows_the_config_flag(self) -> None:
@@ -415,13 +424,51 @@ class LaunchArgsTests(unittest.TestCase):
 
     def test_kill_all_instances_terminates_pids(self) -> None:
         stdout = io.StringIO()
-        with mock.patch("launch.find_vipercapture_pids", return_value={12345}):
-            with mock.patch("launch.port_open", side_effect=[True, False, False, False]):
-                with mock.patch("subprocess.run") as mock_run:
-                    with mock.patch("sys.stdout", stdout):
-                        code = launch.kill_all_instances(port=8999)
+        with (
+            mock.patch("launch.find_vipercapture_pids", return_value={12345}),
+            mock.patch("launch._get_process_start_time", return_value=123456),
+            mock.patch("launch._terminate_pid", return_value=(True, None)) as mock_term,
+            mock.patch("launch.port_open", side_effect=[True, False, False, False]),
+            mock.patch("sys.stdout", stdout),
+        ):
+            code = launch.kill_all_instances(port=8999)
         self.assertEqual(code, 0)
+        mock_term.assert_called_once_with(12345, expected_start_time=123456)
+        self.assertIn("Stopped 1 ViperCapture process(es): 12345", stdout.getvalue())
         self.assertIn("All ViperCapture instances stopped", stdout.getvalue())
+
+    def test_kill_all_instances_reports_failure_on_permission_or_error(self) -> None:
+        stdout = io.StringIO()
+        with (
+            mock.patch("launch.find_vipercapture_pids", return_value={12345, 12346}),
+            mock.patch("launch._get_process_start_time", return_value=1),
+            mock.patch(
+                "launch._terminate_pid",
+                side_effect=[(False, "access_denied"), (False, "taskkill failed")],
+            ),
+            mock.patch("launch.port_open", return_value=False),
+            mock.patch("sys.stdout", stdout),
+        ):
+            code = launch.kill_all_instances(port=8999)
+        self.assertEqual(code, 1)
+        output = stdout.getvalue()
+        self.assertIn("Access was denied", output)
+        self.assertIn("Failed to stop PID 12346", output)
+        self.assertNotIn("All ViperCapture instances stopped", output)
+
+    def test_kill_all_instances_fails_if_port_remains_open(self) -> None:
+        stdout = io.StringIO()
+        with (
+            mock.patch("launch.find_vipercapture_pids", return_value={12345}),
+            mock.patch("launch._get_process_start_time", return_value=1),
+            mock.patch("launch._terminate_pid", return_value=(True, None)),
+            mock.patch("launch.port_open", return_value=True),
+            mock.patch("launch.time.sleep"),
+            mock.patch("sys.stdout", stdout),
+        ):
+            code = launch.kill_all_instances(port=8999)
+        self.assertEqual(code, 1)
+        self.assertIn("Warning: Port 8999 is still in use", stdout.getvalue())
 
     def test_gui_flag_and_viewport(self) -> None:
         command = launch.parse_cli(["--GUI"])
@@ -1457,3 +1504,170 @@ class UpdateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ViperCaptureProcessSafetyTests(unittest.TestCase):
+    def test_matches_vipercapture_command(self) -> None:
+        root = launch.ROOT
+        self.assertTrue(launch._matches_vipercapture_command(f"python {root}/launch.py"))
+        self.assertTrue(launch._matches_vipercapture_command(f"{root}/.venv/bin/python {root}/gui.py"))
+        self.assertTrue(launch._matches_vipercapture_command("python -m uvicorn vipercapture.main:app --port 8000"))
+
+        # Rejects unrelated paths and collisions
+        self.assertFalse(launch._matches_vipercapture_command("python /other/project/launch.py"))
+        self.assertFalse(launch._matches_vipercapture_command("python /other/project/gui.py"))
+        self.assertFalse(launch._matches_vipercapture_command("pytest tests/test_launch_installer.py"))
+        self.assertFalse(launch._matches_vipercapture_command("grep -rn launch.py ."))
+        self.assertFalse(launch._matches_vipercapture_command("vipercapture kill"))
+        self.assertFalse(launch._matches_vipercapture_command(f"python {root}/launch.py kill"))
+        self.assertFalse(launch._matches_vipercapture_command(""))
+
+    def test_find_vipercapture_pids_ignores_unrelated_port_owner(self) -> None:
+        with (
+            mock.patch("launch.sys.platform", "linux"),
+            mock.patch("launch._get_process_ancestors", return_value=set()),
+            mock.patch("subprocess.check_output", return_value="pid=9999"),
+            mock.patch("launch._is_vipercapture_endpoint", return_value=False),
+            mock.patch("launch._get_pid_commandline", return_value="node server.js"),
+        ):
+            pids = launch.find_vipercapture_pids(port=8000)
+        self.assertEqual(pids, set())
+
+    def test_find_vipercapture_pids_includes_verified_endpoint(self) -> None:
+        with (
+            mock.patch("launch.sys.platform", "linux"),
+            mock.patch("launch._get_process_ancestors", return_value=set()),
+            mock.patch("subprocess.check_output", side_effect=["pid=8888", ""]),
+            mock.patch("launch._is_vipercapture_endpoint", return_value=True),
+            mock.patch("pathlib.Path.is_dir", return_value=False),
+        ):
+            pids = launch.find_vipercapture_pids(port=8000)
+        self.assertEqual(pids, {8888})
+
+    def test_find_vipercapture_pids_excludes_ancestors(self) -> None:
+        with (
+            mock.patch("launch.sys.platform", "linux"),
+            mock.patch("launch._get_process_ancestors", return_value={8888}),
+            mock.patch("subprocess.check_output", return_value="pid=8888"),
+            mock.patch("launch._is_vipercapture_endpoint", return_value=True),
+        ):
+            pids = launch.find_vipercapture_pids(port=8000)
+        self.assertEqual(pids, set())
+
+    def test_terminate_pid_windows_graceful_shutdown(self) -> None:
+        runs: list[list[str]] = []
+        def fake_run(cmd, **_kwargs):
+            runs.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with (
+            mock.patch("launch.sys.platform", "win32"),
+            mock.patch("launch._is_process_alive", side_effect=[True, False]),
+            mock.patch("launch.subprocess.run", side_effect=fake_run),
+            mock.patch("launch.time.sleep"),
+        ):
+            ok, err = launch._terminate_pid(12345)
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+        self.assertEqual(runs, [["taskkill", "/PID", "12345"]])
+
+    def test_terminate_pid_windows_escalation_to_force(self) -> None:
+        runs: list[list[str]] = []
+        def fake_run(cmd, **_kwargs):
+            runs.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with (
+            mock.patch("launch.sys.platform", "win32"),
+            mock.patch("launch._is_process_alive", side_effect=[True, True, False]),
+            mock.patch("launch.subprocess.run", side_effect=fake_run),
+            mock.patch("launch.time.monotonic", side_effect=[0.0, 0.1, 3.0, 3.1]),
+            mock.patch("launch.time.sleep"),
+        ):
+            ok, err = launch._terminate_pid(12345)
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+        self.assertEqual(runs, [["taskkill", "/PID", "12345"], ["taskkill", "/F", "/PID", "12345"]])
+
+    def test_terminate_pid_windows_access_denied(self) -> None:
+        def fake_run(cmd, **_kwargs):
+            return subprocess.CompletedProcess(cmd, 5, stdout="", stderr="ERROR: Access is denied.")
+
+        with (
+            mock.patch("launch.sys.platform", "win32"),
+            mock.patch("launch._is_process_alive", return_value=True),
+            mock.patch("launch.subprocess.run", side_effect=fake_run),
+            mock.patch("launch.time.monotonic", side_effect=[0.0, 3.0, 3.1]),
+            mock.patch("launch.time.sleep"),
+        ):
+            ok, err = launch._terminate_pid(12345)
+        self.assertFalse(ok)
+        self.assertEqual(err, "access_denied")
+
+    def test_terminate_pid_posix_graceful_sigterm(self) -> None:
+        kills: list[tuple[int, int]] = []
+        def fake_kill(pid, sig):
+            kills.append((pid, sig))
+
+        with (
+            mock.patch("launch.sys.platform", "linux"),
+            mock.patch("launch.os.kill", side_effect=fake_kill),
+            mock.patch("launch._is_process_alive", side_effect=[True, False]),
+            mock.patch("launch.time.sleep"),
+        ):
+            ok, err = launch._terminate_pid(12345)
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+        sigterm = getattr(signal, "SIGTERM", 15)
+        self.assertEqual(kills, [(12345, sigterm)])
+
+    def test_terminate_pid_posix_escalation_sigkill(self) -> None:
+        kills: list[tuple[int, int]] = []
+        def fake_kill(pid, sig):
+            kills.append((pid, sig))
+
+        with (
+            mock.patch("launch.sys.platform", "linux"),
+            mock.patch("launch.os.kill", side_effect=fake_kill),
+            mock.patch("launch._is_process_alive", side_effect=[True, True, False]),
+            mock.patch("launch.time.monotonic", side_effect=[0.0, 0.1, 3.0, 3.1]),
+            mock.patch("launch.time.sleep"),
+        ):
+            ok, err = launch._terminate_pid(12345)
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+        sigterm = getattr(signal, "SIGTERM", 15)
+        sigkill = getattr(signal, "SIGKILL", 9)
+        self.assertEqual(kills, [(12345, sigterm), (12345, sigkill)])
+
+    def test_terminate_pid_posix_permission_error(self) -> None:
+        def fake_kill(pid, sig):
+            raise PermissionError("Access denied")
+
+        with (
+            mock.patch("launch.sys.platform", "linux"),
+            mock.patch("launch.os.kill", side_effect=fake_kill),
+            mock.patch("launch._is_process_alive", return_value=True),
+        ):
+            ok, err = launch._terminate_pid(12345)
+        self.assertFalse(ok)
+        self.assertEqual(err, "access_denied")
+
+    def test_terminate_pid_guards_against_pid_reuse(self) -> None:
+        kills: list[tuple[int, int]] = []
+        with (
+            mock.patch("launch.sys.platform", "linux"),
+            mock.patch("launch._is_process_alive", return_value=True),
+            mock.patch("launch._get_process_start_time", return_value=9999),
+            mock.patch("launch.os.kill", side_effect=lambda p, s: kills.append((p, s))),
+        ):
+            ok, err = launch._terminate_pid(12345, expected_start_time=1111)
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+        self.assertEqual(kills, [])
+
+    def test_windows_terminal_sixel_detection(self) -> None:
+        self.assertFalse(launch._windows_terminal_supports_sixel({}))
+        self.assertFalse(launch._windows_terminal_supports_sixel({"WT_SESSION": "1", "WT_VERSION": "1.18.0"}))
+        self.assertTrue(launch._windows_terminal_supports_sixel({"WT_SESSION": "1", "WT_VERSION": "1.22.0"}))
+        self.assertTrue(launch._windows_terminal_supports_sixel({"WT_PROFILE_ID": "1", "WT_BUILD_VERSION": "1.23.100"}))
