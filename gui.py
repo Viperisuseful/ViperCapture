@@ -986,6 +986,8 @@ def _wait_until_ready(
 ) -> GuiState:
     tick = 0
     while time.monotonic() < deadline:
+        if launch.application_shutdown_requested():
+            raise KeyboardInterrupt
         if launch.port_open():
             return state
         if server.poll() is not None:
@@ -1094,6 +1096,8 @@ def _run_posix_keys(
         dirty = True
         last_size = _window_size()
         while True:
+            if launch.application_shutdown_requested():
+                return 0
             current_size = _window_size()
             if current_size != last_size:
                 last_size = current_size
@@ -1167,6 +1171,8 @@ def _run_windows_keys(
     dirty = True
     last_size = _window_size()
     while True:
+        if launch.application_shutdown_requested():
+            return 0
         current_size = _window_size()
         if current_size != last_size:
             last_size = current_size
@@ -1233,6 +1239,7 @@ def run_capture_gui(viewport: tuple[int, int], directory: Path | None = None) ->
         return 1
     if directory is None:
         directory = Path.cwd()
+    launch._clear_application_shutdown_request()
     # ensure_deps compares the requirements hash itself. A stamp left behind
     # by an update is not enough.
     launch.ensure_deps()
@@ -1274,6 +1281,11 @@ def _pause_for_quit() -> None:
         import msvcrt
 
         while True:
+            if launch.application_shutdown_requested():
+                return
+            if not msvcrt.kbhit():
+                time.sleep(0.05)
+                continue
             char = msvcrt.getwch()
             if char in {"\x1b", "\x03", "\r"}:
                 return
@@ -1288,6 +1300,8 @@ def _pause_for_quit() -> None:
     pending = bytearray()
     try:
         while True:
+            if launch.application_shutdown_requested():
+                return
             ready, _, _ = select.select(
                 [fd],
                 [],

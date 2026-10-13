@@ -4,6 +4,7 @@ import base64
 import io
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -147,7 +148,7 @@ class TerminalLogoTests(unittest.TestCase):
             launch.choose_graphics_protocol(
                 platform_name="win32",
                 is_tty=True,
-                environ={"WT_SESSION": "abc", "WT_VERSION": "1.22.0"},
+                environ={"WT_SESSION": "abc", "VIPERCAPTURE_SIXEL": "1"},
             ),
             "sixel",
         )
@@ -433,7 +434,11 @@ class LaunchArgsTests(unittest.TestCase):
         ):
             code = launch.kill_all_instances(port=8999)
         self.assertEqual(code, 0)
-        mock_term.assert_called_once_with(12345, expected_start_time=123456)
+        mock_term.assert_called_once_with(
+            12345,
+            expected_start_time=123456,
+            application_handshake=False,
+        )
         self.assertIn("Stopped 1 ViperCapture process(es): 12345", stdout.getvalue())
         self.assertIn("All ViperCapture instances stopped", stdout.getvalue())
 
@@ -1502,25 +1507,39 @@ class UpdateTests(unittest.TestCase):
             self.assertFalse((Path(tmp) / "revision").exists())
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ViperCaptureProcessSafetyTests(unittest.TestCase):
     def test_matches_vipercapture_command(self) -> None:
         root = launch.ROOT
         self.assertTrue(launch._matches_vipercapture_command(f"python {root}/launch.py"))
         self.assertTrue(launch._matches_vipercapture_command(f"{root}/.venv/bin/python {root}/gui.py"))
-        self.assertTrue(launch._matches_vipercapture_command("python -m uvicorn vipercapture.main:app --port 8000"))
+        self.assertTrue(launch._matches_vipercapture_command(
+            f"{root}/.venv/bin/python -m uvicorn vipercapture.main:app --port 8000"
+        ))
 
         # Rejects unrelated paths and collisions
         self.assertFalse(launch._matches_vipercapture_command("python /other/project/launch.py"))
         self.assertFalse(launch._matches_vipercapture_command("python /other/project/gui.py"))
+        self.assertFalse(launch._matches_vipercapture_command(f"python {root}-backup/launch.py"))
+        self.assertFalse(launch._matches_vipercapture_command(
+            "python worker.py --label 'uvicorn vipercapture.main:app'"
+        ))
+        self.assertFalse(launch._matches_vipercapture_command(
+            f"python worker.py --label {root}/launch.py"
+        ))
+        self.assertFalse(launch._matches_vipercapture_command(
+            "python -m uvicorn vipercapture.main:app --port 8000"
+        ))
         self.assertFalse(launch._matches_vipercapture_command("pytest tests/test_launch_installer.py"))
         self.assertFalse(launch._matches_vipercapture_command("grep -rn launch.py ."))
         self.assertFalse(launch._matches_vipercapture_command("vipercapture kill"))
         self.assertFalse(launch._matches_vipercapture_command(f"python {root}/launch.py kill"))
         self.assertFalse(launch._matches_vipercapture_command(""))
+
+    def test_matches_exact_script_path_when_install_path_contains_spaces(self) -> None:
+        root = Path(tempfile.gettempdir()) / "Viper Capture"
+        argv = [sys.executable, str(root / "launch.py"), "--one-window"]
+        command = subprocess.list2cmdline(argv) if sys.platform == "win32" else shlex.join(argv)
+        self.assertTrue(launch._matches_vipercapture_command(command, root_dir=root))
 
     def test_find_vipercapture_pids_ignores_unrelated_port_owner(self) -> None:
         with (
@@ -1553,6 +1572,115 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
         ):
             pids = launch.find_vipercapture_pids(port=8000)
         self.assertEqual(pids, set())
+
+    def test_endpoint_probe_requires_service_install_and_owner_pid(self) -> None:
+        class Response:
+            status = 200
+
+            def __init__(self, payload: dict[str, object]) -> None:
+                self.payload = payload
+
+            def read(self) -> bytes:
+                return json.dumps(self.payload).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        valid = {
+            "ready": True,
+            "service": "vipercapture",
+            "install_id": launch._installation_id(),
+            "pid": 4321,
+        }
+        with mock.patch("launch.urllib.request.urlopen", return_value=Response(valid)):
+            self.assertTrue(launch._is_vipercapture_endpoint(expected_pids={4321}))
+            self.assertFalse(launch._is_vipercapture_endpoint(expected_pids={9999}))
+
+        generic = {"ready": True}
+        with mock.patch("launch.urllib.request.urlopen", return_value=Response(generic)):
+            self.assertFalse(launch._is_vipercapture_endpoint(expected_pids={4321}))
+
+        wrong_install = {**valid, "install_id": "another-install"}
+        with mock.patch("launch.urllib.request.urlopen", return_value=Response(wrong_install)):
+            self.assertFalse(launch._is_vipercapture_endpoint(expected_pids={4321}))
+
+    def test_endpoint_probe_rejects_malformed_json(self) -> None:
+        response = mock.MagicMock()
+        response.status = 200
+        response.read.return_value = b"not-json"
+        response.__enter__.return_value = response
+        with mock.patch("launch.urllib.request.urlopen", return_value=response):
+            self.assertFalse(launch._is_vipercapture_endpoint(expected_pids={4321}))
+
+    def test_darwin_ancestor_walk_uses_each_discovered_parent(self) -> None:
+        with (
+            mock.patch("launch.sys.platform", "darwin"),
+            mock.patch("launch.os.getpid", return_value=300),
+            mock.patch("launch.subprocess.check_output", side_effect=["200\n", "100\n", "1\n"]) as check,
+        ):
+            self.assertEqual(launch._get_process_ancestors(), {300, 200, 100})
+        self.assertEqual(
+            [call.args[0][2] for call in check.call_args_list],
+            ["300", "200", "100"],
+        )
+
+    def test_darwin_process_start_time_is_available_for_reuse_checks(self) -> None:
+        with (
+            mock.patch("launch.sys.platform", "darwin"),
+            mock.patch("launch.subprocess.check_output", return_value="Tue Oct 13 12:34:56 2026\n") as check,
+        ):
+            value = launch._get_process_start_time(4321)
+        self.assertEqual(value, "Tue Oct 13 12:34:56 2026")
+        self.assertEqual(check.call_args.args[0], ["ps", "-p", "4321", "-o", "lstart="])
+
+    def test_application_handshake_can_exit_before_os_termination(self) -> None:
+        with (
+            mock.patch("launch._is_process_alive", side_effect=[True, False]),
+            mock.patch("launch._request_application_shutdown", return_value=True) as request,
+            mock.patch("launch._clear_application_shutdown_request") as clear,
+            mock.patch("launch.os.kill") as kill,
+            mock.patch("launch.time.sleep"),
+        ):
+            ok, error = launch._terminate_pid(4321, application_handshake=True)
+        self.assertTrue(ok)
+        self.assertIsNone(error)
+        request.assert_called_once_with(4321)
+        clear.assert_called_once_with(4321)
+        kill.assert_not_called()
+
+    def test_kill_orders_server_before_interactive_process_and_uses_handshake(self) -> None:
+        commands = {
+            10: f"{launch.ROOT}/.venv/bin/python {launch.ROOT}/launch.py",
+            20: f"{launch.ROOT}/.venv/bin/python -m uvicorn vipercapture.main:app --port 8000",
+        }
+        with (
+            mock.patch("launch.find_vipercapture_pids", return_value={10, 20}),
+            mock.patch("launch._get_process_start_time", return_value="start"),
+            mock.patch("launch._get_pid_commandline", side_effect=lambda pid: commands[pid]),
+            mock.patch("launch._terminate_pid", return_value=(True, None)) as terminate,
+            mock.patch("launch.port_open", return_value=False),
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            self.assertEqual(launch.kill_all_instances(), 0)
+        self.assertEqual(
+            terminate.call_args_list,
+            [
+                mock.call(20, expected_start_time="start", application_handshake=False),
+                mock.call(10, expected_start_time="start", application_handshake=True),
+            ],
+        )
+
+    def test_kill_checks_the_requested_port(self) -> None:
+        with (
+            mock.patch("launch.find_vipercapture_pids", return_value=set()),
+            mock.patch("launch.port_open", return_value=False) as port_open,
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            self.assertEqual(launch.kill_all_instances(port=9123), 0)
+        port_open.assert_called_once_with(port=9123)
 
     def test_terminate_pid_windows_graceful_shutdown(self) -> None:
         runs: list[list[str]] = []
@@ -1666,8 +1794,28 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
         self.assertIsNone(err)
         self.assertEqual(kills, [])
 
+    def test_terminate_pid_refuses_when_identity_can_no_longer_be_verified(self) -> None:
+        with (
+            mock.patch("launch._is_process_alive", return_value=True),
+            mock.patch("launch._get_process_start_time", return_value=None),
+            mock.patch("launch.os.kill") as kill,
+        ):
+            ok, err = launch._terminate_pid(12345, expected_start_time=1111)
+        self.assertFalse(ok)
+        self.assertEqual(err, "unable_to_verify_process_identity")
+        kill.assert_not_called()
+
     def test_windows_terminal_sixel_detection(self) -> None:
         self.assertFalse(launch._windows_terminal_supports_sixel({}))
-        self.assertFalse(launch._windows_terminal_supports_sixel({"WT_SESSION": "1", "WT_VERSION": "1.18.0"}))
-        self.assertTrue(launch._windows_terminal_supports_sixel({"WT_SESSION": "1", "WT_VERSION": "1.22.0"}))
-        self.assertTrue(launch._windows_terminal_supports_sixel({"WT_PROFILE_ID": "1", "WT_BUILD_VERSION": "1.23.100"}))
+        self.assertFalse(launch._windows_terminal_supports_sixel({"WT_SESSION": "1"}))
+        self.assertFalse(launch._windows_terminal_supports_sixel({"VIPERCAPTURE_SIXEL": "1"}))
+        self.assertTrue(launch._windows_terminal_supports_sixel(
+            {"WT_SESSION": "1", "VIPERCAPTURE_SIXEL": "1"}
+        ))
+        self.assertTrue(launch._windows_terminal_supports_sixel(
+            {"WT_PROFILE_ID": "1", "VIPERCAPTURE_SIXEL": "true"}
+        ))
+
+
+if __name__ == "__main__":
+    unittest.main()

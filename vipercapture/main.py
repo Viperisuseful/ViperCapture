@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import hmac
 import json
 import os
@@ -100,6 +101,9 @@ if sys.platform.startswith("win"):
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 APP_VERSION = (BASE_DIR / "VERSION").read_text(encoding="utf-8").strip()
+INSTALL_ID = hashlib.sha256(
+    os.path.normcase(os.path.abspath(BASE_DIR)).encode("utf-8", errors="surrogatepass")
+).hexdigest()
 def _load_local_env() -> None:
     """Load machine-only KEY=VALUE settings without another dependency."""
     path = BASE_DIR / ".env.local"
@@ -1115,8 +1119,13 @@ install_render_error_layer(app)
 
 
 @app.get("/health")
-async def health() -> dict[str, bool]:
-    return {"ready": True}
+async def health() -> dict[str, object]:
+    return {
+        "ready": True,
+        "service": "vipercapture",
+        "install_id": INSTALL_ID,
+        "pid": os.getpid(),
+    }
 
 
 @app.get("/ready")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 
 import pytest
 
@@ -56,6 +57,10 @@ def test_responses_carry_nosniff_and_frame_ancestors() -> None:
 
     response = TestClient(app).get("/health")
     assert response.status_code == 200
+    payload = response.json()
+    assert payload["service"] == "vipercapture"
+    assert payload["pid"] == os.getpid()
+    assert len(payload["install_id"]) == 64
     assert response.headers["X-Content-Type-Options"] == "nosniff"
     assert response.headers["Content-Security-Policy"] == "frame-ancestors 'none'"
 

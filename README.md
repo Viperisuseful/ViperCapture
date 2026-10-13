@@ -115,7 +115,7 @@ and Windows. On Windows, stop the running server first with `vipercapture kill`.
 
 On Linux and macOS, Ghostty and Kitty open request logs in another window and
 show a full-screen status view in this one. The terminal graphics logo is drawn for Kitty,
-Ghostty, iTerm2, WezTerm, foot, mlterm, Contour, and Windows Terminal 1.22+; terminals without graphics protocols (including older Windows Terminal) display a styled two-tone block ASCII wordmark. WezTerm
+Ghostty, iTerm2, WezTerm, foot, mlterm, and Contour. Terminals without a reliably detectable graphics protocol, including Windows Terminal, display a styled two-tone block ASCII wordmark. Windows Terminal does not expose a supported Sixel capability/version variable; users who know their active native or WSL session supports Sixel can opt in with `VIPERCAPTURE_SIXEL=1`. WezTerm
 uses the Kitty graphics protocol when `enable_kitty_graphics = true`, and the
 iTerm2 image protocol otherwise. `vipercapture --one-window` keeps the status
 and the request log together in this terminal, which is what you want over SSH.
