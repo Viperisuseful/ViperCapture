@@ -1613,6 +1613,32 @@ def _request_server_shutdown(
         return False
 
 
+def _get_posix_process_state(pid: int) -> str | None:
+    """Return the POSIX process state, including ``Z`` for an unreaped child."""
+    if pid <= 0 or sys.platform == "win32":
+        return None
+    if sys.platform.startswith("linux"):
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            # The command is parenthesized and may itself contain spaces or ``)``.
+            closing_paren = stat.rfind(")")
+            fields = stat[closing_paren + 1 :].split() if closing_paren >= 0 else []
+            if fields:
+                return fields[0]
+        except (OSError, UnicodeError):
+            pass
+    try:
+        output = subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "stat="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return output.split()[0] if output else None
+
+
 def _is_process_alive(pid: int) -> bool:
     """True if process exists and is alive."""
     if pid <= 0:
@@ -1637,6 +1663,11 @@ def _is_process_alive(pid: int) -> bool:
         except Exception:
             return False
     else:
+        # kill(pid, 0) reports zombies as existing. They have already exited and
+        # cannot respond to another signal; their parent only needs to reap them.
+        state = _get_posix_process_state(pid)
+        if state and state.upper().startswith("Z"):
+            return False
         try:
             os.kill(pid, 0)
             return True

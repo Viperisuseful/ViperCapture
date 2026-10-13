@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 import urllib.parse
 from pathlib import Path
@@ -890,6 +891,7 @@ class IntelMacosCryptographyTests(unittest.TestCase):
 
 
 class InstallScriptTests(unittest.TestCase):
+    @unittest.skipIf(sys.platform == "win32", "install.sh requires a POSIX shell")
     def test_install_script_creates_a_user_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1070,6 +1072,9 @@ class UpdateTests(unittest.TestCase):
             self.assertIn("ViperCapture 1.0.4 is already up to date.", stdout.getvalue())
             self.assertEqual((app / "old.txt").read_text(encoding="utf-8"), "gone\n")
 
+    @unittest.skipIf(
+        sys.platform == "win32", "running updates use POSIX rename semantics"
+    )
     def test_update_replaces_the_app_and_keeps_venv_and_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
@@ -1146,7 +1151,8 @@ class UpdateTests(unittest.TestCase):
                 )
             self.assertEqual(code, 0, stdout.getvalue())
             self.assertEqual((app / ".env.local").read_text(encoding="utf-8"), marker)
-            self.assertEqual(os.stat(app / ".env.local").st_mode & 0o777, 0o600)
+            if os.name != "nt":
+                self.assertEqual(os.stat(app / ".env.local").st_mode & 0o777, 0o600)
 
     def test_download_is_pinned_to_the_checked_commit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1235,9 +1241,8 @@ class UpdateTests(unittest.TestCase):
             bin_dir = home / "bin"
             bin_dir.mkdir()
             shim = bin_dir / "vipercapture.cmd"
-            shim.write_text(
-                f'@echo off\r\n"C:\\Python\\python.exe" "{app / "launch.py"}" %*\r\n',
-                encoding="utf-8",
+            shim.write_bytes(
+                f'@echo off\r\n"C:\\Python\\python.exe" "{app / "launch.py"}" %*\r\n'.encode()
             )
             source = home / "incoming"
             source.mkdir()
@@ -1260,6 +1265,9 @@ class UpdateTests(unittest.TestCase):
             self.assertIn(b"%*", raw)
             self.assertNotIn(b"#!/bin/sh", raw)
 
+    @unittest.skipIf(
+        sys.platform == "win32", "POSIX executable bits are unavailable on Windows"
+    )
     def test_new_posix_shim_records_path_without_trusting_the_live_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
@@ -1507,6 +1515,40 @@ class UpdateTests(unittest.TestCase):
 
 
 class ViperCaptureProcessSafetyTests(unittest.TestCase):
+    def test_linux_process_state_parses_a_parenthesized_command(self) -> None:
+        stat = "4321 (worker with ) in its name) Z 1 2 3\n"
+        with (
+            mock.patch("launch.sys.platform", "linux"),
+            mock.patch("pathlib.Path.read_text", return_value=stat),
+        ):
+            self.assertEqual(launch._get_posix_process_state(4321), "Z")
+
+    def test_posix_zombie_is_not_alive(self) -> None:
+        with (
+            mock.patch("launch.sys.platform", "linux"),
+            mock.patch("launch._get_posix_process_state", return_value="Z"),
+            mock.patch("launch.os.kill") as kill,
+        ):
+            self.assertFalse(launch._is_process_alive(4321))
+        kill.assert_not_called()
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX child-process semantics")
+    def test_unreaped_child_is_not_alive(self) -> None:
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        try:
+            deadline = time.monotonic() + 3
+            state = None
+            while time.monotonic() < deadline:
+                state = launch._get_posix_process_state(child.pid)
+                if state and state.upper().startswith("Z"):
+                    break
+                time.sleep(0.01)
+            self.assertIsNotNone(state, "child process state was unavailable")
+            self.assertTrue(state.upper().startswith("Z"), state)
+            self.assertFalse(launch._is_process_alive(child.pid))
+        finally:
+            child.wait(timeout=3)
+
     def test_matches_vipercapture_command(self) -> None:
         root = launch.ROOT
         self.assertTrue(launch._matches_vipercapture_command(f"python {root}/launch.py"))
