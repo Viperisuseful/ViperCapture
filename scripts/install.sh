@@ -203,5 +203,6 @@ echo
 echo "  Installed the vipercapture command."
 echo "  Run: vipercapture"
 echo "  Update later with: vipercapture update"
+echo "  Stop running instances with: vipercapture kill"
 echo "  The first launch installs dependencies and browsers, then starts the API."
 echo

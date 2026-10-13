@@ -369,6 +369,27 @@ class GuiFrameTests(TestCase):
         self.assertNotIn(b"\x1b_G", frame)
         self.assertIn(b"ViperCapture", frame)
 
+    def test_opencode_styled_ascii_wordmark(self) -> None:
+        lines = gui.styled_ascii_logo()
+        self.assertEqual(len(lines), 5)
+        self.assertEqual(gui.visible(lines[0]), gui.ASCII_LOGO[0])
+        self.assertEqual(gui.visible(lines[4]), gui.ASCII_LOGO[4])
+        self.assertIn('ViperCapture', gui.visible(lines[4]))
+        self.assertIn("\x1b[", lines[0])
+        self.assertIn("\x1b[1;34m", lines[1])
+        self.assertIn("\x1b[1;37m", lines[1])
+        self.assertNotIn("\x1b[90m", lines[1])
+        self.assertIn("\x1b[48;2;60;66;80m", lines[2])
+        self.assertIn("\x1b[48;2;20;42;90m", lines[2])
+
+    def test_wordmark_switches_between_plain_and_styled_by_width(self) -> None:
+        self.assertEqual(gui._wordmark(40, image=False), ("ViperCapture",))
+        self.assertEqual(gui._wordmark(60, image=False), ("ViperCapture",))
+        self.assertEqual(gui._wordmark(63, image=False), ("ViperCapture",))
+        self.assertEqual(gui._wordmark(64, image=False), tuple(gui.styled_ascii_logo()))
+        self.assertEqual(gui._wordmark(80, image=False), tuple(gui.styled_ascii_logo()))
+        self.assertEqual(gui._wordmark(80, image=True), ())
+
     def test_logo_is_sent_once_until_the_layout_changes(self) -> None:
         png = b"\x89PNG\r\n\x1a\n" + b"x"
         out = io.BytesIO()
@@ -470,6 +491,23 @@ class GuiRuntimeTests(TestCase):
         ):
             size = gui._window_size()
         self.assertEqual((size.cols, size.rows), (90, 30))
+
+    def test_window_size_handles_stream_without_fileno_gracefully(self) -> None:
+        broken_stream = mock.Mock()
+        broken_stream.fileno.side_effect = ValueError("I/O operation on closed file")
+        with (
+            mock.patch.object(gui.os, "name", "posix"),
+            mock.patch.object(gui.launch, "read_window_size", side_effect=OSError("not tty")),
+            mock.patch.object(gui.sys, "stdout", broken_stream),
+            mock.patch.object(gui.sys, "stdin", broken_stream),
+            mock.patch.object(
+                gui.shutil,
+                "get_terminal_size",
+                return_value=os_terminal_size(88, 22),
+            ),
+        ):
+            size = gui._window_size()
+        self.assertEqual((size.cols, size.rows), (88, 22))
 
     def test_dependency_hashes_are_checked_before_the_screen(self) -> None:
         order: list[str] = []

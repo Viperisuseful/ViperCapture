@@ -4,10 +4,13 @@ import base64
 import io
 import json
 import os
+import shlex
+import signal
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 import urllib.parse
 from pathlib import Path
@@ -135,11 +138,18 @@ class TerminalLogoTests(unittest.TestCase):
             ),
             "sixel",
         )
-        self.assertEqual(
+        self.assertIsNone(
             launch.choose_graphics_protocol(
                 platform_name="win32",
                 is_tty=True,
                 environ={"WT_SESSION": "abc", "TERM": "xterm-256color"},
+            ),
+        )
+        self.assertEqual(
+            launch.choose_graphics_protocol(
+                platform_name="win32",
+                is_tty=True,
+                environ={"WT_SESSION": "abc", "VIPERCAPTURE_SIXEL": "1"},
             ),
             "sixel",
         )
@@ -361,6 +371,8 @@ class LaunchArgsTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 0)
         self.assertIn("--one-window", stdout.getvalue())
         self.assertIn("vipercapture update", stdout.getvalue())
+        self.assertIn("vipercapture kill", stdout.getvalue())
+        self.assertIn("Stop all running instances", stdout.getvalue())
         self.assertIn("Windows always uses one window.", stdout.getvalue())
 
     def test_unknown_argument_exits(self) -> None:
@@ -387,6 +399,81 @@ class LaunchArgsTests(unittest.TestCase):
                 launch.parse_cli(["update", "--one-window"])
         self.assertEqual(caught.exception.code, 2)
         self.assertIn("Unknown argument: --one-window", stderr.getvalue())
+
+    def test_kill_is_a_command(self) -> None:
+        command = launch.parse_cli(["kill"])
+        self.assertTrue(command.kill)
+        self.assertFalse(command.update)
+        self.assertFalse(command.gui)
+        self.assertFalse(command.one_window)
+
+    def test_kill_rejects_launch_flags(self) -> None:
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", stderr):
+            with self.assertRaises(SystemExit) as caught:
+                launch.parse_cli(["kill", "--one-window"])
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("Unknown argument: --one-window", stderr.getvalue())
+
+    def test_kill_all_instances_when_none_running(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch("launch.find_vipercapture_processes", return_value={}):
+            with mock.patch("launch.port_open", return_value=False):
+                with mock.patch("sys.stdout", stdout):
+                    code = launch.kill_all_instances(port=8999)
+        self.assertEqual(code, 0)
+        self.assertIn("No running instances of ViperCapture found", stdout.getvalue())
+
+    def test_kill_all_instances_terminates_pids(self) -> None:
+        stdout = io.StringIO()
+        identity = launch.ProcessIdentity(12345, 123456, "server", "server")
+        with (
+            mock.patch("launch.find_vipercapture_processes", return_value={12345: identity}),
+            mock.patch("launch._terminate_process", return_value=(True, None)) as mock_term,
+            mock.patch("launch.port_open", side_effect=[True, False, False, False]),
+            mock.patch("sys.stdout", stdout),
+        ):
+            code = launch.kill_all_instances(port=8999)
+        self.assertEqual(code, 0)
+        mock_term.assert_called_once_with(identity, port=8999)
+        self.assertIn("Stopped 1 ViperCapture process(es): 12345", stdout.getvalue())
+        self.assertIn("All ViperCapture instances stopped", stdout.getvalue())
+
+    def test_kill_all_instances_reports_failure_on_permission_or_error(self) -> None:
+        stdout = io.StringIO()
+        identities = {
+            12345: launch.ProcessIdentity(12345, 1, "server-a", "server"),
+            12346: launch.ProcessIdentity(12346, 1, "server-b", "server"),
+        }
+        with (
+            mock.patch("launch.find_vipercapture_processes", return_value=identities),
+            mock.patch(
+                "launch._terminate_process",
+                side_effect=[(False, "access_denied"), (False, "taskkill failed")],
+            ),
+            mock.patch("launch.port_open", return_value=False),
+            mock.patch("sys.stdout", stdout),
+        ):
+            code = launch.kill_all_instances(port=8999)
+        self.assertEqual(code, 1)
+        output = stdout.getvalue()
+        self.assertIn("Access was denied", output)
+        self.assertIn("Failed to stop PID 12346", output)
+        self.assertNotIn("All ViperCapture instances stopped", output)
+
+    def test_kill_all_instances_fails_if_port_remains_open(self) -> None:
+        stdout = io.StringIO()
+        identity = launch.ProcessIdentity(12345, 1, "server", "server")
+        with (
+            mock.patch("launch.find_vipercapture_processes", return_value={12345: identity}),
+            mock.patch("launch._terminate_process", return_value=(True, None)),
+            mock.patch("launch.port_open", return_value=True),
+            mock.patch("launch.time.sleep"),
+            mock.patch("sys.stdout", stdout),
+        ):
+            code = launch.kill_all_instances(port=8999)
+        self.assertEqual(code, 1)
+        self.assertIn("Warning: Port 8999 is still in use", stdout.getvalue())
 
     def test_gui_flag_and_viewport(self) -> None:
         command = launch.parse_cli(["--GUI"])
@@ -804,6 +891,7 @@ class IntelMacosCryptographyTests(unittest.TestCase):
 
 
 class InstallScriptTests(unittest.TestCase):
+    @unittest.skipIf(sys.platform == "win32", "install.sh requires a POSIX shell")
     def test_install_script_creates_a_user_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -984,6 +1072,9 @@ class UpdateTests(unittest.TestCase):
             self.assertIn("ViperCapture 1.0.4 is already up to date.", stdout.getvalue())
             self.assertEqual((app / "old.txt").read_text(encoding="utf-8"), "gone\n")
 
+    @unittest.skipIf(
+        sys.platform == "win32", "running updates use POSIX rename semantics"
+    )
     def test_update_replaces_the_app_and_keeps_venv_and_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
@@ -1060,7 +1151,8 @@ class UpdateTests(unittest.TestCase):
                 )
             self.assertEqual(code, 0, stdout.getvalue())
             self.assertEqual((app / ".env.local").read_text(encoding="utf-8"), marker)
-            self.assertEqual(os.stat(app / ".env.local").st_mode & 0o777, 0o600)
+            if os.name != "nt":
+                self.assertEqual(os.stat(app / ".env.local").st_mode & 0o777, 0o600)
 
     def test_download_is_pinned_to_the_checked_commit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1149,9 +1241,8 @@ class UpdateTests(unittest.TestCase):
             bin_dir = home / "bin"
             bin_dir.mkdir()
             shim = bin_dir / "vipercapture.cmd"
-            shim.write_text(
-                f'@echo off\r\n"C:\\Python\\python.exe" "{app / "launch.py"}" %*\r\n',
-                encoding="utf-8",
+            shim.write_bytes(
+                f'@echo off\r\n"C:\\Python\\python.exe" "{app / "launch.py"}" %*\r\n'.encode()
             )
             source = home / "incoming"
             source.mkdir()
@@ -1174,6 +1265,9 @@ class UpdateTests(unittest.TestCase):
             self.assertIn(b"%*", raw)
             self.assertNotIn(b"#!/bin/sh", raw)
 
+    @unittest.skipIf(
+        sys.platform == "win32", "POSIX executable bits are unavailable on Windows"
+    )
     def test_new_posix_shim_records_path_without_trusting_the_live_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
@@ -1418,6 +1512,496 @@ class UpdateTests(unittest.TestCase):
             self.assertEqual((root / "launch.py").read_text(encoding="utf-8"), "print('zip')\n")
             self.assertEqual((root / "notes.txt").read_text(encoding="utf-8"), "mine\n")
             self.assertFalse((Path(tmp) / "revision").exists())
+
+
+class ViperCaptureProcessSafetyTests(unittest.TestCase):
+    def test_linux_process_state_parses_a_parenthesized_command(self) -> None:
+        stat = "4321 (worker with ) in its name) Z 1 2 3\n"
+        with (
+            mock.patch("launch.sys.platform", "linux"),
+            mock.patch("pathlib.Path.read_text", return_value=stat),
+        ):
+            self.assertEqual(launch._get_posix_process_state(4321), "Z")
+
+    def test_posix_zombie_is_not_alive(self) -> None:
+        with (
+            mock.patch("launch.sys.platform", "linux"),
+            mock.patch("launch._get_posix_process_state", return_value="Z"),
+            mock.patch("launch.os.kill") as kill,
+        ):
+            self.assertFalse(launch._is_process_alive(4321))
+        kill.assert_not_called()
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX child-process semantics")
+    def test_unreaped_child_is_not_alive(self) -> None:
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        try:
+            deadline = time.monotonic() + 3
+            state = None
+            while time.monotonic() < deadline:
+                state = launch._get_posix_process_state(child.pid)
+                if state and state.upper().startswith("Z"):
+                    break
+                time.sleep(0.01)
+            self.assertIsNotNone(state, "child process state was unavailable")
+            self.assertTrue(state.upper().startswith("Z"), state)
+            self.assertFalse(launch._is_process_alive(child.pid))
+        finally:
+            child.wait(timeout=3)
+
+    def test_matches_vipercapture_command(self) -> None:
+        root = launch.ROOT
+        self.assertTrue(launch._matches_vipercapture_command(f"python {root}/launch.py"))
+        self.assertTrue(launch._matches_vipercapture_command(f"{root}/.venv/bin/python {root}/gui.py"))
+        self.assertTrue(launch._matches_vipercapture_command(
+            f"{root}/.venv/bin/python -m uvicorn vipercapture.main:app --port 8000"
+        ))
+
+        # Rejects unrelated paths and collisions
+        self.assertFalse(launch._matches_vipercapture_command("python /other/project/launch.py"))
+        self.assertFalse(launch._matches_vipercapture_command("python /other/project/gui.py"))
+        self.assertFalse(launch._matches_vipercapture_command(f"python {root}-backup/launch.py"))
+        self.assertFalse(launch._matches_vipercapture_command(
+            "python worker.py --label 'uvicorn vipercapture.main:app'"
+        ))
+        self.assertFalse(launch._matches_vipercapture_command(
+            f"python worker.py --label {root}/launch.py"
+        ))
+        self.assertFalse(launch._matches_vipercapture_command(
+            "python -m uvicorn vipercapture.main:app --port 8000"
+        ))
+        self.assertFalse(launch._matches_vipercapture_command("pytest tests/test_launch_installer.py"))
+        self.assertFalse(launch._matches_vipercapture_command("grep -rn launch.py ."))
+        self.assertFalse(launch._matches_vipercapture_command("vipercapture kill"))
+        self.assertFalse(launch._matches_vipercapture_command(f"python {root}/launch.py kill"))
+        self.assertFalse(launch._matches_vipercapture_command(""))
+
+    def test_matches_exact_script_path_when_install_path_contains_spaces(self) -> None:
+        root = Path(tempfile.gettempdir()) / "Viper Capture"
+        argv = [sys.executable, str(root / "launch.py"), "--one-window"]
+        command = subprocess.list2cmdline(argv) if sys.platform == "win32" else shlex.join(argv)
+        self.assertTrue(launch._matches_vipercapture_command(command, root_dir=root))
+
+    def test_find_vipercapture_pids_ignores_unrelated_port_owner(self) -> None:
+        with (
+            mock.patch("launch.sys.platform", "linux"),
+            mock.patch("launch._get_process_ancestors", return_value=set()),
+            mock.patch("subprocess.check_output", return_value="pid=9999"),
+            mock.patch("launch._is_vipercapture_endpoint", return_value=None),
+            mock.patch("launch._get_pid_commandline", return_value="node server.js"),
+        ):
+            pids = launch.find_vipercapture_pids(port=8000)
+        self.assertEqual(pids, set())
+
+    def test_find_vipercapture_pids_includes_verified_endpoint(self) -> None:
+        identity = launch.ProcessIdentity(8888, "start", "command", "server")
+        with (
+            mock.patch("launch.sys.platform", "linux"),
+            mock.patch("launch._get_process_ancestors", return_value=set()),
+            mock.patch("subprocess.check_output", side_effect=["pid=8888", ""]),
+            mock.patch("launch._is_vipercapture_endpoint", return_value=8888),
+            mock.patch("launch._capture_process_identity", return_value=identity),
+            mock.patch("pathlib.Path.is_dir", return_value=False),
+        ):
+            pids = launch.find_vipercapture_pids(port=8000)
+        self.assertEqual(pids, {8888})
+
+    def test_find_vipercapture_pids_excludes_ancestors(self) -> None:
+        with (
+            mock.patch("launch.sys.platform", "linux"),
+            mock.patch("launch._get_process_ancestors", return_value={8888}),
+            mock.patch("subprocess.check_output", return_value="pid=8888"),
+            mock.patch("launch._is_vipercapture_endpoint", return_value=None),
+        ):
+            pids = launch.find_vipercapture_pids(port=8000)
+        self.assertEqual(pids, set())
+
+    def test_endpoint_authorizes_only_its_reported_listener(self) -> None:
+        with (
+            mock.patch("launch.sys.platform", "linux"),
+            mock.patch("launch._get_process_ancestors", return_value=set()),
+            mock.patch("launch.subprocess.check_output", return_value="pid=8888 pid=9999"),
+            mock.patch("launch._is_vipercapture_endpoint", return_value=8888),
+            mock.patch("launch._get_pid_commandline", return_value="node unrelated.js"),
+            mock.patch("pathlib.Path.is_dir", return_value=False),
+        ):
+            candidates = launch._find_vipercapture_candidate_pids(port=8000)
+        self.assertEqual(candidates, {8888})
+
+    def test_identity_snapshot_rejects_pid_reuse_during_capture(self) -> None:
+        command = f"{launch.ROOT}/.venv/bin/python -m uvicorn vipercapture.main:app"
+        with (
+            mock.patch("launch._get_process_start_time", side_effect=[100, 200]),
+            mock.patch("launch._get_pid_commandline", return_value=command),
+        ):
+            self.assertIsNone(launch._capture_process_identity(4321))
+
+    def test_identity_snapshot_requires_start_time_and_exact_command(self) -> None:
+        with mock.patch("launch._get_process_start_time", return_value=None):
+            self.assertIsNone(launch._capture_process_identity(4321))
+        with (
+            mock.patch("launch._get_process_start_time", side_effect=[100, 100]),
+            mock.patch("launch._get_pid_commandline", return_value="node unrelated.js"),
+        ):
+            self.assertIsNone(launch._capture_process_identity(4321))
+
+    def test_identity_revalidation_rejects_changed_command_with_same_kind(self) -> None:
+        original = f"{sys.executable} {launch.ROOT}/launch.py --one-window"
+        changed = f"{sys.executable} {launch.ROOT}/launch.py"
+        identity = launch.ProcessIdentity(4321, 100, original, "launcher")
+        with (
+            mock.patch("launch._get_process_start_time", side_effect=[100, 100]),
+            mock.patch("launch._get_pid_commandline", return_value=changed),
+        ):
+            self.assertFalse(launch._process_identity_matches(identity))
+
+    def test_endpoint_probe_requires_service_install_and_owner_pid(self) -> None:
+        class Response:
+            status = 200
+
+            def __init__(self, payload: dict[str, object]) -> None:
+                self.payload = payload
+
+            def read(self) -> bytes:
+                return json.dumps(self.payload).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        valid = {
+            "service": "vipercapture",
+            "install_id": launch._installation_id(),
+            "pid": 4321,
+        }
+        with mock.patch("launch.urllib.request.urlopen", return_value=Response(valid)):
+            self.assertEqual(launch._is_vipercapture_endpoint(expected_pids={4321}), 4321)
+            self.assertIsNone(launch._is_vipercapture_endpoint(expected_pids={9999}))
+
+        generic = {"ready": True}
+        with mock.patch("launch.urllib.request.urlopen", return_value=Response(generic)):
+            self.assertIsNone(launch._is_vipercapture_endpoint(expected_pids={4321}))
+
+        wrong_install = {**valid, "install_id": "another-install"}
+        with mock.patch("launch.urllib.request.urlopen", return_value=Response(wrong_install)):
+            self.assertIsNone(launch._is_vipercapture_endpoint(expected_pids={4321}))
+
+    def test_endpoint_probe_rejects_malformed_json(self) -> None:
+        response = mock.MagicMock()
+        response.status = 200
+        response.read.return_value = b"not-json"
+        response.__enter__.return_value = response
+        with mock.patch("launch.urllib.request.urlopen", return_value=response):
+            self.assertIsNone(launch._is_vipercapture_endpoint(expected_pids={4321}))
+
+    def test_darwin_ancestor_walk_uses_each_discovered_parent(self) -> None:
+        with (
+            mock.patch("launch.sys.platform", "darwin"),
+            mock.patch("launch.os.getpid", return_value=300),
+            mock.patch("launch.subprocess.check_output", side_effect=["200\n", "100\n", "1\n"]) as check,
+        ):
+            self.assertEqual(launch._get_process_ancestors(), {300, 200, 100})
+        self.assertEqual(
+            [call.args[0][2] for call in check.call_args_list],
+            ["300", "200", "100"],
+        )
+
+    def test_darwin_process_start_time_is_available_for_reuse_checks(self) -> None:
+        with (
+            mock.patch("launch.sys.platform", "darwin"),
+            mock.patch("launch.subprocess.check_output", return_value="Tue Oct 13 12:34:56 2026\n") as check,
+        ):
+            value = launch._get_process_start_time(4321)
+        self.assertEqual(value, "Tue Oct 13 12:34:56 2026")
+        self.assertEqual(check.call_args.args[0], ["ps", "-p", "4321", "-o", "lstart="])
+
+    def test_application_handshake_can_exit_before_os_termination(self) -> None:
+        identity = launch.ProcessIdentity(4321, "start", "command", "launcher")
+        with (
+            mock.patch("launch._is_process_alive", return_value=True),
+            mock.patch("launch._process_identity_matches", return_value=True),
+            mock.patch("launch._request_application_shutdown", return_value=True) as request,
+            mock.patch("launch._wait_for_process_exit", return_value=True),
+            mock.patch("launch.os.kill") as kill,
+        ):
+            ok, error = launch._terminate_process(identity)
+        self.assertTrue(ok)
+        self.assertIsNone(error)
+        request.assert_called_once_with(4321)
+        kill.assert_not_called()
+
+    def test_kill_orders_server_before_interactive_process_and_uses_handshake(self) -> None:
+        identities = {
+            10: launch.ProcessIdentity(10, "start-a", "launcher", "launcher"),
+            20: launch.ProcessIdentity(20, "start-b", "server", "server"),
+        }
+        with (
+            mock.patch("launch.find_vipercapture_processes", return_value=identities),
+            mock.patch("launch._terminate_process", return_value=(True, None)) as terminate,
+            mock.patch("launch.port_open", return_value=False),
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            self.assertEqual(launch.kill_all_instances(), 0)
+        self.assertEqual(
+            terminate.call_args_list,
+            [
+                mock.call(identities[20], port=8000),
+                mock.call(identities[10], port=8000),
+            ],
+        )
+
+    def test_kill_checks_the_requested_port(self) -> None:
+        with (
+            mock.patch("launch.find_vipercapture_processes", return_value={}),
+            mock.patch("launch.port_open", return_value=False) as port_open,
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            self.assertEqual(launch.kill_all_instances(port=9123), 0)
+        port_open.assert_called_once_with(port=9123)
+
+    def test_terminate_process_windows_graceful_shutdown(self) -> None:
+        identity = launch.ProcessIdentity(12345, "start", "command", "launcher")
+        runs: list[list[str]] = []
+        def fake_run(cmd, **_kwargs):
+            runs.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with (
+            mock.patch("launch.sys.platform", "win32"),
+            mock.patch("launch._is_process_alive", return_value=True),
+            mock.patch("launch._process_identity_matches", return_value=True),
+            mock.patch("launch._request_application_shutdown", return_value=False),
+            mock.patch("launch._wait_for_process_exit", return_value=True),
+            mock.patch("launch.subprocess.run", side_effect=fake_run),
+        ):
+            ok, err = launch._terminate_process(identity)
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+        self.assertEqual(runs, [["taskkill", "/PID", "12345"]])
+
+    def test_terminate_process_windows_escalation_to_force(self) -> None:
+        identity = launch.ProcessIdentity(12345, "start", "command", "launcher")
+        runs: list[list[str]] = []
+        def fake_run(cmd, **_kwargs):
+            runs.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with (
+            mock.patch("launch.sys.platform", "win32"),
+            mock.patch("launch._is_process_alive", side_effect=[True, False]),
+            mock.patch("launch._process_identity_matches", return_value=True),
+            mock.patch("launch._request_application_shutdown", return_value=False),
+            mock.patch("launch._wait_for_process_exit", return_value=False),
+            mock.patch("launch.subprocess.run", side_effect=fake_run),
+            mock.patch("launch.time.sleep"),
+        ):
+            ok, err = launch._terminate_process(identity)
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+        self.assertEqual(runs, [["taskkill", "/PID", "12345"], ["taskkill", "/F", "/PID", "12345"]])
+
+    def test_terminate_process_windows_access_denied(self) -> None:
+        identity = launch.ProcessIdentity(12345, "start", "command", "launcher")
+        def fake_run(cmd, **_kwargs):
+            return subprocess.CompletedProcess(cmd, 5, stdout="", stderr="ERROR: Access is denied.")
+
+        with (
+            mock.patch("launch.sys.platform", "win32"),
+            mock.patch("launch._is_process_alive", return_value=True),
+            mock.patch("launch._process_identity_matches", return_value=True),
+            mock.patch("launch._request_application_shutdown", return_value=False),
+            mock.patch("launch._wait_for_process_exit", return_value=False),
+            mock.patch("launch.subprocess.run", side_effect=fake_run),
+            mock.patch("launch.time.sleep"),
+        ):
+            ok, err = launch._terminate_process(identity)
+        self.assertFalse(ok)
+        self.assertEqual(err, "access_denied")
+
+    def test_terminate_process_posix_graceful_sigterm(self) -> None:
+        identity = launch.ProcessIdentity(12345, "start", "command", "launcher")
+        kills: list[tuple[int, int]] = []
+        def fake_kill(pid, sig):
+            kills.append((pid, sig))
+
+        with (
+            mock.patch("launch.sys.platform", "linux"),
+            mock.patch("launch.os.kill", side_effect=fake_kill),
+            mock.patch("launch._is_process_alive", return_value=True),
+            mock.patch("launch._process_identity_matches", return_value=True),
+            mock.patch("launch._request_application_shutdown", return_value=False),
+            mock.patch("launch._wait_for_process_exit", return_value=True),
+        ):
+            ok, err = launch._terminate_process(identity)
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+        sigterm = getattr(signal, "SIGTERM", 15)
+        self.assertEqual(kills, [(12345, sigterm)])
+
+    def test_terminate_process_posix_escalation_sigkill(self) -> None:
+        identity = launch.ProcessIdentity(12345, "start", "command", "launcher")
+        kills: list[tuple[int, int]] = []
+        def fake_kill(pid, sig):
+            kills.append((pid, sig))
+
+        with (
+            mock.patch("launch.sys.platform", "linux"),
+            mock.patch("launch.os.kill", side_effect=fake_kill),
+            mock.patch("launch._is_process_alive", side_effect=[True, False]),
+            mock.patch("launch._process_identity_matches", return_value=True),
+            mock.patch("launch._request_application_shutdown", return_value=False),
+            mock.patch("launch._wait_for_process_exit", return_value=False),
+            mock.patch("launch.time.sleep"),
+        ):
+            ok, err = launch._terminate_process(identity)
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+        sigterm = getattr(signal, "SIGTERM", 15)
+        sigkill = getattr(signal, "SIGKILL", 9)
+        self.assertEqual(kills, [(12345, sigterm), (12345, sigkill)])
+
+    def test_terminate_process_posix_permission_error(self) -> None:
+        identity = launch.ProcessIdentity(12345, "start", "command", "launcher")
+        def fake_kill(pid, sig):
+            raise PermissionError("Access denied")
+
+        with (
+            mock.patch("launch.sys.platform", "linux"),
+            mock.patch("launch.os.kill", side_effect=fake_kill),
+            mock.patch("launch._is_process_alive", return_value=True),
+            mock.patch("launch._process_identity_matches", return_value=True),
+            mock.patch("launch._request_application_shutdown", return_value=False),
+        ):
+            ok, err = launch._terminate_process(identity)
+        self.assertFalse(ok)
+        self.assertEqual(err, "access_denied")
+
+    def test_terminate_process_refuses_pid_reuse(self) -> None:
+        identity = launch.ProcessIdentity(12345, 1111, "command", "launcher")
+        with (
+            mock.patch("launch._is_process_alive", return_value=True),
+            mock.patch("launch._process_identity_matches", return_value=False),
+            mock.patch("launch.os.kill") as kill,
+        ):
+            ok, err = launch._terminate_process(identity)
+        self.assertFalse(ok)
+        self.assertEqual(err, "process_identity_changed")
+        kill.assert_not_called()
+
+    def test_terminate_process_refuses_unverifiable_identity(self) -> None:
+        identity = launch.ProcessIdentity(12345, 1111, "command", "server")
+        with (
+            mock.patch("launch._is_process_alive", return_value=True),
+            mock.patch("launch._process_identity_matches", return_value=False),
+            mock.patch("launch.os.kill") as kill,
+        ):
+            ok, err = launch._terminate_process(identity)
+        self.assertFalse(ok)
+        self.assertEqual(err, "process_identity_changed")
+        kill.assert_not_called()
+
+    def test_server_uses_authenticated_handshake_and_configurable_grace(self) -> None:
+        identity = launch.ProcessIdentity(12345, "start", "command", "server")
+        with (
+            mock.patch("launch._is_process_alive", return_value=True),
+            mock.patch("launch._process_identity_matches", return_value=True),
+            mock.patch("launch._request_server_shutdown", return_value=True) as request,
+            mock.patch("launch.shutdown_grace_seconds", return_value=17.0),
+            mock.patch("launch._wait_for_process_exit", return_value=True) as wait,
+            mock.patch("launch.os.kill") as kill,
+        ):
+            ok, err = launch._terminate_process(identity, port=9123)
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+        request.assert_called_once_with(identity, host=launch.HOST, port=9123)
+        wait.assert_called_once_with(identity, 17.0)
+        kill.assert_not_called()
+
+    def test_normal_server_stop_uses_the_same_graceful_handshake(self) -> None:
+        identity = launch.ProcessIdentity(12345, "start", "command", "server")
+        server = mock.Mock(pid=12345)
+        server.poll.return_value = None
+        with (
+            mock.patch("launch._capture_process_identity", return_value=identity),
+            mock.patch("launch._request_server_shutdown", return_value=True) as request,
+            mock.patch("launch.shutdown_grace_seconds", return_value=30.0),
+            mock.patch("launch._clear_server_record"),
+        ):
+            launch.stop_server(server, announce=False)
+        request.assert_called_once_with(identity, host=launch.HOST, port=launch.PORT)
+        server.terminate.assert_not_called()
+        server.wait.assert_called_once_with(timeout=30.0)
+
+    def test_server_shutdown_handshake_uses_identity_bound_secret(self) -> None:
+        class Response:
+            status = 200
+
+            def read(self) -> bytes:
+                return b'{"stopping": true, "pid": 12345}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        identity = launch.ProcessIdentity(12345, "start", "command", "server")
+        record = {
+            "service": "vipercapture",
+            "install_id": launch._installation_id(),
+            "pid": 12345,
+            "port": 9123,
+            "start_time": "start",
+            "token": "secret-token",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "server.json"
+            path.write_text(json.dumps(record), encoding="utf-8")
+            with (
+                mock.patch("launch._server_record_path", return_value=path),
+                mock.patch("launch.urllib.request.urlopen", return_value=Response()) as open_url,
+            ):
+                self.assertTrue(launch._request_server_shutdown(identity, port=9123))
+        request = open_url.call_args.args[0]
+        self.assertEqual(request.get_header("X-vipercapture-shutdown-token"), "secret-token")
+        self.assertEqual(request.get_method(), "POST")
+
+    def test_server_shutdown_handshake_rejects_stale_record(self) -> None:
+        identity = launch.ProcessIdentity(12345, "new-start", "command", "server")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "server.json"
+            path.write_text(json.dumps({
+                "service": "vipercapture",
+                "install_id": launch._installation_id(),
+                "pid": 12345,
+                "port": 8000,
+                "start_time": "old-start",
+                "token": "secret-token",
+            }), encoding="utf-8")
+            with (
+                mock.patch("launch._server_record_path", return_value=path),
+                mock.patch("launch.urllib.request.urlopen") as open_url,
+            ):
+                self.assertFalse(launch._request_server_shutdown(identity))
+        open_url.assert_not_called()
+
+    def test_server_grace_period_defaults_to_thirty_seconds_and_is_bounded(self) -> None:
+        self.assertEqual(launch.shutdown_grace_seconds({}), 30.0)
+        self.assertEqual(launch.shutdown_grace_seconds({"VIPERCAPTURE_KILL_GRACE_SECONDS": "1"}), 5.0)
+        self.assertEqual(launch.shutdown_grace_seconds({"VIPERCAPTURE_KILL_GRACE_SECONDS": "999"}), 300.0)
+
+    def test_windows_terminal_sixel_detection(self) -> None:
+        self.assertFalse(launch._windows_terminal_supports_sixel({}))
+        self.assertFalse(launch._windows_terminal_supports_sixel({"WT_SESSION": "1"}))
+        self.assertFalse(launch._windows_terminal_supports_sixel({"VIPERCAPTURE_SIXEL": "1"}))
+        self.assertTrue(launch._windows_terminal_supports_sixel(
+            {"WT_SESSION": "1", "VIPERCAPTURE_SIXEL": "1"}
+        ))
+        self.assertTrue(launch._windows_terminal_supports_sixel(
+            {"WT_PROFILE_ID": "1", "VIPERCAPTURE_SIXEL": "true"}
+        ))
 
 
 if __name__ == "__main__":

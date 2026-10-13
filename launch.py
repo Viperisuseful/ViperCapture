@@ -20,15 +20,20 @@ from __future__ import annotations
 import base64
 import hashlib
 from importlib.metadata import version
+import json
 import os
 import platform
 import re
+import secrets
+import shlex
 import shutil
+import signal
 import sys
 import subprocess
 import socket
 import struct
 import time
+import urllib.request
 import webbrowser
 import zlib
 from dataclasses import dataclass
@@ -55,9 +60,9 @@ INTEL_MACOS_CRYPTOGRAPHY_CHANGELOG = (
 
 # ── Helpers ───────────────────────────────────────────────────
 
-def port_open() -> bool:
+def port_open(host: str = HOST, port: int = PORT) -> bool:
     try:
-        with socket.create_connection((HOST, PORT), timeout=1):
+        with socket.create_connection((host, port), timeout=1):
             return True
     except OSError:
         return False
@@ -123,8 +128,35 @@ def _is_wezterm(environ: Mapping[str, str]) -> bool:
     return program == "wezterm" or bool(environ.get("WEZTERM_PANE") or environ.get("WEZTERM_EXECUTABLE"))
 
 
+def _parse_version_tuple(val: str | None) -> tuple[int, ...] | None:
+    if not val:
+        return None
+    matches = re.findall(r"\d+", str(val))
+    if matches:
+        return tuple(int(x) for x in matches[:3])
+    return None
+
+
+def _windows_terminal_supports_sixel(environ: Mapping[str, str]) -> bool:
+    """Return an explicit Windows Terminal Sixel opt-in.
+
+    Windows Terminal exports ``WT_SESSION`` but no supported capability or
+    version variable.  Looking at an installed ``wt.exe`` is also not proof
+    that it owns this session (and cannot work in WSL), so automatic detection
+    would risk emitting raw Sixel escapes.  The opt-in is intentionally valid
+    in native Windows and WSL alike.
+    """
+    value = environ.get("VIPERCAPTURE_SIXEL", "").strip().lower()
+    return bool(environ.get("WT_SESSION") or environ.get("WT_PROFILE_ID")) and value in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _is_sixel_terminal(environ: Mapping[str, str]) -> bool:
-    """Terminals whose normal build displays Sixel, including Windows Terminal."""
+    """Terminals whose normal build displays Sixel."""
     term = environ.get("TERM", "").lower()
     program = environ.get("TERM_PROGRAM", "").lower()
     if term == "foot" or term.startswith("foot-") or program == "foot":
@@ -135,7 +167,9 @@ def _is_sixel_terminal(environ: Mapping[str, str]) -> bool:
         return True
     if "sixel" in term:
         return True
-    return bool(environ.get("WT_SESSION") or environ.get("WT_PROFILE_ID"))
+    if _windows_terminal_supports_sixel(environ):
+        return True
+    return False
 
 
 def _strip_lua_comments(text: str) -> str:
@@ -839,19 +873,969 @@ class StopKeyBuffer:
         return False
 
 
-def stop_server(server: subprocess.Popen[object], *, announce: bool = True) -> None:
+def stop_server(
+    server: subprocess.Popen[object],
+    *,
+    announce: bool = True,
+    host: str = HOST,
+    port: int = PORT,
+) -> None:
     if server.poll() is not None:
+        _clear_server_record(server.pid)
         return
     if announce:
         print("\n  Stopping server...")
-    server.terminate()
+    identity = _capture_process_identity(server.pid)
+    requested = bool(
+        identity is not None
+        and identity.kind == "server"
+        and _request_server_shutdown(identity, host=host, port=port)
+    )
+    if not requested:
+        server.terminate()
     try:
-        server.wait(timeout=5)
+        server.wait(timeout=shutdown_grace_seconds())
     except subprocess.TimeoutExpired:
         server.kill()
         server.wait(timeout=5)
+    finally:
+        _clear_server_record(server.pid)
     if announce:
         print("  Server stopped.")
+
+
+def _get_process_ancestors() -> set[int]:
+    """Return the set of PIDs covering current process and all its ancestors."""
+    ancestors = {os.getpid()}
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            TH32CS_SNAPPROCESS = 0x00000002
+
+            class PROCESSENTRY32(ctypes.Structure):
+                _fields_ = [
+                    ("dwSize", wintypes.DWORD),
+                    ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", wintypes.LONG),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", ctypes.c_char * 260),
+                ]
+
+            kernel32 = ctypes.windll.kernel32
+            hSnapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            if hSnapshot and hSnapshot != -1:
+                pe = PROCESSENTRY32()
+                pe.dwSize = ctypes.sizeof(PROCESSENTRY32)
+                parents: dict[int, int] = {}
+                success = kernel32.Process32First(hSnapshot, ctypes.byref(pe))
+                while success:
+                    parents[pe.th32ProcessID] = pe.th32ParentProcessID
+                    success = kernel32.Process32Next(hSnapshot, ctypes.byref(pe))
+                kernel32.CloseHandle(hSnapshot)
+
+                cur = os.getpid()
+                while cur in parents and parents[cur] > 4 and parents[cur] not in ancestors:
+                    cur = parents[cur]
+                    ancestors.add(cur)
+        except Exception:
+            pass
+    elif sys.platform == "linux":
+        try:
+            cur = os.getpid()
+            while cur > 1:
+                # Read /proc/<cur>/stat on Linux
+                stat_file = Path(f"/proc/{cur}/stat")
+                if stat_file.is_file():
+                    stat_text = stat_file.read_text(encoding="utf-8", errors="ignore")
+                    rparen = stat_text.rfind(")")
+                    if rparen != -1:
+                        parts = stat_text[rparen + 1 :].split()
+                        ppid = int(parts[1])
+                        if ppid in ancestors or ppid <= 1:
+                            break
+                        ancestors.add(ppid)
+                        cur = ppid
+                        continue
+                out = subprocess.check_output(
+                    ["ps", "-p", str(cur), "-o", "ppid="],
+                    text=True,
+                    errors="ignore",
+                    timeout=2,
+                )
+                ppid = int(out.strip())
+                if ppid in ancestors or ppid <= 1:
+                    break
+                ancestors.add(ppid)
+                cur = ppid
+        except Exception:
+            pass
+    else:
+        # macOS and other POSIX systems do not expose /proc. Walk the complete
+        # chain with ps rather than calling os.getppid(), which only describes
+        # the current Python process and therefore cannot advance the walk.
+        try:
+            cur = os.getpid()
+            while cur > 1:
+                out = subprocess.check_output(
+                    ["ps", "-p", str(cur), "-o", "ppid="],
+                    text=True,
+                    errors="ignore",
+                    timeout=2,
+                )
+                ppid = int(out.strip())
+                if ppid in ancestors or ppid <= 1:
+                    break
+                ancestors.add(ppid)
+                cur = ppid
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    return ancestors
+
+
+def _get_process_start_time(pid: int) -> int | str | None:
+    """Return an opaque identifier for the process start time to guard against PID reuse."""
+    if pid <= 0:
+        return None
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.windll.kernel32
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if h:
+                try:
+                    creation = wintypes.FILETIME()
+                    exit_time = wintypes.FILETIME()
+                    kernel_t = wintypes.FILETIME()
+                    user_t = wintypes.FILETIME()
+                    if kernel32.GetProcessTimes(
+                        h,
+                        ctypes.byref(creation),
+                        ctypes.byref(exit_time),
+                        ctypes.byref(kernel_t),
+                        ctypes.byref(user_t),
+                    ):
+                        return (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+                finally:
+                    kernel32.CloseHandle(h)
+        except Exception:
+            pass
+    elif sys.platform == "linux":
+        try:
+            stat_file = Path(f"/proc/{pid}/stat")
+            if stat_file.is_file():
+                text = stat_file.read_text(encoding="utf-8", errors="ignore")
+                rparen = text.rfind(")")
+                if rparen != -1:
+                    parts = text[rparen + 1 :].split()
+                    if len(parts) >= 20:
+                        return parts[19]  # starttime
+        except OSError:
+            pass
+    elif sys.platform == "darwin":
+        try:
+            value = subprocess.check_output(
+                ["ps", "-p", str(pid), "-o", "lstart="],
+                text=True,
+                errors="ignore",
+                timeout=2,
+            ).strip()
+            return value or None
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return None
+
+
+def _split_process_command(cmdline: str) -> list[str]:
+    """Split a process command line without treating labels as executables."""
+    if not cmdline.strip():
+        return []
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            argc = ctypes.c_int()
+            command_line_to_argv = ctypes.windll.shell32.CommandLineToArgvW
+            command_line_to_argv.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+            command_line_to_argv.restype = ctypes.POINTER(wintypes.LPWSTR)
+            local_free = ctypes.windll.kernel32.LocalFree
+            local_free.argtypes = [wintypes.HLOCAL]
+            local_free.restype = wintypes.HLOCAL
+            argv = command_line_to_argv(cmdline, ctypes.byref(argc))
+            if argv:
+                try:
+                    return [argv[index] for index in range(argc.value)]
+                finally:
+                    local_free(argv)
+        except Exception:
+            pass
+    try:
+        return shlex.split(cmdline, posix=True)
+    except ValueError:
+        return []
+
+
+def _normalized_absolute_path(value: str) -> str | None:
+    """Normalize an absolute argv path without resolving venv symlinks."""
+    value = value.strip().strip('"')
+    if not value or not Path(value).is_absolute():
+        return None
+    normalized = os.path.normpath(os.path.abspath(value))
+    return os.path.normcase(normalized).casefold() if sys.platform == "win32" else normalized
+
+
+def _same_process_path(value: str, expected: Path) -> bool:
+    actual = _normalized_absolute_path(value)
+    wanted = _normalized_absolute_path(str(expected))
+    return actual is not None and wanted is not None and actual == wanted
+
+
+def _vipercapture_process_kind(
+    cmdline: str,
+    root_dir: Path = ROOT,
+    venv_dir: Path | None = None,
+) -> str | None:
+    """Classify only argv forms launched by this exact installation."""
+    argv = _split_process_command(cmdline)
+    if not argv:
+        return None
+
+    root_dir = root_dir.absolute()
+    venv_dir = (root_dir / ".venv") if venv_dir is None else venv_dir.absolute()
+    launch_target = root_dir / "launch.py"
+    gui_target = root_dir / "gui.py"
+
+    script_index = 1
+    script_kind: str | None = None
+    if len(argv) > script_index and _same_process_path(argv[script_index], launch_target):
+        script_kind = "launcher"
+    elif len(argv) > script_index and _same_process_path(argv[script_index], gui_target):
+        script_kind = "gui"
+    if script_kind is not None:
+        trailing = argv[script_index + 1:]
+        if trailing and trailing[0].casefold() == "kill":
+            return None
+        if script_kind == "launcher" and any(arg.casefold() == "--gui" for arg in trailing):
+            return "gui"
+        return script_kind
+
+    # ViperCapture starts uvicorn with the installation's venv interpreter and
+    # this exact module sequence. Text in an unrelated --label is not enough.
+    python_candidates = (
+        venv_dir / "bin" / "python",
+        venv_dir / "bin" / "python3",
+        venv_dir / "Scripts" / "python.exe",
+    )
+    if (
+        len(argv) >= 4
+        and any(_same_process_path(argv[0], candidate) for candidate in python_candidates)
+        and argv[1:4] == ["-m", "uvicorn", "vipercapture.main:app"]
+    ):
+        return "server"
+    return None
+
+
+def _matches_vipercapture_command(
+    cmdline: str,
+    root_dir: Path = ROOT,
+    venv_dir: Path | None = None,
+) -> bool:
+    """True only for a ViperCapture argv belonging to this installation."""
+    return _vipercapture_process_kind(cmdline, root_dir, venv_dir) is not None
+
+
+def _installation_id(root_dir: Path = ROOT) -> str:
+    normalized = os.path.normcase(os.path.abspath(root_dir))
+    return hashlib.sha256(normalized.encode("utf-8", errors="surrogatepass")).hexdigest()
+
+
+@dataclass(frozen=True)
+class ProcessIdentity:
+    pid: int
+    start_time: int | str
+    command: str
+    kind: str
+
+
+def _is_vipercapture_endpoint(
+    host: str = HOST,
+    port: int = PORT,
+    timeout: float = 1.0,
+    *,
+    expected_pids: set[int] | None = None,
+    root_dir: Path = ROOT,
+) -> int | None:
+    """Return the one PID claimed by a verified ViperCapture endpoint."""
+    try:
+        url = f"http://{host}:{port}/__vipercapture__/identity"
+        req = urllib.request.Request(url, headers={"User-Agent": "ViperCapture-Probe"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            data = json.loads(resp.read().decode("utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    pid = data.get("pid")
+    if type(pid) is not int or pid <= 0:
+        return None
+    if not (
+        data.get("service") == "vipercapture"
+        and data.get("install_id") == _installation_id(root_dir)
+        and (expected_pids is None or pid in expected_pids)
+    ):
+        return None
+    return pid
+
+
+def _capture_process_identity(pid: int, root_dir: Path = ROOT) -> ProcessIdentity | None:
+    """Atomically-enough bind a PID to its start time and exact command identity."""
+    if pid <= 0:
+        return None
+    started_before = _get_process_start_time(pid)
+    if started_before is None:
+        return None
+    command = _get_pid_commandline(pid)
+    if not command:
+        return None
+    kind = _vipercapture_process_kind(command, root_dir=root_dir)
+    if kind is None:
+        return None
+    started_after = _get_process_start_time(pid)
+    if started_after is None or started_after != started_before:
+        return None
+    return ProcessIdentity(pid, started_before, command, kind)
+
+
+def _process_identity_matches(identity: ProcessIdentity, root_dir: Path = ROOT) -> bool:
+    """Revalidate start time and exact command before acting on a PID."""
+    started_before = _get_process_start_time(identity.pid)
+    if started_before != identity.start_time:
+        return False
+    command = _get_pid_commandline(identity.pid)
+    if not command:
+        return False
+    if _split_process_command(command) != _split_process_command(identity.command):
+        return False
+    if _vipercapture_process_kind(command, root_dir=root_dir) != identity.kind:
+        return False
+    return _get_process_start_time(identity.pid) == identity.start_time
+
+
+def _find_vipercapture_candidate_pids(
+    port: int = PORT,
+    root_dir: Path = ROOT,
+    host: str = HOST,
+) -> set[int]:
+    """Find candidate PIDs; callers must bind and revalidate their identities."""
+    pids: set[int] = set()
+    exclude_pids = _get_process_ancestors()
+
+    # 1. Port lookup for active listening TCP server
+    listening_pids: set[int] = set()
+    if sys.platform == "win32":
+        try:
+            out = subprocess.check_output(
+                ["netstat", "-ano", "-p", "tcp"],
+                text=True,
+                errors="ignore",
+                timeout=5,
+            )
+            for line in out.splitlines():
+                line = line.strip()
+                parts = line.split()
+                if len(parts) >= 5 and parts[0].upper() == "TCP" and "LISTENING" in line.upper():
+                    try:
+                        local_port = int(parts[1].rsplit(":", 1)[-1])
+                        pid = int(parts[-1])
+                        if local_port == port and pid > 0 and pid not in exclude_pids:
+                            listening_pids.add(pid)
+                    except ValueError:
+                        pass
+        except (OSError, subprocess.SubprocessError):
+            pass
+    elif sys.platform == "darwin":
+        try:
+            out = subprocess.check_output(
+                ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+                text=True,
+                errors="ignore",
+                timeout=5,
+            )
+            for line in out.splitlines():
+                try:
+                    pid = int(line.strip())
+                    if pid > 0 and pid not in exclude_pids:
+                        listening_pids.add(pid)
+                except ValueError:
+                    pass
+        except (OSError, subprocess.SubprocessError):
+            pass
+    else:
+        try:
+            out = subprocess.check_output(
+                ["ss", "-lptn", f"sport = :{port}"],
+                text=True,
+                errors="ignore",
+                timeout=5,
+            )
+            for match in re.finditer(r"pid=(\d+)", out):
+                pid = int(match.group(1))
+                if pid > 0 and pid not in exclude_pids:
+                    listening_pids.add(pid)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if not listening_pids:
+            try:
+                out = subprocess.check_output(
+                    ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+                    text=True,
+                    errors="ignore",
+                    timeout=5,
+                )
+                for line in out.splitlines():
+                    try:
+                        pid = int(line.strip())
+                        if pid > 0 and pid not in exclude_pids:
+                            listening_pids.add(pid)
+                    except ValueError:
+                        pass
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+    # Verify that the port owner is actually ViperCapture before accepting
+    if listening_pids:
+        endpoint_pid = _is_vipercapture_endpoint(
+            host=host,
+            port=port,
+            expected_pids=listening_pids,
+            root_dir=root_dir,
+        )
+        if endpoint_pid is not None:
+            pids.add(endpoint_pid)
+        # Every other listener must independently pass exact command matching.
+        for pid in listening_pids - {endpoint_pid}:
+            cmd = _get_pid_commandline(pid)
+            if cmd and _matches_vipercapture_command(cmd, root_dir=root_dir):
+                pids.add(pid)
+
+    # 2. Process inspection by command line for this specific installation
+    if sys.platform == "win32":
+        try:
+            ps_script = (
+                "Get-CimInstance Win32_Process | ForEach-Object { "
+                "$cmd = $_.CommandLine; "
+                "if ($cmd -and ($cmd -match 'vipercapture' -or $cmd -match 'launch\\.py' -or $cmd -match 'gui\\.py')) { "
+                'Write-Output "$($_.ProcessId)|$($cmd)" '
+                "} }"
+            )
+            out = subprocess.check_output(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+                text=True,
+                errors="ignore",
+                timeout=10,
+            )
+            for line in out.splitlines():
+                line = line.strip()
+                if not line or "|" not in line:
+                    continue
+                parts = line.split("|", 1)
+                try:
+                    proc_id = int(parts[0])
+                    cmd = parts[1] if len(parts) > 1 else ""
+                    if proc_id not in exclude_pids and _matches_vipercapture_command(cmd, root_dir=root_dir):
+                        pids.add(proc_id)
+                except ValueError:
+                    pass
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    elif sys.platform == "darwin":
+        try:
+            out = subprocess.check_output(
+                ["ps", "-axo", "pid,command"],
+                text=True,
+                errors="ignore",
+                timeout=5,
+            )
+            for line in out.splitlines():
+                parts = line.strip().split(None, 1)
+                if len(parts) >= 2:
+                    try:
+                        proc_id = int(parts[0])
+                        cmd = parts[1]
+                        if proc_id not in exclude_pids and _matches_vipercapture_command(cmd, root_dir=root_dir):
+                            pids.add(proc_id)
+                    except ValueError:
+                        pass
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    else:
+        proc_dir = Path("/proc")
+        if proc_dir.is_dir():
+            try:
+                for entry in proc_dir.iterdir():
+                    if entry.name.isdigit():
+                        proc_id = int(entry.name)
+                        if proc_id in exclude_pids:
+                            continue
+                        try:
+                            cmdline_bytes = (entry / "cmdline").read_bytes()
+                            argv = [
+                                item
+                                for item in cmdline_bytes.decode("utf-8", errors="replace").split("\x00")
+                                if item
+                            ]
+                            cmdline = shlex.join(argv)
+                            if _matches_vipercapture_command(cmdline, root_dir=root_dir):
+                                pids.add(proc_id)
+                        except (OSError, UnicodeError):
+                            continue
+            except OSError:
+                pass
+
+    pids.difference_update(exclude_pids)
+    return pids
+
+
+def find_vipercapture_processes(
+    port: int = PORT,
+    root_dir: Path = ROOT,
+    host: str = HOST,
+) -> dict[int, ProcessIdentity]:
+    """Return identity-bound ViperCapture targets safe to revalidate."""
+    identities: dict[int, ProcessIdentity] = {}
+    for pid in _find_vipercapture_candidate_pids(port=port, root_dir=root_dir, host=host):
+        identity = _capture_process_identity(pid, root_dir=root_dir)
+        if identity is not None:
+            identities[pid] = identity
+    return identities
+
+
+def find_vipercapture_pids(
+    port: int = PORT,
+    root_dir: Path = ROOT,
+    host: str = HOST,
+) -> set[int]:
+    """Compatibility wrapper returning PIDs from identity-bound discovery."""
+    return set(find_vipercapture_processes(port=port, root_dir=root_dir, host=host))
+
+
+def _get_pid_commandline(pid: int) -> str | None:
+    """Best-effort command line lookup for a single PID."""
+    if pid <= 0:
+        return None
+    if sys.platform == "win32":
+        try:
+            ps_script = f"(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').CommandLine"
+            out = subprocess.check_output(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+                text=True,
+                errors="ignore",
+                timeout=5,
+            )
+            return out.strip() or None
+        except (OSError, subprocess.SubprocessError):
+            return None
+    elif sys.platform == "darwin":
+        try:
+            out = subprocess.check_output(
+                ["ps", "-p", str(pid), "-o", "command="],
+                text=True,
+                errors="ignore",
+                timeout=5,
+            )
+            return out.strip() or None
+        except (OSError, subprocess.SubprocessError):
+            return None
+    else:
+        try:
+            cmd_file = Path(f"/proc/{pid}/cmdline")
+            if cmd_file.is_file():
+                argv = [
+                    item
+                    for item in cmd_file.read_bytes().decode("utf-8", errors="replace").split("\x00")
+                    if item
+                ]
+                return shlex.join(argv) or None
+        except OSError:
+            pass
+    return None
+
+
+def _shutdown_request_path(pid: int | None = None) -> Path:
+    target_pid = os.getpid() if pid is None else pid
+    return Path.home() / ".vipercapture" / "runtime" / f"shutdown-{target_pid}"
+
+
+def _request_application_shutdown(pid: int) -> bool:
+    """Ask an interactive ViperCapture process to unwind through its cleanup."""
+    try:
+        path = _shutdown_request_path(pid)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.write_text("stop\n", encoding="ascii")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+        return True
+    except OSError:
+        return False
+
+
+def application_shutdown_requested(*, consume: bool = True) -> bool:
+    """Return whether this process received a cross-platform shutdown request."""
+    path = _shutdown_request_path()
+    try:
+        requested = path.is_file()
+        if requested and consume:
+            path.unlink(missing_ok=True)
+        return requested
+    except OSError:
+        return False
+
+
+def _clear_application_shutdown_request(pid: int | None = None) -> None:
+    try:
+        _shutdown_request_path(pid).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def shutdown_grace_seconds(environ: Mapping[str, str] | None = None) -> float:
+    """Grace period before force-kill; configurable without allowing extremes."""
+    env = os.environ if environ is None else environ
+    try:
+        value = float(env.get("VIPERCAPTURE_KILL_GRACE_SECONDS", "30"))
+    except ValueError:
+        value = 30.0
+    return min(300.0, max(5.0, value))
+
+
+def _server_record_path(pid: int) -> Path:
+    return Path.home() / ".vipercapture" / "runtime" / f"server-{pid}.json"
+
+
+def _new_server_environment() -> tuple[dict[str, str], str]:
+    token = secrets.token_urlsafe(32)
+    env = dict(os.environ)
+    env["VIPERCAPTURE_SHUTDOWN_TOKEN"] = token
+    return env, token
+
+
+def _record_server_process(pid: int, token: str, port: int = PORT) -> bool:
+    started = _get_process_start_time(pid)
+    if started is None:
+        return False
+    record = {
+        "service": "vipercapture",
+        "install_id": _installation_id(),
+        "pid": pid,
+        "port": port,
+        "start_time": started,
+        "token": token,
+    }
+    try:
+        path = _server_record_path(pid)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(record), encoding="utf-8")
+        try:
+            temporary.chmod(0o600)
+        except OSError:
+            pass
+        temporary.replace(path)
+        return True
+    except OSError:
+        return False
+
+
+def _clear_server_record(pid: int) -> None:
+    try:
+        _server_record_path(pid).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _request_server_shutdown(
+    identity: ProcessIdentity,
+    *,
+    host: str = HOST,
+    port: int = PORT,
+    timeout: float = 2.0,
+) -> bool:
+    """Use the per-process secret to ask Uvicorn to run application cleanup."""
+    try:
+        record = json.loads(_server_record_path(identity.pid).read_text(encoding="utf-8"))
+        if not isinstance(record, dict):
+            return False
+        if not (
+            record.get("service") == "vipercapture"
+            and record.get("install_id") == _installation_id()
+            and record.get("pid") == identity.pid
+            and record.get("port") == port
+            and record.get("start_time") == identity.start_time
+            and isinstance(record.get("token"), str)
+            and record["token"]
+        ):
+            return False
+        request = urllib.request.Request(
+            f"http://{host}:{port}/__vipercapture__/shutdown",
+            data=b"{}",
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-ViperCapture-Shutdown-Token": record["token"],
+            },
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            if response.status != 200:
+                return False
+            payload = json.loads(response.read().decode("utf-8"))
+        return bool(
+            isinstance(payload, dict)
+            and payload.get("stopping") is True
+            and payload.get("pid") == identity.pid
+        )
+    except (OSError, ValueError, UnicodeError):
+        return False
+
+
+def _get_posix_process_state(pid: int) -> str | None:
+    """Return the POSIX process state, including ``Z`` for an unreaped child."""
+    if pid <= 0 or sys.platform == "win32":
+        return None
+    if sys.platform.startswith("linux"):
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            # The command is parenthesized and may itself contain spaces or ``)``.
+            closing_paren = stat.rfind(")")
+            fields = stat[closing_paren + 1 :].split() if closing_paren >= 0 else []
+            if fields:
+                return fields[0]
+        except (OSError, UnicodeError):
+            pass
+    try:
+        output = subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "stat="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return output.split()[0] if output else None
+
+
+def _is_process_alive(pid: int) -> bool:
+    """True if process exists and is alive."""
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.windll.kernel32
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                err = kernel32.GetLastError()
+                return err == 5  # ERROR_ACCESS_DENIED means process exists
+            exit_code = wintypes.DWORD()
+            if kernel32.GetExitCodeProcess(h, ctypes.byref(exit_code)):
+                kernel32.CloseHandle(h)
+                return exit_code.value == 259  # STILL_ACTIVE
+            kernel32.CloseHandle(h)
+            return False
+        except Exception:
+            return False
+    else:
+        # kill(pid, 0) reports zombies as existing. They have already exited and
+        # cannot respond to another signal; their parent only needs to reap them.
+        state = _get_posix_process_state(pid)
+        if state and state.upper().startswith("Z"):
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+
+
+def _wait_for_process_exit(identity: ProcessIdentity, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _is_process_alive(identity.pid):
+            _clear_application_shutdown_request(identity.pid)
+            _clear_server_record(identity.pid)
+            return True
+        time.sleep(0.1)
+    if not _is_process_alive(identity.pid):
+        _clear_application_shutdown_request(identity.pid)
+        _clear_server_record(identity.pid)
+        return True
+    return False
+
+
+def _terminate_process(
+    identity: ProcessIdentity,
+    *,
+    root_dir: Path = ROOT,
+    host: str = HOST,
+    port: int = PORT,
+) -> tuple[bool, str | None]:
+    """Terminate one identity-bound target, refusing changed or unverifiable PIDs."""
+    if not _is_process_alive(identity.pid):
+        return True, None
+    if identity.kind not in {"server", "launcher", "gui"}:
+        return False, "unrecognized_process_kind"
+    if not _process_identity_matches(identity, root_dir=root_dir):
+        return False, "process_identity_changed"
+
+    server_handshake = False
+    if identity.kind == "server":
+        server_handshake = _request_server_shutdown(identity, host=host, port=port)
+        if server_handshake:
+            if _wait_for_process_exit(identity, shutdown_grace_seconds()):
+                return True, None
+            if not _process_identity_matches(identity, root_dir=root_dir):
+                return False, "process_identity_changed"
+    elif _request_application_shutdown(identity.pid):
+        if _wait_for_process_exit(identity, 3.0):
+            return True, None
+        if not _process_identity_matches(identity, root_dir=root_dir):
+            return False, "process_identity_changed"
+
+    # Older servers without a runtime record and interactive processes that did
+    # not acknowledge their marker still receive an ordinary termination. A
+    # server that acknowledged the HTTP handshake already consumed its entire
+    # configurable grace window and proceeds directly to verified escalation.
+    if not server_handshake:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/PID", str(identity.pid)],
+                capture_output=True,
+                check=False,
+            )
+        else:
+            try:
+                os.kill(identity.pid, getattr(signal, "SIGTERM", 15))
+            except PermissionError:
+                return False, "access_denied"
+            except OSError:
+                pass
+
+        grace = shutdown_grace_seconds() if identity.kind == "server" else 3.0
+        if _wait_for_process_exit(identity, grace):
+            return True, None
+        if not _process_identity_matches(identity, root_dir=root_dir):
+            return False, "process_identity_changed"
+
+    # Force termination only after the exact command and start time still match.
+    if sys.platform == "win32":
+        proc = subprocess.run(
+            ["taskkill", "/F", "/PID", str(identity.pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        time.sleep(0.1)
+        if not _is_process_alive(identity.pid):
+            _clear_application_shutdown_request(identity.pid)
+            _clear_server_record(identity.pid)
+            return True, None
+        combined = f"{proc.stdout} {proc.stderr}".lower()
+        if "access is denied" in combined or proc.returncode == 5:
+            return False, "access_denied"
+        err = proc.stderr.strip() or proc.stdout.strip()
+        return False, err or f"taskkill failed with code {proc.returncode}"
+    try:
+        os.kill(identity.pid, getattr(signal, "SIGKILL", 9))
+    except PermissionError:
+        return False, "access_denied"
+    except OSError:
+        pass
+    time.sleep(0.1)
+    if not _is_process_alive(identity.pid):
+        _clear_application_shutdown_request(identity.pid)
+        _clear_server_record(identity.pid)
+        return True, None
+    return False, "survived_sigkill"
+
+
+def kill_all_instances(port: int = PORT) -> int:
+    """Terminate all running ViperCapture instances with orderly shutdown and verified escalation."""
+    print()
+    print("  ViperCapture")
+    print("  ------------")
+    print()
+
+    processes = find_vipercapture_processes(port=port)
+    if not processes and not port_open(port=port):
+        print("  No running instances of ViperCapture found.")
+        return 0
+
+    print("  Stopping running ViperCapture instance(s)...")
+
+    killed: list[int] = []
+    permission_errors: list[int] = []
+    failed_pids: dict[int, str] = {}
+
+    priority = {"server": 0, "launcher": 1, "gui": 1}
+    ordered = sorted(processes.values(), key=lambda item: (priority[item.kind], item.pid))
+
+    for identity in ordered:
+        pid = identity.pid
+        success, reason = _terminate_process(identity, port=port)
+        if success:
+            killed.append(pid)
+        elif reason == "access_denied":
+            permission_errors.append(pid)
+        else:
+            failed_pids[pid] = reason or "unknown error"
+
+    # Wait briefly for port to close if listening server was targeted
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and port_open(port=port):
+        time.sleep(0.2)
+
+    if killed:
+        pids_str = ", ".join(str(p) for p in killed)
+        print(f"  Stopped {len(killed)} ViperCapture process(es): {pids_str}.")
+    if permission_errors:
+        err_str = ", ".join(str(p) for p in permission_errors)
+        print(f"  Access was denied for PID(s): {err_str}.")
+        print("  If ViperCapture was started as Administrator or another user, run 'vipercapture kill' from an elevated terminal.")
+    if failed_pids:
+        for pid, msg in sorted(failed_pids.items()):
+            print(f"  Failed to stop PID {pid}: {msg}")
+
+    # Port still open or processes failed -> return failure
+    has_failure = bool(permission_errors or failed_pids)
+    if port_open(port=port):
+        print(f"  Warning: Port {port} is still in use.")
+        return 1
+
+    if has_failure:
+        return 1
+
+    print("  All ViperCapture instances stopped.")
+    return 0
 
 
 def _wait_posix_keys(
@@ -878,6 +1862,8 @@ def _wait_posix_keys(
         watched.append(wake_r)
     try:
         while server.poll() is None:
+            if application_shutdown_requested():
+                return
             try:
                 readable, _, _ = select.select(watched, [], [], 0.2)
             except InterruptedError:
@@ -921,6 +1907,8 @@ def _wait_windows_keys(server: subprocess.Popen[object]) -> None:
 
     keys = StopKeyBuffer()
     while server.poll() is None:
+        if application_shutdown_requested():
+            return
         if not msvcrt.kbhit():
             if keys.flush():
                 return
@@ -1437,6 +2425,7 @@ def ensure_playwright() -> None:
 LAUNCH_HELP = """\
 usage: vipercapture [--one-window]
        vipercapture update [--check]
+       vipercapture kill
        vipercapture --gui [--viewport WIDTH HEIGHT]
 
 Start ViperCapture in this terminal. Ghostty and Kitty open request
@@ -1449,6 +2438,8 @@ logs in another window and show a full-screen status view.
                  Python only, on Linux, macOS, and Windows.
   update --check Print whether an update is available, then exit.
                  Exit 10 means an update is available.
+  kill           Stop all running instances of ViperCapture (server, GUI,
+                 and background workers) on Windows, macOS, and Linux.
   --gui          Open a full-screen capture menu in this terminal.
                  Type a website link, press Tab to switch png, gif, and
                  mp4, and press Ctrl+P to switch between the full page and
@@ -1467,6 +2458,7 @@ class CliArgs:
     update: bool = False
     check: bool = False
     gui: bool = False
+    kill: bool = False
     viewport: tuple[int, int] | None = None
 
 
@@ -1499,6 +2491,14 @@ def parse_cli(argv: list[str] | None = None) -> CliArgs:
             print(f"Unknown argument: {arg}\n{LAUNCH_HELP}", end="", file=sys.stderr)
             raise SystemExit(2)
         return CliArgs(update=True, check=check)
+    if args and args[0] == "kill":
+        for arg in args[1:]:
+            if arg in {"-h", "--help"}:
+                print(LAUNCH_HELP, end="")
+                raise SystemExit(0)
+            print(f"Unknown argument: {arg}\n{LAUNCH_HELP}", end="", file=sys.stderr)
+            raise SystemExit(2)
+        return CliArgs(kill=True)
     gui = False
     one_window = False
     viewport: tuple[int, int] | None = None
@@ -1547,9 +2547,12 @@ def main() -> None:
     # dependencies or start the server. ensure_venv re-runs this file with
     # the same arguments when the command is a normal launch.
     cli = parse_cli()
+    if cli.kill:
+        raise SystemExit(kill_all_instances())
     if cli.update:
         import updater
         raise SystemExit(updater.run_update(ROOT, check_only=cli.check))
+    _clear_application_shutdown_request()
     if cli.gui:
         ensure_venv()
         import gui
@@ -1579,7 +2582,8 @@ def main() -> None:
 
     log_path = Path.home() / ".vipercapture" / "requests.log"
     log_handle = None
-    popen_kwargs: dict[str, object] = {"cwd": str(ROOT)}
+    server_env, shutdown_token = _new_server_environment()
+    popen_kwargs: dict[str, object] = {"cwd": str(ROOT), "env": server_env}
     if not one_window:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -1591,6 +2595,7 @@ def main() -> None:
          "--host", HOST, "--port", str(PORT)],
         **popen_kwargs,
     )
+    _record_server_process(server.pid, shutdown_token, PORT)
 
     # ── Wait for port (1 check/sec, 30s max) ────────────────────
     # One-window mode inherits uvicorn's output, so progress dots would

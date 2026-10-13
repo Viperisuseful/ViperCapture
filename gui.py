@@ -33,11 +33,49 @@ DEFAULT_VIEWPORT = (1920, 1080)
 MAX_CAPTURE_BYTES = 200 * 1024 * 1024
 VIDEO_DURATION_MS = 4_000
 ASCII_LOGO = (
-    "█ █ █ █▀█ █▀▀ █▀█   █▀▀ █▀█ █▀█ ▀█▀ █ █ █▀█ █▀▀",
-    "▀▄▀ █ █▀▀ █▀▀ █▀▄   █   █▀█ █▀▀  █  █ █ █▀▄ █▀▀",
-    " ▀  ▀ ▀   ▀▀▀ ▀ ▀   ▀▀▀ ▀ ▀ ▀   ▀▀▀ ▀▀▀ ▀ ▀ ▀▀▀",
+    "                                         █                  ",
+    "█  █  █  █▀▀█ █▀▀█ █▀▀▄  █▀▀▀ ▄▀▀█ █▀▀█ ▀█▀▀ █  █ █▀▀▄ █▀▀█ ",
+    "█__█  █  █__█ █^^^ █     █___ █__█ █__█  █   █__█ █    █^^^ ",
+    " ▀▀   ▀  █▀▀▀ ▀▀▀▀ ▀     ▀▀▀▀ ▀▀▀▀ █▀▀▀  ▀▀  ▀▀▀▀ ▀    ▀▀▀▀ ",
     "ViperCapture",
 )
+
+
+def _draw_wordmark_line(line: str, fg: str, shadow: str, bg: str) -> str:
+    reset = "\x1b[0m"
+    parts: list[str] = []
+    for char in line:
+        if char == "_":
+            parts.append(f"{bg} {reset}")
+        elif char == "^":
+            parts.append(f"{fg}{bg}▀{reset}")
+        elif char == "~":
+            parts.append(f"{shadow}▀{reset}")
+        elif char == " ":
+            parts.append(" ")
+        else:
+            parts.append(f"{fg}{char}{reset}")
+    return "".join(parts)
+
+
+def styled_ascii_logo() -> list[str]:
+    viper_fg = "\x1b[1;34m"
+    capture_fg = "\x1b[1;37m"
+    viper_shadow = "\x1b[38;2;60;66;80m"
+    viper_bg = "\x1b[48;2;60;66;80m"
+    capture_shadow = "\x1b[38;2;20;42;90m"
+    capture_bg = "\x1b[48;2;20;42;90m"
+
+    lines: list[str] = []
+    split_pos = 25
+    for raw in ASCII_LOGO[:4]:
+        left = raw[:split_pos]
+        right = raw[split_pos:]
+        left_styled = _draw_wordmark_line(left, viper_fg, viper_shadow, viper_bg)
+        right_styled = _draw_wordmark_line(right, capture_fg, capture_shadow, capture_bg)
+        lines.append(f"{left_styled}{right_styled}")
+    lines.append(f"\x1b[2m{ASCII_LOGO[4]}\x1b[0m")
+    return lines
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 _HOST = re.compile(r"[^A-Za-z0-9.-]+")
 
@@ -409,9 +447,9 @@ def _logo_placement(
 def _wordmark(cols: int, *, image: bool) -> tuple[str, ...]:
     if image:
         return ()
-    if cols < 52:
+    if cols < 64:
         return ("ViperCapture",)
-    return ASCII_LOGO
+    return tuple(styled_ascii_logo())
 
 
 def _frame_block(state: GuiState, cols: int, *, image: bool) -> list[str]:
@@ -817,8 +855,16 @@ def server_command() -> list[str]:
 def _window_size() -> launch.WindowSize:
     if os.name != "nt":
         try:
-            return launch.read_window_size(sys.stdout.fileno())
-        except (OSError, ModuleNotFoundError):
+            fd = sys.stdout.fileno()
+            return launch.read_window_size(fd)
+        except (OSError, ValueError, AttributeError, ModuleNotFoundError):
+            pass
+    for stream in (sys.stdout, sys.stdin):
+        try:
+            fd = stream.fileno()
+            size = os.get_terminal_size(fd)
+            return launch.WindowSize(size.columns, size.lines)
+        except (OSError, ValueError, AttributeError):
             pass
     size = shutil.get_terminal_size((80, 24))
     return launch.WindowSize(size.columns, size.lines)
@@ -914,8 +960,10 @@ def _start_server() -> tuple[subprocess.Popen[object], object]:
     if hasattr(os, "fchmod"):
         os.fchmod(log_fd, 0o600)
     log_handle = open(log_fd, "w", encoding="utf-8", buffering=1)
+    server_env, shutdown_token = launch._new_server_environment()
     kwargs: dict[str, object] = {
         "cwd": str(launch.ROOT),
+        "env": server_env,
         "stdin": subprocess.DEVNULL,
         "stdout": log_handle,
         "stderr": subprocess.STDOUT,
@@ -926,6 +974,7 @@ def _start_server() -> tuple[subprocess.Popen[object], object]:
         kwargs["creationflags"] = flags
     try:
         server = subprocess.Popen(server_command(), **kwargs)
+        launch._record_server_process(server.pid, shutdown_token, launch.PORT)
     except Exception:
         log_handle.close()
         raise
@@ -940,6 +989,8 @@ def _wait_until_ready(
 ) -> GuiState:
     tick = 0
     while time.monotonic() < deadline:
+        if launch.application_shutdown_requested():
+            raise KeyboardInterrupt
         if launch.port_open():
             return state
         if server.poll() is not None:
@@ -1046,7 +1097,14 @@ def _run_posix_keys(
         signal.set_wakeup_fd(wake_w)
         signal.signal(signal.SIGWINCH, lambda _signum, _frame: None)
         dirty = True
+        last_size = _window_size()
         while True:
+            if launch.application_shutdown_requested():
+                return 0
+            current_size = _window_size()
+            if current_size != last_size:
+                last_size = current_size
+                dirty = True
             if dirty:
                 drawer.draw(state)
                 dirty = False
@@ -1114,7 +1172,14 @@ def _run_windows_keys(
     cancel = CancelFlag()
     box: dict[str, GuiState] = {}
     dirty = True
+    last_size = _window_size()
     while True:
+        if launch.application_shutdown_requested():
+            return 0
+        current_size = _window_size()
+        if current_size != last_size:
+            last_size = current_size
+            dirty = True
         if dirty:
             drawer.draw(state)
             dirty = False
@@ -1177,6 +1242,7 @@ def run_capture_gui(viewport: tuple[int, int], directory: Path | None = None) ->
         return 1
     if directory is None:
         directory = Path.cwd()
+    launch._clear_application_shutdown_request()
     # ensure_deps compares the requirements hash itself. A stamp left behind
     # by an update is not enough.
     launch.ensure_deps()
@@ -1218,6 +1284,11 @@ def _pause_for_quit() -> None:
         import msvcrt
 
         while True:
+            if launch.application_shutdown_requested():
+                return
+            if not msvcrt.kbhit():
+                time.sleep(0.05)
+                continue
             char = msvcrt.getwch()
             if char in {"\x1b", "\x03", "\r"}:
                 return
@@ -1232,6 +1303,8 @@ def _pause_for_quit() -> None:
     pending = bytearray()
     try:
         while True:
+            if launch.application_shutdown_requested():
+                return
             ready, _, _ = select.select(
                 [fd],
                 [],

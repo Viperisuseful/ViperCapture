@@ -1,9 +1,11 @@
 import asyncio
+import hashlib
 import hmac
 import json
 import os
 import re
 import secrets
+import signal
 import sys
 import threading
 import time
@@ -100,6 +102,12 @@ if sys.platform.startswith("win"):
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 APP_VERSION = (BASE_DIR / "VERSION").read_text(encoding="utf-8").strip()
+INSTALL_ID = hashlib.sha256(
+    os.path.normcase(os.path.abspath(BASE_DIR)).encode("utf-8", errors="surrogatepass")
+).hexdigest()
+SHUTDOWN_TOKEN = os.getenv("VIPERCAPTURE_SHUTDOWN_TOKEN", "")
+
+
 def _load_local_env() -> None:
     """Load machine-only KEY=VALUE settings without another dependency."""
     path = BASE_DIR / ".env.local"
@@ -946,6 +954,9 @@ async def lifespan(app: FastAPI):
             if leftover_settlers:
                 _cancel_settling_operations(leftover_settlers)
                 await asyncio.gather(*leftover_settlers, return_exceptions=True)
+            with suppress(OSError):
+                record = Path.home() / ".vipercapture" / "runtime" / f"server-{os.getpid()}.json"
+                record.unlink(missing_ok=True)
 
 
 app = FastAPI(
@@ -1117,6 +1128,25 @@ install_render_error_layer(app)
 @app.get("/health")
 async def health() -> dict[str, bool]:
     return {"ready": True}
+
+
+@app.get("/__vipercapture__/identity", include_in_schema=False)
+async def process_identity() -> dict[str, object]:
+    return {
+        "service": "vipercapture",
+        "install_id": INSTALL_ID,
+        "pid": os.getpid(),
+    }
+
+
+@app.post("/__vipercapture__/shutdown", include_in_schema=False)
+async def request_shutdown(request: Request) -> dict[str, object]:
+    supplied = request.headers.get("X-ViperCapture-Shutdown-Token", "")
+    if not SHUTDOWN_TOKEN or not hmac.compare_digest(supplied, SHUTDOWN_TOKEN):
+        raise HTTPException(status_code=404, detail="Not found")
+    loop = asyncio.get_running_loop()
+    loop.call_later(0.05, signal.raise_signal, signal.SIGINT)
+    return {"stopping": True, "pid": os.getpid()}
 
 
 @app.get("/ready")

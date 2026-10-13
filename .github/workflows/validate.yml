@@ -76,8 +76,11 @@ jobs:
       - name: Check Python and render engines
         run: |
           python -m compileall -q vipercapture launch.py scripts/smoke.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m unittest tests.test_launch_installer
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python scripts/smoke.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Check frontend
         run: |
           npm run lint --prefix frontend
