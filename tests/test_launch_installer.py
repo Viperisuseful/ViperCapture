@@ -416,7 +416,7 @@ class LaunchArgsTests(unittest.TestCase):
 
     def test_kill_all_instances_when_none_running(self) -> None:
         stdout = io.StringIO()
-        with mock.patch("launch.find_vipercapture_pids", return_value=set()):
+        with mock.patch("launch.find_vipercapture_processes", return_value={}):
             with mock.patch("launch.port_open", return_value=False):
                 with mock.patch("sys.stdout", stdout):
                     code = launch.kill_all_instances(port=8999)
@@ -425,30 +425,29 @@ class LaunchArgsTests(unittest.TestCase):
 
     def test_kill_all_instances_terminates_pids(self) -> None:
         stdout = io.StringIO()
+        identity = launch.ProcessIdentity(12345, 123456, "server", "server")
         with (
-            mock.patch("launch.find_vipercapture_pids", return_value={12345}),
-            mock.patch("launch._get_process_start_time", return_value=123456),
-            mock.patch("launch._terminate_pid", return_value=(True, None)) as mock_term,
+            mock.patch("launch.find_vipercapture_processes", return_value={12345: identity}),
+            mock.patch("launch._terminate_process", return_value=(True, None)) as mock_term,
             mock.patch("launch.port_open", side_effect=[True, False, False, False]),
             mock.patch("sys.stdout", stdout),
         ):
             code = launch.kill_all_instances(port=8999)
         self.assertEqual(code, 0)
-        mock_term.assert_called_once_with(
-            12345,
-            expected_start_time=123456,
-            application_handshake=False,
-        )
+        mock_term.assert_called_once_with(identity, port=8999)
         self.assertIn("Stopped 1 ViperCapture process(es): 12345", stdout.getvalue())
         self.assertIn("All ViperCapture instances stopped", stdout.getvalue())
 
     def test_kill_all_instances_reports_failure_on_permission_or_error(self) -> None:
         stdout = io.StringIO()
+        identities = {
+            12345: launch.ProcessIdentity(12345, 1, "server-a", "server"),
+            12346: launch.ProcessIdentity(12346, 1, "server-b", "server"),
+        }
         with (
-            mock.patch("launch.find_vipercapture_pids", return_value={12345, 12346}),
-            mock.patch("launch._get_process_start_time", return_value=1),
+            mock.patch("launch.find_vipercapture_processes", return_value=identities),
             mock.patch(
-                "launch._terminate_pid",
+                "launch._terminate_process",
                 side_effect=[(False, "access_denied"), (False, "taskkill failed")],
             ),
             mock.patch("launch.port_open", return_value=False),
@@ -463,10 +462,10 @@ class LaunchArgsTests(unittest.TestCase):
 
     def test_kill_all_instances_fails_if_port_remains_open(self) -> None:
         stdout = io.StringIO()
+        identity = launch.ProcessIdentity(12345, 1, "server", "server")
         with (
-            mock.patch("launch.find_vipercapture_pids", return_value={12345}),
-            mock.patch("launch._get_process_start_time", return_value=1),
-            mock.patch("launch._terminate_pid", return_value=(True, None)),
+            mock.patch("launch.find_vipercapture_processes", return_value={12345: identity}),
+            mock.patch("launch._terminate_process", return_value=(True, None)),
             mock.patch("launch.port_open", return_value=True),
             mock.patch("launch.time.sleep"),
             mock.patch("sys.stdout", stdout),
@@ -1546,18 +1545,20 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
             mock.patch("launch.sys.platform", "linux"),
             mock.patch("launch._get_process_ancestors", return_value=set()),
             mock.patch("subprocess.check_output", return_value="pid=9999"),
-            mock.patch("launch._is_vipercapture_endpoint", return_value=False),
+            mock.patch("launch._is_vipercapture_endpoint", return_value=None),
             mock.patch("launch._get_pid_commandline", return_value="node server.js"),
         ):
             pids = launch.find_vipercapture_pids(port=8000)
         self.assertEqual(pids, set())
 
     def test_find_vipercapture_pids_includes_verified_endpoint(self) -> None:
+        identity = launch.ProcessIdentity(8888, "start", "command", "server")
         with (
             mock.patch("launch.sys.platform", "linux"),
             mock.patch("launch._get_process_ancestors", return_value=set()),
             mock.patch("subprocess.check_output", side_effect=["pid=8888", ""]),
-            mock.patch("launch._is_vipercapture_endpoint", return_value=True),
+            mock.patch("launch._is_vipercapture_endpoint", return_value=8888),
+            mock.patch("launch._capture_process_identity", return_value=identity),
             mock.patch("pathlib.Path.is_dir", return_value=False),
         ):
             pids = launch.find_vipercapture_pids(port=8000)
@@ -1568,10 +1569,49 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
             mock.patch("launch.sys.platform", "linux"),
             mock.patch("launch._get_process_ancestors", return_value={8888}),
             mock.patch("subprocess.check_output", return_value="pid=8888"),
-            mock.patch("launch._is_vipercapture_endpoint", return_value=True),
+            mock.patch("launch._is_vipercapture_endpoint", return_value=None),
         ):
             pids = launch.find_vipercapture_pids(port=8000)
         self.assertEqual(pids, set())
+
+    def test_endpoint_authorizes_only_its_reported_listener(self) -> None:
+        with (
+            mock.patch("launch.sys.platform", "linux"),
+            mock.patch("launch._get_process_ancestors", return_value=set()),
+            mock.patch("launch.subprocess.check_output", return_value="pid=8888 pid=9999"),
+            mock.patch("launch._is_vipercapture_endpoint", return_value=8888),
+            mock.patch("launch._get_pid_commandline", return_value="node unrelated.js"),
+            mock.patch("pathlib.Path.is_dir", return_value=False),
+        ):
+            candidates = launch._find_vipercapture_candidate_pids(port=8000)
+        self.assertEqual(candidates, {8888})
+
+    def test_identity_snapshot_rejects_pid_reuse_during_capture(self) -> None:
+        command = f"{launch.ROOT}/.venv/bin/python -m uvicorn vipercapture.main:app"
+        with (
+            mock.patch("launch._get_process_start_time", side_effect=[100, 200]),
+            mock.patch("launch._get_pid_commandline", return_value=command),
+        ):
+            self.assertIsNone(launch._capture_process_identity(4321))
+
+    def test_identity_snapshot_requires_start_time_and_exact_command(self) -> None:
+        with mock.patch("launch._get_process_start_time", return_value=None):
+            self.assertIsNone(launch._capture_process_identity(4321))
+        with (
+            mock.patch("launch._get_process_start_time", side_effect=[100, 100]),
+            mock.patch("launch._get_pid_commandline", return_value="node unrelated.js"),
+        ):
+            self.assertIsNone(launch._capture_process_identity(4321))
+
+    def test_identity_revalidation_rejects_changed_command_with_same_kind(self) -> None:
+        original = f"{sys.executable} {launch.ROOT}/launch.py --one-window"
+        changed = f"{sys.executable} {launch.ROOT}/launch.py"
+        identity = launch.ProcessIdentity(4321, 100, original, "launcher")
+        with (
+            mock.patch("launch._get_process_start_time", side_effect=[100, 100]),
+            mock.patch("launch._get_pid_commandline", return_value=changed),
+        ):
+            self.assertFalse(launch._process_identity_matches(identity))
 
     def test_endpoint_probe_requires_service_install_and_owner_pid(self) -> None:
         class Response:
@@ -1590,22 +1630,21 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
                 return False
 
         valid = {
-            "ready": True,
             "service": "vipercapture",
             "install_id": launch._installation_id(),
             "pid": 4321,
         }
         with mock.patch("launch.urllib.request.urlopen", return_value=Response(valid)):
-            self.assertTrue(launch._is_vipercapture_endpoint(expected_pids={4321}))
-            self.assertFalse(launch._is_vipercapture_endpoint(expected_pids={9999}))
+            self.assertEqual(launch._is_vipercapture_endpoint(expected_pids={4321}), 4321)
+            self.assertIsNone(launch._is_vipercapture_endpoint(expected_pids={9999}))
 
         generic = {"ready": True}
         with mock.patch("launch.urllib.request.urlopen", return_value=Response(generic)):
-            self.assertFalse(launch._is_vipercapture_endpoint(expected_pids={4321}))
+            self.assertIsNone(launch._is_vipercapture_endpoint(expected_pids={4321}))
 
         wrong_install = {**valid, "install_id": "another-install"}
         with mock.patch("launch.urllib.request.urlopen", return_value=Response(wrong_install)):
-            self.assertFalse(launch._is_vipercapture_endpoint(expected_pids={4321}))
+            self.assertIsNone(launch._is_vipercapture_endpoint(expected_pids={4321}))
 
     def test_endpoint_probe_rejects_malformed_json(self) -> None:
         response = mock.MagicMock()
@@ -1613,7 +1652,7 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
         response.read.return_value = b"not-json"
         response.__enter__.return_value = response
         with mock.patch("launch.urllib.request.urlopen", return_value=response):
-            self.assertFalse(launch._is_vipercapture_endpoint(expected_pids={4321}))
+            self.assertIsNone(launch._is_vipercapture_endpoint(expected_pids={4321}))
 
     def test_darwin_ancestor_walk_uses_each_discovered_parent(self) -> None:
         with (
@@ -1637,30 +1676,28 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
         self.assertEqual(check.call_args.args[0], ["ps", "-p", "4321", "-o", "lstart="])
 
     def test_application_handshake_can_exit_before_os_termination(self) -> None:
+        identity = launch.ProcessIdentity(4321, "start", "command", "launcher")
         with (
-            mock.patch("launch._is_process_alive", side_effect=[True, False]),
+            mock.patch("launch._is_process_alive", return_value=True),
+            mock.patch("launch._process_identity_matches", return_value=True),
             mock.patch("launch._request_application_shutdown", return_value=True) as request,
-            mock.patch("launch._clear_application_shutdown_request") as clear,
+            mock.patch("launch._wait_for_process_exit", return_value=True),
             mock.patch("launch.os.kill") as kill,
-            mock.patch("launch.time.sleep"),
         ):
-            ok, error = launch._terminate_pid(4321, application_handshake=True)
+            ok, error = launch._terminate_process(identity)
         self.assertTrue(ok)
         self.assertIsNone(error)
         request.assert_called_once_with(4321)
-        clear.assert_called_once_with(4321)
         kill.assert_not_called()
 
     def test_kill_orders_server_before_interactive_process_and_uses_handshake(self) -> None:
-        commands = {
-            10: f"{launch.ROOT}/.venv/bin/python {launch.ROOT}/launch.py",
-            20: f"{launch.ROOT}/.venv/bin/python -m uvicorn vipercapture.main:app --port 8000",
+        identities = {
+            10: launch.ProcessIdentity(10, "start-a", "launcher", "launcher"),
+            20: launch.ProcessIdentity(20, "start-b", "server", "server"),
         }
         with (
-            mock.patch("launch.find_vipercapture_pids", return_value={10, 20}),
-            mock.patch("launch._get_process_start_time", return_value="start"),
-            mock.patch("launch._get_pid_commandline", side_effect=lambda pid: commands[pid]),
-            mock.patch("launch._terminate_pid", return_value=(True, None)) as terminate,
+            mock.patch("launch.find_vipercapture_processes", return_value=identities),
+            mock.patch("launch._terminate_process", return_value=(True, None)) as terminate,
             mock.patch("launch.port_open", return_value=False),
             mock.patch("sys.stdout", io.StringIO()),
         ):
@@ -1668,21 +1705,42 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
         self.assertEqual(
             terminate.call_args_list,
             [
-                mock.call(20, expected_start_time="start", application_handshake=False),
-                mock.call(10, expected_start_time="start", application_handshake=True),
+                mock.call(identities[20], port=8000),
+                mock.call(identities[10], port=8000),
             ],
         )
 
     def test_kill_checks_the_requested_port(self) -> None:
         with (
-            mock.patch("launch.find_vipercapture_pids", return_value=set()),
+            mock.patch("launch.find_vipercapture_processes", return_value={}),
             mock.patch("launch.port_open", return_value=False) as port_open,
             mock.patch("sys.stdout", io.StringIO()),
         ):
             self.assertEqual(launch.kill_all_instances(port=9123), 0)
         port_open.assert_called_once_with(port=9123)
 
-    def test_terminate_pid_windows_graceful_shutdown(self) -> None:
+    def test_terminate_process_windows_graceful_shutdown(self) -> None:
+        identity = launch.ProcessIdentity(12345, "start", "command", "launcher")
+        runs: list[list[str]] = []
+        def fake_run(cmd, **_kwargs):
+            runs.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with (
+            mock.patch("launch.sys.platform", "win32"),
+            mock.patch("launch._is_process_alive", return_value=True),
+            mock.patch("launch._process_identity_matches", return_value=True),
+            mock.patch("launch._request_application_shutdown", return_value=False),
+            mock.patch("launch._wait_for_process_exit", return_value=True),
+            mock.patch("launch.subprocess.run", side_effect=fake_run),
+        ):
+            ok, err = launch._terminate_process(identity)
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+        self.assertEqual(runs, [["taskkill", "/PID", "12345"]])
+
+    def test_terminate_process_windows_escalation_to_force(self) -> None:
+        identity = launch.ProcessIdentity(12345, "start", "command", "launcher")
         runs: list[list[str]] = []
         def fake_run(cmd, **_kwargs):
             runs.append(cmd)
@@ -1691,48 +1749,57 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
         with (
             mock.patch("launch.sys.platform", "win32"),
             mock.patch("launch._is_process_alive", side_effect=[True, False]),
+            mock.patch("launch._process_identity_matches", return_value=True),
+            mock.patch("launch._request_application_shutdown", return_value=False),
+            mock.patch("launch._wait_for_process_exit", return_value=False),
             mock.patch("launch.subprocess.run", side_effect=fake_run),
             mock.patch("launch.time.sleep"),
         ):
-            ok, err = launch._terminate_pid(12345)
-        self.assertTrue(ok)
-        self.assertIsNone(err)
-        self.assertEqual(runs, [["taskkill", "/PID", "12345"]])
-
-    def test_terminate_pid_windows_escalation_to_force(self) -> None:
-        runs: list[list[str]] = []
-        def fake_run(cmd, **_kwargs):
-            runs.append(cmd)
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-        with (
-            mock.patch("launch.sys.platform", "win32"),
-            mock.patch("launch._is_process_alive", side_effect=[True, True, False]),
-            mock.patch("launch.subprocess.run", side_effect=fake_run),
-            mock.patch("launch.time.monotonic", side_effect=[0.0, 0.1, 3.0, 3.1]),
-            mock.patch("launch.time.sleep"),
-        ):
-            ok, err = launch._terminate_pid(12345)
+            ok, err = launch._terminate_process(identity)
         self.assertTrue(ok)
         self.assertIsNone(err)
         self.assertEqual(runs, [["taskkill", "/PID", "12345"], ["taskkill", "/F", "/PID", "12345"]])
 
-    def test_terminate_pid_windows_access_denied(self) -> None:
+    def test_terminate_process_windows_access_denied(self) -> None:
+        identity = launch.ProcessIdentity(12345, "start", "command", "launcher")
         def fake_run(cmd, **_kwargs):
             return subprocess.CompletedProcess(cmd, 5, stdout="", stderr="ERROR: Access is denied.")
 
         with (
             mock.patch("launch.sys.platform", "win32"),
             mock.patch("launch._is_process_alive", return_value=True),
+            mock.patch("launch._process_identity_matches", return_value=True),
+            mock.patch("launch._request_application_shutdown", return_value=False),
+            mock.patch("launch._wait_for_process_exit", return_value=False),
             mock.patch("launch.subprocess.run", side_effect=fake_run),
-            mock.patch("launch.time.monotonic", side_effect=[0.0, 3.0, 3.1]),
             mock.patch("launch.time.sleep"),
         ):
-            ok, err = launch._terminate_pid(12345)
+            ok, err = launch._terminate_process(identity)
         self.assertFalse(ok)
         self.assertEqual(err, "access_denied")
 
-    def test_terminate_pid_posix_graceful_sigterm(self) -> None:
+    def test_terminate_process_posix_graceful_sigterm(self) -> None:
+        identity = launch.ProcessIdentity(12345, "start", "command", "launcher")
+        kills: list[tuple[int, int]] = []
+        def fake_kill(pid, sig):
+            kills.append((pid, sig))
+
+        with (
+            mock.patch("launch.sys.platform", "linux"),
+            mock.patch("launch.os.kill", side_effect=fake_kill),
+            mock.patch("launch._is_process_alive", return_value=True),
+            mock.patch("launch._process_identity_matches", return_value=True),
+            mock.patch("launch._request_application_shutdown", return_value=False),
+            mock.patch("launch._wait_for_process_exit", return_value=True),
+        ):
+            ok, err = launch._terminate_process(identity)
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+        sigterm = getattr(signal, "SIGTERM", 15)
+        self.assertEqual(kills, [(12345, sigterm)])
+
+    def test_terminate_process_posix_escalation_sigkill(self) -> None:
+        identity = launch.ProcessIdentity(12345, "start", "command", "launcher")
         kills: list[tuple[int, int]] = []
         def fake_kill(pid, sig):
             kills.append((pid, sig))
@@ -1741,34 +1808,20 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
             mock.patch("launch.sys.platform", "linux"),
             mock.patch("launch.os.kill", side_effect=fake_kill),
             mock.patch("launch._is_process_alive", side_effect=[True, False]),
+            mock.patch("launch._process_identity_matches", return_value=True),
+            mock.patch("launch._request_application_shutdown", return_value=False),
+            mock.patch("launch._wait_for_process_exit", return_value=False),
             mock.patch("launch.time.sleep"),
         ):
-            ok, err = launch._terminate_pid(12345)
-        self.assertTrue(ok)
-        self.assertIsNone(err)
-        sigterm = getattr(signal, "SIGTERM", 15)
-        self.assertEqual(kills, [(12345, sigterm)])
-
-    def test_terminate_pid_posix_escalation_sigkill(self) -> None:
-        kills: list[tuple[int, int]] = []
-        def fake_kill(pid, sig):
-            kills.append((pid, sig))
-
-        with (
-            mock.patch("launch.sys.platform", "linux"),
-            mock.patch("launch.os.kill", side_effect=fake_kill),
-            mock.patch("launch._is_process_alive", side_effect=[True, True, False]),
-            mock.patch("launch.time.monotonic", side_effect=[0.0, 0.1, 3.0, 3.1]),
-            mock.patch("launch.time.sleep"),
-        ):
-            ok, err = launch._terminate_pid(12345)
+            ok, err = launch._terminate_process(identity)
         self.assertTrue(ok)
         self.assertIsNone(err)
         sigterm = getattr(signal, "SIGTERM", 15)
         sigkill = getattr(signal, "SIGKILL", 9)
         self.assertEqual(kills, [(12345, sigterm), (12345, sigkill)])
 
-    def test_terminate_pid_posix_permission_error(self) -> None:
+    def test_terminate_process_posix_permission_error(self) -> None:
+        identity = launch.ProcessIdentity(12345, "start", "command", "launcher")
         def fake_kill(pid, sig):
             raise PermissionError("Access denied")
 
@@ -1776,34 +1829,126 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
             mock.patch("launch.sys.platform", "linux"),
             mock.patch("launch.os.kill", side_effect=fake_kill),
             mock.patch("launch._is_process_alive", return_value=True),
+            mock.patch("launch._process_identity_matches", return_value=True),
+            mock.patch("launch._request_application_shutdown", return_value=False),
         ):
-            ok, err = launch._terminate_pid(12345)
+            ok, err = launch._terminate_process(identity)
         self.assertFalse(ok)
         self.assertEqual(err, "access_denied")
 
-    def test_terminate_pid_guards_against_pid_reuse(self) -> None:
-        kills: list[tuple[int, int]] = []
-        with (
-            mock.patch("launch.sys.platform", "linux"),
-            mock.patch("launch._is_process_alive", return_value=True),
-            mock.patch("launch._get_process_start_time", return_value=9999),
-            mock.patch("launch.os.kill", side_effect=lambda p, s: kills.append((p, s))),
-        ):
-            ok, err = launch._terminate_pid(12345, expected_start_time=1111)
-        self.assertTrue(ok)
-        self.assertIsNone(err)
-        self.assertEqual(kills, [])
-
-    def test_terminate_pid_refuses_when_identity_can_no_longer_be_verified(self) -> None:
+    def test_terminate_process_refuses_pid_reuse(self) -> None:
+        identity = launch.ProcessIdentity(12345, 1111, "command", "launcher")
         with (
             mock.patch("launch._is_process_alive", return_value=True),
-            mock.patch("launch._get_process_start_time", return_value=None),
+            mock.patch("launch._process_identity_matches", return_value=False),
             mock.patch("launch.os.kill") as kill,
         ):
-            ok, err = launch._terminate_pid(12345, expected_start_time=1111)
+            ok, err = launch._terminate_process(identity)
         self.assertFalse(ok)
-        self.assertEqual(err, "unable_to_verify_process_identity")
+        self.assertEqual(err, "process_identity_changed")
         kill.assert_not_called()
+
+    def test_terminate_process_refuses_unverifiable_identity(self) -> None:
+        identity = launch.ProcessIdentity(12345, 1111, "command", "server")
+        with (
+            mock.patch("launch._is_process_alive", return_value=True),
+            mock.patch("launch._process_identity_matches", return_value=False),
+            mock.patch("launch.os.kill") as kill,
+        ):
+            ok, err = launch._terminate_process(identity)
+        self.assertFalse(ok)
+        self.assertEqual(err, "process_identity_changed")
+        kill.assert_not_called()
+
+    def test_server_uses_authenticated_handshake_and_configurable_grace(self) -> None:
+        identity = launch.ProcessIdentity(12345, "start", "command", "server")
+        with (
+            mock.patch("launch._is_process_alive", return_value=True),
+            mock.patch("launch._process_identity_matches", return_value=True),
+            mock.patch("launch._request_server_shutdown", return_value=True) as request,
+            mock.patch("launch.shutdown_grace_seconds", return_value=17.0),
+            mock.patch("launch._wait_for_process_exit", return_value=True) as wait,
+            mock.patch("launch.os.kill") as kill,
+        ):
+            ok, err = launch._terminate_process(identity, port=9123)
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+        request.assert_called_once_with(identity, host=launch.HOST, port=9123)
+        wait.assert_called_once_with(identity, 17.0)
+        kill.assert_not_called()
+
+    def test_normal_server_stop_uses_the_same_graceful_handshake(self) -> None:
+        identity = launch.ProcessIdentity(12345, "start", "command", "server")
+        server = mock.Mock(pid=12345)
+        server.poll.return_value = None
+        with (
+            mock.patch("launch._capture_process_identity", return_value=identity),
+            mock.patch("launch._request_server_shutdown", return_value=True) as request,
+            mock.patch("launch.shutdown_grace_seconds", return_value=30.0),
+            mock.patch("launch._clear_server_record"),
+        ):
+            launch.stop_server(server, announce=False)
+        request.assert_called_once_with(identity, host=launch.HOST, port=launch.PORT)
+        server.terminate.assert_not_called()
+        server.wait.assert_called_once_with(timeout=30.0)
+
+    def test_server_shutdown_handshake_uses_identity_bound_secret(self) -> None:
+        class Response:
+            status = 200
+
+            def read(self) -> bytes:
+                return b'{"stopping": true, "pid": 12345}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        identity = launch.ProcessIdentity(12345, "start", "command", "server")
+        record = {
+            "service": "vipercapture",
+            "install_id": launch._installation_id(),
+            "pid": 12345,
+            "port": 9123,
+            "start_time": "start",
+            "token": "secret-token",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "server.json"
+            path.write_text(json.dumps(record), encoding="utf-8")
+            with (
+                mock.patch("launch._server_record_path", return_value=path),
+                mock.patch("launch.urllib.request.urlopen", return_value=Response()) as open_url,
+            ):
+                self.assertTrue(launch._request_server_shutdown(identity, port=9123))
+        request = open_url.call_args.args[0]
+        self.assertEqual(request.get_header("X-vipercapture-shutdown-token"), "secret-token")
+        self.assertEqual(request.get_method(), "POST")
+
+    def test_server_shutdown_handshake_rejects_stale_record(self) -> None:
+        identity = launch.ProcessIdentity(12345, "new-start", "command", "server")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "server.json"
+            path.write_text(json.dumps({
+                "service": "vipercapture",
+                "install_id": launch._installation_id(),
+                "pid": 12345,
+                "port": 8000,
+                "start_time": "old-start",
+                "token": "secret-token",
+            }), encoding="utf-8")
+            with (
+                mock.patch("launch._server_record_path", return_value=path),
+                mock.patch("launch.urllib.request.urlopen") as open_url,
+            ):
+                self.assertFalse(launch._request_server_shutdown(identity))
+        open_url.assert_not_called()
+
+    def test_server_grace_period_defaults_to_thirty_seconds_and_is_bounded(self) -> None:
+        self.assertEqual(launch.shutdown_grace_seconds({}), 30.0)
+        self.assertEqual(launch.shutdown_grace_seconds({"VIPERCAPTURE_KILL_GRACE_SECONDS": "1"}), 5.0)
+        self.assertEqual(launch.shutdown_grace_seconds({"VIPERCAPTURE_KILL_GRACE_SECONDS": "999"}), 300.0)
 
     def test_windows_terminal_sixel_detection(self) -> None:
         self.assertFalse(launch._windows_terminal_supports_sixel({}))

@@ -111,7 +111,7 @@ private environment, saved jobs, and presets. The same command works on Linux, m
 and Windows. On Windows, stop the running server first with `vipercapture kill`. The update keeps
 `.env.local`. It does not use sudo or a distro package manager.
 
-`vipercapture kill` stops all running instances of ViperCapture (API server, GUI menu, and background workers) on Windows, macOS, and Linux.
+`vipercapture kill` stops all running instances of ViperCapture (API server, GUI menu, and background workers) on Windows, macOS, and Linux. The API server receives an authenticated graceful-shutdown request and gets 30 seconds to close active work and browser processes before force escalation; set `VIPERCAPTURE_KILL_GRACE_SECONDS` to adjust that window (5–300 seconds).
 
 On Linux and macOS, Ghostty and Kitty open request logs in another window and
 show a full-screen status view in this one. The terminal graphics logo is drawn for Kitty,

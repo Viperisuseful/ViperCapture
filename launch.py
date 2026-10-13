@@ -24,6 +24,7 @@ import json
 import os
 import platform
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -872,17 +873,33 @@ class StopKeyBuffer:
         return False
 
 
-def stop_server(server: subprocess.Popen[object], *, announce: bool = True) -> None:
+def stop_server(
+    server: subprocess.Popen[object],
+    *,
+    announce: bool = True,
+    host: str = HOST,
+    port: int = PORT,
+) -> None:
     if server.poll() is not None:
+        _clear_server_record(server.pid)
         return
     if announce:
         print("\n  Stopping server...")
-    server.terminate()
+    identity = _capture_process_identity(server.pid)
+    requested = bool(
+        identity is not None
+        and identity.kind == "server"
+        and _request_server_shutdown(identity, host=host, port=port)
+    )
+    if not requested:
+        server.terminate()
     try:
-        server.wait(timeout=5)
+        server.wait(timeout=shutdown_grace_seconds())
     except subprocess.TimeoutExpired:
         server.kill()
         server.wait(timeout=5)
+    finally:
+        _clear_server_record(server.pid)
     if announce:
         print("  Server stopped.")
 
@@ -1142,6 +1159,14 @@ def _installation_id(root_dir: Path = ROOT) -> str:
     return hashlib.sha256(normalized.encode("utf-8", errors="surrogatepass")).hexdigest()
 
 
+@dataclass(frozen=True)
+class ProcessIdentity:
+    pid: int
+    start_time: int | str
+    command: str
+    kind: str
+
+
 def _is_vipercapture_endpoint(
     host: str = HOST,
     port: int = PORT,
@@ -1149,35 +1174,71 @@ def _is_vipercapture_endpoint(
     *,
     expected_pids: set[int] | None = None,
     root_dir: Path = ROOT,
-) -> bool:
-    """Verify the service, installation, and owning PID on host:port."""
+) -> int | None:
+    """Return the one PID claimed by a verified ViperCapture endpoint."""
     try:
-        url = f"http://{host}:{port}/health"
+        url = f"http://{host}:{port}/__vipercapture__/identity"
         req = urllib.request.Request(url, headers={"User-Agent": "ViperCapture-Probe"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             if resp.status != 200:
-                return False
+                return None
             data = json.loads(resp.read().decode("utf-8"))
     except (OSError, ValueError, UnicodeError):
-        return False
+        return None
     if not isinstance(data, dict):
-        return False
+        return None
     pid = data.get("pid")
     if type(pid) is not int or pid <= 0:
-        return False
-    return bool(
+        return None
+    if not (
         data.get("service") == "vipercapture"
         and data.get("install_id") == _installation_id(root_dir)
         and (expected_pids is None or pid in expected_pids)
-    )
+    ):
+        return None
+    return pid
 
 
-def find_vipercapture_pids(
+def _capture_process_identity(pid: int, root_dir: Path = ROOT) -> ProcessIdentity | None:
+    """Atomically-enough bind a PID to its start time and exact command identity."""
+    if pid <= 0:
+        return None
+    started_before = _get_process_start_time(pid)
+    if started_before is None:
+        return None
+    command = _get_pid_commandline(pid)
+    if not command:
+        return None
+    kind = _vipercapture_process_kind(command, root_dir=root_dir)
+    if kind is None:
+        return None
+    started_after = _get_process_start_time(pid)
+    if started_after is None or started_after != started_before:
+        return None
+    return ProcessIdentity(pid, started_before, command, kind)
+
+
+def _process_identity_matches(identity: ProcessIdentity, root_dir: Path = ROOT) -> bool:
+    """Revalidate start time and exact command before acting on a PID."""
+    started_before = _get_process_start_time(identity.pid)
+    if started_before != identity.start_time:
+        return False
+    command = _get_pid_commandline(identity.pid)
+    if not command:
+        return False
+    if _split_process_command(command) != _split_process_command(identity.command):
+        return False
+    if _vipercapture_process_kind(command, root_dir=root_dir) != identity.kind:
+        return False
+    return _get_process_start_time(identity.pid) == identity.start_time
+
+
+def _find_vipercapture_candidate_pids(
     port: int = PORT,
     root_dir: Path = ROOT,
     host: str = HOST,
 ) -> set[int]:
-    """Find PIDs of all running ViperCapture instances (server, GUI, launcher) belonging to this install."""
+    """Find candidate PIDs; callers must bind and revalidate their identities."""
     pids: set[int] = set()
     exclude_pids = _get_process_ancestors()
 
@@ -1255,19 +1316,19 @@ def find_vipercapture_pids(
 
     # Verify that the port owner is actually ViperCapture before accepting
     if listening_pids:
-        if _is_vipercapture_endpoint(
+        endpoint_pid = _is_vipercapture_endpoint(
             host=host,
             port=port,
             expected_pids=listening_pids,
             root_dir=root_dir,
-        ):
-            pids.update(listening_pids)
-        else:
-            # Check commandline of listening PID directly
-            for pid in listening_pids:
-                cmd = _get_pid_commandline(pid)
-                if cmd and _matches_vipercapture_command(cmd, root_dir=root_dir):
-                    pids.add(pid)
+        )
+        if endpoint_pid is not None:
+            pids.add(endpoint_pid)
+        # Every other listener must independently pass exact command matching.
+        for pid in listening_pids - {endpoint_pid}:
+            cmd = _get_pid_commandline(pid)
+            if cmd and _matches_vipercapture_command(cmd, root_dir=root_dir):
+                pids.add(pid)
 
     # 2. Process inspection by command line for this specific installation
     if sys.platform == "win32":
@@ -1347,6 +1408,29 @@ def find_vipercapture_pids(
 
     pids.difference_update(exclude_pids)
     return pids
+
+
+def find_vipercapture_processes(
+    port: int = PORT,
+    root_dir: Path = ROOT,
+    host: str = HOST,
+) -> dict[int, ProcessIdentity]:
+    """Return identity-bound ViperCapture targets safe to revalidate."""
+    identities: dict[int, ProcessIdentity] = {}
+    for pid in _find_vipercapture_candidate_pids(port=port, root_dir=root_dir, host=host):
+        identity = _capture_process_identity(pid, root_dir=root_dir)
+        if identity is not None:
+            identities[pid] = identity
+    return identities
+
+
+def find_vipercapture_pids(
+    port: int = PORT,
+    root_dir: Path = ROOT,
+    host: str = HOST,
+) -> set[int]:
+    """Compatibility wrapper returning PIDs from identity-bound discovery."""
+    return set(find_vipercapture_processes(port=port, root_dir=root_dir, host=host))
 
 
 def _get_pid_commandline(pid: int) -> str | None:
@@ -1430,6 +1514,105 @@ def _clear_application_shutdown_request(pid: int | None = None) -> None:
         pass
 
 
+def shutdown_grace_seconds(environ: Mapping[str, str] | None = None) -> float:
+    """Grace period before force-kill; configurable without allowing extremes."""
+    env = os.environ if environ is None else environ
+    try:
+        value = float(env.get("VIPERCAPTURE_KILL_GRACE_SECONDS", "30"))
+    except ValueError:
+        value = 30.0
+    return min(300.0, max(5.0, value))
+
+
+def _server_record_path(pid: int) -> Path:
+    return Path.home() / ".vipercapture" / "runtime" / f"server-{pid}.json"
+
+
+def _new_server_environment() -> tuple[dict[str, str], str]:
+    token = secrets.token_urlsafe(32)
+    env = dict(os.environ)
+    env["VIPERCAPTURE_SHUTDOWN_TOKEN"] = token
+    return env, token
+
+
+def _record_server_process(pid: int, token: str, port: int = PORT) -> bool:
+    started = _get_process_start_time(pid)
+    if started is None:
+        return False
+    record = {
+        "service": "vipercapture",
+        "install_id": _installation_id(),
+        "pid": pid,
+        "port": port,
+        "start_time": started,
+        "token": token,
+    }
+    try:
+        path = _server_record_path(pid)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(record), encoding="utf-8")
+        try:
+            temporary.chmod(0o600)
+        except OSError:
+            pass
+        temporary.replace(path)
+        return True
+    except OSError:
+        return False
+
+
+def _clear_server_record(pid: int) -> None:
+    try:
+        _server_record_path(pid).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _request_server_shutdown(
+    identity: ProcessIdentity,
+    *,
+    host: str = HOST,
+    port: int = PORT,
+    timeout: float = 2.0,
+) -> bool:
+    """Use the per-process secret to ask Uvicorn to run application cleanup."""
+    try:
+        record = json.loads(_server_record_path(identity.pid).read_text(encoding="utf-8"))
+        if not isinstance(record, dict):
+            return False
+        if not (
+            record.get("service") == "vipercapture"
+            and record.get("install_id") == _installation_id()
+            and record.get("pid") == identity.pid
+            and record.get("port") == port
+            and record.get("start_time") == identity.start_time
+            and isinstance(record.get("token"), str)
+            and record["token"]
+        ):
+            return False
+        request = urllib.request.Request(
+            f"http://{host}:{port}/__vipercapture__/shutdown",
+            data=b"{}",
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-ViperCapture-Shutdown-Token": record["token"],
+            },
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            if response.status != 200:
+                return False
+            payload = json.loads(response.read().decode("utf-8"))
+        return bool(
+            isinstance(payload, dict)
+            and payload.get("stopping") is True
+            and payload.get("pid") == identity.pid
+        )
+    except (OSError, ValueError, UnicodeError):
+        return False
+
+
 def _is_process_alive(pid: int) -> bool:
     """True if process exists and is alive."""
     if pid <= 0:
@@ -1463,98 +1646,105 @@ def _is_process_alive(pid: int) -> bool:
             return False
 
 
-def _terminate_pid(
-    pid: int,
-    expected_start_time: int | str | None = None,
-    *,
-    application_handshake: bool = False,
-) -> tuple[bool, str | None]:
-    """Gracefully request orderly shutdown, wait, and escalate only if still alive and un-reused."""
-    if not _is_process_alive(pid):
-        return True, None
-
-    # Verify PID has not been reused by comparing start time if available
-    if expected_start_time is not None:
-        current_start = _get_process_start_time(pid)
-        if current_start is None:
-            return False, "unable_to_verify_process_identity"
-        if current_start != expected_start_time:
-            return True, None
-
-    if application_handshake and _request_application_shutdown(pid):
-        deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline:
-            if not _is_process_alive(pid):
-                _clear_application_shutdown_request(pid)
-                return True, None
-            time.sleep(0.1)
-
-        if expected_start_time is not None:
-            current_start = _get_process_start_time(pid)
-            if current_start is None:
-                return False, "unable_to_verify_process_identity"
-            if current_start != expected_start_time:
-                _clear_application_shutdown_request(pid)
-                return True, None
-
-    # 1. Orderly / graceful shutdown
-    if sys.platform == "win32":
-        subprocess.run(["taskkill", "/PID", str(pid)], capture_output=True, check=False)
-    else:
-        try:
-            sigterm = getattr(signal, "SIGTERM", 15)
-            os.kill(pid, sigterm)
-        except PermissionError:
-            return False, "access_denied"
-        except OSError:
-            pass
-
-    # Wait up to 2 seconds for process to exit
-    deadline = time.monotonic() + 2.0
+def _wait_for_process_exit(identity: ProcessIdentity, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if not _is_process_alive(pid):
-            _clear_application_shutdown_request(pid)
-            return True, None
+        if not _is_process_alive(identity.pid):
+            _clear_application_shutdown_request(identity.pid)
+            _clear_server_record(identity.pid)
+            return True
         time.sleep(0.1)
+    if not _is_process_alive(identity.pid):
+        _clear_application_shutdown_request(identity.pid)
+        _clear_server_record(identity.pid)
+        return True
+    return False
 
-    # Re-verify start time before force escalation
-    if expected_start_time is not None:
-        current_start = _get_process_start_time(pid)
-        if current_start is None:
-            return False, "unable_to_verify_process_identity"
-        if current_start != expected_start_time:
+
+def _terminate_process(
+    identity: ProcessIdentity,
+    *,
+    root_dir: Path = ROOT,
+    host: str = HOST,
+    port: int = PORT,
+) -> tuple[bool, str | None]:
+    """Terminate one identity-bound target, refusing changed or unverifiable PIDs."""
+    if not _is_process_alive(identity.pid):
+        return True, None
+    if identity.kind not in {"server", "launcher", "gui"}:
+        return False, "unrecognized_process_kind"
+    if not _process_identity_matches(identity, root_dir=root_dir):
+        return False, "process_identity_changed"
+
+    server_handshake = False
+    if identity.kind == "server":
+        server_handshake = _request_server_shutdown(identity, host=host, port=port)
+        if server_handshake:
+            if _wait_for_process_exit(identity, shutdown_grace_seconds()):
+                return True, None
+            if not _process_identity_matches(identity, root_dir=root_dir):
+                return False, "process_identity_changed"
+    elif _request_application_shutdown(identity.pid):
+        if _wait_for_process_exit(identity, 3.0):
             return True, None
+        if not _process_identity_matches(identity, root_dir=root_dir):
+            return False, "process_identity_changed"
 
-    # 2. Force termination for survivors
+    # Older servers without a runtime record and interactive processes that did
+    # not acknowledge their marker still receive an ordinary termination. A
+    # server that acknowledged the HTTP handshake already consumed its entire
+    # configurable grace window and proceeds directly to verified escalation.
+    if not server_handshake:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/PID", str(identity.pid)],
+                capture_output=True,
+                check=False,
+            )
+        else:
+            try:
+                os.kill(identity.pid, getattr(signal, "SIGTERM", 15))
+            except PermissionError:
+                return False, "access_denied"
+            except OSError:
+                pass
+
+        grace = shutdown_grace_seconds() if identity.kind == "server" else 3.0
+        if _wait_for_process_exit(identity, grace):
+            return True, None
+        if not _process_identity_matches(identity, root_dir=root_dir):
+            return False, "process_identity_changed"
+
+    # Force termination only after the exact command and start time still match.
     if sys.platform == "win32":
         proc = subprocess.run(
-            ["taskkill", "/F", "/PID", str(pid)],
+            ["taskkill", "/F", "/PID", str(identity.pid)],
             capture_output=True,
             text=True,
             check=False,
         )
         time.sleep(0.1)
-        if not _is_process_alive(pid):
-            _clear_application_shutdown_request(pid)
+        if not _is_process_alive(identity.pid):
+            _clear_application_shutdown_request(identity.pid)
+            _clear_server_record(identity.pid)
             return True, None
         combined = f"{proc.stdout} {proc.stderr}".lower()
         if "access is denied" in combined or proc.returncode == 5:
             return False, "access_denied"
         err = proc.stderr.strip() or proc.stdout.strip()
         return False, err or f"taskkill failed with code {proc.returncode}"
-    else:
-        try:
-            sigkill = getattr(signal, "SIGKILL", 9)
-            os.kill(pid, sigkill)
-        except PermissionError:
-            return False, "access_denied"
-        except OSError:
-            pass
-        time.sleep(0.1)
-        if not _is_process_alive(pid):
-            _clear_application_shutdown_request(pid)
-            return True, None
-        return False, "survived_sigkill"
+    try:
+        os.kill(identity.pid, getattr(signal, "SIGKILL", 9))
+    except PermissionError:
+        return False, "access_denied"
+    except OSError:
+        pass
+    time.sleep(0.1)
+    if not _is_process_alive(identity.pid):
+        _clear_application_shutdown_request(identity.pid)
+        _clear_server_record(identity.pid)
+        return True, None
+    return False, "survived_sigkill"
 
 
 def kill_all_instances(port: int = PORT) -> int:
@@ -1564,33 +1754,23 @@ def kill_all_instances(port: int = PORT) -> int:
     print("  ------------")
     print()
 
-    pids = find_vipercapture_pids(port=port)
-    if not pids and not port_open(port=port):
+    processes = find_vipercapture_processes(port=port)
+    if not processes and not port_open(port=port):
         print("  No running instances of ViperCapture found.")
         return 0
 
     print("  Stopping running ViperCapture instance(s)...")
 
-    # Record start times to guard against PID reuse
-    start_times: dict[int, int | str | None] = {pid: _get_process_start_time(pid) for pid in pids}
-
     killed: list[int] = []
     permission_errors: list[int] = []
     failed_pids: dict[int, str] = {}
 
-    process_kinds = {
-        pid: _vipercapture_process_kind(_get_pid_commandline(pid) or "") for pid in pids
-    }
-    priority = {"server": 0, None: 1, "launcher": 2, "gui": 2}
-    ordered_pids = sorted(pids, key=lambda pid: (priority[process_kinds[pid]], pid))
+    priority = {"server": 0, "launcher": 1, "gui": 1}
+    ordered = sorted(processes.values(), key=lambda item: (priority[item.kind], item.pid))
 
-    for pid in ordered_pids:
-        kind = process_kinds[pid]
-        success, reason = _terminate_pid(
-            pid,
-            expected_start_time=start_times.get(pid),
-            application_handshake=kind in {"launcher", "gui"},
-        )
+    for identity in ordered:
+        pid = identity.pid
+        success, reason = _terminate_process(identity, port=port)
         if success:
             killed.append(pid)
         elif reason == "access_denied":
@@ -2371,7 +2551,8 @@ def main() -> None:
 
     log_path = Path.home() / ".vipercapture" / "requests.log"
     log_handle = None
-    popen_kwargs: dict[str, object] = {"cwd": str(ROOT)}
+    server_env, shutdown_token = _new_server_environment()
+    popen_kwargs: dict[str, object] = {"cwd": str(ROOT), "env": server_env}
     if not one_window:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -2383,6 +2564,7 @@ def main() -> None:
          "--host", HOST, "--port", str(PORT)],
         **popen_kwargs,
     )
+    _record_server_process(server.pid, shutdown_token, PORT)
 
     # ── Wait for port (1 check/sec, 30s max) ────────────────────
     # One-window mode inherits uvicorn's output, so progress dots would

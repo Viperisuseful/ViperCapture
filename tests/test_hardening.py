@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from unittest.mock import patch
 
 import pytest
 
@@ -53,16 +54,26 @@ def test_verify_render_request_rejects_empty_secret() -> None:
 def test_responses_carry_nosniff_and_frame_ancestors() -> None:
     from fastapi.testclient import TestClient
 
-    from vipercapture.main import app
+    from vipercapture import main
+
+    app = main.app
 
     response = TestClient(app).get("/health")
     assert response.status_code == 200
-    payload = response.json()
-    assert payload["service"] == "vipercapture"
-    assert payload["pid"] == os.getpid()
-    assert len(payload["install_id"]) == 64
+    assert response.json() == {"ready": True}
     assert response.headers["X-Content-Type-Options"] == "nosniff"
     assert response.headers["Content-Security-Policy"] == "frame-ancestors 'none'"
+
+    identity = TestClient(app).get("/__vipercapture__/identity")
+    assert identity.status_code == 200
+    assert identity.json() == {
+        "service": "vipercapture",
+        "install_id": main.INSTALL_ID,
+        "pid": os.getpid(),
+    }
+    with patch.object(main, "SHUTDOWN_TOKEN", "expected-secret"):
+        denied = TestClient(app).post("/__vipercapture__/shutdown")
+    assert denied.status_code == 404
 
 
 def test_html_and_markdown_skip_main_target_and_use_about_blank() -> None:

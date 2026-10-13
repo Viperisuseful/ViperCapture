@@ -960,8 +960,10 @@ def _start_server() -> tuple[subprocess.Popen[object], object]:
     if hasattr(os, "fchmod"):
         os.fchmod(log_fd, 0o600)
     log_handle = open(log_fd, "w", encoding="utf-8", buffering=1)
+    server_env, shutdown_token = launch._new_server_environment()
     kwargs: dict[str, object] = {
         "cwd": str(launch.ROOT),
+        "env": server_env,
         "stdin": subprocess.DEVNULL,
         "stdout": log_handle,
         "stderr": subprocess.STDOUT,
@@ -972,6 +974,7 @@ def _start_server() -> tuple[subprocess.Popen[object], object]:
         kwargs["creationflags"] = flags
     try:
         server = subprocess.Popen(server_command(), **kwargs)
+        launch._record_server_process(server.pid, shutdown_token, launch.PORT)
     except Exception:
         log_handle.close()
         raise
