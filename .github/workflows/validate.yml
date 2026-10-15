@@ -28,7 +28,7 @@ jobs:
           npm run build --prefix frontend
           git diff --exit-code -- static/app
       - name: Check launcher installer selection
-        run: python -m unittest tests.test_launch_installer
+        run: python -m unittest tests.test_launch_installer tests.test_capture_cli
       - name: Build and smoke container
         run: |
           python -m compileall -q vipercapture launch.py scripts/smoke.py
@@ -77,7 +77,7 @@ jobs:
         run: |
           python -m compileall -q vipercapture launch.py scripts/smoke.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m unittest tests.test_launch_installer
+          python -m unittest tests.test_launch_installer tests.test_capture_cli
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python scripts/smoke.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

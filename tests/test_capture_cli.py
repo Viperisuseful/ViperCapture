@@ -1,0 +1,536 @@
+"""Cross-platform tests for the vipercapture capture command."""
+
+from __future__ import annotations
+
+import io
+import json
+import os
+import sys
+import tempfile
+import threading
+import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from unittest import mock
+
+import launch
+from vipercapture.capture_cli import (
+    EXAMPLE,
+    api_root,
+    build_payload,
+    display_path,
+    is_local_default,
+    main,
+    normalize_url,
+    parse_capture_args,
+    prepare_private_data_dir,
+    resolve_output,
+    safe_filename,
+    validate_payload,
+)
+
+EXAMPLE_ARGV = [
+    "https://dimaths.ma",
+    "--output",
+    "dimaths.png",
+    "--viewport",
+    "1440",
+    "900",
+    "--scale",
+    "2",
+    "--full-page=false",
+    "--color-scheme",
+    "dark",
+    "--wait",
+    "h1",
+    "--delay-ms",
+    "2500",
+    "--click",
+    "[aria-label='Activer le thème sombre']",
+]
+
+
+def _payload(argv: list[str]) -> dict:
+    return build_payload(parse_capture_args(argv))
+
+
+class PayloadTests(unittest.TestCase):
+    def test_dimaths_command_maps_onto_the_render_contract(self) -> None:
+        payload = _payload(EXAMPLE_ARGV)
+        self.assertEqual(
+            payload,
+            {
+                "url": "https://dimaths.ma",
+                "output": "png",
+                "viewport": {"width": 1440, "height": 900, "device_scale_factor": 2.0},
+                "full_page": False,
+                "environment": {"color_scheme": "dark"},
+                "wait_for": {"selector": "h1", "delay_ms": 2500},
+                "actions": [{
+                    "type": "click",
+                    "selector": "[aria-label='Activer le thème sombre']",
+                }],
+            },
+        )
+
+    def test_boolean_forms_match_on_every_shell(self) -> None:
+        self.assertFalse(_payload(["https://example.com", "--full-page=false"])["full_page"])
+        self.assertFalse(_payload(["https://example.com", "--full-page", "false"])["full_page"])
+        self.assertFalse(_payload(["https://example.com", "--no-full-page"])["full_page"])
+        self.assertNotIn("full_page", _payload(["https://example.com", "--full-page=true"]))
+        self.assertNotIn("full_page", _payload(["https://example.com", "--full-page"]))
+        self.assertFalse(
+            _payload(["https://example.com", "--no-javascript"])["network"]["java_script_enabled"]
+        )
+        self.assertFalse(_payload(["https://example.com", "--javascript=false"])["network"]["java_script_enabled"])
+
+    def test_actions_keep_command_order_and_later_timeouts(self) -> None:
+        payload = _payload([
+            "https://example.com",
+            "--action-delay-ms", "10",
+            "--click", "a",
+            "--fill", "#email", "person@example.com",
+            "--hover", "b",
+            "--press", "Enter",
+            "--press-on", "#field", "Tab",
+            "--select", "#plan", "starter", "pro",
+            "--hide", ".cookie",
+            "--scroll", "0", "400",
+            "--scroll-to", "#next",
+            "--action-timeout-ms", "8000",
+            "--js", "return 1",
+            "--action-wait", "#done",
+            "--pause-ms", "50",
+            "--action", '{"type":"click","selector":"z","delay_ms":5}',
+        ])
+        self.assertEqual(
+            [item["type"] for item in payload["actions"]],
+            ["click", "fill", "hover", "press", "press", "select", "hide", "scroll", "scroll", "javascript", "wait", "wait", "click"],
+        )
+        self.assertEqual(payload["actions"][0]["delay_ms"], 10)
+        self.assertNotIn("timeout_ms", payload["actions"][0])
+        self.assertEqual(payload["actions"][1]["value"], "person@example.com")
+        self.assertEqual(payload["actions"][4], {"type": "press", "selector": "#field", "key": "Tab", "delay_ms": 10})
+        self.assertEqual(payload["actions"][5]["values"], ["starter", "pro"])
+        self.assertEqual(payload["actions"][7], {"type": "scroll", "x": 0.0, "y": 400.0, "delay_ms": 10})
+        self.assertEqual(payload["actions"][9]["timeout_ms"], 8000)
+        self.assertEqual(payload["actions"][11], {"type": "wait", "delay_ms": 50, "timeout_ms": 8000})
+        self.assertEqual(payload["actions"][12]["delay_ms"], 5)
+        self.assertEqual(payload["actions"][12]["timeout_ms"], 8000)
+
+    def test_format_comes_from_the_file_or_the_explicit_flag(self) -> None:
+        self.assertEqual(_payload(["https://example.com", "--output", "shot.jpg"])["output"], "jpeg")
+        self.assertEqual(_payload(["https://example.com", "--output", "notes.md"])["output"], "markdown")
+        self.assertEqual(
+            _payload(["https://example.com", "--format", "pdf", "--output", "shot.png"])["output"],
+            "pdf",
+        )
+        self.assertEqual(_payload(["https://example.com", "--format", "jpg"])["output"], "jpeg")
+        self.assertEqual(_payload(["dimaths.ma"])["url"], "https://dimaths.ma")
+
+    def test_headers_cookies_proxy_and_blocks(self) -> None:
+        with mock.patch.dict(os.environ, {"VIPERCAPTURE_PROXY_PASSWORD": "from-env"}, clear=False):
+            payload = _payload([
+                "https://example.com",
+                "--header", "Accept-Language: fr-FR",
+                "--header", "X-Token=abc:def",
+                "--cookie", "sid=abc; domain=example.com; path=/; Secure; HttpOnly; SameSite=Lax",
+                "--block-url", "*tracker*",
+                "--block-resource", "image",
+                "--geolocation", "33.57", "-7.58",
+                "--geo-accuracy", "20",
+                "--proxy", "socks5://proxy.example:1080",
+                "--proxy-username", "account",
+                "--proxy-bypass", ".internal",
+                "--no-javascript",
+                "--bypass-csp",
+            ])
+        self.assertEqual(payload["headers"], {"Accept-Language": "fr-FR", "X-Token": "abc:def"})
+        self.assertEqual(payload["network"]["cookies"], [{
+            "name": "sid",
+            "value": "abc",
+            "domain": "example.com",
+            "path": "/",
+            "secure": True,
+            "http_only": True,
+            "same_site": "Lax",
+        }])
+        self.assertEqual(payload["network"]["proxy"]["password"], "from-env")
+        self.assertNotIn("network", _payload(["https://example.com"]))
+        with mock.patch.dict(os.environ, {"VIPERCAPTURE_PROXY_PASSWORD": ""}, clear=False):
+            proxied = _payload(["https://example.com", "--proxy", "http://proxy.example:8080"])
+        self.assertNotIn("password", proxied["network"]["proxy"])
+
+    def test_proxy_password_flag_is_not_taken_from_the_environment_without_a_proxy(self) -> None:
+        with mock.patch.dict(os.environ, {"VIPERCAPTURE_PROXY_PASSWORD": "secret"}, clear=False):
+            payload = _payload(["https://example.com"])
+        self.assertNotIn("network", payload)
+
+    def test_nested_feature_flags(self) -> None:
+        payload = _payload([
+            "https://example.com",
+            "--full-page=false",
+            "--format", "png",
+            "--device", "iphone_14",
+            "--locale", "fr-FR",
+            "--timezone", "Africa/Casablanca",
+            "--media", "screen",
+            "--reduced-motion", "reduce",
+            "--quality", "80",
+            "--format", "webp",
+            "--image-width", "640",
+            "--transparent",
+            "--no-optimize-for-speed",
+            "--thumbnail", "card:640",
+            "--thumbnail", "preview:320x180",
+            "--side", "markdown",
+            "--element", "h1",
+            "--consent", "reject",
+            "--block-ads",
+            "--assert-includes", "Hello",
+            "--fail-on", "404",
+            "--named-viewport", "desktop:1440x900",
+            "--named-viewport", "phone:390x844@iphone_14@2",
+            "--diagnostics",
+            "--har",
+            "--no-console",
+            "--deterministic",
+            "--seed", "7",
+            "--timestamp-ms", "1700000000000",
+            "--certify",
+            "--extract", "article",
+            "--shadow-dom",
+            "--lazy-load", "thorough",
+            "--profile", "accurate",
+            "--cache",
+            "--cache-key", "home",
+            "--engine", "firefox",
+            "--user-agent", "ViperCapture",
+            "--captcha", "external",
+            "--captcha-solver", "desk",
+            "--webhook", "https://hooks.example/vipercapture",
+            "--pdf-mode", "print",
+        ])
+        self.assertEqual(payload["output"], "webp")
+        self.assertEqual(payload["environment"]["timezone"], "Africa/Casablanca")
+        self.assertEqual(payload["image"]["thumbnails"][1], {"name": "preview", "width": 320, "height": 180})
+        self.assertTrue(payload["image"]["optimize_for_speed"] is False)
+        self.assertEqual(payload["viewports"][1]["device_scale_factor"], 2.0)
+        self.assertTrue(payload["diagnostics"]["bundle"])
+        self.assertTrue(payload["diagnostics"]["include_har"])
+        self.assertFalse(payload["diagnostics"]["include_console"])
+        self.assertEqual(payload["deterministic"]["random_seed"], 7)
+        self.assertEqual(payload["cleanup"], {"consent_mode": "reject", "block_ads": True})
+        self.assertEqual(payload["elements"], [{"selector": "h1"}])
+        self.assertTrue(payload["cache"])
+        self.assertEqual(payload["cache_key"], "home")
+        self.assertEqual(payload["captcha"], {"action": "external", "solver": "desk"})
+
+    def test_pdf_video_and_raw_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            html = Path(directory) / "page.html"
+            css = Path(directory) / "page.css"
+            html.write_text("<p>Bonjour</p>", encoding="utf-8")
+            css.write_text("p{color:red}", encoding="utf-8")
+            payload = _payload([
+                "--html-file", str(html),
+                "--base-url", "example.com",
+                "--css-file", str(css),
+                "--format", "pdf",
+                "--paper", "letter",
+                "--orientation", "landscape",
+                "--pdf-margin", "0.5",
+                "--no-pdf-background",
+                "--pdf-tagged=false",
+                "--page-ranges", "1-2",
+            ])
+        self.assertEqual(payload["html"], "<p>Bonjour</p>")
+        self.assertEqual(payload["base_url"], "https://example.com")
+        self.assertEqual(payload["custom_css"], "p{color:red}")
+        self.assertEqual(payload["pdf"]["paper_size"], "Letter")
+        self.assertEqual(payload["pdf"]["margins"]["top"], 0.5)
+        self.assertFalse(payload["pdf"]["print_background"])
+        self.assertFalse(payload["pdf"]["tagged"])
+        video = _payload([
+            "https://example.com",
+            "--format", "webm",
+            "--full-page=false",
+            "--video-duration-ms", "2000",
+            "--fps", "30",
+            "--bitrate-mbps", "8",
+            "--video-scroll",
+        ])
+        self.assertEqual(video["video"]["duration_ms"], 2000)
+        self.assertTrue(video["video"]["scroll"])
+
+    def test_output_names_are_safe_on_windows(self) -> None:
+        self.assertEqual(safe_filename("CON"), "_CON")
+        self.assertEqual(safe_filename("a:b"), "a_b")
+        self.assertEqual(safe_filename("  ... "), "capture")
+        args = parse_capture_args(["https://example.com", "--diagnostics"])
+        path = resolve_output(args, _payload(["https://example.com", "--diagnostics"]))
+        self.assertEqual(path.name, "example.com.zip")
+        stdout_args = parse_capture_args(["https://example.com", "--output", "-"])
+        self.assertIsNone(resolve_output(stdout_args, _payload(["https://example.com", "--output", "-"])))
+
+    def test_display_path_stays_relative_inside_the_working_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            previous = Path.cwd()
+            os.chdir(directory)
+            try:
+                path = Path(directory) / "dimaths.png"
+                path.write_bytes(b"x")
+                self.assertEqual(display_path(path), "dimaths.png")
+            finally:
+                os.chdir(previous)
+
+    def test_started_server_uses_a_private_data_directory(self) -> None:
+        if os.name == "nt":
+            self.skipTest("Windows keeps the default data directory")
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            checkout = home / "checkout"
+            checkout.mkdir()
+            env: dict[str, str] = {}
+            prepare_private_data_dir(env, home=home)
+            data = home / ".vipercapture" / "data"
+            self.assertEqual(env["VIPERCAPTURE_DATA_DIR"], str(data))
+            self.assertEqual(data.stat().st_mode & 0o777, 0o700)
+            self.assertEqual((home / ".vipercapture").stat().st_mode & 0o777, 0o700)
+            explicit = {"VIPERCAPTURE_DATA_DIR": str(checkout)}
+            prepare_private_data_dir(explicit, home=home)
+            self.assertEqual(explicit["VIPERCAPTURE_DATA_DIR"], str(checkout))
+
+    def test_server_url_and_local_detection(self) -> None:
+        self.assertEqual(api_root("http://127.0.0.1:8000/v1/render"), "http://127.0.0.1:8000")
+        self.assertEqual(api_root("http://[::1]:9000/v1"), "http://[::1]:9000")
+        self.assertTrue(is_local_default(f"http://{launch.HOST}:{launch.PORT}"))
+        self.assertTrue(is_local_default("http://localhost:8000"))
+        self.assertFalse(is_local_default("http://127.0.0.1:9000"))
+        self.assertFalse(is_local_default("https://example.com"))
+
+    def test_usage_errors_are_json_and_exit_2(self) -> None:
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", stderr):
+            code = main([])
+        self.assertEqual(code, 2)
+        self.assertFalse(json.loads(stderr.getvalue())["ok"])
+        stderr.seek(0)
+        stderr.truncate()
+        with mock.patch("sys.stderr", stderr):
+            code = main(["https://example.com", "--full-page=maybe"])
+        self.assertEqual(code, 2)
+        self.assertIn("true or false", json.loads(stderr.getvalue())["error"])
+        with mock.patch("sys.stderr", io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parse_capture_args(["--select", "only-one"])
+
+    def test_help_includes_the_example_and_does_not_start_a_server(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch("sys.stdout", stdout):
+            code = main(["--help"])
+        self.assertEqual(code, 0)
+        text = stdout.getvalue()
+        self.assertIn(EXAMPLE, text)
+        self.assertIn("--full-page", text)
+        self.assertIn("--scale", text)
+        self.assertIn("--click", text)
+
+    def test_dry_run_prints_the_request(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch("sys.stdout", stdout), mock.patch("urllib.request.urlopen", side_effect=AssertionError("network")):
+            code = main(["--dry-run", *EXAMPLE_ARGV])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), _payload(EXAMPLE_ARGV))
+
+    def test_contract_rejects_quality_on_png_when_installed(self) -> None:
+        try:
+            import vipercapture.render_contract  # noqa: F401
+        except ImportError:
+            self.skipTest("render contract dependencies are not installed")
+        payload = _payload(["https://example.com", "--quality", "40"])
+        with self.assertRaises(ValueError):
+            validate_payload(payload)
+        validate_payload(_payload(EXAMPLE_ARGV))
+
+    def test_javascript_and_data_urls_are_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            normalize_url("javascript:alert(1)")
+        self.assertEqual(normalize_url("localhost:8080"), "https://localhost:8080")
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length)
+        self.server.requests.append(("POST", self.path, raw, self.headers.get("Authorization")))  # type: ignore[attr-defined]
+        if self.path.endswith("/v1/jobs"):
+            body = json.dumps({
+                "id": "job-1",
+                "status": "queued",
+                "status_url": "/v1/jobs/job-1",
+                "result_url": None,
+            }).encode("utf-8")
+            self._send(202, body, "application/json")
+            return
+        if b"\"url\":\"https://fail.example\"" in raw:
+            body = json.dumps({
+                "error": {"code": "invalid_request", "message": "The page was rejected.", "retryable": False}
+            }).encode("utf-8")
+            self._send(422, body, "application/json")
+            return
+        self._send(200, b"\x89PNG\r\n\x1a\nfake", "image/png", extra={"X-Request-Id": "req-1", "X-ViperCapture-Width": "1440"})
+
+    def do_GET(self) -> None:
+        self.server.requests.append(("GET", self.path, b"", self.headers.get("Authorization")))  # type: ignore[attr-defined]
+        if self.path.endswith("/result"):
+            self._send(200, b"GIF89a", "image/gif")
+            return
+        body = json.dumps({
+            "id": "job-1",
+            "status": "succeeded",
+            "status_url": "/v1/jobs/job-1",
+            "result_url": "/v1/jobs/job-1/result",
+        }).encode("utf-8")
+        self._send(200, body, "application/json")
+
+    def _send(self, status: int, body: bytes, content_type: str, extra: dict[str, str] | None = None) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        for key, value in (extra or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args) -> None:
+        return
+
+
+class HttpTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.httpd.requests = []  # type: ignore[attr-defined]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        host, port = self.httpd.server_address[:2]
+        self.server = f"http://{host}:{port}"
+
+    def tearDown(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def _run(self, argv: list[str]) -> tuple[int, str, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch("sys.stdout", stdout),
+            mock.patch("sys.stderr", stderr),
+            mock.patch("vipercapture.capture_cli.is_local_default", return_value=False),
+            mock.patch("vipercapture.capture_cli.load_local_env"),
+        ):
+            code = main(argv)
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_capture_writes_the_response_and_prints_the_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "dimaths.png"
+            code, stdout, stderr = self._run([
+                "--server", self.server,
+                "--no-start",
+                *EXAMPLE_ARGV[:1],
+                "--output", str(target),
+                *EXAMPLE_ARGV[3:],
+            ])
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(target.read_bytes(), b"\x89PNG\r\n\x1a\nfake")
+            self.assertEqual(Path(stdout.strip()).resolve(), target.resolve())
+            self.assertEqual(stderr, "")
+            method, path, raw, _auth = self.httpd.requests[0]  # type: ignore[attr-defined]
+            self.assertEqual((method, path), ("POST", "/v1/render"))
+            self.assertEqual(json.loads(raw)["viewport"]["width"], 1440)
+
+    def test_api_errors_are_json_on_stderr(self) -> None:
+        code, _stdout, stderr = self._run([
+            "--server", self.server,
+            "https://fail.example",
+            "--output", "ignored.png",
+        ])
+        self.assertEqual(code, 1)
+        document = json.loads(stderr)
+        self.assertEqual(document["status"], 422)
+        self.assertEqual(document["code"], "invalid_request")
+        self.assertEqual(document["error"], "The page was rejected.")
+
+    def test_json_result_includes_response_headers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "page.png"
+            code, stdout, stderr = self._run([
+                "--server", self.server,
+                "--json",
+                "https://example.com",
+                "--output", str(target),
+            ])
+        self.assertEqual(code, 0, stderr)
+        document = json.loads(stdout)
+        self.assertTrue(document["ok"])
+        self.assertEqual(document["bytes"], len(b"\x89PNG\r\n\x1a\nfake"))
+        self.assertEqual(document["request_id"], "req-1")
+        self.assertEqual(document["media_type"], "image/png")
+
+    def test_async_polls_and_downloads_the_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "clip.gif"
+            code, stdout, stderr = self._run([
+                "--server", self.server,
+                "--async",
+                "--idempotency-key", "clip-1",
+                "--poll-ms", "1",
+                "https://example.com",
+                "--format", "gif",
+                "--output", str(target),
+            ])
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(target.read_bytes(), b"GIF89a")
+            self.assertTrue(stdout.strip().endswith("clip.gif"))
+            paths = [item[1] for item in self.httpd.requests]  # type: ignore[attr-defined]
+            self.assertEqual(paths[0], "/v1/jobs")
+            self.assertEqual(paths[-1], "/v1/jobs/job-1/result")
+
+    def test_api_key_is_sent_and_not_printed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "page.png"
+            code, stdout, stderr = self._run([
+                "--server", self.server,
+                "--api-key", "secret-token",
+                "--verbose",
+                "https://example.com",
+                "--output", str(target),
+            ])
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn("secret-token", stdout)
+        self.assertNotIn("secret-token", stderr)
+        self.assertIn(self.server, stderr)
+        self.assertEqual(self.httpd.requests[0][3], "Bearer secret-token")  # type: ignore[attr-defined]
+
+
+class LaunchDispatchTests(unittest.TestCase):
+    def test_capture_help_does_not_create_a_venv(self) -> None:
+        stdout = io.StringIO()
+        previous = launch.INTERACTIVE_FAILURES
+        try:
+            with (
+                mock.patch("sys.stdout", stdout),
+                mock.patch.object(launch, "ensure_venv", side_effect=AssertionError("venv")),
+                mock.patch.object(sys, "argv", ["launch.py", "capture", "--help"]),
+            ):
+                with self.assertRaises(SystemExit) as caught:
+                    launch.main()
+            self.assertEqual(caught.exception.code, 0)
+            self.assertIn("dimaths.ma", stdout.getvalue())
+        finally:
+            launch.INTERACTIVE_FAILURES = previous
+
+
+if __name__ == "__main__":
+    unittest.main()
