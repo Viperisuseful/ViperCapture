@@ -17,7 +17,9 @@ import launch
 from vipercapture.capture_cli import (
     EXAMPLE,
     CaptureError,
+    _is_descendant_process,
     _read_json,
+    _wait_for_local_server,
     api_root,
     build_payload,
     display_path,
@@ -724,6 +726,42 @@ class LaunchDispatchTests(unittest.TestCase):
             self.assertIn("dimaths.ma", stdout.getvalue())
         finally:
             launch.INTERACTIVE_FAILURES = previous
+
+
+class LocalServerStartupTests(unittest.TestCase):
+    def test_is_descendant_process(self) -> None:
+        self.assertTrue(_is_descendant_process(os.getpid(), os.getpid()))
+        self.assertFalse(_is_descendant_process(999999, 999998))
+
+    def test_wait_for_local_server_accepts_child_process(self) -> None:
+        proc = mock.Mock(pid=100)
+        proc.poll.return_value = None
+        log_path = Path("unused.log")
+        with (
+            mock.patch.object(launch, "port_open", return_value=True),
+            mock.patch.object(launch, "_is_vipercapture_endpoint", return_value=200),
+            mock.patch("vipercapture.capture_cli._is_descendant_process", return_value=True),
+            mock.patch.object(launch, "_record_server_process") as record_mock,
+        ):
+            ok = _wait_for_local_server(proc, log_path, token="tok")
+            self.assertTrue(ok)
+            record_mock.assert_called_once_with(200, "tok", launch.PORT)
+            proc.terminate.assert_not_called()
+
+    def test_wait_for_local_server_rejects_unrelated_process(self) -> None:
+        proc = mock.Mock(pid=100)
+        proc.poll.return_value = None
+        log_path = Path("unused.log")
+        with (
+            mock.patch.object(launch, "port_open", return_value=True),
+            mock.patch.object(launch, "_is_vipercapture_endpoint", return_value=300),
+            mock.patch("vipercapture.capture_cli._is_descendant_process", return_value=False),
+            mock.patch.object(launch, "_clear_server_record") as clear_mock,
+        ):
+            ok = _wait_for_local_server(proc, log_path, token="tok")
+            self.assertFalse(ok)
+            proc.terminate.assert_called_once()
+            clear_mock.assert_called_once_with(100)
 
 
 if __name__ == "__main__":

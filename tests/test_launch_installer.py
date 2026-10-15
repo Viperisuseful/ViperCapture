@@ -1407,7 +1407,10 @@ class UpdateTests(unittest.TestCase):
             (source / "launch.py").write_text("print('new')\n", encoding="utf-8")
             (source / "VERSION").write_text("1.0.5\n", encoding="utf-8")
             link = source / "linked"
-            link.symlink_to(outside)
+            try:
+                link.symlink_to(outside)
+            except OSError:
+                self.skipTest("symlinks require privileges on Windows")
             app = self._install(home)
             code = updater.run_update(
                 app,

@@ -1275,18 +1275,104 @@ def _log_tail(path: Path) -> str:
     return "\n".join(lines[-40:])[-2000:]
 
 
-def _wait_for_local_server(proc: subprocess.Popen[object], log_path: Path) -> bool:
+def _is_descendant_process(child_pid: int, ancestor_pid: int) -> bool:
+    if child_pid == ancestor_pid:
+        return True
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            TH32CS_SNAPPROCESS = 0x00000002
+
+            class PROCESSENTRY32(ctypes.Structure):
+                _fields_ = [
+                    ("dwSize", wintypes.DWORD),
+                    ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", wintypes.LONG),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", ctypes.c_char * 260),
+                ]
+
+            kernel32 = ctypes.windll.kernel32
+            hSnapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            if hSnapshot and hSnapshot != -1:
+                pe = PROCESSENTRY32()
+                pe.dwSize = ctypes.sizeof(PROCESSENTRY32)
+                parents: dict[int, int] = {}
+                success = kernel32.Process32First(hSnapshot, ctypes.byref(pe))
+                while success:
+                    parents[pe.th32ProcessID] = pe.th32ParentProcessID
+                    success = kernel32.Process32Next(hSnapshot, ctypes.byref(pe))
+                kernel32.CloseHandle(hSnapshot)
+
+                cur = child_pid
+                while cur in parents and parents[cur] > 4:
+                    cur = parents[cur]
+                    if cur == ancestor_pid:
+                        return True
+        except Exception:
+            pass
+    elif sys.platform == "linux":
+        try:
+            cur = child_pid
+            while cur > 1:
+                stat_path = Path(f"/proc/{cur}/stat")
+                if not stat_path.exists():
+                    break
+                content = stat_path.read_text()
+                ppid = int(content[content.rfind(")") + 1 :].split()[1])
+                if ppid == ancestor_pid:
+                    return True
+                cur = ppid
+        except Exception:
+            pass
+    elif sys.platform == "darwin":
+        try:
+            cur = child_pid
+            while cur > 1:
+                out = subprocess.check_output(
+                    ["ps", "-o", "ppid=", "-p", str(cur)],
+                    text=True,
+                    errors="ignore",
+                ).strip()
+                if not out:
+                    break
+                ppid = int(out)
+                if ppid == ancestor_pid:
+                    return True
+                cur = ppid
+        except Exception:
+            pass
+    return False
+
+
+def _wait_for_local_server(
+    proc: subprocess.Popen[object],
+    log_path: Path,
+    *,
+    token: str = "",
+) -> bool:
     """Return True when the process this command started is the listening server."""
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
         if launch.port_open():
             pid = launch._is_vipercapture_endpoint()
             if pid is not None:
-                if pid != proc.pid:
+                is_ours = (pid == proc.pid) or _is_descendant_process(pid, proc.pid)
+                if not is_ours:
                     if proc.poll() is None:
                         proc.terminate()
                     launch._clear_server_record(proc.pid)
-                return pid == proc.pid
+                    return False
+                if pid != proc.pid and token:
+                    launch._record_server_process(pid, token, launch.PORT)
+                return True
         if proc.poll() is not None and not launch.port_open():
             break
         time.sleep(0.25)
@@ -1369,7 +1455,7 @@ def start_local_server() -> bool:
     finally:
         log_handle.close()
     launch._record_server_process(proc.pid, token, launch.PORT)
-    return _wait_for_local_server(proc, log_path)
+    return _wait_for_local_server(proc, log_path, token=token)
 
 
 def ensure_server(args: argparse.Namespace) -> bool:
@@ -1595,6 +1681,12 @@ def run_capture(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
     try:
         args = parse_capture_args(list(sys.argv[1:] if argv is None else argv))
     except SystemExit as exc:
