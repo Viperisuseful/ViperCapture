@@ -16,14 +16,19 @@ from unittest import mock
 import launch
 from vipercapture.capture_cli import (
     EXAMPLE,
+    CaptureError,
+    _read_json,
     api_root,
     build_payload,
     display_path,
+    display_server,
     is_local_default,
     main,
     normalize_url,
     parse_capture_args,
     prepare_private_data_dir,
+    public_payload,
+    resolve_api_url,
     resolve_output,
     safe_filename,
     validate_payload,
@@ -304,6 +309,7 @@ class PayloadTests(unittest.TestCase):
     def test_server_url_and_local_detection(self) -> None:
         self.assertEqual(api_root("http://127.0.0.1:8000/v1/render"), "http://127.0.0.1:8000")
         self.assertEqual(api_root("http://[::1]:9000/v1"), "http://[::1]:9000")
+        self.assertEqual(api_root("http://user:s3cret@127.0.0.1:8000/v1"), "http://127.0.0.1:8000")
         self.assertTrue(is_local_default(f"http://{launch.HOST}:{launch.PORT}"))
         self.assertTrue(is_local_default("http://localhost:8000"))
         self.assertFalse(is_local_default("http://127.0.0.1:9000"))
@@ -343,6 +349,71 @@ class PayloadTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(stdout.getvalue()), _payload(EXAMPLE_ARGV))
 
+    def test_dry_run_redacts_the_proxy_password(self) -> None:
+        argv = [
+            "https://example.com",
+            "--proxy",
+            "http://proxy.example:8080",
+            "--proxy-password",
+            "s3cret-password",
+        ]
+        stdout = io.StringIO()
+        with (
+            mock.patch("sys.stdout", stdout),
+            mock.patch.dict(os.environ, {"VIPERCAPTURE_PROXY_PASSWORD": "env-secret"}, clear=False),
+        ):
+            code = main(["--dry-run", *argv])
+        self.assertEqual(code, 0)
+        text = stdout.getvalue()
+        self.assertNotIn("s3cret-password", text)
+        self.assertNotIn("env-secret", text)
+        self.assertEqual(json.loads(text)["network"]["proxy"]["password"], "***")
+        self.assertEqual(build_payload(parse_capture_args(argv))["network"]["proxy"]["password"], "s3cret-password")
+        env_argv = ["https://example.com", "--proxy", "http://proxy.example:8080"]
+        with mock.patch.dict(os.environ, {"VIPERCAPTURE_PROXY_PASSWORD": "env-secret"}, clear=False):
+            printed = public_payload(build_payload(parse_capture_args(env_argv)))
+        self.assertEqual(printed["network"]["proxy"]["password"], "***")
+
+    def test_job_urls_stay_on_the_api_host(self) -> None:
+        root = "http://127.0.0.1:8000"
+        self.assertEqual(resolve_api_url(root, "/v1/jobs/1"), "http://127.0.0.1:8000/v1/jobs/1")
+        self.assertEqual(resolve_api_url(root, "v1/jobs/1"), "http://127.0.0.1:8000/v1/jobs/1")
+        self.assertEqual(
+            resolve_api_url(root, "http://127.0.0.1:8000/v1/jobs/1/result"),
+            "http://127.0.0.1:8000/v1/jobs/1/result",
+        )
+        self.assertEqual(
+            resolve_api_url("https://capture.example", "https://capture.example:443/v1/jobs/1"),
+            "https://capture.example:443/v1/jobs/1",
+        )
+        self.assertEqual(display_server("http://user:s3cret@127.0.0.1:8000/v1"), "http://127.0.0.1:8000/v1")
+        for bad in (
+            "https://evil.example/v1/jobs/1",
+            "http://127.0.0.1:9000/v1/jobs/1",
+            "http://localhost:8000/v1/jobs/1",
+            "http://user:s3cret@127.0.0.1:8000/v1/jobs/1",
+            "//evil.example/v1/jobs/1",
+            "javascript:alert(1)",
+        ):
+            with self.assertRaises(CaptureError):
+                resolve_api_url(root, bad)
+
+    def test_json_responses_are_size_capped(self) -> None:
+        class Bounded:
+            def read(self, amount: int = -1) -> bytes:
+                blob = b'{"ok": true}' + b"x" * (2 * 1024 * 1024)
+                return blob if amount < 0 else blob[:amount]
+
+        with self.assertRaises(CaptureError):
+            _read_json(Bounded())
+
+        class Small:
+            def read(self, amount: int = -1) -> bytes:
+                blob = b'{"ok": true}'
+                return blob if amount < 0 else blob[:amount]
+
+        self.assertEqual(_read_json(Small()), {"ok": True})
+
     def test_contract_rejects_quality_on_png_when_installed(self) -> None:
         try:
             import vipercapture.render_contract  # noqa: F401
@@ -365,13 +436,31 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         self.server.requests.append(("POST", self.path, raw, self.headers.get("Authorization")))  # type: ignore[attr-defined]
         if self.path.endswith("/v1/jobs"):
-            body = json.dumps({
-                "id": "job-1",
-                "status": "queued",
-                "status_url": "/v1/jobs/job-1",
-                "result_url": None,
-            }).encode("utf-8")
-            self._send(202, body, "application/json")
+            host, port = self.server.server_address[:2]
+            origin = f"http://{host}:{port}"
+            mode = getattr(self.server, "job_url", "relative")
+            if mode == "foreign":
+                document = {
+                    "id": "job-1",
+                    "status": "queued",
+                    "status_url": "https://evil.example/steal",
+                    "result_url": None,
+                }
+            elif mode == "absolute":
+                document = {
+                    "id": "job-1",
+                    "status": "succeeded",
+                    "status_url": f"{origin}/v1/jobs/job-1",
+                    "result_url": f"{origin}/v1/jobs/job-1/result",
+                }
+            else:
+                document = {
+                    "id": "job-1",
+                    "status": "queued",
+                    "status_url": "/v1/jobs/job-1",
+                    "result_url": None,
+                }
+            self._send(202, json.dumps(document).encode("utf-8"), "application/json")
             return
         if b"\"url\":\"https://fail.example\"" in raw:
             body = json.dumps({
@@ -411,6 +500,7 @@ class HttpTests(unittest.TestCase):
     def setUp(self) -> None:
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.httpd.requests = []  # type: ignore[attr-defined]
+        self.httpd.job_url = "relative"  # type: ignore[attr-defined]
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
         host, port = self.httpd.server_address[:2]
@@ -496,6 +586,56 @@ class HttpTests(unittest.TestCase):
             paths = [item[1] for item in self.httpd.requests]  # type: ignore[attr-defined]
             self.assertEqual(paths[0], "/v1/jobs")
             self.assertEqual(paths[-1], "/v1/jobs/job-1/result")
+
+    def test_async_accepts_a_result_url_on_the_same_host(self) -> None:
+        self.httpd.job_url = "absolute"  # type: ignore[attr-defined]
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "clip.gif"
+            code, stdout, stderr = self._run([
+                "--server", self.server,
+                "--async",
+                "--poll-ms", "1",
+                "https://example.com",
+                "--format", "gif",
+                "--output", str(target),
+            ])
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(target.read_bytes(), b"GIF89a")
+            self.assertTrue(stdout.strip().endswith("clip.gif"))
+
+    def test_async_refuses_a_status_url_on_another_host(self) -> None:
+        self.httpd.job_url = "foreign"  # type: ignore[attr-defined]
+        code, stdout, stderr = self._run([
+            "--server", self.server,
+            "--async",
+            "--api-key", "secret-token",
+            "--poll-ms", "1",
+            "https://example.com",
+            "--output", "ignored.png",
+        ])
+        self.assertEqual(code, 1)
+        self.assertNotIn("secret-token", stdout)
+        self.assertNotIn("secret-token", stderr)
+        self.assertIn("different host", stderr)
+        self.assertEqual(len(self.httpd.requests), 1)  # type: ignore[attr-defined]
+
+    def test_verbose_hides_server_userinfo(self) -> None:
+        host, port = self.httpd.server_address[:2]
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "page.png"
+            code, stdout, stderr = self._run([
+                "--server", f"http://user:s3cret@{host}:{port}",
+                "--verbose",
+                "--api-key", "secret-token",
+                "https://example.com",
+                "--output", str(target),
+            ])
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn("s3cret", stdout)
+        self.assertNotIn("s3cret", stderr)
+        self.assertNotIn("secret-token", stdout)
+        self.assertNotIn("secret-token", stderr)
+        self.assertIn(f"http://{host}:{port}/v1/render", stderr)
 
     def test_api_key_is_sent_and_not_printed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

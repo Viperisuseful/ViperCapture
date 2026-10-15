@@ -334,6 +334,25 @@ def _json_line(document: dict[str, object]) -> str:
     return json.dumps(document, ensure_ascii=False)
 
 
+def public_payload(payload: dict[str, object]) -> dict[str, object]:
+    """A copy that can be printed. The proxy password is never copied out."""
+
+    def walk(value: object) -> object:
+        if isinstance(value, dict):
+            printed: dict[str, object] = {}
+            for key, item in value.items():
+                printed[key] = "***" if key == "password" else walk(item)
+            return printed
+        if isinstance(value, list):
+            return [walk(item) for item in value]
+        return value
+
+    printed = walk(payload)
+    if not isinstance(printed, dict):
+        return {}
+    return printed
+
+
 def write_line(stream: TextIO, text: str) -> None:
     try:
         stream.write(text + "\n")
@@ -1008,13 +1027,19 @@ def api_root(server: str) -> str:
     if ":" in host:
         host = f"[{host}]"
     port = f":{parsed.port}" if parsed.port else ""
-    auth = ""
-    if parsed.username:
-        auth = parsed.username
-        if parsed.password:
-            auth += f":{parsed.password}"
-        auth += "@"
-    return f"{parsed.scheme}://{auth}{host}{port}{path}"
+    # Userinfo is not sent. A password in this URL would be printed by
+    # --verbose, and urllib would treat "user:password@host" as the hostname.
+    return f"{parsed.scheme}://{host}{port}{path}"
+
+
+def display_server(server: str) -> str:
+    """The server URL with any userinfo removed, for logs and error text."""
+    parsed = urlsplit(server)
+    host = parsed.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    port = f":{parsed.port}" if parsed.port else ""
+    return f"{parsed.scheme}://{host}{port}{parsed.path}"
 
 
 def is_local_default(server: str) -> bool:
@@ -1363,14 +1388,50 @@ def request_timeout(args: argparse.Namespace, payload: dict[str, object]) -> flo
     return 120
 
 
-def _join_api(root: str, url: str) -> str:
-    if url.startswith(("http://", "https://")):
-        return url
-    return root.rstrip("/") + "/" + url.lstrip("/")
+def _origin(url: str) -> tuple[str, str, int]:
+    parsed = urlsplit(url)
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    if scheme == "https":
+        port = parsed.port or 443
+    elif scheme == "http":
+        port = parsed.port or 80
+    else:
+        port = parsed.port or 0
+    return scheme, host, port
+
+
+def resolve_api_url(root: str, url: str) -> str:
+    """Follow a job URL only when it stays on the API the command was given."""
+    text = url.strip()
+    if not text or text.startswith("//") or any(char in text for char in "\r\n\x00\\"):
+        raise CaptureError("The API returned a URL this command will not follow.")
+    if "://" in text:
+        parsed = urlsplit(text)
+        if (
+            parsed.username
+            or parsed.password
+            or parsed.scheme.lower() not in {"http", "https"}
+            or not parsed.hostname
+            or _origin(text) != _origin(root)
+        ):
+            raise CaptureError("The API returned a URL on a different host.")
+        return text
+    if ":" in text:
+        raise CaptureError("The API returned a URL this command will not follow.")
+    base = urlsplit(root)
+    if text.startswith("/"):
+        return f"{base.scheme}://{base.netloc}{text}"
+    return root.rstrip("/") + "/" + text
+
+
+_MAX_JSON_BYTES = 1024 * 1024
 
 
 def _read_json(response) -> dict[str, object]:
-    raw = response.read()
+    raw = response.read(_MAX_JSON_BYTES + 1)
+    if len(raw) > _MAX_JSON_BYTES:
+        raise CaptureError("The API returned a JSON document that is too large.")
     try:
         parsed = json.loads(raw.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as exc:
@@ -1386,7 +1447,7 @@ def execute(args: argparse.Namespace, payload: dict[str, object], *, started_ser
     output = resolve_output(args, payload)
     if args.verbose and not args.quiet:
         route = "/v1/jobs" if args.async_job else "/v1/render"
-        write_line(sys.stderr, f"POST {root}{route}")
+        write_line(sys.stderr, f"POST {display_server(root)}{route}")
     if args.async_job:
         response_headers, total = _execute_async(
             args,
@@ -1441,7 +1502,7 @@ def _execute_async(
             if not isinstance(result_url, str) or not result_url:
                 raise CaptureError("The async job did not include a result URL.")
             result = open_response(
-                _join_api(root, result_url),
+                resolve_api_url(root, result_url),
                 method="GET",
                 payload=None,
                 headers=request_headers(args, started_server=started_server, json_body=False),
@@ -1465,7 +1526,7 @@ def _execute_async(
             raise CaptureError("The async job did not include a status URL.")
         time.sleep(min(max(args.poll_ms, 1) / 1000, _remaining(deadline)))
         polled = open_response(
-            _join_api(root, status_url),
+            resolve_api_url(root, status_url),
             method="GET",
             payload=None,
             headers=request_headers(args, started_server=started_server, json_body=False),
@@ -1491,7 +1552,7 @@ def run_capture(args: argparse.Namespace) -> int:
     except ValueError as exc:
         return fail(str(exc), exit_code=2)
     if args.dry_run:
-        write_line(sys.stdout, json.dumps(payload, ensure_ascii=False, indent=2))
+        write_line(sys.stdout, json.dumps(public_payload(payload), ensure_ascii=False, indent=2))
         return 0
     try:
         load_local_env()
