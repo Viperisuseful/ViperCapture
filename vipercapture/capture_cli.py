@@ -1136,6 +1136,28 @@ def _error_from_body(status: int, raw: bytes) -> CaptureError:
     return CaptureError(text or f"HTTP {status}", status=status, body=text or None)
 
 
+class _SameOriginRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect only when it stays on the host that issued it.
+
+    urllib copies Authorization onto the next request. A 302 to another
+    host or port would send the API token there.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        try:
+            resolve_api_url(req.full_url, newurl)
+        except CaptureError:
+            fp.close()
+            raise CaptureError(
+                "The API redirected to another host. This command will not follow it."
+            ) from None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open(request: urllib.request.Request, timeout: float):
+    return urllib.request.build_opener(_SameOriginRedirect).open(request, timeout=timeout)
+
+
 def open_response(
     url: str,
     *,
@@ -1149,7 +1171,7 @@ def open_response(
         data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        return urllib.request.urlopen(request, timeout=timeout)
+        return _open(request, timeout)
     except urllib.error.HTTPError as exc:
         try:
             raw = exc.read(64 * 1024)

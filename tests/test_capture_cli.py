@@ -435,6 +435,13 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length)
         self.server.requests.append(("POST", self.path, raw, self.headers.get("Authorization")))  # type: ignore[attr-defined]
+        redirect = getattr(self.server, "redirect_to", None)
+        if redirect and self.path == "/v1/render":
+            self.send_response(302)
+            self.send_header("Location", redirect)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if self.path.endswith("/v1/jobs"):
             host, port = self.server.server_address[:2]
             origin = f"http://{host}:{port}"
@@ -472,6 +479,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         self.server.requests.append(("GET", self.path, b"", self.headers.get("Authorization")))  # type: ignore[attr-defined]
+        if self.path.endswith("/done"):
+            self._send(200, b"\x89PNG\r\n\x1a\nfake", "image/png", extra={"X-Request-Id": "req-1"})
+            return
         if self.path.endswith("/result"):
             self._send(200, b"GIF89a", "image/gif")
             return
@@ -501,6 +511,7 @@ class HttpTests(unittest.TestCase):
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.httpd.requests = []  # type: ignore[attr-defined]
         self.httpd.job_url = "relative"  # type: ignore[attr-defined]
+        self.httpd.redirect_to = None  # type: ignore[attr-defined]
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
         host, port = self.httpd.server_address[:2]
@@ -636,6 +647,49 @@ class HttpTests(unittest.TestCase):
         self.assertNotIn("secret-token", stdout)
         self.assertNotIn("secret-token", stderr)
         self.assertIn(f"http://{host}:{port}/v1/render", stderr)
+
+    def test_same_origin_redirect_keeps_the_token_on_that_host(self) -> None:
+        self.httpd.redirect_to = "/v1/done"  # type: ignore[attr-defined]
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "page.png"
+            code, stdout, stderr = self._run([
+                "--server", self.server,
+                "--api-key", "secret-token",
+                "https://example.com",
+                "--output", str(target),
+            ])
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(target.read_bytes(), b"\x89PNG\r\n\x1a\nfake")
+            self.assertNotIn("secret-token", stdout)
+            self.assertNotIn("secret-token", stderr)
+            authorizations = [item[3] for item in self.httpd.requests]  # type: ignore[attr-defined]
+            self.assertEqual(authorizations, ["Bearer secret-token", "Bearer secret-token"])
+
+    def test_authorization_does_not_follow_a_cross_host_redirect(self) -> None:
+        other = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        other.requests = []  # type: ignore[attr-defined]
+        other.job_url = "relative"  # type: ignore[attr-defined]
+        other.redirect_to = None  # type: ignore[attr-defined]
+        thread = threading.Thread(target=other.serve_forever, daemon=True)
+        thread.start()
+        try:
+            _host, port = other.server_address[:2]
+            self.httpd.redirect_to = f"http://127.0.0.1:{port}/stolen"  # type: ignore[attr-defined]
+            code, stdout, stderr = self._run([
+                "--server", self.server,
+                "--api-key", "secret-token",
+                "https://example.com",
+                "--output", "ignored.png",
+            ])
+            self.assertEqual(code, 1)
+            self.assertNotIn("secret-token", stdout)
+            self.assertNotIn("secret-token", stderr)
+            self.assertIn("another host", stderr)
+            self.assertEqual(other.requests, [])  # type: ignore[attr-defined]
+            self.assertEqual(len(self.httpd.requests), 1)  # type: ignore[attr-defined]
+        finally:
+            other.shutdown()
+            other.server_close()
 
     def test_api_key_is_sent_and_not_printed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
