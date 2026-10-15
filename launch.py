@@ -78,8 +78,13 @@ def run(*cmd: str | Path, label: str = "") -> None:
         wait_and_exit(1)
 
 
+# The capture command reports failure and exits. The interactive launcher
+# still waits for Enter when a person is sitting at the terminal.
+INTERACTIVE_FAILURES = True
+
+
 def wait_and_exit(code: int = 0) -> None:
-    if sys.stdin.isatty():
+    if INTERACTIVE_FAILURES and sys.stdin.isatty():
         input("\n  Press Enter to close...")
     sys.exit(code)
 
@@ -2426,6 +2431,7 @@ LAUNCH_HELP = """\
 usage: vipercapture [--one-window]
        vipercapture update [--check]
        vipercapture kill
+       vipercapture capture URL --output FILE [options]
        vipercapture --gui [--viewport WIDTH HEIGHT]
 
 Start ViperCapture in this terminal. Ghostty and Kitty open request
@@ -2440,6 +2446,10 @@ logs in another window and show a full-screen status view.
                  Exit 10 means an update is available.
   kill           Stop all running instances of ViperCapture (server, GUI,
                  and background workers) on Windows, macOS, and Linux.
+  capture        Render a page and save the file. The saved path is printed
+                 on stdout. vipercapture capture --help lists a flag for
+                 each major API field. The same flags work on Linux, macOS,
+                 and Windows.
   --gui          Open a full-screen capture menu in this terminal.
                  Type a website link, press Tab to switch png, gif, and
                  mp4, and press Ctrl+P to switch between the full page and
@@ -2459,6 +2469,8 @@ class CliArgs:
     check: bool = False
     gui: bool = False
     kill: bool = False
+    capture: bool = False
+    capture_argv: tuple[str, ...] = ()
     viewport: tuple[int, int] | None = None
 
 
@@ -2499,6 +2511,8 @@ def parse_cli(argv: list[str] | None = None) -> CliArgs:
             print(f"Unknown argument: {arg}\n{LAUNCH_HELP}", end="", file=sys.stderr)
             raise SystemExit(2)
         return CliArgs(kill=True)
+    if args and args[0] == "capture":
+        return CliArgs(capture=True, capture_argv=tuple(args[1:]))
     gui = False
     one_window = False
     viewport: tuple[int, int] | None = None
@@ -2547,6 +2561,13 @@ def main() -> None:
     # dependencies or start the server. ensure_venv re-runs this file with
     # the same arguments when the command is a normal launch.
     cli = parse_cli()
+    if cli.capture:
+        global INTERACTIVE_FAILURES
+        INTERACTIVE_FAILURES = False
+        import vipercapture.capture_cli as capture_cli
+        if not capture_cli.wants_help(list(cli.capture_argv)):
+            ensure_venv()
+        raise SystemExit(capture_cli.main(list(cli.capture_argv)))
     if cli.kill:
         raise SystemExit(kill_all_instances())
     if cli.update:

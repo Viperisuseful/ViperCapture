@@ -372,6 +372,7 @@ class LaunchArgsTests(unittest.TestCase):
         self.assertIn("--one-window", stdout.getvalue())
         self.assertIn("vipercapture update", stdout.getvalue())
         self.assertIn("vipercapture kill", stdout.getvalue())
+        self.assertIn("vipercapture capture", stdout.getvalue())
         self.assertIn("Stop all running instances", stdout.getvalue())
         self.assertIn("Windows always uses one window.", stdout.getvalue())
 
@@ -406,6 +407,14 @@ class LaunchArgsTests(unittest.TestCase):
         self.assertFalse(command.update)
         self.assertFalse(command.gui)
         self.assertFalse(command.one_window)
+
+    def test_capture_is_a_command(self) -> None:
+        command = launch.parse_cli(["capture", "--output", "page.png", "https://example.com"])
+        self.assertTrue(command.capture)
+        self.assertEqual(command.capture_argv, ("--output", "page.png", "https://example.com"))
+        self.assertFalse(command.kill)
+        self.assertFalse(command.update)
+        self.assertFalse(command.gui)
 
     def test_kill_rejects_launch_flags(self) -> None:
         stderr = io.StringIO()
@@ -1398,7 +1407,10 @@ class UpdateTests(unittest.TestCase):
             (source / "launch.py").write_text("print('new')\n", encoding="utf-8")
             (source / "VERSION").write_text("1.0.5\n", encoding="utf-8")
             link = source / "linked"
-            link.symlink_to(outside)
+            try:
+                link.symlink_to(outside)
+            except OSError:
+                self.skipTest("symlinks require privileges on Windows")
             app = self._install(home)
             code = updater.run_update(
                 app,
@@ -1574,6 +1586,9 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
         self.assertFalse(launch._matches_vipercapture_command("grep -rn launch.py ."))
         self.assertFalse(launch._matches_vipercapture_command("vipercapture kill"))
         self.assertFalse(launch._matches_vipercapture_command(f"python {root}/launch.py kill"))
+        self.assertTrue(launch._matches_vipercapture_command(
+            f"python {root}/launch.py capture https://example.com --output page.png"
+        ))
         self.assertFalse(launch._matches_vipercapture_command(""))
 
     def test_matches_exact_script_path_when_install_path_contains_spaces(self) -> None:

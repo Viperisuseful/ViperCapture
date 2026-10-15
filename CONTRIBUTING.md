@@ -55,6 +55,7 @@ private URLs, generated captures, virtual environments, or browser binaries.
 The main files are:
 
 - `vipercapture/main.py` — FastAPI application and local interface
+- `vipercapture/capture_cli.py` — `vipercapture capture` command
 - `vipercapture/render_contract.py` — request validation
 - `vipercapture/render_engine.py` — Playwright rendering and network controls
 - `vipercapture/render_errors.py` — stable API errors

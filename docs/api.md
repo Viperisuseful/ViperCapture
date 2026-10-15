@@ -4,6 +4,8 @@ The API rejects unknown request fields. Each render request requires exactly
 one of `url`, `html`, or `markdown`. `RenderRequest` in
 `vipercapture/render_contract.py` is the canonical schema. When the service is
 running, the interactive OpenAPI reference is available at `/docs`.
+`vipercapture capture` sends this contract from the shell. `vipercapture capture --help`
+lists a flag for each major field.
 
 ## Outputs
 

@@ -50,6 +50,12 @@ checkout, `python launch.py` runs that same startup path. The launcher uses uv
 when it is on `PATH` and otherwise falls back to pip. The Docker image already
 includes FFmpeg.
 
+`vipercapture capture https://example.com --output page.png` renders through
+the local API and prints the saved path. The same flags work on Linux, macOS,
+and Windows. `vipercapture capture --help` lists them. On Linux and macOS the
+server this command starts stores its data in `~/.vipercapture/data`, which
+it keeps owner-only, including when the checkout itself is group-writable.
+
 ### Intel macOS (x86_64)
 
 [GHSA-jwv3-5hgf-82ww](https://github.com/advisories/GHSA-jwv3-5hgf-82ww) is

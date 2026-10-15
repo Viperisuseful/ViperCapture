@@ -198,6 +198,30 @@ curl --fail-with-body http://127.0.0.1:8000/v1/render \
   }' --output example.png
 ```
 
+The same request from the `vipercapture` command:
+
+```bash
+vipercapture capture https://dimaths.ma \
+  --output dimaths.png \
+  --viewport 1440 900 \
+  --scale 2 \
+  --full-page=false \
+  --color-scheme dark \
+  --wait h1 \
+  --delay-ms 2500 \
+  --click "[aria-label='Activer le thème sombre']"
+```
+
+Stdout is the saved path. A failure is one JSON object on stderr. Exit 0
+means the file was written, 2 means the command was rejected, and 1 means
+the capture or the network failed. `--full-page=false` and `--no-full-page`
+are the same flag. Action flags run in the order you write them, after
+`--wait` and `--delay-ms`. PowerShell and cmd take these same flags; put
+them on one line if the shell does not continue a trailing backslash.
+`vipercapture capture --help` lists a flag for each major API field. When
+the local server is not already running, `capture` starts it and leaves it
+listening. Stop that process with `vipercapture kill`.
+
 A synchronous request returns the artifact directly. The
 `X-ViperCapture-*` headers include the request ID, queue and render timing,
 dimensions, navigation status, and cache outcome.
