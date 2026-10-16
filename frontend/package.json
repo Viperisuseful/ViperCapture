@@ -34,5 +34,16 @@
     "oxlint": "^1.78.0",
     "typescript": "^6.0.3",
     "vite": "^8.2.1"
+  },
+  "overrides": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "proxy-addr": "2.0.8",
+    "source-map-js": "1.2.2",
+    "undici": "7.30.0",
+    "brace-expansion@>=4 <6": "5.0.12",
+    "hono": "4.13.7",
+    "fast-uri": "3.1.8",
+    "ip-address": "10.7.1",
+    "postcss-selector-parser": "7.1.6"
   }
 }
