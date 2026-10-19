@@ -18,9 +18,10 @@ Use GitHub's private vulnerability reporting:
 2. Select **Advisories**.
 3. Select **Report a vulnerability**.
 
-If that option is unavailable, ask the repository owner through their GitHub
-profile for a private communication channel without including technical
-details publicly.
+Security contact: viperisuseful@gmail.com
+
+If that option is unavailable, email viperisuseful@gmail.com, and don't
+include technical details in public channels.
 
 Include the affected component, reproduction steps, a minimal proof of concept,
 impact, and any suggested mitigation. Remove secrets, credentials, cookies,
