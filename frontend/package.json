@@ -20,7 +20,7 @@
     "radix-ui": "^1.6.7",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
-    "shadcn": "^4.17.0",
+    "shadcn": "^4.23.0",
     "sonner": "^2.0.8",
     "tailwind-merge": "^3.6.0",
     "tailwindcss": "^4.3.3",
@@ -36,18 +36,12 @@
     "vite": "^8.2.4"
   },
   "overrides": {
-    "@modelcontextprotocol/sdk": "1.32.1",
-    "proxy-addr": "2.0.8",
     "source-map-js": "1.2.2",
     "undici": "7.30.1",
     "brace-expansion@>=4 <6": "5.0.12",
-    "hono": "4.13.14",
-    "@hono/node-server": "2.1.3",
     "fast-uri": "3.1.9",
     "ip-address": "10.7.4",
     "systeminformation": "5.33.16",
-    "body-parser": "2.4.0",
-    "qs": "6.16.1",
     "postcss-selector-parser": "7.1.6"
   }
 }
