@@ -927,8 +927,9 @@ def _windows_parent_map() -> dict[int, int]:
         from ctypes import wintypes
 
         TH32CS_SNAPPROCESS = 0x00000002
+        INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
 
-        class PROCESSENTRY32(ctypes.Structure):
+        class PROCESSENTRY32W(ctypes.Structure):
             _fields_ = [
                 ("dwSize", wintypes.DWORD),
                 ("cntUsage", wintypes.DWORD),
@@ -939,24 +940,37 @@ def _windows_parent_map() -> dict[int, int]:
                 ("th32ParentProcessID", wintypes.DWORD),
                 ("pcPriClassBase", wintypes.LONG),
                 ("dwFlags", wintypes.DWORD),
-                ("szExeFile", ctypes.c_char * 260),
+                ("szExeFile", ctypes.c_wchar * 260),
             ]
 
-        kernel32 = ctypes.windll.kernel32
-        hSnapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-        if not hSnapshot or hSnapshot == -1:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_snapshot = kernel32.CreateToolhelp32Snapshot
+        create_snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        create_snapshot.restype = wintypes.HANDLE
+        process_first = kernel32.Process32FirstW
+        process_first.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+        process_first.restype = wintypes.BOOL
+        process_next = kernel32.Process32NextW
+        process_next.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+        process_next.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        hSnapshot = create_snapshot(TH32CS_SNAPPROCESS, 0)
+        if not hSnapshot or hSnapshot == INVALID_HANDLE_VALUE:
             return {}
         try:
-            pe = PROCESSENTRY32()
-            pe.dwSize = ctypes.sizeof(PROCESSENTRY32)
+            pe = PROCESSENTRY32W()
+            pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
             parents: dict[int, int] = {}
-            success = kernel32.Process32First(hSnapshot, ctypes.byref(pe))
+            success = process_first(hSnapshot, ctypes.byref(pe))
             while success:
                 parents[pe.th32ProcessID] = pe.th32ParentProcessID
-                success = kernel32.Process32Next(hSnapshot, ctypes.byref(pe))
+                success = process_next(hSnapshot, ctypes.byref(pe))
             return parents
         finally:
-            kernel32.CloseHandle(hSnapshot)
+            close_handle(hSnapshot)
     except Exception:
         return {}
 

@@ -349,8 +349,15 @@ internal static class ViperCaptureShim
             }
         }
 
-        # Fallback when .NET Framework csc.exe is unavailable: encode in the OEM code page
-        # that cmd.exe uses to parse batch files.
+        # Fallback when .NET Framework csc.exe is unavailable: remove any stale
+        # .exe shim so Windows does not prefer it over the .cmd fallback, and
+        # encode the batch file in the OEM code page used by cmd.exe.
+        if (Test-Path -LiteralPath $exePath) {
+            Remove-Item -LiteralPath $exePath -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path -LiteralPath $configPath) {
+            Remove-Item -LiteralPath $configPath -Force -ErrorAction SilentlyContinue
+        }
         $oemCodePage = [System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage
         $oemEncoding = [System.Text.Encoding]::GetEncoding($oemCodePage)
         $cmdText = "@echo off`r`n`"$Python`" `"$Launch`" %*`r`n"
