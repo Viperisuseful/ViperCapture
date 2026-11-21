@@ -403,27 +403,47 @@ internal static class ViperCaptureShim
                 if ($compiled) {
                     Write-AtomicUtf8Lines -Path $configPath -Lines @($Python, $Launch)
                     $oldExe = "$exePath.old"
+                    $stagedExe = "$exePath.new"
                     if (Test-Path -LiteralPath $oldExe) {
                         Remove-Item -LiteralPath $oldExe -Force -ErrorAction SilentlyContinue
                     }
+                    $exeInstalled = $false
                     try {
-                        Copy-Item -LiteralPath $builtExe -Destination $exePath -Force
-                    } catch [System.IO.IOException], [System.UnauthorizedAccessException] {
-                        if (-not (Test-Path -LiteralPath $exePath)) { throw }
+                        Copy-Item -LiteralPath $builtExe -Destination $stagedExe -Force
                         try {
-                            Move-Item -LiteralPath $exePath -Destination $oldExe -Force
-                            Copy-Item -LiteralPath $builtExe -Destination $exePath -Force
-                            Remove-Item -LiteralPath $oldExe -Force -ErrorAction SilentlyContinue
-                        } catch {
-                            if (-not (Test-Path -LiteralPath $exePath) -and (Test-Path -LiteralPath $oldExe)) {
-                                Move-Item -LiteralPath $oldExe -Destination $exePath -Force -ErrorAction SilentlyContinue
+                            Move-Item -LiteralPath $stagedExe -Destination $exePath -Force
+                            $exeInstalled = $true
+                        } catch [System.IO.IOException], [System.UnauthorizedAccessException] {
+                            if (-not (Test-Path -LiteralPath $exePath)) { throw }
+                            try {
+                                Move-Item -LiteralPath $exePath -Destination $oldExe -Force
+                                Move-Item -LiteralPath $stagedExe -Destination $exePath -Force
+                                $exeInstalled = $true
+                                Remove-Item -LiteralPath $oldExe -Force -ErrorAction SilentlyContinue
+                            } catch {
+                                if (Test-Path -LiteralPath $oldExe) {
+                                    if (Test-Path -LiteralPath $exePath) {
+                                        Remove-Item -LiteralPath $exePath -Force -ErrorAction SilentlyContinue
+                                    }
+                                    Move-Item -LiteralPath $oldExe -Destination $exePath -Force -ErrorAction SilentlyContinue
+                                }
+                                $exeInstalled = Test-Path -LiteralPath $exePath
+                                if (-not $exeInstalled) {
+                                    throw
+                                }
                             }
                         }
+                    } finally {
+                        if (Test-Path -LiteralPath $stagedExe) {
+                            Remove-Item -LiteralPath $stagedExe -Force -ErrorAction SilentlyContinue
+                        }
                     }
-                    if (Test-Path -LiteralPath $cmdPath) {
-                        Remove-Item -LiteralPath $cmdPath -Force -ErrorAction SilentlyContinue
+                    if ($exeInstalled -and (Test-Path -LiteralPath $exePath)) {
+                        if (Test-Path -LiteralPath $cmdPath) {
+                            Remove-Item -LiteralPath $cmdPath -Force -ErrorAction SilentlyContinue
+                        }
+                        return
                     }
-                    return
                 }
             } finally {
                 if (Test-Path -LiteralPath $buildTemp) {

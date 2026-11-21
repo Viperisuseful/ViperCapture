@@ -3392,16 +3392,17 @@ def main() -> None:
     print("  ------------")
     print()
 
-    ensure_deps()
-    ensure_playwright()
-
-    # Server already running from a previous session?
+    # Server already running from a previous session? Open it immediately
+    # without hashing requirements or importing Playwright first.
     if port_open():
         show_terminal_logo()
         print(f"\n{listening_line()}")
         print("  That server is already running. Opening it in your browser.")
         _mod("webbrowser").open(URL)
         return
+
+    ensure_deps()
+    ensure_playwright()
 
     # ── Start the server ────────────────────────────────────────
     print(f"\n  Starting server at {URL}\n")

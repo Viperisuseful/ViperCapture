@@ -246,3 +246,90 @@ def test_page_cleanup_frozenset_domain_matching() -> None:
     assert should_block_resource("https://www.google-analytics.com/g.js", opts) == "trackers"
     assert should_block_resource("https://widget.intercom.io/v1", opts) == "chats"
     assert should_block_resource("https://example.com/app.js", opts) is None
+
+
+def test_lifespan_cancellation_closes_launched_browser() -> None:
+    import asyncio
+    from types import SimpleNamespace
+    import vipercapture.main as main_mod
+
+    browser_closed = False
+    pw_stopped = False
+    browser_ready = asyncio.Event()
+    cache_gate = asyncio.Event()
+
+    class FakeBrowser:
+        async def close(self) -> None:
+            nonlocal browser_closed
+            browser_closed = True
+
+    class FakePlaywright:
+        devices = {}
+
+        async def stop(self) -> None:
+            nonlocal pw_stopped
+            pw_stopped = True
+
+    class FakePlaywrightCtx:
+        async def start(self) -> FakePlaywright:
+            return FakePlaywright()
+
+    async def fake_launch_browser(_pw) -> FakeBrowser:
+        browser_ready.set()
+        return FakeBrowser()
+
+    async def blocked_cache_start(_self) -> None:
+        await cache_gate.wait()
+
+    async def run() -> None:
+        fake_app = SimpleNamespace(state=SimpleNamespace())
+        with (
+            mock.patch.object(main_mod, "async_playwright", return_value=FakePlaywrightCtx()),
+            mock.patch.object(main_mod, "_launch_browser", side_effect=fake_launch_browser),
+            mock.patch.object(main_mod.RenderCache, "start", blocked_cache_start),
+            mock.patch.object(main_mod, "CONTROL_ENABLED", False),
+            mock.patch.object(main_mod, "ASYNC_JOBS_ENABLED", False),
+            mock.patch.object(main_mod, "SCHEDULES_ENABLED", False),
+        ):
+            async def enter_lifespan() -> None:
+                async with main_mod.lifespan(fake_app):  # type: ignore[arg-type]
+                    pass
+
+            task = asyncio.create_task(enter_lifespan())
+            await browser_ready.wait()
+            await asyncio.sleep(0)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(run())
+    assert browser_closed is True
+    assert pw_stopped is True
+
+
+def test_render_cache_indexed_put_evicts_without_rescanning_disk() -> None:
+    import asyncio
+    import tempfile
+    from pathlib import Path
+    from vipercapture.render_cache import RenderCache
+    from vipercapture.render_engine import RenderArtifact
+
+    async def run() -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = RenderCache(Path(tmp), ttl_seconds=300, max_entries=2, max_bytes=1024 * 1024)
+            await cache.start()
+            with mock.patch.object(cache, "_trim", side_effect=AssertionError("put should use index")):
+                reqs = [
+                    RenderRequest.model_validate({"html": f"<h1>{i}</h1>", "output": "png", "cache": True})
+                    for i in range(3)
+                ]
+                for i, req in enumerate(reqs):
+                    await cache.put(req, RenderArtifact(f"img-{i}".encode(), "image/png", f"{i}.png", {}))
+                    await asyncio.sleep(0.02)
+            assert await cache.get(reqs[0]) is None
+            assert (await cache.get(reqs[1])) is not None
+            assert (await cache.get(reqs[2])) is not None
+
+    asyncio.run(run())

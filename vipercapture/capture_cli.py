@@ -988,7 +988,11 @@ def _is_int(value: object) -> bool:
 
 
 def _is_number(value: object) -> bool:
-    return type(value) in {int, float} and math.isfinite(float(value))
+    if type(value) is int:
+        return True
+    if type(value) is float:
+        return math.isfinite(value)
+    return False
 
 
 def _fast_validate_simple_payload(payload: dict[str, object]) -> bool:
@@ -1076,7 +1080,7 @@ def _fast_validate_simple_payload(payload: dict[str, object]) -> bool:
             return False
         if "device_scale_factor" in vp:
             dsf = vp["device_scale_factor"]
-            if not _is_number(dsf) or not (0.1 <= float(dsf) <= 8.0):
+            if not _is_number(dsf) or not (0.1 <= dsf <= 8.0):
                 return False
 
     if "environment" in payload:
@@ -1155,9 +1159,9 @@ def _fast_validate_simple_payload(payload: dict[str, object]) -> bool:
             key = act.get("key")
             if "key" in act and (not isinstance(key, str) or not (1 <= len(key) <= 128)):
                 return False
-            if "x" in act and (not _is_number(act["x"]) or not (-100_000 <= float(act["x"]) <= 100_000)):
+            if "x" in act and (not _is_number(act["x"]) or not (-100_000 <= act["x"] <= 100_000)):
                 return False
-            if "y" in act and (not _is_number(act["y"]) or not (-100_000 <= float(act["y"]) <= 100_000)):
+            if "y" in act and (not _is_number(act["y"]) or not (-100_000 <= act["y"] <= 100_000)):
                 return False
             if "delay_ms" in act and (not _is_int(act["delay_ms"]) or not (0 <= act["delay_ms"] <= 15_000)):
                 return False
