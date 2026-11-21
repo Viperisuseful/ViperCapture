@@ -14,8 +14,6 @@ from contextlib import suppress
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
-import httpx
-
 from .render_errors import RenderError
 
 
@@ -236,6 +234,11 @@ class WebhookDispatcher:
             client = await client_context.__aenter__()
         else:
             client = None
+        retryable_errors: tuple[type[BaseException], ...] = (OSError, TimeoutError, ValueError)
+        if client is not None:
+            import httpx
+
+            retryable_errors = (httpx.RequestError, OSError, TimeoutError, ValueError)
         try:
             for attempt in range(self.attempts):
                 try:
@@ -260,7 +263,7 @@ class WebhookDispatcher:
                             f"webhook delivery failed: {last_error}",
                             retryable=False,
                         )
-                except (httpx.RequestError, OSError, TimeoutError, ValueError) as exc:
+                except retryable_errors as exc:
                     last_error = type(exc).__name__
                 if attempt + 1 < self.attempts:
                     await self.sleep(min(2**attempt, 4))

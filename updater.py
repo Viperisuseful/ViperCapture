@@ -20,7 +20,7 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Callable
 
 DEFAULT_REPO = "Viperisuseful/ViperCapture"
@@ -365,6 +365,110 @@ def cmd_encoding() -> str:
     return f"cp{code_page}"
 
 
+_WINDOWS_SHIM_VENV_MARKER = ".venv".encode("utf-16le")
+
+
+def _find_csc_compiler() -> Path | None:
+    system_root = os.environ.get("SystemRoot") or r"C:\Windows"
+    for rel in (r"Microsoft.NET\Framework64", r"Microsoft.NET\Framework"):
+        root = Path(system_root) / rel
+        if not root.is_dir():
+            continue
+        candidates = sorted(
+            (child / "csc.exe" for child in root.iterdir() if child.is_dir() and child.name.startswith("v4.")),
+            key=lambda p: p.parent.name,
+            reverse=True,
+        )
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+def _extract_windows_shim_source(app_root: Path) -> str | None:
+    script = app_root / "scripts" / "install.ps1"
+    if not script.is_file():
+        return None
+    try:
+        text = script.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = re.search(
+        r"\$csSource\s*=\s*@'\r?\n(.*?)\r?\n'@",
+        text,
+        re.DOTALL,
+    )
+    if not match:
+        return None
+    source = match.group(1)
+    if "class ViperCaptureShim" not in source:
+        return None
+    return source
+
+
+def _upgrade_windows_exe_shim(exe_path: Path, app_root: Path) -> bool:
+    """Recompile an older vipercapture.exe so it uses the direct .venv fast path."""
+    if sys.platform != "win32" or not exe_path.is_file():
+        return False
+    old_path = exe_path.with_name(exe_path.name + ".old")
+    try:
+        old_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    try:
+        if _WINDOWS_SHIM_VENV_MARKER in exe_path.read_bytes():
+            return False
+    except OSError:
+        return False
+    source = _extract_windows_shim_source(app_root)
+    csc = _find_csc_compiler()
+    if not source or csc is None:
+        return False
+    import subprocess
+
+    with tempfile.TemporaryDirectory(prefix="vipercapture-shim-") as tmp:
+        tmp_dir = Path(tmp)
+        cs_path = tmp_dir / "ViperCaptureShim.cs"
+        built_exe = tmp_dir / "vipercapture.exe"
+        cs_path.write_text(source, encoding="utf-8", newline="\n")
+        try:
+            result = subprocess.run(
+                [str(csc), "/nologo", "/optimize+", "/target:exe", f"/out:{built_exe}", str(cs_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if result.returncode != 0 or not built_exe.is_file():
+            return False
+        staged = exe_path.with_name(exe_path.name + ".new")
+        try:
+            shutil.copy2(built_exe, staged)
+            try:
+                staged.replace(exe_path)
+            except OSError:
+                # Windows blocks overwriting a running executable, but allows
+                # renaming it aside first so the upgraded binary takes effect.
+                exe_path.replace(old_path)
+                try:
+                    staged.replace(exe_path)
+                except OSError:
+                    try:
+                        old_path.replace(exe_path)
+                    except OSError:
+                        pass
+                    return False
+                try:
+                    old_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            return True
+        except OSError:
+            staged.unlink(missing_ok=True)
+            return False
+
+
 def write_shim(
     path: Path,
     python: str,
@@ -389,8 +493,19 @@ def write_shim(
             except Exception:
                 temporary.unlink(missing_ok=True)
                 raise
+            _upgrade_windows_exe_shim(path, launch.parent)
             return created
-        text = f"@echo off\r\n{cmd_quote(python)} {cmd_quote(str(launch))} %*\r\n"
+        venv_python = PureWindowsPath(str(launch)).parent / ".venv" / "Scripts" / "python.exe"
+        text = (
+            "@echo off\r\n"
+            "setlocal disabledelayedexpansion\r\n"
+            f'if /i not "%~1"=="update" if exist {cmd_quote(str(venv_python))} goto :venv\r\n'
+            f"{cmd_quote(python)} {cmd_quote(str(launch))} %*\r\n"
+            "exit /b %ERRORLEVEL%\r\n"
+            ":venv\r\n"
+            f"{cmd_quote(str(venv_python))} {cmd_quote(str(launch))} %*\r\n"
+            "exit /b %ERRORLEVEL%\r\n"
+        )
         chosen = encoding or cmd_encoding()
         try:
             data = text.encode(chosen)
@@ -403,8 +518,16 @@ def write_shim(
             ) from exc
         path.write_bytes(data)
     else:
+        venv_python = launch.parent / ".venv" / "bin" / "python"
+        quoted_venv = f"{shell_single_quote(str(venv_python))} {shell_single_quote(str(launch))}"
         quoted = f"{shell_single_quote(python)} {shell_single_quote(str(launch))}"
-        text = f"#!/bin/sh\nexec {quoted} \"$@\"\n"
+        text = (
+            "#!/bin/sh\n"
+            f'if [ "${{1:-}}" != "update" ] && [ -x {shell_single_quote(str(venv_python))} ]; then\n'
+            f'    exec {quoted_venv} "$@"\n'
+            "fi\n"
+            f'exec {quoted} "$@"\n'
+        )
         path.write_text(text, encoding="utf-8", newline="")
         path.chmod(0o755)
     return created

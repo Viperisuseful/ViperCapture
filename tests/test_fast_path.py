@@ -196,3 +196,53 @@ def test_browser_pool_size_is_half_of_concurrency() -> None:
         os.environ.pop("VIPERCAPTURE_BROWSER_POOL_SIZE", None)
         assert default_browser_pool_size(4) == 2
         assert default_browser_pool_size(1) == 1
+
+
+def test_stealth_context_options_prefers_cdp_over_throwaway_page() -> None:
+    import asyncio
+    from vipercapture.main import _stealth_context_options
+
+    class FakeCdpSession:
+        def __init__(self) -> None:
+            self.detached = False
+
+        async def send(self, method: str) -> dict[str, str]:
+            assert method == "Browser.getVersion"
+            return {"userAgent": "Mozilla/5.0 HeadlessChrome/153.0.0.0 Safari/537.36"}
+
+        async def detach(self) -> None:
+            self.detached = True
+
+    class FakeBrowser:
+        def __init__(self) -> None:
+            self.session = FakeCdpSession()
+            self.new_page_calls = 0
+
+        async def new_browser_cdp_session(self) -> FakeCdpSession:
+            return self.session
+
+        async def new_page(self):
+            self.new_page_calls += 1
+            raise AssertionError("new_page should not be called when CDP succeeds")
+
+    browser = FakeBrowser()
+    req = RenderRequest.model_validate({"html": "<h1>ok</h1>", "output": "png"})
+    opts = asyncio.run(_stealth_context_options(browser, req))  # type: ignore[arg-type]
+    assert opts == {"user_agent": "Mozilla/5.0 Chrome/153.0.0.0 Safari/537.36"}
+    assert browser.session.detached is True
+    assert browser.new_page_calls == 0
+    # Second call returns cached UA without creating another CDP session
+    opts2 = asyncio.run(_stealth_context_options(browser, req))  # type: ignore[arg-type]
+    assert opts2 == opts
+
+
+def test_page_cleanup_frozenset_domain_matching() -> None:
+    from vipercapture.page_cleanup import CleanupOptions, should_block_resource
+
+    opts = CleanupOptions(block_ads=True, block_trackers=True, block_chats=True)
+    assert should_block_resource("https://doubleclick.net/a.js", opts) == "ads"
+    assert should_block_resource("https://stats.g.doubleclick.net/a.js", opts) == "ads"
+    assert should_block_resource("https://notdoubleclick.net/a.js", opts) is None
+    assert should_block_resource("https://www.google-analytics.com/g.js", opts) == "trackers"
+    assert should_block_resource("https://widget.intercom.io/v1", opts) == "chats"
+    assert should_block_resource("https://example.com/app.js", opts) is None

@@ -17,28 +17,52 @@ On subsequent runs, dependency checks are skipped unless
 """
 
 from __future__ import annotations
-import base64
-import hashlib
-from importlib.metadata import version
-import json
 import os
-import platform
-import re
-import secrets
-import shlex
-import shutil
-import signal
 import sys
-import subprocess
-import socket
-import struct
 import time
-import urllib.request
-import webbrowser
-import zlib
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import subprocess
+    from typing import Callable, Mapping
+
+_LAZY_MODULES = frozenset({
+    "base64",
+    "hashlib",
+    "json",
+    "platform",
+    "re",
+    "secrets",
+    "shlex",
+    "shutil",
+    "signal",
+    "socket",
+    "struct",
+    "subprocess",
+    "webbrowser",
+    "zlib",
+})
+
+
+def _mod(name: str):
+    existing = globals().get(name)
+    if existing is not None:
+        return existing
+    loaded = __import__(name)
+    globals()[name] = loaded
+    return loaded
+
+
+def __getattr__(name: str):
+    if name in _LAZY_MODULES:
+        return _mod(name)
+    if name == "version":
+        from importlib.metadata import version as _meta_version
+
+        globals()["version"] = _meta_version
+        return _meta_version
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 ROOT             = Path(__file__).parent.resolve()
 VENV_PYTHON      = ROOT / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
@@ -60,9 +84,126 @@ INTEL_MACOS_CRYPTOGRAPHY_CHANGELOG = (
 
 # ── Helpers ───────────────────────────────────────────────────
 
-def port_open(host: str = HOST, port: int = PORT) -> bool:
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _windows_tcp_listener_pids(port: int, *, host: str | None = None) -> set[int] | None:
+    """Query listening TCP socket owner PIDs on Windows via iphlpapi (<1ms)."""
+    if sys.platform != "win32":
+        return None
     try:
-        with socket.create_connection((host, port), timeout=1):
+        import ctypes
+        from ctypes import wintypes
+
+        iphlpapi = ctypes.WinDLL("iphlpapi")
+        get_tcp_table = iphlpapi.GetExtendedTcpTable
+        get_tcp_table.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(wintypes.DWORD),
+            wintypes.BOOL,
+            wintypes.ULONG,
+            wintypes.DWORD,
+            wintypes.ULONG,
+        ]
+        get_tcp_table.restype = wintypes.DWORD
+
+        AF_INET = 2
+        AF_INET6 = 23
+        TCP_TABLE_OWNER_PID_LISTENER = 3
+        ERROR_INSUFFICIENT_BUFFER = 122
+
+        class MIB_TCPROW_OWNER_PID(ctypes.Structure):
+            _fields_ = [
+                ("dwState", wintypes.DWORD),
+                ("dwLocalAddr", wintypes.DWORD),
+                ("dwLocalPort", wintypes.DWORD),
+                ("dwRemoteAddr", wintypes.DWORD),
+                ("dwRemotePort", wintypes.DWORD),
+                ("dwOwningPid", wintypes.DWORD),
+            ]
+
+        class MIB_TCP6ROW_OWNER_PID(ctypes.Structure):
+            _fields_ = [
+                ("ucLocalAddr", ctypes.c_ubyte * 16),
+                ("dwLocalScopeId", wintypes.DWORD),
+                ("dwLocalPort", wintypes.DWORD),
+                ("ucRemoteAddr", ctypes.c_ubyte * 16),
+                ("dwRemoteScopeId", wintypes.DWORD),
+                ("dwRemotePort", wintypes.DWORD),
+                ("dwState", wintypes.DWORD),
+                ("dwOwningPid", wintypes.DWORD),
+            ]
+
+        host_lower = host.lower() if host is not None else None
+        families: list[tuple[int, type[ctypes.Structure]]] = []
+        if host_lower in {None, "127.0.0.1", "localhost"}:
+            families.append((AF_INET, MIB_TCPROW_OWNER_PID))
+        if host_lower in {None, "::1", "localhost", "::"}:
+            families.append((AF_INET6, MIB_TCP6ROW_OWNER_PID))
+
+        pids: set[int] = set()
+        ipv6_any = bytes(16)
+        ipv6_loopback = bytes(15) + b"\x01"
+        ipv6_mapped_loopback = b"\x00" * 10 + b"\xff\xff\x7f\x00\x00\x01"
+        for af, row_cls in families:
+            size = wintypes.DWORD(0)
+            rc = get_tcp_table(None, ctypes.byref(size), False, af, TCP_TABLE_OWNER_PID_LISTENER, 0)
+            if rc not in {0, ERROR_INSUFFICIENT_BUFFER} or not size.value:
+                if rc not in {0, ERROR_INSUFFICIENT_BUFFER}:
+                    return None
+                continue
+            buf = ctypes.create_string_buffer(size.value)
+            rc = get_tcp_table(buf, ctypes.byref(size), False, af, TCP_TABLE_OWNER_PID_LISTENER, 0)
+            if rc == ERROR_INSUFFICIENT_BUFFER and size.value:
+                buf = ctypes.create_string_buffer(size.value)
+                rc = get_tcp_table(buf, ctypes.byref(size), False, af, TCP_TABLE_OWNER_PID_LISTENER, 0)
+            if rc != 0:
+                return None
+            count = wintypes.DWORD.from_buffer(buf, 0).value
+            row_size = ctypes.sizeof(row_cls)
+            offset = 4
+            for idx in range(count):
+                row = row_cls.from_buffer(buf, offset + idx * row_size)
+                local_port = ((row.dwLocalPort & 0xFF) << 8) | ((row.dwLocalPort >> 8) & 0xFF)
+                if local_port != port:
+                    continue
+                if host_lower is not None:
+                    if af == AF_INET:
+                        # 0.0.0.0 or 127.0.0.1 in network byte order
+                        if row.dwLocalAddr not in {0, 0x0100007F}:
+                            continue
+                    else:
+                        addr_bytes = bytes(row.ucLocalAddr)
+                        if host_lower == "::":
+                            if addr_bytes not in {ipv6_any, ipv6_mapped_loopback}:
+                                continue
+                        elif addr_bytes not in {ipv6_any, ipv6_loopback}:
+                            continue
+                if row.dwOwningPid > 0:
+                    pids.add(int(row.dwOwningPid))
+        return pids
+    except Exception:
+        return None
+
+
+def port_open(host: str = HOST, port: int = PORT, *, timeout: float = 0.2) -> bool:
+    host_lower = host.lower()
+    if sys.platform == "win32" and host_lower in _LOOPBACK_HOSTS:
+        listeners = _windows_tcp_listener_pids(port, host=host_lower)
+        if listeners is not None:
+            if listeners:
+                return True
+            if host_lower != "127.0.0.1":
+                return False
+            # A dual-stack IPv6 wildcard (::) or IPv4-mapped loopback socket
+            # accepts 127.0.0.1 connections while appearing only in the IPv6
+            # TCP table. Probe via socket only when such a listener exists.
+            v6_dual_candidates = _windows_tcp_listener_pids(port, host="::")
+            if v6_dual_candidates is not None and not v6_dual_candidates:
+                return False
+    socket = _mod("socket")
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
             return True
     except OSError:
         return False
@@ -70,6 +211,7 @@ def port_open(host: str = HOST, port: int = PORT) -> bool:
 
 def run(*cmd: str | Path, label: str = "") -> None:
     """Run a subprocess and exit hard if it fails."""
+    subprocess = _mod("subprocess")
     result = subprocess.run([str(c) for c in cmd])
     if result.returncode != 0:
         tag = f" ({label})" if label else ""
@@ -136,7 +278,7 @@ def _is_wezterm(environ: Mapping[str, str]) -> bool:
 def _parse_version_tuple(val: str | None) -> tuple[int, ...] | None:
     if not val:
         return None
-    matches = re.findall(r"\d+", str(val))
+    matches = _mod("re").findall(r"\d+", str(val))
     if matches:
         return tuple(int(x) for x in matches[:3])
     return None
@@ -178,12 +320,13 @@ def _is_sixel_terminal(environ: Mapping[str, str]) -> bool:
 
 
 def _strip_lua_comments(text: str) -> str:
+    re = _mod("re")
     text = re.sub(r"--\[\[.*?\]\]", "", text, flags=re.DOTALL)
     return re.sub(r"--[^\n]*", "", text)
 
 
 def _lua_assigns_true(text: str, name: str) -> bool:
-    matches = re.findall(rf"\b{name}\s*=\s*(true|false)\b", _strip_lua_comments(text))
+    matches = _mod("re").findall(rf"\b{name}\s*=\s*(true|false)\b", _strip_lua_comments(text))
     return bool(matches) and matches[-1] == "true"
 
 
@@ -273,7 +416,7 @@ def terminal_graphics_supported(
 
 def kitty_graphics_sequence(png: bytes, *, rows: int = LOGO_ROWS) -> bytes:
     """Place a PNG with the Kitty graphics protocol, which Ghostty also implements."""
-    encoded = base64.standard_b64encode(png)
+    encoded = _mod("base64").standard_b64encode(png)
     parts: list[bytes] = []
     for start in range(0, len(encoded), 4096):
         chunk = encoded[start : start + 4096]
@@ -295,7 +438,7 @@ def iterm2_image_sequence(
     height: int | None = None,
 ) -> bytes:
     """iTerm2 inline image. WezTerm displays this protocol without extra config."""
-    encoded = base64.standard_b64encode(png)
+    encoded = _mod("base64").standard_b64encode(png)
     fields = ["inline=1", "preserveAspectRatio=1", f"size={len(png)}"]
     if width:
         fields.append(f"width={width}")
@@ -319,6 +462,8 @@ def _paeth(left: int, up: int, upper_left: int) -> int:
 
 def png_rgba(png: bytes) -> tuple[int, int, bytes]:
     """Decode an 8-bit RGB or RGBA PNG. Other PNG kinds raise ValueError."""
+    struct = _mod("struct")
+    zlib = _mod("zlib")
     if not png.startswith(b"\x89PNG\r\n\x1a\n"):
         raise ValueError("not a png")
     offset = 8
@@ -494,6 +639,8 @@ def place_logo(
     size: WindowSize | None = None,
 ) -> bytes:
     """Draw the logo at the cursor with the protocol this terminal understands."""
+    struct = _mod("struct")
+    zlib = _mod("zlib")
     try:
         if protocol == "kitty":
             if cols:
@@ -538,22 +685,70 @@ def _logo_png() -> bytes | None:
     return png
 
 
-@dataclass(frozen=True)
 class WindowSize:
-    cols: int
-    rows: int
-    xpixels: int = 0
-    ypixels: int = 0
+    __slots__ = ("cols", "rows", "xpixels", "ypixels")
+
+    def __init__(self, cols: int, rows: int, xpixels: int = 0, ypixels: int = 0) -> None:
+        object.__setattr__(self, "cols", cols)
+        object.__setattr__(self, "rows", rows)
+        object.__setattr__(self, "xpixels", xpixels)
+        object.__setattr__(self, "ypixels", ypixels)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("WindowSize is immutable")
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, WindowSize):
+            return NotImplemented
+        return (self.cols, self.rows, self.xpixels, self.ypixels) == (
+            other.cols, other.rows, other.xpixels, other.ypixels
+        )
+
+    def __hash__(self) -> int:
+        return hash((self.cols, self.rows, self.xpixels, self.ypixels))
+
+    def __repr__(self) -> str:
+        return f"WindowSize(cols={self.cols!r}, rows={self.rows!r}, xpixels={self.xpixels!r}, ypixels={self.ypixels!r})"
 
 
-@dataclass(frozen=True)
 class StatusLayout:
-    logo_col: int
-    logo_row: int
-    logo_cols: int
-    logo_rows: int
-    text_row: int
-    lines: tuple[str, ...]
+    __slots__ = ("logo_col", "logo_row", "logo_cols", "logo_rows", "text_row", "lines")
+
+    def __init__(
+        self,
+        logo_col: int,
+        logo_row: int,
+        logo_cols: int,
+        logo_rows: int,
+        text_row: int,
+        lines: tuple[str, ...],
+    ) -> None:
+        object.__setattr__(self, "logo_col", logo_col)
+        object.__setattr__(self, "logo_row", logo_row)
+        object.__setattr__(self, "logo_cols", logo_cols)
+        object.__setattr__(self, "logo_rows", logo_rows)
+        object.__setattr__(self, "text_row", text_row)
+        object.__setattr__(self, "lines", lines)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("StatusLayout is immutable")
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, StatusLayout):
+            return NotImplemented
+        return (self.logo_col, self.logo_row, self.logo_cols, self.logo_rows, self.text_row, self.lines) == (
+            other.logo_col, other.logo_row, other.logo_cols, other.logo_rows, other.text_row, other.lines
+        )
+
+    def __hash__(self) -> int:
+        return hash((self.logo_col, self.logo_row, self.logo_cols, self.logo_rows, self.text_row, self.lines))
+
+    def __repr__(self) -> str:
+        return (
+            f"StatusLayout(logo_col={self.logo_col!r}, logo_row={self.logo_row!r}, "
+            f"logo_cols={self.logo_cols!r}, logo_rows={self.logo_rows!r}, "
+            f"text_row={self.text_row!r}, lines={self.lines!r})"
+        )
 
 
 def status_lines(url: str = URL, note: str = "") -> tuple[str, ...]:
@@ -633,7 +828,7 @@ def status_layout(
 
 def kitty_graphics_at(png: bytes, *, cols: int, rows: int) -> bytes:
     """Transmit and place a PNG at the cursor, scaled to a cell rectangle."""
-    encoded = base64.standard_b64encode(png)
+    encoded = _mod("base64").standard_b64encode(png)
     parts = [b"\x1b_Ga=d,d=A,q=2\x1b\\"]
     for start in range(0, len(encoded), 4096):
         chunk = encoded[start : start + 4096]
@@ -702,6 +897,8 @@ def terminal_kind(environ: Mapping[str, str] | None = None) -> str | None:
 
 def tail_can_follow_pid() -> bool:
     """GNU tail accepts ``--pid``. BSD tail, including macOS, does not."""
+    shutil = _mod("shutil")
+    subprocess = _mod("subprocess")
     tail = shutil.which("tail")
     if tail is None:
         return False
@@ -762,6 +959,8 @@ def request_window_argv(
 
 
 def open_request_window(log_path: Path, pid: int, environ: Mapping[str, str] | None = None) -> bool:
+    shutil = _mod("shutil")
+    subprocess = _mod("subprocess")
     kind = terminal_kind(environ)
     if kind is None:
         return False
@@ -916,7 +1115,7 @@ def stop_server(
             server.terminate()
     try:
         server.wait(timeout=shutdown_grace_seconds())
-    except subprocess.TimeoutExpired:
+    except _mod("subprocess").TimeoutExpired:
         if resolved_worker is not None and resolved_worker != server.pid and _is_process_alive(resolved_worker):
             worker_identity = _capture_process_identity(resolved_worker)
             if worker_identity is not None and worker_identity.kind == "server":
@@ -942,10 +1141,10 @@ def stop_server(
         print("  Server stopped.")
 
 
-def _windows_parent_map() -> dict[int, int]:
-    """Return {pid: ppid} on Windows via CreateToolhelp32Snapshot."""
+def _windows_process_snapshot() -> list[tuple[int, int, str]] | None:
+    """Return [(pid, ppid, exe_name), ...] on Windows via CreateToolhelp32Snapshot."""
     if sys.platform != "win32":
-        return {}
+        return None
     try:
         import ctypes
         from ctypes import wintypes
@@ -983,20 +1182,105 @@ def _windows_parent_map() -> dict[int, int]:
 
         hSnapshot = create_snapshot(TH32CS_SNAPPROCESS, 0)
         if not hSnapshot or hSnapshot == INVALID_HANDLE_VALUE:
-            return {}
+            return None
         try:
             pe = PROCESSENTRY32W()
             pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
-            parents: dict[int, int] = {}
+            entries: list[tuple[int, int, str]] = []
             success = process_first(hSnapshot, ctypes.byref(pe))
             while success:
-                parents[pe.th32ProcessID] = pe.th32ParentProcessID
+                entries.append((int(pe.th32ProcessID), int(pe.th32ParentProcessID), pe.szExeFile))
                 success = process_next(hSnapshot, ctypes.byref(pe))
-            return parents
+            return entries
         finally:
             close_handle(hSnapshot)
     except Exception:
+        return None
+
+
+def _windows_parent_map() -> dict[int, int]:
+    """Return {pid: ppid} on Windows via CreateToolhelp32Snapshot."""
+    entries = _windows_process_snapshot()
+    if not entries:
         return {}
+    return {pid: ppid for pid, ppid, _name in entries}
+
+
+def _windows_pid_commandline(pid: int) -> tuple[bool, str | None]:
+    """Read a Windows process command line directly via NtQueryInformationProcess (<0.2ms).
+
+    Returns ``(handled, cmdline)``. ``handled=False`` signals that the OS does not
+    support ProcessCommandLineInformation (Windows < 8.1) and the caller may fall back.
+    """
+    if sys.platform != "win32" or pid <= 0:
+        return True, None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        ProcessCommandLineInformation = 60
+        STATUS_INVALID_INFO_CLASS = -1073741821  # 0xC0000003
+        STATUS_NOT_IMPLEMENTED = -1073741822     # 0xC0000002
+
+        class UNICODE_STRING(ctypes.Structure):
+            _fields_ = [
+                ("Length", wintypes.USHORT),
+                ("MaximumLength", wintypes.USHORT),
+                ("Buffer", wintypes.LPWSTR),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        open_process.restype = wintypes.HANDLE
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        ntdll = ctypes.WinDLL("ntdll")
+        query_info = ntdll.NtQueryInformationProcess
+        query_info.argtypes = [
+            wintypes.HANDLE,
+            wintypes.ULONG,
+            ctypes.c_void_p,
+            wintypes.ULONG,
+            ctypes.POINTER(wintypes.ULONG),
+        ]
+        query_info.restype = wintypes.LONG
+
+        handle = open_process(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return True, None
+        try:
+            needed = wintypes.ULONG(0)
+            buf_size = 1024
+            for _ in range(4):
+                buf = ctypes.create_string_buffer(buf_size)
+                status = query_info(
+                    handle,
+                    ProcessCommandLineInformation,
+                    buf,
+                    buf_size,
+                    ctypes.byref(needed),
+                )
+                if status == 0:
+                    us = UNICODE_STRING.from_buffer(buf)
+                    if us.Length == 0 or not us.Buffer:
+                        return True, None
+                    text = ctypes.wstring_at(us.Buffer, us.Length // 2).strip()
+                    return True, text or None
+                if status in {STATUS_INVALID_INFO_CLASS, STATUS_NOT_IMPLEMENTED}:
+                    return False, None
+                if needed.value > buf_size:
+                    buf_size = int(needed.value) + 64
+                    continue
+                return True, None
+        finally:
+            close_handle(handle)
+        return True, None
+    except Exception:
+        return False, None
 
 
 def _get_parent_pid(pid: int) -> int | None:
@@ -1051,7 +1335,7 @@ def _get_process_ancestors() -> set[int]:
                         ancestors.add(ppid)
                         cur = ppid
                         continue
-                out = subprocess.check_output(
+                out = _mod("subprocess").check_output(
                     ["ps", "-p", str(cur), "-o", "ppid="],
                     text=True,
                     errors="ignore",
@@ -1068,6 +1352,7 @@ def _get_process_ancestors() -> set[int]:
         # macOS and other POSIX systems do not expose /proc. Walk the complete
         # chain with ps rather than calling os.getppid(), which only describes
         # the current Python process and therefore cannot advance the walk.
+        subprocess = _mod("subprocess")
         try:
             cur = os.getpid()
             while cur > 1:
@@ -1130,6 +1415,7 @@ def _get_process_start_time(pid: int) -> int | str | None:
         except OSError:
             pass
     elif sys.platform == "darwin":
+        subprocess = _mod("subprocess")
         try:
             value = subprocess.check_output(
                 ["ps", "-p", str(pid), "-o", "lstart="],
@@ -1168,7 +1454,7 @@ def _split_process_command(cmdline: str) -> list[str]:
         except Exception:
             pass
     try:
-        return shlex.split(cmdline, posix=True)
+        return _mod("shlex").split(cmdline, posix=True)
     except ValueError:
         return []
 
@@ -1244,15 +1530,58 @@ def _matches_vipercapture_command(
 
 def _installation_id(root_dir: Path = ROOT) -> str:
     normalized = os.path.normcase(os.path.abspath(root_dir))
-    return hashlib.sha256(normalized.encode("utf-8", errors="surrogatepass")).hexdigest()
+    return _mod("hashlib").sha256(normalized.encode("utf-8", errors="surrogatepass")).hexdigest()
 
 
-@dataclass(frozen=True)
 class ProcessIdentity:
-    pid: int
-    start_time: int | str
-    command: str
-    kind: str
+    __slots__ = ("pid", "start_time", "command", "kind")
+
+    def __init__(self, pid: int, start_time: int | str, command: str, kind: str) -> None:
+        object.__setattr__(self, "pid", pid)
+        object.__setattr__(self, "start_time", start_time)
+        object.__setattr__(self, "command", command)
+        object.__setattr__(self, "kind", kind)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("ProcessIdentity is immutable")
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ProcessIdentity):
+            return NotImplemented
+        return (self.pid, self.start_time, self.command, self.kind) == (
+            other.pid, other.start_time, other.command, other.kind
+        )
+
+    def __hash__(self) -> int:
+        return hash((self.pid, self.start_time, self.command, self.kind))
+
+    def __repr__(self) -> str:
+        return (
+            f"ProcessIdentity(pid={self.pid!r}, start_time={self.start_time!r}, "
+            f"command={self.command!r}, kind={self.kind!r})"
+        )
+
+
+def _local_http_request(
+    method: str,
+    path: str,
+    *,
+    host: str,
+    port: int,
+    timeout: float,
+    headers: dict[str, str],
+    body: bytes | None = None,
+) -> tuple[int, bytes]:
+    """Send one direct local HTTP request without importing urllib/proxy stacks."""
+    import http.client
+
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        conn.request(method, path, body=body, headers=headers)
+        resp = conn.getresponse()
+        return resp.status, resp.read(16 * 1024)
+    finally:
+        conn.close()
 
 
 def _is_vipercapture_endpoint(
@@ -1264,14 +1593,20 @@ def _is_vipercapture_endpoint(
     root_dir: Path = ROOT,
 ) -> int | None:
     """Return the one PID claimed by a verified ViperCapture endpoint."""
+    json = _mod("json")
     try:
-        url = f"http://{host}:{port}/__vipercapture__/identity"
-        req = urllib.request.Request(url, headers={"User-Agent": "ViperCapture-Probe"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if resp.status != 200:
-                return None
-            data = json.loads(resp.read().decode("utf-8"))
-    except (OSError, ValueError, UnicodeError):
+        status, raw = _local_http_request(
+            "GET",
+            "/__vipercapture__/identity",
+            host=host,
+            port=port,
+            timeout=timeout,
+            headers={"User-Agent": "ViperCapture-Probe"},
+        )
+        if status != 200:
+            return None
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, UnicodeError, Exception):
         return None
     if not isinstance(data, dict):
         return None
@@ -1295,7 +1630,7 @@ def _has_matching_server_record(pid: int, root_dir: Path = ROOT) -> bool:
     if started is None:
         return False
     try:
-        record = json.loads(_server_record_path(pid).read_text(encoding="utf-8"))
+        record = _mod("json").loads(_server_record_path(pid).read_text(encoding="utf-8"))
     except (OSError, ValueError, UnicodeError):
         return False
     return bool(
@@ -1386,27 +1721,35 @@ def _find_vipercapture_candidate_pids(
     # 1. Port lookup for active listening TCP server
     listening_pids: set[int] = set()
     if sys.platform == "win32":
-        try:
-            out = subprocess.check_output(
-                ["netstat", "-ano", "-p", "tcp"],
-                text=True,
-                errors="ignore",
-                timeout=5,
-            )
-            for line in out.splitlines():
-                line = line.strip()
-                parts = line.split()
-                if len(parts) >= 5 and parts[0].upper() == "TCP" and "LISTENING" in line.upper():
-                    try:
-                        local_port = int(parts[1].rsplit(":", 1)[-1])
-                        pid = int(parts[-1])
-                        if local_port == port and pid > 0 and pid not in exclude_pids:
-                            listening_pids.add(pid)
-                    except ValueError:
-                        pass
-        except (OSError, subprocess.SubprocessError):
-            pass
+        native_listeners = _windows_tcp_listener_pids(port)
+        if native_listeners is not None:
+            for pid in native_listeners:
+                if pid > 0 and pid not in exclude_pids:
+                    listening_pids.add(pid)
+        else:
+            subprocess = _mod("subprocess")
+            try:
+                out = subprocess.check_output(
+                    ["netstat", "-ano", "-p", "tcp"],
+                    text=True,
+                    errors="ignore",
+                    timeout=5,
+                )
+                for line in out.splitlines():
+                    line = line.strip()
+                    parts = line.split()
+                    if len(parts) >= 5 and parts[0].upper() == "TCP" and "LISTENING" in line.upper():
+                        try:
+                            local_port = int(parts[1].rsplit(":", 1)[-1])
+                            pid = int(parts[-1])
+                            if local_port == port and pid > 0 and pid not in exclude_pids:
+                                listening_pids.add(pid)
+                        except ValueError:
+                            pass
+            except (OSError, subprocess.SubprocessError):
+                pass
     elif sys.platform == "darwin":
+        subprocess = _mod("subprocess")
         try:
             out = subprocess.check_output(
                 ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
@@ -1424,6 +1767,9 @@ def _find_vipercapture_candidate_pids(
         except (OSError, subprocess.SubprocessError):
             pass
     else:
+        subprocess = _mod("subprocess")
+        re = _mod("re")
+        ss_ok = False
         try:
             out = subprocess.check_output(
                 ["ss", "-lptn", f"sport = :{port}"],
@@ -1431,13 +1777,14 @@ def _find_vipercapture_candidate_pids(
                 errors="ignore",
                 timeout=5,
             )
+            ss_ok = True
             for match in re.finditer(r"pid=(\d+)", out):
                 pid = int(match.group(1))
                 if pid > 0 and pid not in exclude_pids:
                     listening_pids.add(pid)
         except (OSError, subprocess.SubprocessError):
             pass
-        if not listening_pids:
+        if not listening_pids and (not ss_ok or port_open(host=host, port=port)):
             try:
                 out = subprocess.check_output(
                     ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
@@ -1473,38 +1820,62 @@ def _find_vipercapture_candidate_pids(
 
     # 2. Process inspection by command line for this specific installation
     if sys.platform == "win32":
-        try:
-            ps_script = (
-                "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
-                "Get-CimInstance Win32_Process | ForEach-Object { "
-                "$cmd = $_.CommandLine; "
-                "if ($cmd -and ($cmd -match 'vipercapture' -or $cmd -match 'launch\\.py' -or $cmd -match 'gui\\.py')) { "
-                'Write-Output "$($_.ProcessId)|$($cmd)" '
-                "} }"
-            )
-            out = subprocess.check_output(
-                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=10,
-            )
-            for line in out.splitlines():
-                line = line.strip()
-                if not line or "|" not in line:
+        snapshot = _windows_process_snapshot()
+        if snapshot is not None:
+            for proc_id, _ppid, exe_name in snapshot:
+                if proc_id in exclude_pids or proc_id in pids:
                     continue
-                parts = line.split("|", 1)
-                try:
-                    proc_id = int(parts[0])
-                    cmd = parts[1] if len(parts) > 1 else ""
-                    if proc_id not in exclude_pids and _classify_pid_kind(proc_id, cmd, root_dir=root_dir) is not None:
-                        pids.add(proc_id)
-                except ValueError:
-                    pass
-        except (OSError, subprocess.SubprocessError):
-            pass
+                lower_name = exe_name.lower()
+                if not (
+                    lower_name in {"python.exe", "pythonw.exe", "py.exe", "vipercapture.exe"}
+                    or lower_name.startswith("python3")
+                ):
+                    continue
+                cmd = _get_pid_commandline(proc_id)
+                if not cmd:
+                    continue
+                cmd_lower = cmd.lower()
+                if (
+                    "vipercapture" in cmd_lower
+                    or "launch.py" in cmd_lower
+                    or "gui.py" in cmd_lower
+                ) and _classify_pid_kind(proc_id, cmd, root_dir=root_dir) is not None:
+                    pids.add(proc_id)
+        else:
+            subprocess = _mod("subprocess")
+            try:
+                ps_script = (
+                    "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
+                    "Get-CimInstance Win32_Process | ForEach-Object { "
+                    "$cmd = $_.CommandLine; "
+                    "if ($cmd -and ($cmd -match 'vipercapture' -or $cmd -match 'launch\\.py' -or $cmd -match 'gui\\.py')) { "
+                    'Write-Output "$($_.ProcessId)|$($cmd)" '
+                    "} }"
+                )
+                out = subprocess.check_output(
+                    ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=10,
+                )
+                for line in out.splitlines():
+                    line = line.strip()
+                    if not line or "|" not in line:
+                        continue
+                    parts = line.split("|", 1)
+                    try:
+                        proc_id = int(parts[0])
+                        cmd = parts[1] if len(parts) > 1 else ""
+                        if proc_id not in exclude_pids and _classify_pid_kind(proc_id, cmd, root_dir=root_dir) is not None:
+                            pids.add(proc_id)
+                    except ValueError:
+                        pass
+            except (OSError, subprocess.SubprocessError):
+                pass
 
     elif sys.platform == "darwin":
+        subprocess = _mod("subprocess")
         try:
             out = subprocess.check_output(
                 ["ps", "-axo", "pid,command"],
@@ -1528,6 +1899,7 @@ def _find_vipercapture_candidate_pids(
     else:
         proc_dir = Path("/proc")
         if proc_dir.is_dir():
+            shlex = _mod("shlex")
             try:
                 for entry in proc_dir.iterdir():
                     if entry.name.isdigit():
@@ -1536,6 +1908,15 @@ def _find_vipercapture_candidate_pids(
                             continue
                         try:
                             cmdline_bytes = (entry / "cmdline").read_bytes()
+                            if not cmdline_bytes:
+                                continue
+                            lowered_bytes = cmdline_bytes.lower()
+                            if (
+                                b"vipercapture" not in lowered_bytes
+                                and b"launch.py" not in lowered_bytes
+                                and b"gui.py" not in lowered_bytes
+                            ):
+                                continue
                             argv = [
                                 item
                                 for item in cmdline_bytes.decode("utf-8", errors="replace").split("\x00")
@@ -1581,6 +1962,10 @@ def _get_pid_commandline(pid: int) -> str | None:
     if pid <= 0:
         return None
     if sys.platform == "win32":
+        handled, cmdline = _windows_pid_commandline(pid)
+        if handled:
+            return cmdline
+        subprocess = _mod("subprocess")
         try:
             ps_script = (
                 "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
@@ -1597,6 +1982,7 @@ def _get_pid_commandline(pid: int) -> str | None:
         except (OSError, subprocess.SubprocessError):
             return None
     elif sys.platform == "darwin":
+        subprocess = _mod("subprocess")
         try:
             out = subprocess.check_output(
                 ["ps", "-p", str(pid), "-o", "command="],
@@ -1616,7 +2002,7 @@ def _get_pid_commandline(pid: int) -> str | None:
                     for item in cmd_file.read_bytes().decode("utf-8", errors="replace").split("\x00")
                     if item
                 ]
-                return shlex.join(argv) or None
+                return _mod("shlex").join(argv) or None
         except OSError:
             pass
     return None
@@ -1676,7 +2062,7 @@ def _server_record_path(pid: int) -> Path:
 
 
 def _new_server_environment() -> tuple[dict[str, str], str]:
-    token = secrets.token_urlsafe(32)
+    token = _mod("secrets").token_urlsafe(32)
     env = dict(os.environ)
     env["VIPERCAPTURE_SHUTDOWN_TOKEN"] = token
     return env, token
@@ -1691,6 +2077,9 @@ def _prune_stale_server_records(root_dir: Path = ROOT) -> None:
         candidates = list(runtime_dir.glob("server-*.json"))
     except OSError:
         return
+    if not candidates:
+        return
+    json = _mod("json")
     install_id = _installation_id(root_dir)
     for path in candidates:
         try:
@@ -1739,7 +2128,7 @@ def _record_server_process(pid: int, token: str, port: int = PORT) -> bool:
         path = _server_record_path(pid)
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(record), encoding="utf-8")
+        temporary.write_text(_mod("json").dumps(record), encoding="utf-8")
         try:
             temporary.chmod(0o600)
         except OSError:
@@ -1782,6 +2171,7 @@ def _request_server_shutdown(
     timeout: float = 2.0,
 ) -> bool:
     """Use the per-process secret to ask Uvicorn to run application cleanup."""
+    json = _mod("json")
     try:
         record = json.loads(_server_record_path(identity.pid).read_text(encoding="utf-8"))
         if not isinstance(record, dict):
@@ -1796,25 +2186,28 @@ def _request_server_shutdown(
             and record["token"]
         ):
             return False
-        request = urllib.request.Request(
-            f"http://{host}:{port}/__vipercapture__/shutdown",
-            data=b"{}",
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "X-ViperCapture-Shutdown-Token": record["token"],
-            },
+        req_headers = {
+            "Content-Type": "application/json",
+            "X-ViperCapture-Shutdown-Token": record["token"],
+        }
+        status, raw = _local_http_request(
+            "POST",
+            "/__vipercapture__/shutdown",
+            host=host,
+            port=port,
+            timeout=timeout,
+            headers=req_headers,
+            body=b"{}",
         )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            if response.status != 200:
-                return False
-            payload = json.loads(response.read().decode("utf-8"))
+        if status != 200:
+            return False
+        payload = json.loads(raw.decode("utf-8"))
         return bool(
             isinstance(payload, dict)
             and payload.get("stopping") is True
             and payload.get("pid") == identity.pid
         )
-    except (OSError, ValueError, UnicodeError):
+    except (OSError, ValueError, UnicodeError, Exception):
         return False
 
 
@@ -1832,6 +2225,7 @@ def _get_posix_process_state(pid: int) -> str | None:
                 return fields[0]
         except (OSError, UnicodeError):
             pass
+    subprocess = _mod("subprocess")
     try:
         output = subprocess.check_output(
             ["ps", "-p", str(pid), "-o", "stat="],
@@ -1889,7 +2283,7 @@ def _wait_for_process_exit(identity: ProcessIdentity, timeout: float) -> bool:
             _clear_application_shutdown_request(identity.pid)
             _clear_server_record(identity.pid)
             return True
-        time.sleep(0.1)
+        time.sleep(0.02)
     if not _is_process_alive(identity.pid):
         _clear_application_shutdown_request(identity.pid)
         _clear_server_record(identity.pid)
@@ -1932,14 +2326,14 @@ def _terminate_process(
     # configurable grace window and proceeds directly to verified escalation.
     if not server_handshake:
         if sys.platform == "win32":
-            subprocess.run(
+            _mod("subprocess").run(
                 ["taskkill", "/PID", str(identity.pid)],
                 capture_output=True,
                 check=False,
             )
         else:
             try:
-                os.kill(identity.pid, getattr(signal, "SIGTERM", 15))
+                os.kill(identity.pid, getattr(_mod("signal"), "SIGTERM", 15))
             except PermissionError:
                 return False, "access_denied"
             except OSError:
@@ -1953,7 +2347,7 @@ def _terminate_process(
 
     # Force termination only after the exact command and start time still match.
     if sys.platform == "win32":
-        proc = subprocess.run(
+        proc = _mod("subprocess").run(
             ["taskkill", "/F", "/PID", str(identity.pid)],
             capture_output=True,
             text=True,
@@ -1970,7 +2364,7 @@ def _terminate_process(
         err = proc.stderr.strip() or proc.stdout.strip()
         return False, err or f"taskkill failed with code {proc.returncode}"
     try:
-        os.kill(identity.pid, getattr(signal, "SIGKILL", 9))
+        os.kill(identity.pid, getattr(_mod("signal"), "SIGKILL", 9))
     except PermissionError:
         return False, "access_denied"
     except OSError:
@@ -2002,7 +2396,8 @@ def kill_all_instances(port: int = PORT) -> int:
     failed_pids: dict[int, str] = {}
 
     priority = {"server": 0, "launcher": 1, "gui": 1}
-    active_server_pid = _is_vipercapture_endpoint(port=port)
+    has_server = any(item.kind == "server" for item in processes.values())
+    active_server_pid = _is_vipercapture_endpoint(port=port) if has_server else None
     parent_map = _windows_parent_map() if sys.platform == "win32" else {}
 
     def _ancestor_depth(pid: int) -> int:
@@ -2043,7 +2438,7 @@ def kill_all_instances(port: int = PORT) -> int:
     # Wait briefly for port to close if listening server was targeted
     deadline = time.monotonic() + 3.0
     while time.monotonic() < deadline and port_open(port=port):
-        time.sleep(0.2)
+        time.sleep(0.03)
 
     if killed:
         pids_str = ", ".join(str(p) for p in killed)
@@ -2226,7 +2621,7 @@ def present_running_server(
 def _req_hash() -> str:
     """MD5 of requirements.txt — used to detect changes between runs."""
     req = ROOT / "requirements.txt"
-    return hashlib.md5(req.read_bytes()).hexdigest() if req.exists() else ""
+    return _mod("hashlib").md5(req.read_bytes()).hexdigest() if req.exists() else ""
 
 
 def find_uv(*, home: Path | None = None) -> str | None:
@@ -2234,7 +2629,7 @@ def find_uv(*, home: Path | None = None) -> str | None:
     flag = os.environ.get("VIPERCAPTURE_USE_UV", "").strip().lower()
     if flag in {"0", "false", "no", "off"}:
         return None
-    found = shutil.which("uv")
+    found = _mod("shutil").which("uv")
     if found:
         return found
     base = Path.home() if home is None else home
@@ -2286,11 +2681,11 @@ def is_intel_macos(
     sys_platform: str = sys.platform,
     machine: str | None = None,
 ) -> bool:
-    return sys_platform == "darwin" and (machine or platform.machine()) == "x86_64"
+    return sys_platform == "darwin" and (machine or _mod("platform").machine()) == "x86_64"
 
 
 def parse_rustc_version(text: str) -> tuple[int, int, int] | None:
-    match = re.search(r"rustc\s+(\d+)\.(\d+)\.(\d+)", text)
+    match = _mod("re").search(r"rustc\s+(\d+)\.(\d+)\.(\d+)", text)
     if not match:
         return None
     return int(match.group(1)), int(match.group(2)), int(match.group(3))
@@ -2301,6 +2696,7 @@ def _run_command(
     run: Callable[..., subprocess.CompletedProcess[str]],
     timeout: int = 15,
 ) -> subprocess.CompletedProcess[str] | None:
+    subprocess = _mod("subprocess")
     try:
         return run(
             cmd,
@@ -2382,6 +2778,7 @@ def _has_openssl_libs(prefix: Path) -> bool:
 
 def openssl_headers_are_usable(opensslv_h: str) -> bool:
     """Accept OpenSSL 3+; reject LibreSSL and older OpenSSL."""
+    re = _mod("re")
     if re.search(r"^\s*#\s*define\s+LIBRESSL_VERSION_NUMBER\b", opensslv_h, re.M):
         return False
     major = re.search(
@@ -2420,11 +2817,15 @@ def _openssl_prefix_if_present(prefix: str) -> str | None:
 
 def probe_intel_macos_cryptography_toolchain(
     *,
-    which: Callable[[str], str | None] = shutil.which,
-    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    which: Callable[[str], str | None] | None = None,
+    run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     environ: dict[str, str] | None = None,
 ) -> dict[str, object]:
     """Discover a working compiler, rustc+cargo, and non-Apple OpenSSL 3 prefix."""
+    if which is None:
+        which = _mod("shutil").which
+    if run is None:
+        run = _mod("subprocess").run
     env = os.environ if environ is None else environ
     compiler = _working_compiler(which, run)
     rustc = which("rustc")
@@ -2518,8 +2919,8 @@ def prepare_intel_macos_cryptography_build(
     *,
     sys_platform: str = sys.platform,
     machine: str | None = None,
-    which: Callable[[str], str | None] = shutil.which,
-    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    which: Callable[[str], str | None] | None = None,
+    run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     environ: dict[str, str] | None = None,
 ) -> list[str]:
     """
@@ -2528,6 +2929,10 @@ def prepare_intel_macos_cryptography_build(
     """
     if not is_intel_macos(sys_platform, machine):
         return []
+    if which is None:
+        which = _mod("shutil").which
+    if run is None:
+        run = _mod("subprocess").run
     env = os.environ if environ is None else environ
     toolchain = probe_intel_macos_cryptography_toolchain(
         which=which, run=run, environ=env
@@ -2546,6 +2951,7 @@ def prepare_intel_macos_cryptography_build(
 
 
 def _venv_has_pip(python: str) -> bool:
+    subprocess = _mod("subprocess")
     result = subprocess.run(
         [python, "-m", "pip", "--version"],
         stdout=subprocess.DEVNULL,
@@ -2556,6 +2962,7 @@ def _venv_has_pip(python: str) -> bool:
 
 def _bootstrap_venv_pip(python: str) -> bool:
     """Bootstrap pip inside a venv created without it (for example by uv venv)."""
+    subprocess = _mod("subprocess")
     result = subprocess.run(
         [python, "-m", "ensurepip", "--upgrade"],
         stdout=subprocess.DEVNULL,
@@ -2642,10 +3049,10 @@ def ensure_venv() -> None:
                 installer = "uv" if uv else "venv"
                 print(f"  [1/3] Creating Python environment with {installer} (first run only)...")
                 command = venv_command(sys.executable, venv_dir, uv)
-                result = subprocess.run([str(c) for c in command])
+                result = _mod("subprocess").run([str(c) for c in command])
                 if result.returncode != 0:
                     if not existed_before:
-                        shutil.rmtree(venv_dir, ignore_errors=True)
+                        _mod("shutil").rmtree(venv_dir, ignore_errors=True)
                     print(f"\n  ERROR ({installer} venv): command exited with code {result.returncode}")
                     print(f"  Command: {' '.join(str(c) for c in command)}")
                     if VENV_PYTHON.exists():
@@ -2660,9 +3067,13 @@ def ensure_venv() -> None:
             _release_venv_lock(lock_path, lock_fd)
 
     if not in_project_venv():
-        # Hand off to the venv Python — this process becomes just a waiter.
-        # Pass the venv path itself. Do not resolve the symlink first.
-        result = subprocess.run([str(VENV_PYTHON), __file__] + sys.argv[1:])
+        # Hand off to the venv Python. Pass the venv path itself without
+        # resolving symlinks. On POSIX, replace the current process in-place
+        # to avoid keeping two Python interpreters alive.
+        argv = [str(VENV_PYTHON), __file__, *sys.argv[1:]]
+        if os.name != "nt" and "subprocess" not in globals():
+            os.execv(str(VENV_PYTHON), argv)
+        result = _mod("subprocess").run(argv)
         sys.exit(result.returncode)
 
 
@@ -2723,12 +3134,26 @@ def playwright_install_command(
     return command
 
 
+def _playwright_version() -> str:
+    try:
+        from playwright._repo_version import version as repo_version
+
+        if isinstance(repo_version, str) and repo_version:
+            return repo_version
+    except Exception:
+        pass
+    meta_version = globals().get("version")
+    if meta_version is None:
+        from importlib.metadata import version as meta_version
+    return meta_version("playwright")
+
+
 def ensure_playwright() -> None:
     """
     Install Playwright's Chromium, Firefox, and WebKit browsers.
     Skipped when the installed browser matches the Playwright package version.
     """
-    playwright_stamp = f"{version('playwright')}:chromium,firefox,webkit"
+    playwright_stamp = f"{_playwright_version()}:chromium,firefox,webkit"
     if (
         PLAYWRIGHT_STAMP.exists()
         and PLAYWRIGHT_STAMP.read_text().strip() == playwright_stamp
@@ -2737,7 +3162,7 @@ def ensure_playwright() -> None:
         return
 
     print("  [3/3] Installing Playwright browsers...")
-    has_apt = shutil.which("apt-get") is not None
+    has_apt = _mod("shutil").which("apt-get") is not None
     command = playwright_install_command(sys.executable, has_apt=has_apt)
     if sys.platform.startswith("linux") and not has_apt:
         print("  This distro does not use apt, so system packages are left alone.")
@@ -2782,16 +3207,65 @@ Windows always uses one window. --gui stays in this window on every OS.
 """
 
 
-@dataclass(frozen=True)
 class CliArgs:
-    one_window: bool = False
-    update: bool = False
-    check: bool = False
-    gui: bool = False
-    kill: bool = False
-    capture: bool = False
-    capture_argv: tuple[str, ...] = ()
-    viewport: tuple[int, int] | None = None
+    __slots__ = (
+        "one_window",
+        "update",
+        "check",
+        "gui",
+        "kill",
+        "capture",
+        "capture_argv",
+        "viewport",
+    )
+
+    def __init__(
+        self,
+        one_window: bool = False,
+        update: bool = False,
+        check: bool = False,
+        gui: bool = False,
+        kill: bool = False,
+        capture: bool = False,
+        capture_argv: tuple[str, ...] = (),
+        viewport: tuple[int, int] | None = None,
+    ) -> None:
+        object.__setattr__(self, "one_window", one_window)
+        object.__setattr__(self, "update", update)
+        object.__setattr__(self, "check", check)
+        object.__setattr__(self, "gui", gui)
+        object.__setattr__(self, "kill", kill)
+        object.__setattr__(self, "capture", capture)
+        object.__setattr__(self, "capture_argv", capture_argv)
+        object.__setattr__(self, "viewport", viewport)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("CliArgs is immutable")
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, CliArgs):
+            return NotImplemented
+        return (
+            self.one_window, self.update, self.check, self.gui,
+            self.kill, self.capture, self.capture_argv, self.viewport,
+        ) == (
+            other.one_window, other.update, other.check, other.gui,
+            other.kill, other.capture, other.capture_argv, other.viewport,
+        )
+
+    def __hash__(self) -> int:
+        return hash((
+            self.one_window, self.update, self.check, self.gui,
+            self.kill, self.capture, self.capture_argv, self.viewport,
+        ))
+
+    def __repr__(self) -> str:
+        return (
+            f"CliArgs(one_window={self.one_window!r}, update={self.update!r}, "
+            f"check={self.check!r}, gui={self.gui!r}, kill={self.kill!r}, "
+            f"capture={self.capture!r}, capture_argv={self.capture_argv!r}, "
+            f"viewport={self.viewport!r})"
+        )
 
 
 def _reject_arg(message: str) -> None:
@@ -2926,12 +3400,13 @@ def main() -> None:
         show_terminal_logo()
         print(f"\n{listening_line()}")
         print("  That server is already running. Opening it in your browser.")
-        webbrowser.open(URL)
+        _mod("webbrowser").open(URL)
         return
 
     # ── Start the server ────────────────────────────────────────
     print(f"\n  Starting server at {URL}\n")
 
+    subprocess = _mod("subprocess")
     log_path = Path.home() / ".vipercapture" / "requests.log"
     log_handle = None
     server_env, shutdown_token = _new_server_environment()
@@ -2944,12 +3419,12 @@ def main() -> None:
         popen_kwargs["stderr"] = subprocess.STDOUT
     server = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "vipercapture.main:app",
-         "--host", HOST, "--port", str(PORT)],
+         "--host", HOST, "--port", str(PORT), "--ws", "none"],
         **popen_kwargs,
     )
     _record_server_process(server.pid, shutdown_token, PORT)
 
-    # ── Wait for port (1 check/sec, 30s max) ────────────────────
+    # ── Wait for port (50ms poll, 30s max) ──────────────────────
     # One-window mode inherits uvicorn's output, so progress dots would
     # land in the middle of those lines.
     if one_window:
@@ -2958,7 +3433,10 @@ def main() -> None:
         print("  Waiting for server to be ready...", end="", flush=True)
     ready = False
     worker_pid: int | None = None
-    for _ in range(30):
+    wait_start = time.monotonic()
+    deadline = wait_start + 30.0
+    next_dot = wait_start + 1.0
+    while time.monotonic() < deadline:
         if port_open():
             worker_pid = _record_endpoint_server_process(server.pid, shutdown_token, PORT)
             ready = True
@@ -2966,9 +3444,11 @@ def main() -> None:
         if server.poll() is not None:
             # Server process already exited — don't wait the full 30s
             break
-        time.sleep(1)
-        if not one_window:
+        now = time.monotonic()
+        if not one_window and now >= next_dot:
             print(".", end="", flush=True)
+            next_dot = now + 1.0
+        time.sleep(0.05)
     print()
 
     if not ready:
@@ -2991,7 +3471,7 @@ def main() -> None:
         wait_and_exit(1)
 
     # ── Open browser, then present this terminal ───────────────
-    webbrowser.open(URL)
+    _mod("webbrowser").open(URL)
     try:
         if one_window:
             show_terminal_logo()

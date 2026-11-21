@@ -9,19 +9,15 @@ the shell quotes arguments before Python sees them.
 from __future__ import annotations
 
 import argparse
-import copy
 import json
+import math
 import os
 import re
-import subprocess
 import sys
-import tempfile
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import TextIO
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import launch
 
@@ -962,8 +958,233 @@ def _validation_message(exc: Exception) -> str:
     return "; ".join(parts) or "invalid render request"
 
 
+_FAST_VALID_KEYS = frozenset({
+    "url", "html", "markdown", "output", "engine", "full_page", "viewport",
+    "environment", "wait_for", "actions", "cache", "cache_key", "lazy_load",
+    "profile", "stealth",
+})
+_FAST_IMAGE_OUTPUTS = frozenset({"png", "jpeg", "webp", "avif"})
+_FAST_SIMPLE_OUTPUTS = frozenset({"png", "jpeg", "webp", "avif", "html", "markdown", "metadata"})
+_FAST_ENGINES = frozenset(_ENGINES)
+_FAST_DEVICES = frozenset(_DEVICES)
+_FAST_COLOR_SCHEMES = frozenset(_COLOR_SCHEMES)
+_FAST_REDUCED_MOTION = frozenset(_REDUCED_MOTION)
+_FAST_MEDIA = frozenset(_MEDIA)
+_FAST_LAZY = frozenset(_LAZY)
+_FAST_PROFILES = frozenset(_PROFILES)
+_FAST_WAIT_EVENTS = frozenset(_WAIT_EVENTS)
+_FAST_WAIT_STATES = frozenset(_WAIT_STATES)
+_FAST_LOCALE = re.compile(r"^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$")
+_FAST_CACHE_KEY = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_FAST_SIMPLE_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+_FAST_SELECTOR_ACTIONS = frozenset({"click", "hover", "fill", "select", "hide"})
+_FAST_ALL_ACTIONS = frozenset({
+    "click", "hover", "fill", "press", "select", "scroll", "wait", "hide", "javascript",
+})
+
+
+def _is_int(value: object) -> bool:
+    return type(value) is int
+
+
+def _is_number(value: object) -> bool:
+    return type(value) in {int, float} and math.isfinite(float(value))
+
+
+def _fast_validate_simple_payload(payload: dict[str, object]) -> bool:
+    """Return True when payload is guaranteed valid under RenderRequest.
+
+    Anything outside this strict subset returns False and falls back to full
+    Pydantic validation so error messages and edge cases remain identical.
+    """
+    if not isinstance(payload, dict) or not payload.keys() <= _FAST_VALID_KEYS:
+        return False
+    has_url = "url" in payload
+    has_html = "html" in payload
+    has_md = "markdown" in payload
+    if has_url + has_html + has_md != 1:
+        return False
+    if has_url:
+        url = payload["url"]
+        if not isinstance(url, str) or not url or len(url) > 2083:
+            return False
+        if any(ord(ch) <= 32 or ord(ch) >= 127 for ch in url):
+            return False
+        parsed = urlsplit(url)
+        if parsed.scheme.lower() not in {"http", "https"}:
+            return False
+        if parsed.username is not None or parsed.password is not None:
+            return False
+        host = parsed.hostname or ""
+        if not host or len(host) > 253:
+            return False
+        if host != "localhost":
+            if "." not in host:
+                return False
+            labels = host.split(".")
+            if any(not _FAST_SIMPLE_LABEL.fullmatch(label) for label in labels):
+                return False
+            if not labels[-1].isalpha() or len(labels[-1]) < 2:
+                return False
+        try:
+            port = parsed.port
+        except ValueError:
+            return False
+        if port is not None and not (1 <= port <= 65535):
+            return False
+    if has_html:
+        html = payload["html"]
+        if not isinstance(html, str) or len(html.encode("utf-8")) > 5 * 1024 * 1024:
+            return False
+    if has_md:
+        md = payload["markdown"]
+        if not isinstance(md, str) or len(md.encode("utf-8")) > 5 * 1024 * 1024:
+            return False
+
+    output = payload.get("output", "png")
+    if not isinstance(output, str) or output not in _FAST_SIMPLE_OUTPUTS:
+        return False
+    if "engine" in payload:
+        if payload["engine"] not in _FAST_ENGINES:
+            return False
+    if "full_page" in payload and type(payload["full_page"]) is not bool:
+        return False
+    if "stealth" in payload and type(payload["stealth"]) is not bool:
+        return False
+    if "lazy_load" in payload and payload["lazy_load"] not in _FAST_LAZY:
+        return False
+    if "profile" in payload and payload["profile"] not in _FAST_PROFILES:
+        return False
+
+    cache = payload.get("cache", False)
+    if type(cache) is not bool:
+        return False
+    if cache and output not in _FAST_IMAGE_OUTPUTS:
+        return False
+    if "cache_key" in payload:
+        key = payload["cache_key"]
+        if not cache or not isinstance(key, str) or not _FAST_CACHE_KEY.fullmatch(key):
+            return False
+
+    if "viewport" in payload:
+        vp = payload["viewport"]
+        if not isinstance(vp, dict) or not vp.keys() <= {"width", "height", "device_scale_factor"}:
+            return False
+        if "width" in vp and (not _is_int(vp["width"]) or not (1 <= vp["width"] <= 65_535)):
+            return False
+        if "height" in vp and (not _is_int(vp["height"]) or not (1 <= vp["height"] <= 65_535)):
+            return False
+        if "device_scale_factor" in vp:
+            dsf = vp["device_scale_factor"]
+            if not _is_number(dsf) or not (0.1 <= float(dsf) <= 8.0):
+                return False
+
+    if "environment" in payload:
+        env = payload["environment"]
+        if not isinstance(env, dict) or not env.keys() <= {
+            "device", "color_scheme", "reduced_motion", "media", "locale"
+        }:
+            return False
+        if "device" in env and env["device"] not in _FAST_DEVICES:
+            return False
+        if "color_scheme" in env and env["color_scheme"] not in _FAST_COLOR_SCHEMES:
+            return False
+        if "reduced_motion" in env and env["reduced_motion"] not in _FAST_REDUCED_MOTION:
+            return False
+        if "media" in env and env["media"] not in _FAST_MEDIA:
+            return False
+        if "locale" in env:
+            loc = env["locale"]
+            if not isinstance(loc, str) or not (2 <= len(loc) <= 64) or not _FAST_LOCALE.fullmatch(loc):
+                return False
+
+    if "wait_for" in payload:
+        wf = payload["wait_for"]
+        if not isinstance(wf, dict) or not wf.keys() <= {
+            "event", "selector", "selector_state", "text", "images", "delay_ms", "timeout_ms"
+        }:
+            return False
+        if "event" in wf and wf["event"] not in _FAST_WAIT_EVENTS:
+            return False
+        if "selector" in wf:
+            sel = wf["selector"]
+            if not isinstance(sel, str) or not (1 <= len(sel) <= 2_048):
+                return False
+        if "selector_state" in wf:
+            st = wf["selector_state"]
+            if st not in _FAST_WAIT_STATES:
+                return False
+            if st != "visible" and "selector" not in wf:
+                return False
+        if "text" in wf:
+            txt = wf["text"]
+            if not isinstance(txt, str) or not (1 <= len(txt) <= 4_096):
+                return False
+        if "images" in wf and type(wf["images"]) is not bool:
+            return False
+        if "delay_ms" in wf and (not _is_int(wf["delay_ms"]) or not (0 <= wf["delay_ms"] <= 15_000)):
+            return False
+        if "timeout_ms" in wf and (not _is_int(wf["timeout_ms"]) or not (1 <= wf["timeout_ms"] <= 30_000)):
+            return False
+
+    if "actions" in payload:
+        actions = payload["actions"]
+        if not isinstance(actions, list) or len(actions) > 32:
+            return False
+        action_keys = {"type", "selector", "value", "values", "key", "x", "y", "delay_ms", "timeout_ms"}
+        for act in actions:
+            if not isinstance(act, dict) or not act.keys() <= action_keys:
+                return False
+            kind = act.get("type")
+            if not isinstance(kind, str) or kind not in _FAST_ALL_ACTIONS:
+                return False
+            sel = act.get("selector")
+            if "selector" in act and (not isinstance(sel, str) or not (1 <= len(sel) <= 2_048)):
+                return False
+            val = act.get("value")
+            if "value" in act and (not isinstance(val, str) or len(val) > 16_384):
+                return False
+            vals = act.get("values")
+            if "values" in act:
+                if (
+                    not isinstance(vals, list)
+                    or not (1 <= len(vals) <= 32)
+                    or any(not isinstance(item, str) or len(item) > 16_384 for item in vals)
+                ):
+                    return False
+            key = act.get("key")
+            if "key" in act and (not isinstance(key, str) or not (1 <= len(key) <= 128)):
+                return False
+            if "x" in act and (not _is_number(act["x"]) or not (-100_000 <= float(act["x"]) <= 100_000)):
+                return False
+            if "y" in act and (not _is_number(act["y"]) or not (-100_000 <= float(act["y"]) <= 100_000)):
+                return False
+            if "delay_ms" in act and (not _is_int(act["delay_ms"]) or not (0 <= act["delay_ms"] <= 15_000)):
+                return False
+            if "timeout_ms" in act and (not _is_int(act["timeout_ms"]) or not (1 <= act["timeout_ms"] <= 30_000)):
+                return False
+            if kind in _FAST_SELECTOR_ACTIONS and "selector" not in act:
+                return False
+            if kind == "fill" and "value" not in act:
+                return False
+            if kind == "press" and "key" not in act:
+                return False
+            if kind == "select" and not vals:
+                return False
+            if kind == "scroll" and "selector" not in act and "x" not in act and "y" not in act:
+                return False
+            if kind == "wait" and "selector" not in act and "value" not in act and not act.get("delay_ms"):
+                return False
+            if kind == "javascript" and "value" not in act:
+                return False
+    return True
+
+
 def validate_payload(payload: dict[str, object]) -> None:
+    if _fast_validate_simple_payload(payload):
+        return
     try:
+        import copy
         from pydantic import ValidationError
         from vipercapture.render_contract import RenderRequest
     except ImportError:
@@ -1085,9 +1306,13 @@ def _header_token(value: str) -> str:
 def bearer_token(args: argparse.Namespace, *, started_server: bool) -> str:
     if args.api_key is not None:
         return _header_token(args.api_key)
-    from gui import capture_credential
-
-    return capture_credential(started_server=started_server)
+    project_key = _header_token(os.environ.get("VIPERCAPTURE_API_KEY", ""))
+    admin = _header_token(os.environ.get("VIPERCAPTURE_ADMIN_TOKEN", ""))
+    if started_server and admin:
+        return admin
+    if project_key:
+        return project_key
+    return admin
 
 
 def request_headers(args: argparse.Namespace, *, started_server: bool, json_body: bool) -> dict[str, str]:
@@ -1136,26 +1361,132 @@ def _error_from_body(status: int, raw: bytes) -> CaptureError:
     return CaptureError(text or f"HTTP {status}", status=status, body=text or None)
 
 
-class _SameOriginRedirect(urllib.request.HTTPRedirectHandler):
-    """Follow a redirect only when it stays on the host that issued it.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_LOCAL_OPENER = None
+_REMOTE_OPENER = None
 
-    urllib copies Authorization onto the next request. A 302 to another
-    host or port would send the API token there.
-    """
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
+def _build_redirect_handler():
+    import urllib.request
+
+    class _SameOriginRedirect(urllib.request.HTTPRedirectHandler):
+        """Follow a redirect only when it stays on the host that issued it.
+
+        urllib copies Authorization onto the next request. A 302 to another
+        host or port would send the API token there.
+        """
+
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            try:
+                resolve_api_url(req.full_url, newurl)
+            except CaptureError:
+                fp.close()
+                raise CaptureError(
+                    "The API redirected to another host. This command will not follow it."
+                ) from None
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    return _SameOriginRedirect
+
+
+def _open(request, timeout: float):
+    global _LOCAL_OPENER, _REMOTE_OPENER
+    import urllib.request
+
+    host = (urlsplit(request.full_url).hostname or "").lower()
+    if host in _LOOPBACK_HOSTS:
+        if _LOCAL_OPENER is None:
+            _LOCAL_OPENER = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}),
+                _build_redirect_handler(),
+            )
+        return _LOCAL_OPENER.open(request, timeout=timeout)
+    if _REMOTE_OPENER is None:
+        _REMOTE_OPENER = urllib.request.build_opener(_build_redirect_handler())
+    return _REMOTE_OPENER.open(request, timeout=timeout)
+
+
+class _LocalHttpResponse:
+    def __init__(self, conn, resp) -> None:
+        self._conn = conn
+        self._resp = resp
+        self.status = resp.status
+        self.headers = resp.headers
+
+    def read(self, amt: int = -1) -> bytes:
+        return self._resp.read(amt)
+
+    def close(self) -> None:
         try:
-            resolve_api_url(req.full_url, newurl)
-        except CaptureError:
-            fp.close()
-            raise CaptureError(
-                "The API redirected to another host. This command will not follow it."
-            ) from None
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+            self._resp.close()
+        finally:
+            self._conn.close()
 
 
-def _open(request: urllib.request.Request, timeout: float):
-    return urllib.request.build_opener(_SameOriginRedirect).open(request, timeout=timeout)
+def _open_local_http(
+    url: str,
+    *,
+    method: str,
+    data: bytes | None,
+    headers: dict[str, str],
+    timeout: float,
+) -> _LocalHttpResponse:
+    import http.client
+
+    current_url = url
+    current_method = method
+    current_data = data
+    current_headers = dict(headers)
+    for _ in range(10):
+        parsed = urlsplit(current_url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 80
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        try:
+            conn.request(current_method, path, body=current_data, headers=current_headers)
+            resp = conn.getresponse()
+        except TimeoutError as exc:
+            conn.close()
+            raise CaptureError("The API did not answer before the timeout.") from exc
+        except (OSError, http.client.HTTPException) as exc:
+            conn.close()
+            raise CaptureError(f"The API did not answer: {exc}") from exc
+        if resp.status in {301, 302, 303, 307, 308}:
+            location = resp.getheader("Location")
+            resp.read(4096)
+            conn.close()
+            if not location:
+                raise CaptureError(f"HTTP {resp.status}", status=resp.status)
+            candidate = location.strip()
+            if not candidate or any(char in candidate for char in "\r\n\x00\\"):
+                raise CaptureError(
+                    "The API redirected to another host. This command will not follow it."
+                )
+            try:
+                next_url = resolve_api_url(current_url, urljoin(current_url, candidate))
+            except (CaptureError, ValueError):
+                raise CaptureError(
+                    "The API redirected to another host. This command will not follow it."
+                ) from None
+            if resp.status in {301, 302, 303} and current_method == "POST":
+                current_method = "GET"
+                current_data = None
+                current_headers = {
+                    k: v for k, v in current_headers.items() if k.lower() != "content-type"
+                }
+            current_url = next_url
+            continue
+        if not (200 <= resp.status < 300):
+            try:
+                raw = resp.read(64 * 1024)
+            finally:
+                conn.close()
+            raise _error_from_body(resp.status, raw)
+        return _LocalHttpResponse(conn, resp)
+    raise CaptureError("The API redirected too many times.")
 
 
 def open_response(
@@ -1169,6 +1500,18 @@ def open_response(
     data = None
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    parsed = urlsplit(url)
+    if parsed.scheme == "http" and (parsed.hostname or "").lower() in _LOOPBACK_HOSTS:
+        return _open_local_http(
+            url,
+            method=method,
+            data=data,
+            headers=headers,
+            timeout=timeout,
+        )
+    import urllib.error
+    import urllib.request
+
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         return _open(request, timeout)
@@ -1208,6 +1551,8 @@ def write_response(response, path: Path | None) -> int:
     directory.mkdir(parents=True, exist_ok=True)
     if path.exists() and path.is_dir():
         raise CaptureError(f"{path} is a directory.")
+    import tempfile
+
     descriptor, name = tempfile.mkstemp(prefix=".vipercapture-", suffix=".part", dir=directory)
     temporary = Path(name)
     try:
@@ -1295,6 +1640,8 @@ def _is_descendant_process(child_pid: int, ancestor_pid: int) -> bool:
         except Exception:
             pass
     elif sys.platform == "darwin":
+        import subprocess
+
         try:
             cur = child_pid
             while cur > 1:
@@ -1315,13 +1662,14 @@ def _is_descendant_process(child_pid: int, ancestor_pid: int) -> bool:
 
 
 def _wait_for_local_server(
-    proc: subprocess.Popen[object],
+    proc,
     log_path: Path,
     *,
     token: str = "",
 ) -> bool:
     """Return True when the process this command started is the listening server."""
-    deadline = time.monotonic() + 60
+    started = time.monotonic()
+    deadline = started + 60
     while time.monotonic() < deadline:
         if launch.port_open():
             pid = launch._is_vipercapture_endpoint()
@@ -1337,7 +1685,8 @@ def _wait_for_local_server(
                 return True
         if proc.poll() is not None and not launch.port_open():
             break
-        time.sleep(0.25)
+        elapsed = time.monotonic() - started
+        time.sleep(0.03 if elapsed < 3.0 else 0.08)
     detail = _log_tail(log_path)
     if proc.poll() is None:
         proc.terminate()
@@ -1372,6 +1721,8 @@ def prepare_private_data_dir(env: dict[str, str], *, home: Path | None = None) -
 
 
 def start_local_server() -> bool:
+    import subprocess
+
     env, token = launch._new_server_environment()
     prepare_private_data_dir(env)
     log_path = Path.home() / ".vipercapture" / "requests.log"
@@ -1390,6 +1741,8 @@ def start_local_server() -> bool:
         launch.HOST,
         "--port",
         str(launch.PORT),
+        "--ws",
+        "none",
     ]
     kwargs: dict[str, object] = {
         "cwd": str(launch.ROOT),
@@ -1423,9 +1776,9 @@ def start_local_server() -> bool:
 def ensure_server(args: argparse.Namespace) -> bool:
     if not is_local_default(args.server):
         return False
-    if launch._is_vipercapture_endpoint() is not None:
-        return False
     if launch.port_open():
+        if launch._is_vipercapture_endpoint() is not None:
+            return False
         raise CaptureError(
             f"Port {launch.PORT} is open, but it is not ViperCapture. "
             "Choose another API with --server."

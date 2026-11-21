@@ -344,6 +344,18 @@ internal static class ViperCaptureShim
             }
             string python = lines[0].Trim();
             string launchScript = lines[1].Trim();
+            if (args.Length == 0 || !string.Equals(args[0], "update", StringComparison.OrdinalIgnoreCase))
+            {
+                string appDir = Path.GetDirectoryName(launchScript);
+                if (!string.IsNullOrEmpty(appDir))
+                {
+                    string venvPython = Path.Combine(appDir, ".venv", "Scripts", "python.exe");
+                    if (File.Exists(venvPython))
+                    {
+                        python = venvPython;
+                    }
+                }
+            }
 
             var sb = new StringBuilder();
             sb.Append(QuoteArg(launchScript));
@@ -390,12 +402,23 @@ internal static class ViperCaptureShim
                 }
                 if ($compiled) {
                     Write-AtomicUtf8Lines -Path $configPath -Lines @($Python, $Launch)
+                    $oldExe = "$exePath.old"
+                    if (Test-Path -LiteralPath $oldExe) {
+                        Remove-Item -LiteralPath $oldExe -Force -ErrorAction SilentlyContinue
+                    }
                     try {
                         Copy-Item -LiteralPath $builtExe -Destination $exePath -Force
-                    } catch [System.IO.IOException] {
+                    } catch [System.IO.IOException], [System.UnauthorizedAccessException] {
                         if (-not (Test-Path -LiteralPath $exePath)) { throw }
-                    } catch [System.UnauthorizedAccessException] {
-                        if (-not (Test-Path -LiteralPath $exePath)) { throw }
+                        try {
+                            Move-Item -LiteralPath $exePath -Destination $oldExe -Force
+                            Copy-Item -LiteralPath $builtExe -Destination $exePath -Force
+                            Remove-Item -LiteralPath $oldExe -Force -ErrorAction SilentlyContinue
+                        } catch {
+                            if (-not (Test-Path -LiteralPath $exePath) -and (Test-Path -LiteralPath $oldExe)) {
+                                Move-Item -LiteralPath $oldExe -Destination $exePath -Force -ErrorAction SilentlyContinue
+                            }
+                        }
                     }
                     if (Test-Path -LiteralPath $cmdPath) {
                         Remove-Item -LiteralPath $cmdPath -Force -ErrorAction SilentlyContinue
@@ -425,8 +448,9 @@ internal static class ViperCaptureShim
                 throw "The Windows batch fallback cannot represent path: $value"
             }
         }
+        $venvPython = Join-Path (Split-Path $Launch -Parent) ".venv\Scripts\python.exe"
         $oemEncoding = Get-StrictOemEncoding
-        $cmdText = "@echo off`r`nsetlocal disabledelayedexpansion`r`n`"$Python`" `"$Launch`" %*`r`n"
+        $cmdText = "@echo off`r`nsetlocal disabledelayedexpansion`r`nif /i not `"%~1`"==`"update`" if exist `"$venvPython`" goto :venv`r`n`"$Python`" `"$Launch`" %*`r`nexit /b %ERRORLEVEL%`r`n:venv`r`n`"$venvPython`" `"$Launch`" %*`r`nexit /b %ERRORLEVEL%`r`n"
         try {
             $bytes = $oemEncoding.GetBytes($cmdText)
         } catch [System.Text.EncoderFallbackException] {

@@ -11,6 +11,7 @@ import threading
 import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
+from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Annotated, Awaitable, Literal, TypeVar
@@ -26,7 +27,6 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 from playwright.async_api import Browser, Playwright, async_playwright
-from playwright_stealth import Stealth
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .async_jobs import (
@@ -286,21 +286,34 @@ CONTROL_DATABASE = Path(
     os.getenv("VIPERCAPTURE_CONTROL_DATABASE", str(CACHE_DIRECTORY.parent / "control.sqlite3"))
 ).expanduser()
 METRICS = Metrics()
-STEALTH = Stealth(
-    navigator_platform_override=(
-        "Win32"
-        if sys.platform.startswith("win")
-        else "MacIntel"
-        if sys.platform == "darwin"
-        else "Linux x86_64"
-    ),
-    sec_ch_ua=False,
-    webgl_vendor=False,
-    init_scripts_only=True,
+_DEFAULT_NAVIGATOR_PLATFORM = (
+    "Win32"
+    if sys.platform.startswith("win")
+    else "MacIntel"
+    if sys.platform == "darwin"
+    else "Linux x86_64"
 )
 
 
-def _stealth_for_request(payload: RenderRequest) -> Stealth:
+@lru_cache(maxsize=64)
+def _cached_stealth(
+    languages: tuple[str, str],
+    platform: str,
+    user_agent: str | None,
+):
+    from playwright_stealth import Stealth
+
+    return Stealth(
+        navigator_languages_override=languages,
+        navigator_platform_override=platform,
+        navigator_user_agent_override=user_agent,
+        sec_ch_ua=False,
+        webgl_vendor=False,
+        init_scripts_only=True,
+    )
+
+
+def _stealth_for_request(payload: RenderRequest):
     locale = payload.environment.locale or "en-US"
     languages = (locale, locale.partition("-")[0])
     user_agent = (payload.network.user_agent or "").lower()
@@ -309,16 +322,9 @@ def _stealth_for_request(payload: RenderRequest) -> Stealth:
         else "iPhone" if "iphone" in user_agent or payload.environment.device.value == "iphone_14"
         else "MacIntel" if "macintosh" in user_agent or payload.environment.device.value == "ipad"
         else "Linux armv8l" if "android" in user_agent or payload.environment.device.value == "pixel_7"
-        else STEALTH.navigator_platform_override
+        else _DEFAULT_NAVIGATOR_PLATFORM
     )
-    return Stealth(
-        navigator_languages_override=languages,
-        navigator_platform_override=platform,
-        navigator_user_agent_override=payload.network.user_agent,
-        sec_ch_ua=False,
-        webgl_vendor=False,
-        init_scripts_only=True,
-    )
+    return _cached_stealth(languages, platform, payload.network.user_agent)
 
 
 async def _apply_stealth(context, payload: RenderRequest) -> None:
@@ -337,11 +343,24 @@ async def _stealth_context_options(
     cached = getattr(browser, "_vipercapture_user_agent", None)
     if cached is not None:
         return {"user_agent": cached}
-    page = await browser.new_page()
-    try:
-        user_agent = await page.evaluate("navigator.userAgent")
-    finally:
-        await page.close()
+    user_agent = ""
+    if hasattr(browser, "new_browser_cdp_session"):
+        try:
+            session = await browser.new_browser_cdp_session()
+            try:
+                info = await session.send("Browser.getVersion")
+            finally:
+                await session.detach()
+            if isinstance(info, dict) and isinstance(info.get("userAgent"), str):
+                user_agent = info["userAgent"]
+        except Exception:
+            user_agent = ""
+    if not user_agent:
+        page = await browser.new_page()
+        try:
+            user_agent = await page.evaluate("navigator.userAgent")
+        finally:
+            await page.close()
     user_agent = user_agent.replace("HeadlessChrome/", "Chrome/")
     setattr(browser, "_vipercapture_user_agent", user_agent)
     return {"user_agent": user_agent}
@@ -740,6 +759,7 @@ async def _record_browser_render(app: FastAPI, browser: Browser) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.control = None
+    control_task: asyncio.Task[None] | None = None
     if CONTROL_ENABLED:
         if PROCESS_ROLE != "all":
             raise RuntimeError(
@@ -747,28 +767,78 @@ async def lifespan(app: FastAPI):
                 "put authentication and quotas in shared infrastructure for split roles"
             )
         control = ControlPlane(CONTROL_DATABASE, encryption_secret=CONTROL_SECRET)
-        await asyncio.to_thread(control.initialize)
+        control_task = asyncio.create_task(asyncio.to_thread(control.initialize))
         app.state.control = control
     if PROCESS_ROLE in {"api", "worker"} and ASYNC_JOBS_ENABLED:
         if not os.getenv("VIPERCAPTURE_JOB_STORE_FACTORY"):
+            if control_task is not None:
+                with suppress(BaseException):
+                    await control_task
             raise RuntimeError("split api/worker roles require VIPERCAPTURE_JOB_STORE_FACTORY")
         if not (
             os.getenv("VIPERCAPTURE_ARTIFACT_STORE_FACTORY")
             or os.getenv("VIPERCAPTURE_S3_BUCKET")
         ):
+            if control_task is not None:
+                with suppress(BaseException):
+                    await control_task
             raise RuntimeError("split api/worker roles require shared artifact storage")
         if not os.getenv("VIPERCAPTURE_JOB_SECRET"):
+            if control_task is not None:
+                with suppress(BaseException):
+                    await control_task
             raise RuntimeError("split api/worker roles require VIPERCAPTURE_JOB_SECRET")
         if SCHEDULES_ENABLED and not os.getenv(
             "VIPERCAPTURE_SCHEDULE_STORE_FACTORY"
         ):
+            if control_task is not None:
+                with suppress(BaseException):
+                    await control_task
             raise RuntimeError(
                 "split api/worker roles require VIPERCAPTURE_SCHEDULE_STORE_FACTORY or VIPERCAPTURE_SCHEDULES=0"
             )
     captcha_handler = load_captcha_handler(CAPTCHA_HANDLER_FACTORY)
-    playwright: Playwright = await async_playwright().start()
-    browser = await _launch_browser(playwright)
+    render_cache = RenderCache(
+        CACHE_DIRECTORY,
+        ttl_seconds=CACHE_TTL_SECONDS,
+        max_entries=CACHE_MAX_ENTRIES,
+        max_bytes=CACHE_MAX_BYTES,
+        security_namespace=(
+            f"hosted={int(HOSTED)};scripts={int(ALLOW_SCRIPTS)};"
+            f"max_pixels={MAX_SCREENSHOT_PIXELS}"
+        ),
+    )
+
+    async def _start_playwright_and_browser() -> tuple[Playwright, Browser]:
+        pw: Playwright = await async_playwright().start()
+        try:
+            launched = await _launch_browser(pw)
+        except BaseException:
+            with suppress(Exception):
+                await pw.stop()
+            raise
+        return pw, launched
+
+    pw_task = asyncio.create_task(_start_playwright_and_browser())
+    cache_task = asyncio.create_task(render_cache.start())
+    tasks_to_wait: list[asyncio.Task[object]] = [pw_task, cache_task]
+    if control_task is not None:
+        tasks_to_wait.append(control_task)
+    results = await asyncio.gather(*tasks_to_wait, return_exceptions=True)
+    pw_result = results[0]
+    first_error = next((item for item in results if isinstance(item, BaseException)), None)
+    if first_error is not None:
+        if not isinstance(pw_result, BaseException):
+            pw_started, browser_started = pw_result
+            with suppress(Exception):
+                await browser_started.close()
+            with suppress(Exception):
+                await pw_started.stop()
+        raise first_error
+
+    playwright, browser = pw_result
     app.state.playwright = playwright
+    app.state.device_descriptors = dict(playwright.devices)
     app.state.browser = browser
     app.state.browsers = {BrowserEngine.CHROMIUM: [browser]}
     app.state.browser_rr = {BrowserEngine.CHROMIUM: 0}
@@ -789,23 +859,21 @@ async def lifespan(app: FastAPI):
     app.state.retired_browsers = []
     app.state.async_jobs = None
     app.state.schedules = None
-    app.state.render_cache = RenderCache(
-        CACHE_DIRECTORY,
-        ttl_seconds=CACHE_TTL_SECONDS,
-        max_entries=CACHE_MAX_ENTRIES,
-        max_bytes=CACHE_MAX_BYTES,
-        security_namespace=(
-            f"hosted={int(HOSTED)};scripts={int(ALLOW_SCRIPTS)};"
-            f"max_pixels={MAX_SCREENSHOT_PIXELS}"
-        ),
-    )
-    try:
-        await app.state.render_cache.start()
-    except BaseException:
+    app.state.render_cache = render_cache
+
+    async def _warm_initial_browser(target_browser: Browser) -> None:
         with suppress(Exception):
-            await browser.close()
-        await playwright.stop()
-        raise
+            await _stealth_context_options(
+                target_browser,
+                SimpleNamespace(
+                    network=SimpleNamespace(user_agent=None),
+                    environment=SimpleNamespace(device=DevicePreset.DESKTOP),
+                    engine=BrowserEngine.CHROMIUM,
+                ),  # type: ignore[arg-type]
+            )
+            _cached_stealth(("en-US", "en"), _DEFAULT_NAVIGATOR_PLATFORM, None)
+
+    app.state.warmup_task = asyncio.create_task(_warm_initial_browser(browser))
     app.state.webhooks = (
         WebhookDispatcher(
             secret=WEBHOOK_SECRET,
@@ -931,6 +999,11 @@ async def lifespan(app: FastAPI):
             settling = list(getattr(app.state, "settling_captures", ()))
             if settling:
                 leftover_settlers = await _wait_for_settling_captures(settling)
+            warmup_task = getattr(app.state, "warmup_task", None)
+            if warmup_task is not None and not warmup_task.done():
+                warmup_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await warmup_task
             grow_tasks = list(getattr(app.state, "browser_grow_tasks", []))
             for task in grow_tasks:
                 task.cancel()
@@ -1145,7 +1218,7 @@ async def request_shutdown(request: Request) -> dict[str, object]:
     if not SHUTDOWN_TOKEN or not hmac.compare_digest(supplied, SHUTDOWN_TOKEN):
         raise HTTPException(status_code=404, detail="Not found")
     loop = asyncio.get_running_loop()
-    loop.call_later(0.05, signal.raise_signal, signal.SIGINT)
+    loop.call_later(0.01, signal.raise_signal, signal.SIGINT)
     return {"stopping": True, "pid": os.getpid()}
 
 
@@ -1733,6 +1806,11 @@ def _render_engine() -> RenderEngine:
         if not saved:
             raise RenderError("profile_not_found", "The browser profile was not found.", 404, False)
 
+    device_descriptors = getattr(app.state, "device_descriptors", None)
+    if device_descriptors is None and playwright is not None:
+        device_descriptors = dict(playwright.devices)
+        app.state.device_descriptors = device_descriptors
+
     return RenderEngine(
         hosted=HOSTED,
         cleanup_hooks=CleanupHooks(
@@ -1745,9 +1823,7 @@ def _render_engine() -> RenderEngine:
         stealth_context_options=_stealth_context_options,
         stealth_applier=_apply_stealth,
         browser_replacer=lambda failed: _replace_browser(app, failed),
-        device_descriptors=(
-            dict(playwright.devices) if playwright is not None else None
-        ),
+        device_descriptors=device_descriptors,
         allow_scripts=ALLOW_SCRIPTS,
         allow_proxies=ALLOW_CUSTOM_PROXIES,
         hardware_video=getattr(app.state, "gpu_mode", GPU_MODE) != "off",

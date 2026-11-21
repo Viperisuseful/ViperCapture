@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlparse
+from urllib.parse import urlsplit
 
 ConsentMode = Literal["none", "reject", "accept", "hide"]
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -81,23 +81,40 @@ CHAT_HOST_SUFFIXES = (
 )
 
 
-def _matches_suffix(hostname: str, suffixes: tuple[str, ...]) -> bool:
+_AD_HOST_SET = frozenset(AD_HOST_SUFFIXES)
+_TRACKER_HOST_SET = frozenset(TRACKER_HOST_SUFFIXES)
+_CHAT_HOST_SET = frozenset(CHAT_HOST_SUFFIXES)
+
+
+def _matches_suffix(hostname: str, suffixes: tuple[str, ...] | frozenset[str]) -> bool:
+    if isinstance(suffixes, frozenset):
+        candidate = hostname
+        while candidate:
+            if candidate in suffixes:
+                return True
+            dot = candidate.find(".")
+            if dot < 0:
+                return False
+            candidate = candidate[dot + 1 :]
+        return False
     return any(hostname == suffix or hostname.endswith(f".{suffix}") for suffix in suffixes)
 
 
 def should_block_resource(url: str, options: CleanupOptions) -> str | None:
     """Return blocker category for known third-party resources, otherwise None."""
+    if not (options.block_ads or options.block_trackers or options.block_chats):
+        return None
     try:
-        hostname = (urlparse(url).hostname or "").lower().rstrip(".")
+        hostname = (urlsplit(url).hostname or "").lower().rstrip(".")
     except ValueError:
         return None
     if not hostname:
         return None
-    if options.block_ads and _matches_suffix(hostname, AD_HOST_SUFFIXES):
+    if options.block_ads and _matches_suffix(hostname, _AD_HOST_SET):
         return "ads"
-    if options.block_trackers and _matches_suffix(hostname, TRACKER_HOST_SUFFIXES):
+    if options.block_trackers and _matches_suffix(hostname, _TRACKER_HOST_SET):
         return "trackers"
-    if options.block_chats and _matches_suffix(hostname, CHAT_HOST_SUFFIXES):
+    if options.block_chats and _matches_suffix(hostname, _CHAT_HOST_SET):
         return "chats"
     return None
 

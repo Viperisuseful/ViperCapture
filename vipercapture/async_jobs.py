@@ -20,8 +20,6 @@ from pathlib import Path
 from typing import Protocol, runtime_checkable
 from uuid import uuid4
 
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
 from .render_contract import RenderRequest, canonical_render_document
 from .render_errors import RenderError
 
@@ -489,6 +487,8 @@ def _read_or_create_key(data_dir: Path) -> bytes:
 
 class PayloadCipher:
     def __init__(self, key: bytes) -> None:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
         self._cipher = AESGCM(key)
         self._fingerprint_key = sha256(
             b"vipercapture-request-fingerprint\0" + key

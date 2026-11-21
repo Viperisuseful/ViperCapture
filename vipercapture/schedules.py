@@ -18,7 +18,6 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from croniter import croniter
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .async_jobs import AsyncJobService, PayloadCipher, _ensure_private_directory
@@ -85,6 +84,8 @@ class ScheduleRecord:
 
 
 def validate_cron(expression: str, timezone_name: str) -> None:
+    from croniter import croniter
+
     try:
         zone = ZoneInfo(timezone_name)
     except ZoneInfoNotFoundError as exc:
@@ -98,6 +99,8 @@ def validate_cron(expression: str, timezone_name: str) -> None:
 
 
 def next_run(expression: str, timezone_name: str, after: datetime) -> datetime:
+    from croniter import croniter
+
     zone = ZoneInfo(timezone_name)
     localized = after.astimezone(zone)
     return croniter(expression, localized).get_next(datetime).astimezone(UTC)

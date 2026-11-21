@@ -194,6 +194,9 @@ mkdir -p "$bin_dir"
 shim="$bin_dir/vipercapture"
 cat > "$shim" <<EOF
 #!/bin/sh
+if [ "\${1:-}" != "update" ] && [ -x $(quote "$app/.venv/bin/python") ]; then
+    exec $(quote "$app/.venv/bin/python") $(quote "$app/launch.py") "\$@"
+fi
 exec $(quote "$python_bin") $(quote "$app/launch.py") "\$@"
 EOF
 chmod 755 "$shim"

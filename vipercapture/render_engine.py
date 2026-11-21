@@ -28,9 +28,6 @@ from typing import AsyncContextManager, Awaitable, Callable
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from PIL import Image
 from playwright.async_api import Browser, BrowserContext, Page
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -166,11 +163,11 @@ def _descriptor_screen(descriptor: dict[str, object]) -> dict[str, object]:
     return {}
 
 
-def device_context_options(
+def _device_context_options_for_resolved(
     request: RenderRequest,
+    resolved: RenderRequest,
     device_descriptors: dict[str, dict[str, object]] | None = None,
 ) -> dict[str, object]:
-    """Context options for a device preset, honoring explicit viewport/DSF."""
     explicit = request.viewport.model_fields_set
     descriptor = resolved_device_descriptor(
         request.environment.device, device_descriptors
@@ -179,7 +176,6 @@ def device_context_options(
     if descriptor:
         options.update(descriptor)
         options.pop("default_browser_type", None)
-    resolved = apply_device_metrics(request, device_descriptors)
     options["viewport"] = {
         "width": resolved.viewport.width,
         "height": resolved.viewport.height,
@@ -202,6 +198,15 @@ def device_context_options(
     if request.environment.device is not DevicePreset.DESKTOP:
         options.setdefault("has_touch", True)
     return options
+
+
+def device_context_options(
+    request: RenderRequest,
+    device_descriptors: dict[str, dict[str, object]] | None = None,
+) -> dict[str, object]:
+    """Context options for a device preset, honoring explicit viewport/DSF."""
+    resolved = apply_device_metrics(request, device_descriptors)
+    return _device_context_options_for_resolved(request, resolved, device_descriptors)
 
 
 MAX_METADATA_ITEMS = 100
@@ -1206,6 +1211,8 @@ def _write_diagnostic_zip(entries: list[tuple[str, bytes]]) -> bytes:
 
 
 def _convert_image(body: bytes, output: OutputFormat, quality: int | None) -> bytes:
+    from PIL import Image
+
     destination = io.BytesIO()
     with Image.open(io.BytesIO(body)) as image:
         if output is OutputFormat.JPEG and image.mode not in {"RGB", "L"}:
@@ -1221,6 +1228,8 @@ def _render_thumbnails(
     thumbnails: tuple[tuple[str, int | None, int | None], ...],
 ) -> list[tuple[str, bytes, int, int]]:
     """Resize the primary image once for every named thumbnail."""
+    from PIL import Image
+
     rendered: list[tuple[str, bytes, int, int]] = []
     with Image.open(io.BytesIO(body)) as source:
         for name, width, height in thumbnails:
@@ -1248,6 +1257,8 @@ def _postprocess_image(
     width: int | None,
     height: int | None,
 ) -> tuple[bytes, int, int]:
+    from PIL import Image
+
     destination = io.BytesIO()
     with Image.open(io.BytesIO(body)) as image:
         if width is not None or height is not None:
@@ -1275,6 +1286,8 @@ async def _encode_avif(body: bytes, quality: int | None) -> bytes:
 
 
 def _slice_image(body: bytes, *, height: int, overlap: int, filename: str) -> bytes:
+    from PIL import Image
+
     output = io.BytesIO()
     with Image.open(io.BytesIO(body)) as image, zipfile.ZipFile(
         output, "w", compression=zipfile.ZIP_DEFLATED
@@ -1304,6 +1317,9 @@ def _slice_image(body: bytes, *, height: int, overlap: int, filename: str) -> by
 
 
 def _certify_artifact(artifact: "RenderArtifact", secret: str) -> bytes:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
     seed = hashlib.sha256(secret.encode("utf-8")).digest()
     private_key = Ed25519PrivateKey.from_private_bytes(seed)
     public_key = private_key.public_key().public_bytes(
@@ -1334,6 +1350,9 @@ def _certify_artifact(artifact: "RenderArtifact", secret: str) -> bytes:
 
 
 def certification_public_key(secret: str) -> str:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
     seed = hashlib.sha256(secret.encode("utf-8")).digest()
     public_key = Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes(
         serialization.Encoding.Raw,
@@ -3090,10 +3109,11 @@ class RenderEngine:
         *,
         parent_timeout: asyncio.Timeout | None = None,
     ) -> RenderArtifact:
-        from .content_rendering import input_document, render_document_output
-
-        context_device = device_context_options(request, self.device_descriptors)
-        request = apply_device_metrics(request, self.device_descriptors)
+        resolved_request = apply_device_metrics(request, self.device_descriptors)
+        context_device = _device_context_options_for_resolved(
+            request, resolved_request, self.device_descriptors
+        )
+        request = resolved_request
         target = str(request.url or request.base_url or "about:blank")
         public_urls = PublicUrlValidator()
         if self.hosted and target != "about:blank" and not await public_urls.is_public(target):
@@ -3302,6 +3322,10 @@ class RenderEngine:
                     task.add_done_callback(pending_hosted_validations.discard)
                     return task
 
+                blocked_resource_types = frozenset(
+                    resource.value for resource in request.network.block_resource_types
+                )
+
                 async def route_request(route) -> None:
                     nonlocal blocked_private_subresources, blocked_subresources
                     request_url = route.request.url
@@ -3319,9 +3343,7 @@ class RenderEngine:
                             blocked_private_subresources = True
                             await route.abort("blockedbyclient")
                             return
-                    blocked_by_type = route.request.resource_type in {
-                        resource.value for resource in request.network.block_resource_types
-                    }
+                    blocked_by_type = route.request.resource_type in blocked_resource_types
                     main_document = (
                         route.request.resource_type == "document"
                         and route.request.is_navigation_request()
@@ -3512,8 +3534,9 @@ class RenderEngine:
                         }
                     )
 
-                page.on("requestfailed", record_failed)
-                page.on("response", record_error_response)
+                if request.assertions.request_failures or request.diagnostics.bundle:
+                    page.on("requestfailed", record_failed)
+                    page.on("response", record_error_response)
 
                 async def close_popup(popup) -> None:
                     with suppress(Exception):
@@ -3533,6 +3556,8 @@ class RenderEngine:
                             timeout=min(request.wait_for.timeout_ms, limits.wait_timeout_ms),
                         )
                     else:
+                        from .content_rendering import input_document
+
                         navigation = None
                         document = await _settled_thread(input_document, request)
                         if len(document.encode("utf-8")) > limits.output_bytes:
@@ -3830,6 +3855,8 @@ class RenderEngine:
                             metadata_artifact.filename,
                         )
                     else:
+                        from .content_rendering import render_document_output
+
                         artifact = await render_document_output(page, request, limits)
                     if len(artifact.body) > limits.output_bytes:
                         raise RenderError(
@@ -3973,40 +4000,42 @@ class RenderEngine:
                             )
                     else:
                         width, height = request.viewport.width, request.viewport.height
-                pillow_pixel_limit = (
-                    int(Image.MAX_IMAGE_PIXELS * 2)
-                    if Image.MAX_IMAGE_PIXELS is not None
-                    else None
-                )
-                pillow_source_height = (
-                    min(height, request.slices.height)
-                    if request.slices is not None
-                    else height
-                )
                 uses_pillow_conversion = (
                     resizing_image or screenshot_output is not request.output
                     or bool(request.image.thumbnails)
                 )
-                if (
-                    uses_pillow_conversion
-                    and pillow_pixel_limit is not None
-                    and math.ceil(width * request.viewport.device_scale_factor)
-                    * math.ceil(
-                        pillow_source_height * request.viewport.device_scale_factor
+                if uses_pillow_conversion:
+                    from PIL import Image
+
+                    pillow_pixel_limit = (
+                        int(Image.MAX_IMAGE_PIXELS * 2)
+                        if Image.MAX_IMAGE_PIXELS is not None
+                        else None
                     )
-                    > pillow_pixel_limit
-                ):
-                    raise RenderError(
-                        (
-                            "image_resize_source_too_large"
-                            if resizing_image
-                            else "image_conversion_source_too_large"
-                        ),
-                        "The source image is too large for safe image processing.",
-                        413,
-                        False,
-                        {"max_source_pixels": pillow_pixel_limit},
+                    pillow_source_height = (
+                        min(height, request.slices.height)
+                        if request.slices is not None
+                        else height
                     )
+                    if (
+                        pillow_pixel_limit is not None
+                        and math.ceil(width * request.viewport.device_scale_factor)
+                        * math.ceil(
+                            pillow_source_height * request.viewport.device_scale_factor
+                        )
+                        > pillow_pixel_limit
+                    ):
+                        raise RenderError(
+                            (
+                                "image_resize_source_too_large"
+                                if resizing_image
+                                else "image_conversion_source_too_large"
+                            ),
+                            "The source image is too large for safe image processing.",
+                            413,
+                            False,
+                            {"max_source_pixels": pillow_pixel_limit},
+                        )
                 encode_started = time.perf_counter()
                 cdp_capture = {
                     "quality": request.image.quality,
@@ -4282,9 +4311,13 @@ class RenderEngine:
                         "encode_ms": encode_ms,
                     },
                 )
+                needs_post_capture_dom = bool(
+                    request.side_outputs or request.diagnostics.bundle
+                )
                 if cdp_prepared and page is not None:
-                    with suppress(Exception):
-                        await page.evaluate(CDP_CAPTURE_CLEANUP_SCRIPT)
+                    if needs_post_capture_dom:
+                        with suppress(Exception):
+                            await page.evaluate(CDP_CAPTURE_CLEANUP_SCRIPT)
                     cdp_prepared = False
                 if request.side_outputs or request.image.thumbnails:
                     artifact = await _multi_artifact_bundle(
