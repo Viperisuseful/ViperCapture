@@ -993,6 +993,143 @@ class InstallScriptTests(unittest.TestCase):
             self.assertIn(str(shim), sourced.stdout)
             self.assertIn("vipercapture", sourced.stdout)
 
+    @unittest.skipIf(sys.platform != "win32", "install.ps1 requires Windows PowerShell")
+    def test_windows_install_script_updates_current_powershell_session_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "install-home"
+            bin_dir = root / "bin"
+            source = root / "source"
+            source.mkdir()
+            (source / "launch.py").write_text("print('vipercapture')\n", encoding="utf-8")
+            (source / "requirements.txt").write_text("\n", encoding="utf-8")
+            nested = source / "frontend" / "node_modules"
+            nested.mkdir(parents=True)
+            (nested / "junk.txt").write_text("nope\n", encoding="utf-8")
+            (source / "keep.txt").write_text("yes\n", encoding="utf-8")
+
+            env = os.environ.copy()
+            env["VIPERCAPTURE_HOME"] = str(home)
+            env["VIPERCAPTURE_BIN_DIR"] = str(bin_dir)
+            env["VIPERCAPTURE_SOURCE"] = str(source)
+            env["VIPERCAPTURE_PYTHON"] = sys.executable
+            env["VIPERCAPTURE_SKIP_USER_PATH"] = "1"
+            bin_norm = str(bin_dir).rstrip("\\/").casefold()
+            filtered_path: list[str] = []
+            for part in env.get("PATH", "").split(os.pathsep):
+                cleaned = part.strip().strip('"')
+                if not cleaned or cleaned.rstrip("\\/").casefold() == bin_norm:
+                    continue
+                if (Path(cleaned) / "vipercapture.cmd").exists() or (
+                    Path(cleaned) / "vipercapture"
+                ).exists():
+                    continue
+                filtered_path.append(part)
+            env["PATH"] = os.pathsep.join(filtered_path)
+
+            script = ROOT / "scripts" / "install.ps1"
+            ps_body = (
+                "$ErrorActionPreference = 'Continue'\n"
+                "$before = Get-Command vipercapture -ErrorAction SilentlyContinue\n"
+                "if ($before) { throw \"Unexpected pre-existing vipercapture: $($before.Source)\" }\n"
+                f"Get-Content -LiteralPath '{str(script)}' -Raw | Invoke-Expression\n"
+                "if ($ErrorActionPreference -ne 'Continue') { throw \"Leaked ErrorActionPreference: $ErrorActionPreference\" }\n"
+                "if (Get-Command Resolve-Python -ErrorAction SilentlyContinue) { throw 'Leaked Resolve-Python function' }\n"
+                "$resolved = (Get-Command vipercapture -ErrorAction Stop).Source\n"
+                "Write-Output \"RESOLVED=$resolved\"\n"
+                "$output = vipercapture\n"
+                "Write-Output \"OUTPUT=$output\"\n"
+                "$venv = Join-Path $env:VIPERCAPTURE_HOME 'app\\.venv'\n"
+                "New-Item -ItemType Directory -Force -Path $venv | Out-Null\n"
+                "Set-Content -Path (Join-Path $venv 'marker') -Value 'keep'\n"
+                f"Get-Content -LiteralPath '{str(script)}' -Raw | Invoke-Expression\n"
+                "$matches = @($env:Path -split ';' | Where-Object { $_ -and $_.Trim().Trim('\"').TrimEnd('\\', '/') -ieq $env:VIPERCAPTURE_BIN_DIR.TrimEnd('\\', '/') })\n"
+                "Write-Output \"PATH_COUNT=$($matches.Count)\"\n"
+            )
+            ran = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_body],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+            app = home / "app"
+            shim = bin_dir / "vipercapture.cmd"
+            self.assertTrue(shim.is_file())
+            self.assertIn(f"RESOLVED={shim}", ran.stdout)
+            self.assertIn("OUTPUT=vipercapture", ran.stdout)
+            self.assertIn("PATH_COUNT=1", ran.stdout)
+            self.assertEqual((app / "keep.txt").read_text(encoding="utf-8"), "yes\n")
+            self.assertFalse((app / "frontend" / "node_modules").exists())
+            self.assertEqual((app / ".venv" / "marker").read_text(encoding="utf-8").strip(), "keep")
+
+    @unittest.skipIf(sys.platform != "win32", "install.ps1 requires Windows PowerShell")
+    def test_windows_install_script_silences_store_stub_and_finds_later_python(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "install-home"
+            bin_dir = root / "bin"
+            source = root / "source"
+            stub_dir = root / "stub-bin"
+            real_dir = root / "real-bin"
+            for directory in (source, stub_dir, real_dir):
+                directory.mkdir()
+            (source / "launch.py").write_text("print('vipercapture')\n", encoding="utf-8")
+            (stub_dir / "python.cmd").write_text(
+                "@echo off\r\n"
+                "echo Python was not found; run without arguments to install from the Microsoft Store 1>&2\r\n"
+                "exit /b 9009\r\n",
+                encoding="utf-8",
+            )
+            (stub_dir / "py.cmd").write_text(
+                "@echo off\r\n"
+                "echo No installed Python found! 1>&2\r\n"
+                "exit /b 103\r\n",
+                encoding="utf-8",
+            )
+            (real_dir / "python.cmd").write_text(
+                f'@echo off\r\n"{sys.executable}" %*\r\n',
+                encoding="utf-8",
+            )
+
+            env = os.environ.copy()
+            env["VIPERCAPTURE_HOME"] = str(home)
+            env["VIPERCAPTURE_BIN_DIR"] = str(bin_dir)
+            env["VIPERCAPTURE_SOURCE"] = str(source)
+            env["VIPERCAPTURE_SKIP_USER_PATH"] = "1"
+            env.pop("VIPERCAPTURE_PYTHON", None)
+            system_root = env.get("SystemRoot", r"C:\Windows")
+            env["PATH"] = os.pathsep.join(
+                [
+                    str(stub_dir),
+                    str(real_dir),
+                    str(Path(system_root) / "System32"),
+                    str(Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0"),
+                ]
+            )
+
+            script = ROOT / "scripts" / "install.ps1"
+            ran = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    f"Get-Content -LiteralPath '{str(script)}' -Raw | Invoke-Expression; vipercapture",
+                ],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+            self.assertNotIn("Microsoft Store", ran.stdout + ran.stderr)
+            self.assertIn("vipercapture", ran.stdout)
+            shim_text = (bin_dir / "vipercapture.cmd").read_text(encoding="utf-8")
+            self.assertIn(str(real_dir / "python.cmd"), shim_text)
+
 
 OLD_SHA = "a" * 40
 NEW_SHA = "b" * 40
