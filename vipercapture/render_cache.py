@@ -37,6 +37,9 @@ class RenderCache:
         self.security_namespace = security_namespace
         self.lock = asyncio.Lock()
         self._fingerprint_key: bytes | None = None
+        # In-memory index: stem -> (mtime, created_at, total_bytes)
+        self._index: dict[str, tuple[float, datetime, int]] | None = None
+        self._total_bytes: int = 0
 
     async def start(self) -> None:
         if os.name == "nt":
@@ -155,11 +158,13 @@ class RenderCache:
             metadata = json.loads(metadata_path.read_text("utf-8"))
             created = datetime.fromisoformat(metadata["created_at"])
             if datetime.now(UTC) - created > self.ttl:
+                self._drop_indexed(metadata_path.stem)
                 body_path.unlink(missing_ok=True)
                 metadata_path.unlink(missing_ok=True)
                 return None
             body = body_path.read_bytes()
             if sha256(body).hexdigest() != metadata["sha256"]:
+                self._drop_indexed(metadata_path.stem)
                 body_path.unlink(missing_ok=True)
                 metadata_path.unlink(missing_ok=True)
                 return None
@@ -178,6 +183,12 @@ class RenderCache:
             OSError,
         ):
             return None
+
+    def _drop_indexed(self, stem: str) -> None:
+        if self._index is not None:
+            previous = self._index.pop(stem, None)
+            if previous is not None:
+                self._total_bytes = max(0, self._total_bytes - previous[2])
 
     async def put(
         self,
@@ -222,7 +233,49 @@ class RenderCache:
         metadata: dict,
     ) -> None:
         self._write(body_path, metadata_path, body, metadata)
-        self._trim()
+        if self._index is None:
+            self._trim()
+            return
+        stem = metadata_path.stem
+        self._drop_indexed(stem)
+        try:
+            meta_stat = metadata_path.stat()
+            entry_bytes = meta_stat.st_size + body_path.stat().st_size
+            created = datetime.fromisoformat(metadata["created_at"])
+            self._index[stem] = (meta_stat.st_mtime, created, entry_bytes)
+            self._total_bytes += entry_bytes
+        except OSError:
+            self._trim()
+            return
+        self._evict_indexed()
+
+    def _evict_indexed(self) -> None:
+        if self._index is None:
+            return
+        now = datetime.now(UTC)
+        expired = [
+            stem for stem, (_mtime, created, _size) in self._index.items()
+            if now - created > self.ttl
+        ]
+        for stem in expired:
+            self._drop_indexed(stem)
+            (self.directory / f"{stem}.json").unlink(missing_ok=True)
+            (self.directory / f"{stem}.bin").unlink(missing_ok=True)
+        if len(self._index) <= self.max_entries and self._total_bytes <= self.max_bytes:
+            return
+        # Sort newest-first so we retain the most recent entries within limits.
+        ordered = sorted(self._index.items(), key=lambda item: item[1][0], reverse=True)
+        retained_bytes = 0
+        new_index: dict[str, tuple[float, datetime, int]] = {}
+        for idx, (stem, entry) in enumerate(ordered):
+            if idx >= self.max_entries or retained_bytes + entry[2] > self.max_bytes:
+                (self.directory / f"{stem}.json").unlink(missing_ok=True)
+                (self.directory / f"{stem}.bin").unlink(missing_ok=True)
+            else:
+                new_index[stem] = entry
+                retained_bytes += entry[2]
+        self._index = new_index
+        self._total_bytes = retained_bytes
 
     def _write(self, body_path: Path, metadata_path: Path, body: bytes, metadata: dict) -> None:
         descriptors = []
@@ -248,30 +301,53 @@ class RenderCache:
                 path.unlink(missing_ok=True)
 
     def _trim(self) -> None:
-        for temporary in self.directory.glob(".fingerprint-key.*.tmp"):
-            temporary.unlink(missing_ok=True)
-        for temporary in self.directory.glob(".cache-*"):
-            temporary.unlink(missing_ok=True)
-        for body_path in self.directory.glob("*.bin"):
-            if not body_path.with_suffix(".json").exists():
+        json_entries: list[tuple[str, float, Path, int]] = []
+        bin_sizes: dict[str, int] = {}
+        bin_paths: dict[str, Path] = {}
+        with os.scandir(self.directory) as entries:
+            for entry in entries:
+                name = entry.name
+                if name.startswith(".fingerprint-key.") and name.endswith(".tmp"):
+                    Path(entry.path).unlink(missing_ok=True)
+                    continue
+                if name.startswith(".cache-"):
+                    Path(entry.path).unlink(missing_ok=True)
+                    continue
+                if name.endswith(".bin"):
+                    stem = name[:-4]
+                    try:
+                        bin_sizes[stem] = entry.stat().st_size
+                        bin_paths[stem] = Path(entry.path)
+                    except OSError:
+                        pass
+                elif name.endswith(".json"):
+                    stem = name[:-5]
+                    try:
+                        st = entry.stat()
+                        json_entries.append((stem, st.st_mtime, Path(entry.path), st.st_size))
+                    except OSError:
+                        pass
+
+        json_stems = {stem for stem, _mtime, _path, _size in json_entries}
+        for stem, body_path in bin_paths.items():
+            if stem not in json_stems:
                 body_path.unlink(missing_ok=True)
-        metadata_files = sorted(
-            self.directory.glob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True
-        )
+
+        json_entries.sort(key=lambda item: item[1], reverse=True)
         now = datetime.now(UTC)
         retained_bytes = 0
-        for index, metadata_path in enumerate(metadata_files):
-            remove = index >= self.max_entries
+        index: dict[str, tuple[float, datetime, int]] = {}
+        for idx, (stem, mtime, metadata_path, meta_size) in enumerate(json_entries):
+            remove = idx >= self.max_entries or stem not in bin_sizes
+            created: datetime | None = None
+            entry_bytes = 0
             if not remove:
                 try:
                     document = json.loads(metadata_path.read_text("utf-8"))
-                    remove = now - datetime.fromisoformat(document["created_at"]) > self.ttl
+                    created = datetime.fromisoformat(document["created_at"])
+                    remove = now - created > self.ttl
                     if not remove:
-                        body_path = metadata_path.with_suffix(".bin")
-                        entry_bytes = (
-                            metadata_path.stat().st_size
-                            + body_path.stat().st_size
-                        )
+                        entry_bytes = meta_size + bin_sizes[stem]
                         if retained_bytes + entry_bytes > self.max_bytes:
                             remove = True
                         else:
@@ -280,4 +356,8 @@ class RenderCache:
                     remove = True
             if remove:
                 metadata_path.unlink(missing_ok=True)
-                metadata_path.with_suffix(".bin").unlink(missing_ok=True)
+                (bin_paths.get(stem) or metadata_path.with_suffix(".bin")).unlink(missing_ok=True)
+            elif created is not None:
+                index[stem] = (mtime, created, entry_bytes)
+        self._index = index
+        self._total_bytes = retained_bytes

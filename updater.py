@@ -455,9 +455,15 @@ def _upgrade_windows_exe_shim(exe_path: Path, app_root: Path) -> bool:
                     staged.replace(exe_path)
                 except OSError:
                     try:
+                        if exe_path.exists():
+                            exe_path.unlink(missing_ok=True)
                         old_path.replace(exe_path)
                     except OSError:
                         pass
+                    if not exe_path.is_file():
+                        raise UpdateError(
+                            "Could not replace vipercapture.exe. Close running instances and run vipercapture update again."
+                        ) from None
                     return False
                 try:
                     old_path.unlink(missing_ok=True)
@@ -465,8 +471,16 @@ def _upgrade_windows_exe_shim(exe_path: Path, app_root: Path) -> bool:
                     pass
             return True
         except OSError:
-            staged.unlink(missing_ok=True)
+            if not exe_path.is_file():
+                raise UpdateError(
+                    "Could not replace vipercapture.exe. Close running instances and run vipercapture update again."
+                ) from None
             return False
+        finally:
+            try:
+                staged.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def write_shim(

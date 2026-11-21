@@ -824,7 +824,21 @@ async def lifespan(app: FastAPI):
     tasks_to_wait: list[asyncio.Task[object]] = [pw_task, cache_task]
     if control_task is not None:
         tasks_to_wait.append(control_task)
-    results = await asyncio.gather(*tasks_to_wait, return_exceptions=True)
+    try:
+        results = await asyncio.gather(*tasks_to_wait, return_exceptions=True)
+    except BaseException:
+        for task in tasks_to_wait:
+            if not task.done():
+                task.cancel()
+        settled = await asyncio.gather(*tasks_to_wait, return_exceptions=True)
+        pw_settled = settled[0]
+        if not isinstance(pw_settled, BaseException):
+            pw_started, browser_started = pw_settled
+            with suppress(Exception):
+                await browser_started.close()
+            with suppress(Exception):
+                await pw_started.stop()
+        raise
     pw_result = results[0]
     first_error = next((item for item in results if isinstance(item, BaseException)), None)
     if first_error is not None:
@@ -847,7 +861,9 @@ async def lifespan(app: FastAPI):
     app.state.browser_grow_tasks = []
     app.state.browser_pool_generation = 0
     app.state.gpu_mode = GPU_MODE
-    app.state.gpu_hardware_active = await _detect_hardware_gpu(browser, GPU_MODE)
+    # GPU_MODE=="required" was already verified in _launch_browser; "auto" is
+    # probed in the non-blocking warmup task so it does not delay readiness.
+    app.state.gpu_hardware_active = GPU_MODE == "required"
     app.state.captcha_handler = captcha_handler
     app.state.capture_slots = asyncio.Semaphore(MAX_CONCURRENT_CAPTURES)
     app.state.settling_captures = set()
@@ -872,6 +888,11 @@ async def lifespan(app: FastAPI):
                 ),  # type: ignore[arg-type]
             )
             _cached_stealth(("en-US", "en"), _DEFAULT_NAVIGATOR_PLATFORM, None)
+        if GPU_MODE == "auto":
+            with suppress(Exception):
+                app.state.gpu_hardware_active = await _detect_hardware_gpu(
+                    target_browser, GPU_MODE
+                )
 
     app.state.warmup_task = asyncio.create_task(_warm_initial_browser(browser))
     app.state.webhooks = (

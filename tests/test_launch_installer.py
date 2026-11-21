@@ -2555,6 +2555,20 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
                 # Second call detects the marker and skips recompilation.
                 self.assertFalse(updater._upgrade_windows_exe_shim(exe_path, ROOT))
 
+    def test_main_warm_launch_checks_port_before_deps(self) -> None:
+        with (
+            mock.patch("launch.sys.argv", ["launch.py"]),
+            mock.patch("launch.ensure_venv"),
+            mock.patch("launch.port_open", return_value=True) as port_open,
+            mock.patch("launch.show_terminal_logo"),
+            mock.patch("launch.ensure_deps", side_effect=AssertionError("ensure_deps should not run when port is open")),
+            mock.patch("launch.ensure_playwright", side_effect=AssertionError("ensure_playwright should not run when port is open")),
+            mock.patch("launch._mod") as mod_mock,
+        ):
+            launch.main()
+        port_open.assert_called_once()
+        mod_mock.assert_called_once_with("webbrowser")
+
 
 if __name__ == "__main__":
     unittest.main()

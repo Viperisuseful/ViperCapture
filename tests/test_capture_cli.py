@@ -780,6 +780,14 @@ class FastValidationTests(unittest.TestCase):
         self.assertFalse(_fast_validate_simple_payload({"url": "http://999.999.999.999", "output": "png"}))
         self.assertFalse(_fast_validate_simple_payload({"url": "http://example.123", "output": "png"}))
         self.assertFalse(_fast_validate_simple_payload({"url": "https://example.com", "output": "png", "cache_key": "k"}))
+        huge_int = 10**400
+        huge_scroll = {"url": "https://example.com", "output": "png", "actions": [{"type": "scroll", "x": huge_int}]}
+        self.assertFalse(_fast_validate_simple_payload(huge_scroll))
+        self.assertFalse(
+            _fast_validate_simple_payload(
+                {"url": "https://example.com", "output": "png", "viewport": {"device_scale_factor": huge_int}}
+            )
+        )
         try:
             import pydantic  # noqa: F401
         except ImportError:
@@ -791,6 +799,8 @@ class FastValidationTests(unittest.TestCase):
                 validate_payload({"url": "http://999.999.999.999", "output": "png"})
             with self.assertRaises(ValueError):
                 validate_payload({"url": "http://example.123", "output": "png"})
+            with self.assertRaises(ValueError):
+                validate_payload(huge_scroll)
 
     def test_relative_redirect_resolves_against_request_path(self) -> None:
         from vipercapture.capture_cli import open_response
