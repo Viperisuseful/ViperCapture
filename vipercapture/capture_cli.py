@@ -1479,7 +1479,7 @@ def _open_local_http(
                 }
             current_url = next_url
             continue
-        if resp.status >= 400:
+        if not (200 <= resp.status < 300):
             try:
                 raw = resp.read(64 * 1024)
             finally:

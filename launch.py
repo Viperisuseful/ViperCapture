@@ -144,12 +144,13 @@ def _windows_tcp_listener_pids(port: int, *, host: str | None = None) -> set[int
         families: list[tuple[int, type[ctypes.Structure]]] = []
         if host_lower in {None, "127.0.0.1", "localhost"}:
             families.append((AF_INET, MIB_TCPROW_OWNER_PID))
-        if host_lower in {None, "::1", "localhost"}:
+        if host_lower in {None, "::1", "localhost", "::"}:
             families.append((AF_INET6, MIB_TCP6ROW_OWNER_PID))
 
         pids: set[int] = set()
         ipv6_any = bytes(16)
         ipv6_loopback = bytes(15) + b"\x01"
+        ipv6_mapped_loopback = b"\x00" * 10 + b"\xff\xff\x7f\x00\x00\x01"
         for af, row_cls in families:
             size = wintypes.DWORD(0)
             rc = get_tcp_table(None, ctypes.byref(size), False, af, TCP_TABLE_OWNER_PID_LISTENER, 0)
@@ -179,7 +180,10 @@ def _windows_tcp_listener_pids(port: int, *, host: str | None = None) -> set[int
                             continue
                     else:
                         addr_bytes = bytes(row.ucLocalAddr)
-                        if addr_bytes not in {ipv6_any, ipv6_loopback}:
+                        if host_lower == "::":
+                            if addr_bytes not in {ipv6_any, ipv6_mapped_loopback}:
+                                continue
+                        elif addr_bytes not in {ipv6_any, ipv6_loopback}:
                             continue
                 if row.dwOwningPid > 0:
                     pids.add(int(row.dwOwningPid))
@@ -189,10 +193,20 @@ def _windows_tcp_listener_pids(port: int, *, host: str | None = None) -> set[int
 
 
 def port_open(host: str = HOST, port: int = PORT, *, timeout: float = 0.2) -> bool:
-    if sys.platform == "win32" and host.lower() in _LOOPBACK_HOSTS:
-        listeners = _windows_tcp_listener_pids(port, host=host)
+    host_lower = host.lower()
+    if sys.platform == "win32" and host_lower in _LOOPBACK_HOSTS:
+        listeners = _windows_tcp_listener_pids(port, host=host_lower)
         if listeners is not None:
-            return bool(listeners)
+            if listeners:
+                return True
+            if host_lower != "127.0.0.1":
+                return False
+            # A dual-stack IPv6 wildcard (::) or IPv4-mapped loopback socket
+            # accepts 127.0.0.1 connections while appearing only in the IPv6
+            # TCP table. Probe via socket only when such a listener exists.
+            v6_dual_candidates = _windows_tcp_listener_pids(port, host="::")
+            if v6_dual_candidates is not None and not v6_dual_candidates:
+                return False
     socket = _mod("socket")
     try:
         with socket.create_connection((host, port), timeout=timeout):

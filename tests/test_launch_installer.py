@@ -2545,6 +2545,14 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
             self.assertIn(os.getpid(), listeners)
             self.assertTrue(launch.port_open("127.0.0.1", open_port))
 
+        if socket.has_dualstack_ipv6():
+            with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as srv6:
+                srv6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                srv6.bind(("::", 0))
+                srv6.listen(1)
+                dual_port = srv6.getsockname()[1]
+                self.assertTrue(launch.port_open("127.0.0.1", dual_port))
+
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as unused:
             unused.bind(("127.0.0.1", 0))
             closed_port = unused.getsockname()[1]

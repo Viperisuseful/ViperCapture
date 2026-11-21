@@ -21,8 +21,9 @@ RUN apt-get update \
     && chown -R vipercapture:vipercapture /data /ms-playwright
 
 COPY --chown=vipercapture:vipercapture . .
+RUN python -m compileall -q vipercapture launch.py \
+    && chown -R vipercapture:vipercapture __pycache__ vipercapture
 USER vipercapture
-RUN python -m compileall -q vipercapture launch.py
 ENV VIPERCAPTURE_DATA_DIR=/data
 EXPOSE 8000
 VOLUME ["/data"]

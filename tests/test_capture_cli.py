@@ -849,6 +849,36 @@ class FastValidationTests(unittest.TestCase):
             thread.join(timeout=2)
         self.assertEqual(seen_paths, ["/api/v1/jobs", "/api/v1/jobs2", "/api/v1/jobs"])
 
+    def test_local_http_rejects_non_redirect_3xx(self) -> None:
+        from vipercapture.capture_cli import open_response
+
+        class _NotModifiedHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(304)
+                self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _NotModifiedHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            with self.assertRaises(CaptureError) as ctx:
+                open_response(
+                    f"http://127.0.0.1:{port}/v1/render",
+                    method="GET",
+                    payload=None,
+                    headers={},
+                    timeout=5,
+                )
+            self.assertEqual(ctx.exception.status, 304)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
     def test_ensure_server_checks_port_open_before_http_probe(self) -> None:
         from vipercapture.capture_cli import ensure_server
 
