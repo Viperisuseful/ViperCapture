@@ -389,6 +389,61 @@ class GuiFrameTests(TestCase):
         self.assertEqual(gui._wordmark(64, image=False), tuple(gui.styled_ascii_logo()))
         self.assertEqual(gui._wordmark(80, image=False), tuple(gui.styled_ascii_logo()))
         self.assertEqual(gui._wordmark(80, image=True), ())
+        self.assertEqual(gui._wordmark(80, image=False, rows=12), ("ViperCapture",))
+
+    def test_narrow_and_short_terminals_never_overflow_or_clip_panel(self) -> None:
+        import re
+
+        csi_move = re.compile(r"\x1b\[(\d+);(\d+)H")
+        sizes = [
+            launch.WindowSize(120, 30),
+            launch.WindowSize(80, 24),
+            launch.WindowSize(50, 18),
+            launch.WindowSize(40, 14),
+            launch.WindowSize(120, 12),
+            launch.WindowSize(80, 10),
+        ]
+        states = [
+            gui.GuiState(),
+            gui.GuiState(
+                url="https://example.com/a/very/long/path/that/exceeds/the/panel/width/1234567890Z"
+            ),
+            gui.GuiState(
+                url="https://example.com",
+                output="mp4",
+                full_page=True,
+                viewport=(3840, 2160),
+                error="A full FFmpeg executable is unavailable. Install FFmpeg on PATH or set VIPERCAPTURE_FFMPEG.",
+            ),
+            gui.GuiState(url="https://example.com", busy=True, progress=7),
+            gui.GuiState(
+                url="https://example.com",
+                saved=r"C:\Users\viper\Documents\ViperCapture\vipercapture-example.com-20261121.png",
+            ),
+        ]
+        for size in sizes:
+            for state in states:
+                frame = gui.render_frame(size, state).decode("utf-8", errors="replace")
+                parts = csi_move.split(frame)
+                placed = []
+                for idx in range(1, len(parts), 3):
+                    row, col = int(parts[idx]), int(parts[idx + 1])
+                    vis = gui.visible(parts[idx + 2])
+                    placed.append((row, col, vis))
+                    self.assertLessEqual(
+                        col + len(vis) - 1,
+                        size.cols,
+                        f"Horizontal overflow at {size.cols}x{size.rows}: {vis!r}",
+                    )
+                    self.assertLessEqual(row, size.rows)
+                lines = [vis for _, _, vis in placed]
+                self.assertTrue(any("└" in line and "┘" in line for line in lines))
+                self.assertTrue(any("esc" in line for line in lines))
+                if state.url.endswith("Z"):
+                    self.assertTrue(
+                        any("Z" in line for line in lines),
+                        f"Last typed char truncated at {size.cols}x{size.rows}",
+                    )
 
     def test_logo_is_sent_once_until_the_layout_changes(self) -> None:
         png = b"\x89PNG\r\n\x1a\n" + b"x"

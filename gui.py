@@ -381,7 +381,7 @@ def _wrap(text: str, width: int) -> list[str]:
     return lines
 
 
-def panel_lines(state: GuiState, width: int) -> list[str]:
+def panel_lines(state: GuiState, width: int, *, max_extra_lines: int | None = None) -> list[str]:
     """The input panel, without ANSI, so tests can read the words."""
     inner = max(12, width - 4)
     if state.url:
@@ -402,20 +402,41 @@ def panel_lines(state: GuiState, width: int) -> list[str]:
             label = "Starting"
         lines.append(_clip(f"{label}  {progress_bar(state.progress, min(20, inner - 14))}", inner))
     elif state.error:
-        lines.extend(_wrap(state.error, inner)[:3])
+        limit = 3 if max_extra_lines is None else max(1, min(3, max_extra_lines))
+        lines.extend(_wrap(state.error, inner)[:limit])
     elif state.saved:
-        lines.extend(_wrap(f"Saved {state.saved}", inner)[:2])
+        limit = 2 if max_extra_lines is None else max(1, min(2, max_extra_lines))
+        lines.extend(_wrap(f"Saved {state.saved}", inner)[:limit])
     return lines
 
 
-def footer(state: GuiState) -> str:
+def footer(state: GuiState, *, max_width: int | None = None) -> str:
     if state.busy and state.cancelling:
-        return "waiting for the capture to stop    ctrl+c quit"
-    if state.busy:
-        return "esc cancel"
-    if state.saved:
-        return "enter capture again    esc quit"
-    return "tab format    ctrl+p page    enter capture    esc quit"
+        candidates = (
+            "waiting for the capture to stop    ctrl+c quit",
+            "stopping...  ctrl+c quit",
+            "ctrl+c quit",
+        )
+    elif state.busy:
+        candidates = ("esc cancel",)
+    elif state.saved:
+        candidates = (
+            "enter capture again    esc quit",
+            "enter again  esc quit",
+            "enter  esc",
+        )
+    else:
+        candidates = (
+            "tab format    ctrl+p page    enter capture    esc quit",
+            "tab fmt  ^p page  enter go  esc quit",
+            "tab  ^p  enter  esc",
+        )
+    if max_width is None:
+        return candidates[0]
+    for text in candidates:
+        if len(text) <= max_width:
+            return text
+    return _clip(candidates[-1], max(1, max_width))
 
 
 def _screen_bounds(size: launch.WindowSize) -> tuple[int, int]:
@@ -444,19 +465,40 @@ def _logo_placement(
     return logo, logo_cols, logo_rows
 
 
-def _wordmark(cols: int, *, image: bool) -> tuple[str, ...]:
+def _wordmark(cols: int, *, image: bool, rows: int | None = None) -> tuple[str, ...]:
     if image:
         return ()
-    if cols < 64:
+    if cols < 64 or (rows is not None and rows < 15):
         return ("ViperCapture",)
     return tuple(styled_ascii_logo())
 
 
-def _frame_block(state: GuiState, cols: int, *, image: bool) -> list[str]:
+def _frame_block(
+    state: GuiState,
+    cols: int,
+    *,
+    image: bool,
+    rows: int | None = None,
+) -> list[str]:
     panel_width = min(72, cols - 4)
-    plain = panel_lines(state, panel_width)
+    max_extra: int | None = None
+    if rows is not None and rows < 12:
+        max_extra = max(1, rows - 6)
+    plain = panel_lines(state, panel_width, max_extra_lines=max_extra)
     colored = _color_panel(state, panel_width, plain)
-    return [*_wordmark(cols, image=image), "", *colored, "", f"\x1b[2m{footer(state)}\x1b[0m"]
+    mark = _wordmark(cols, image=image, rows=rows)
+    if rows is not None and len(mark) > 1 and (len(mark) + len(colored) + 3) > rows:
+        mark = ("ViperCapture",)
+    footer_line = f"\x1b[2m{footer(state, max_width=max(8, cols - 2))}\x1b[0m"
+    full_block = [*mark, "", *colored, "", footer_line]
+    if rows is not None and len(full_block) > rows:
+        compact_block = [*mark, *colored, footer_line]
+        if len(compact_block) <= rows:
+            return compact_block
+        if rows <= len(colored) + 1:
+            return [*colored, footer_line]
+        return compact_block
+    return full_block
 
 
 def _frame_origin(rows: int, block_len: int, logo_rows: int) -> int:
@@ -487,7 +529,8 @@ def render_frame(
     if logo_cols is None:
         logo_cols = 0
     logo_bytes = logo or b""
-    block = _frame_block(state, cols, image=logo_rows > 0)
+    available_rows = max(1, rows - (logo_rows + 1 if logo_rows else 0))
+    block = _frame_block(state, cols, image=logo_rows > 0, rows=available_rows)
     if origin is None:
         origin = _frame_origin(rows, len(block), logo_rows)
     parts: list[bytes] = []
@@ -524,8 +567,12 @@ def _color_panel(state: GuiState, width: int, plain: list[str]) -> list[str]:
         if index == 1:
             body = _colored_summary(state, inner)
         elif index == 0 and not state.busy:
-            shown = text[: inner - 1]
-            pad = " " * (inner - 1 - len(shown))
+            editable_width = max(1, inner - 1)
+            if state.url:
+                shown = _clip(state.url, editable_width)
+            else:
+                shown = "example.com"[:editable_width]
+            pad = " " * max(0, editable_width - len(shown))
             caret = "\x1b[7m \x1b[0m"
             if state.url:
                 body = shown + caret + pad
@@ -540,23 +587,38 @@ def _color_panel(state: GuiState, width: int, plain: list[str]) -> list[str]:
     return lines
 
 
-def _colored_summary(state: GuiState, inner: int) -> str:
+def _colored_formats(state: GuiState, separator: str) -> tuple[str, int]:
     pieces: list[str] = []
     visible_len = 0
     for index, name in enumerate(FORMATS):
         if index:
-            pieces.append("   ")
-            visible_len += 3
+            pieces.append(separator)
+            visible_len += len(separator)
         if name == state.output:
             pieces.append(f"\x1b[1;34m{name}\x1b[0m")
         else:
             pieces.append(f"\x1b[2m{name}\x1b[0m")
         visible_len += len(name)
-    tail = f"    {page_label(state.full_page)}    {state.viewport[0]}x{state.viewport[1]}"
-    pieces.append(tail)
-    visible_len += len(tail)
-    pad = max(0, inner - visible_len)
-    return "".join(pieces) + " " * pad
+    return "".join(pieces), visible_len
+
+
+def _colored_summary(state: GuiState, inner: int) -> str:
+    mode = page_label(state.full_page)
+    dims = f"{state.viewport[0]}x{state.viewport[1]}"
+    for fmt_sep, tail_sep in (("   ", "    "), (" ", "  ")):
+        colored_fmts, fmt_len = _colored_formats(state, fmt_sep)
+        tail = f"{tail_sep}{mode}{tail_sep}{dims}"
+        total = fmt_len + len(tail)
+        if total <= inner:
+            return colored_fmts + tail + " " * (inner - total)
+    short_mode = "full" if state.full_page else "view"
+    active = f"\x1b[1;34m{state.output}\x1b[0m"
+    for tail in (f"  {mode}  {dims}", f"  {short_mode}  {dims}", f"  {dims}", ""):
+        total = len(state.output) + len(tail)
+        if total <= inner:
+            return active + tail + " " * (inner - total)
+    clipped = _clip(state.output, inner)
+    return f"\x1b[1;34m{clipped}\x1b[0m" + " " * max(0, inner - len(clipped))
 
 
 class _Cancelled(Exception):
@@ -890,7 +952,8 @@ class _Drawer:
             self._logo, self._logo_cols, self._logo_rows = _logo_placement(size, protocol, png)
             self._key = key
         cols, rows = _screen_bounds(size)
-        block_len = len(_frame_block(state, cols, image=self._logo_rows > 0))
+        available_rows = max(1, rows - (self._logo_rows + 1 if self._logo_rows else 0))
+        block_len = len(_frame_block(state, cols, image=self._logo_rows > 0, rows=available_rows))
         origin = _frame_origin(rows, block_len, self._logo_rows)
         full = size_changed or origin != self._origin
         self._origin = origin

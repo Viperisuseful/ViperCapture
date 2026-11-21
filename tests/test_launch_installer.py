@@ -1581,7 +1581,7 @@ class UpdateTests(unittest.TestCase):
 
     def test_windows_exe_shim_updates_utf8_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp)
+            home = Path(tmp).resolve()
             app = self._install(home)
             bin_dir = home / "bin"
             bin_dir.mkdir()
