@@ -953,7 +953,7 @@ def _leave(protocol: str | None) -> None:
     sys.stdout.buffer.flush()
 
 
-def _start_server() -> tuple[subprocess.Popen[object], object]:
+def _start_server() -> tuple[subprocess.Popen[object], object, str]:
     log_path = Path.home() / ".vipercapture" / "requests.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -978,7 +978,7 @@ def _start_server() -> tuple[subprocess.Popen[object], object]:
     except Exception:
         log_handle.close()
         raise
-    return server, log_handle
+    return server, log_handle, shutdown_token
 
 
 def _wait_until_ready(
@@ -986,12 +986,16 @@ def _wait_until_ready(
     deadline: float,
     server: subprocess.Popen[object],
     drawer: _Drawer,
+    *,
+    shutdown_token: str = "",
 ) -> GuiState:
     tick = 0
     while time.monotonic() < deadline:
         if launch.application_shutdown_requested():
             raise KeyboardInterrupt
         if launch.port_open():
+            if shutdown_token:
+                launch._record_endpoint_server_process(server.pid, shutdown_token, launch.PORT)
             return state
         if server.poll() is not None:
             break
@@ -1258,8 +1262,19 @@ def run_capture_gui(viewport: tuple[int, int], directory: Path | None = None) ->
         _enter()
         entered = True
         if not launch.port_open():
-            started, log_handle = _start_server()
-            state = _wait_until_ready(state, time.monotonic() + 30, started, drawer)
+            started_info = _start_server()
+            if len(started_info) == 3:
+                started, log_handle, shutdown_token = started_info
+            else:
+                started, log_handle = started_info  # type: ignore[misc]
+                shutdown_token = ""
+            state = _wait_until_ready(
+                state,
+                time.monotonic() + 30,
+                started,
+                drawer,
+                shutdown_token=shutdown_token,
+            )
             if state.error:
                 drawer.draw(state)
                 _pause_for_quit()

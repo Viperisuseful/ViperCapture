@@ -197,14 +197,170 @@
         if (Test-Path $Temp) { Remove-Item -Recurse -Force $Temp }
     }
 
+    function Find-CscCompiler {
+        foreach ($frameworkDir in @("Microsoft.NET\Framework64", "Microsoft.NET\Framework")) {
+            $root = Join-Path $env:SystemRoot $frameworkDir
+            if (-not (Test-Path -LiteralPath $root)) { continue }
+            $candidate = Get-ChildItem -LiteralPath $root -Directory -Filter "v4.*" -ErrorAction SilentlyContinue |
+                Sort-Object Name -Descending |
+                ForEach-Object { Join-Path $_.FullName "csc.exe" } |
+                Where-Object { Test-Path -LiteralPath $_ } |
+                Select-Object -First 1
+            if ($candidate) { return $candidate }
+        }
+        return $null
+    }
+
+    function Write-WindowsShim {
+        param([string]$BinDir, [string]$Python, [string]$Launch)
+
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        $exePath = Join-Path $BinDir "vipercapture.exe"
+        $configPath = Join-Path $BinDir "vipercapture.shim"
+        $cmdPath = Join-Path $BinDir "vipercapture.cmd"
+
+        $csc = Find-CscCompiler
+        if ($csc) {
+            [System.IO.File]::WriteAllLines($configPath, [string[]]@($Python, $Launch), $utf8NoBom)
+            $buildTemp = Join-Path ([System.IO.Path]::GetTempPath()) ("vipercapture-shim-" + [guid]::NewGuid().ToString("n"))
+            New-Item -ItemType Directory -Path $buildTemp | Out-Null
+            try {
+                $csPath = Join-Path $buildTemp "ViperCaptureShim.cs"
+                $builtExe = Join-Path $buildTemp "vipercapture.exe"
+                $csSource = @'
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+
+internal static class ViperCaptureShim
+{
+    private static string QuoteArg(string arg)
+    {
+        if (arg == null) return "\"\"";
+        var sb = new StringBuilder();
+        sb.Append('"');
+        int backslashes = 0;
+        foreach (char c in arg)
+        {
+            if (c == '\\')
+            {
+                backslashes++;
+            }
+            else if (c == '"')
+            {
+                sb.Append('\\', backslashes * 2 + 1);
+                sb.Append('"');
+                backslashes = 0;
+            }
+            else
+            {
+                if (backslashes > 0)
+                {
+                    sb.Append('\\', backslashes);
+                    backslashes = 0;
+                }
+                sb.Append(c);
+            }
+        }
+        if (backslashes > 0)
+        {
+            sb.Append('\\', backslashes * 2);
+        }
+        sb.Append('"');
+        return sb.ToString();
+    }
+
+    public static int Main(string[] args)
+    {
+        string exeDir = Path.GetDirectoryName(typeof(ViperCaptureShim).Assembly.Location);
+        string configPath = Path.Combine(exeDir, "vipercapture.shim");
+        if (!File.Exists(configPath))
+        {
+            Console.Error.WriteLine("Missing ViperCapture shim config: " + configPath);
+            return 1;
+        }
+        string[] lines = File.ReadAllLines(configPath, new UTF8Encoding(false));
+        if (lines.Length < 2 || string.IsNullOrWhiteSpace(lines[0]) || string.IsNullOrWhiteSpace(lines[1]))
+        {
+            Console.Error.WriteLine("Invalid ViperCapture shim config: " + configPath);
+            return 1;
+        }
+        string python = lines[0].Trim();
+        string launchScript = lines[1].Trim();
+
+        var sb = new StringBuilder();
+        sb.Append(QuoteArg(launchScript));
+        for (int i = 0; i < args.Length; i++)
+        {
+            sb.Append(' ');
+            sb.Append(QuoteArg(args[i]));
+        }
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = python,
+            Arguments = sb.ToString(),
+            UseShellExecute = false,
+        };
+        Console.CancelKeyPress += (sender, e) => { e.Cancel = true; };
+        try
+        {
+            using (var proc = Process.Start(psi))
+            {
+                if (proc == null) return 1;
+                proc.WaitForExit();
+                return proc.ExitCode;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("Failed to launch ViperCapture: " + ex.Message);
+            return 1;
+        }
+    }
+}
+'@
+                [System.IO.File]::WriteAllText($csPath, $csSource, $utf8NoBom)
+                $previousPreference = $ErrorActionPreference
+                $ErrorActionPreference = "Continue"
+                try {
+                    $global:LASTEXITCODE = 1
+                    & $csc /nologo /optimize+ /target:exe "/out:$builtExe" $csPath *> $null
+                    $compiled = ($LASTEXITCODE -eq 0) -and (Test-Path -LiteralPath $builtExe)
+                } finally {
+                    $ErrorActionPreference = $previousPreference
+                }
+                if ($compiled) {
+                    try {
+                        Copy-Item -LiteralPath $builtExe -Destination $exePath -Force
+                    } catch {
+                        if (-not (Test-Path -LiteralPath $exePath)) { throw }
+                    }
+                    if (Test-Path -LiteralPath $cmdPath) {
+                        Remove-Item -LiteralPath $cmdPath -Force -ErrorAction SilentlyContinue
+                    }
+                    return
+                }
+            } finally {
+                if (Test-Path -LiteralPath $buildTemp) {
+                    Remove-Item -LiteralPath $buildTemp -Recurse -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+
+        # Fallback when .NET Framework csc.exe is unavailable: encode in the OEM code page
+        # that cmd.exe uses to parse batch files.
+        $oemCodePage = [System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage
+        $oemEncoding = [System.Text.Encoding]::GetEncoding($oemCodePage)
+        $cmdText = "@echo off`r`n`"$Python`" `"$Launch`" %*`r`n"
+        [System.IO.File]::WriteAllText($cmdPath, $cmdText, $oemEncoding)
+    }
+
     New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
     $BinDir = (Get-Item -LiteralPath $BinDir).FullName
-    $Shim = Join-Path $BinDir "vipercapture.cmd"
     $Launch = Join-Path $App "launch.py"
-    @(
-        "@echo off"
-        "`"$Python`" `"$Launch`" %*"
-    ) | Set-Content -Path $Shim -Encoding Default
+    Write-WindowsShim -BinDir $BinDir -Python $Python -Launch $Launch
 
     $AddedUserPath = $false
     if ($env:VIPERCAPTURE_SKIP_USER_PATH -ne "1") {

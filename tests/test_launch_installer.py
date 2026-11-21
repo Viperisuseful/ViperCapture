@@ -577,6 +577,98 @@ class FindUvTests(unittest.TestCase):
                 self.assertIsNone(launch.find_uv())
                 which.assert_not_called()
 
+    def test_find_uv_falls_back_to_user_local_bin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            uv_name = "uv.exe" if os.name == "nt" else "uv"
+            uv_path = home / ".local" / "bin" / uv_name
+            uv_path.parent.mkdir(parents=True)
+            uv_path.write_text("#!/bin/sh\n", encoding="utf-8")
+            if os.name != "nt":
+                uv_path.chmod(0o755)
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("VIPERCAPTURE_USE_UV", None)
+                with mock.patch("launch.shutil.which", return_value=None):
+                    self.assertEqual(launch.find_uv(home=home), str(uv_path))
+
+    def test_ensure_deps_bootstraps_pip_when_uv_is_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            req = root / "requirements.txt"
+            req.write_text("", encoding="utf-8")
+            venv_dir = root / ".venv"
+            venv_dir.mkdir()
+            venv_python = venv_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+            deps_stamp = venv_dir / ".deps_stamp"
+            calls: list[tuple[str, ...]] = []
+            with (
+                mock.patch.object(launch, "ROOT", root),
+                mock.patch.object(launch, "VENV_PYTHON", venv_python),
+                mock.patch.object(launch, "DEPS_STAMP", deps_stamp),
+                mock.patch.object(launch, "find_uv", return_value=None),
+                mock.patch.object(launch, "_venv_has_pip", return_value=False),
+                mock.patch.object(launch, "_bootstrap_venv_pip", return_value=True) as bootstrap,
+                mock.patch.object(launch, "is_intel_macos", return_value=False),
+                mock.patch.object(launch, "prepare_intel_macos_cryptography_build", return_value=[]),
+                mock.patch.object(launch, "run", side_effect=lambda *cmd, label="": calls.append(tuple(str(c) for c in cmd))),
+            ):
+                launch.ensure_deps()
+            bootstrap.assert_called_once_with(str(venv_python))
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(deps_stamp.is_file())
+
+    def test_ensure_venv_removes_partial_venv_when_creation_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            venv_dir = root / ".venv"
+            venv_python = venv_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+            def fail_halfway(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+                venv_python.parent.mkdir(parents=True, exist_ok=True)
+                venv_python.write_bytes(b"stub")
+                return subprocess.CompletedProcess(cmd, 1)
+
+            with (
+                mock.patch.object(launch, "ROOT", root),
+                mock.patch.object(launch, "VENV_PYTHON", venv_python),
+                mock.patch.object(launch, "INTERACTIVE_FAILURES", False),
+                mock.patch.object(launch, "find_uv", return_value=None),
+                mock.patch.object(launch.subprocess, "run", side_effect=fail_halfway),
+            ):
+                with self.assertRaises(SystemExit) as ctx:
+                    launch.ensure_venv()
+            self.assertEqual(ctx.exception.code, 1)
+            self.assertFalse(venv_dir.exists())
+
+    def test_windows_venvlauncher_descendant_uvicorn_is_classified_as_server(self) -> None:
+        root = Path(r"C:\Users\alice\AppData\Local\ViperCapture\app")
+        other_root = Path(r"C:\Users\alice\OtherCheckout")
+        parent_cmd = f'"{root}\\.venv\\Scripts\\python.exe" -m uvicorn vipercapture.main:app --host 127.0.0.1 --port 8000'
+        child_cmd = r'"C:\Users\alice\AppData\Roaming\uv\python\cpython-3.12\python.exe" -m uvicorn vipercapture.main:app --host 127.0.0.1 --port 8000'
+        with (
+            mock.patch.object(launch.sys, "platform", "win32"),
+            mock.patch.object(launch, "_get_parent_pid", return_value=100),
+            mock.patch.object(launch, "_get_pid_commandline", return_value=parent_cmd),
+        ):
+            self.assertEqual(launch._classify_pid_kind(200, child_cmd, root_dir=root), "server")
+            self.assertIsNone(launch._classify_pid_kind(200, child_cmd, root_dir=other_root))
+
+    def test_launch_prints_without_unicode_error_under_cp437(self) -> None:
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "cp437"
+        ran = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import launch; launch._configure_console_streams(); print('ok \\u2014 done')",
+            ],
+            cwd=str(ROOT),
+            env=env,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+
 
 class InstallerCommandTests(unittest.TestCase):
     def test_venv_prefers_uv(self) -> None:
@@ -1020,9 +1112,10 @@ class InstallScriptTests(unittest.TestCase):
                 cleaned = part.strip().strip('"')
                 if not cleaned or cleaned.rstrip("\\/").casefold() == bin_norm:
                     continue
-                if (Path(cleaned) / "vipercapture.cmd").exists() or (
-                    Path(cleaned) / "vipercapture"
-                ).exists():
+                if any(
+                    (Path(cleaned) / name).exists()
+                    for name in ("vipercapture.exe", "vipercapture.cmd", "vipercapture")
+                ):
                     continue
                 filtered_path.append(part)
             env["PATH"] = os.pathsep.join(filtered_path)
@@ -1056,7 +1149,8 @@ class InstallScriptTests(unittest.TestCase):
             )
             self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
             app = home / "app"
-            shim = bin_dir / "vipercapture.cmd"
+            exe_shim = bin_dir / "vipercapture.exe"
+            shim = exe_shim if exe_shim.is_file() else (bin_dir / "vipercapture.cmd")
             self.assertTrue(shim.is_file())
             self.assertIn(f"RESOLVED={shim}", ran.stdout)
             self.assertIn("OUTPUT=vipercapture", ran.stdout)
@@ -1064,6 +1158,67 @@ class InstallScriptTests(unittest.TestCase):
             self.assertEqual((app / "keep.txt").read_text(encoding="utf-8"), "yes\n")
             self.assertFalse((app / "frontend" / "node_modules").exists())
             self.assertEqual((app / ".venv" / "marker").read_text(encoding="utf-8").strip(), "keep")
+
+    @unittest.skipIf(sys.platform != "win32", "install.ps1 requires Windows PowerShell")
+    def test_windows_install_script_preserves_metacharacters_and_unicode_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            home = root / "José Dir"
+            bin_dir = home / "bin"
+            source = root / "source"
+            source.mkdir()
+            (source / "launch.py").write_text(
+                "import json, sys; print(json.dumps(sys.argv[1:]))\n",
+                encoding="utf-8",
+            )
+            bin_dir.mkdir(parents=True)
+            stale_cmd = bin_dir / "vipercapture.cmd"
+            stale_cmd.write_text("@echo off\r\necho stale\r\n", encoding="utf-8")
+
+            env = os.environ.copy()
+            env["VIPERCAPTURE_HOME"] = str(home)
+            env["VIPERCAPTURE_BIN_DIR"] = str(bin_dir)
+            env["VIPERCAPTURE_SOURCE"] = str(source)
+            env["VIPERCAPTURE_PYTHON"] = sys.executable
+            env["VIPERCAPTURE_SKIP_USER_PATH"] = "1"
+            filtered_path = [
+                part
+                for part in env.get("PATH", "").split(os.pathsep)
+                if part.strip()
+                and not any(
+                    (Path(part.strip().strip('"')) / name).exists()
+                    for name in ("vipercapture.exe", "vipercapture.cmd", "vipercapture")
+                )
+            ]
+            env["PATH"] = os.pathsep.join(filtered_path)
+
+            script = ROOT / "scripts" / "install.ps1"
+            ps_body = (
+                f"Get-Content -LiteralPath '{str(script)}' -Raw | Invoke-Expression\n"
+                "vipercapture capture 'https://example.com/?a=1&b=2&x=%TEMP%' --html '<h1>hi</h1>' --dry-run\n"
+            )
+            ran = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_body],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+            self.assertTrue((bin_dir / "vipercapture.exe").is_file())
+            self.assertTrue((bin_dir / "vipercapture.shim").is_file())
+            self.assertFalse(stale_cmd.exists())
+            parsed = json.loads(ran.stdout.strip().splitlines()[-1])
+            self.assertEqual(
+                parsed,
+                [
+                    "capture",
+                    "https://example.com/?a=1&b=2&x=%TEMP%",
+                    "--html",
+                    "<h1>hi</h1>",
+                    "--dry-run",
+                ],
+            )
 
     @unittest.skipIf(sys.platform != "win32", "install.ps1 requires Windows PowerShell")
     def test_windows_install_script_silences_store_stub_and_finds_later_python(self) -> None:
@@ -1128,7 +1283,9 @@ class InstallScriptTests(unittest.TestCase):
             self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
             self.assertNotIn("Microsoft Store", ran.stdout + ran.stderr)
             self.assertIn("vipercapture", ran.stdout)
-            shim_text = (bin_dir / "vipercapture.cmd").read_text(encoding="utf-8")
+            shim_config = bin_dir / "vipercapture.shim"
+            shim_file = shim_config if shim_config.is_file() else (bin_dir / "vipercapture.cmd")
+            shim_text = shim_file.read_text(encoding="utf-8")
             self.assertIn(str(real_dir / "python.cmd"), shim_text)
 
 
@@ -1411,6 +1568,37 @@ class UpdateTests(unittest.TestCase):
             self.assertIn(b'"C:\\Python\\python.exe"', raw)
             self.assertIn(b"%*", raw)
             self.assertNotIn(b"#!/bin/sh", raw)
+
+    def test_windows_exe_shim_updates_utf8_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            app = self._install(home)
+            bin_dir = home / "bin"
+            bin_dir.mkdir()
+            exe_shim = bin_dir / "vipercapture.exe"
+            exe_shim.write_bytes(b"MZ-stub")
+            config = bin_dir / "vipercapture.shim"
+            config.write_text(f"C:\\Python\\python.exe\n{app / 'launch.py'}\n", encoding="utf-8")
+            source = home / "incoming"
+            source.mkdir()
+            (source / "launch.py").write_text("print('new')\n", encoding="utf-8")
+            (source / "VERSION").write_text("1.0.5\n", encoding="utf-8")
+            code = updater.run_update(
+                app,
+                fetch=self._fetch(_archive(source)),
+                home=home,
+                path_env=str(bin_dir),
+                platform_name="win32",
+                shell="",
+                server_running=lambda: False,
+                executable="C:\\Users\\José\\python.exe",
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(
+                config.read_text(encoding="utf-8"),
+                f"C:\\Users\\José\\python.exe\n{app / 'launch.py'}\n",
+            )
+            self.assertEqual(exe_shim.read_bytes(), b"MZ-stub")
 
     @unittest.skipIf(
         sys.platform == "win32", "POSIX executable bits are unavailable on Windows"
