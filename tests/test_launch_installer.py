@@ -641,17 +641,27 @@ class FindUvTests(unittest.TestCase):
             self.assertFalse(venv_dir.exists())
 
     def test_windows_venvlauncher_descendant_uvicorn_is_classified_as_server(self) -> None:
-        root = Path(r"C:\Users\alice\AppData\Local\ViperCapture\app")
-        other_root = Path(r"C:\Users\alice\OtherCheckout")
-        parent_cmd = f'"{root}\\.venv\\Scripts\\python.exe" -m uvicorn vipercapture.main:app --host 127.0.0.1 --port 8000'
-        child_cmd = r'"C:\Users\alice\AppData\Roaming\uv\python\cpython-3.12\python.exe" -m uvicorn vipercapture.main:app --host 127.0.0.1 --port 8000'
-        with (
-            mock.patch.object(launch.sys, "platform", "win32"),
-            mock.patch.object(launch, "_get_parent_pid", return_value=100),
-            mock.patch.object(launch, "_get_pid_commandline", return_value=parent_cmd),
-        ):
-            self.assertEqual(launch._classify_pid_kind(200, child_cmd, root_dir=root), "server")
-            self.assertIsNone(launch._classify_pid_kind(200, child_cmd, root_dir=other_root))
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve()
+            root = base / "app"
+            other_root = base / "other"
+            parent_exe = root / ".venv" / "Scripts" / "python.exe"
+            child_exe = base / "uv" / "python" / "python.exe"
+            parent_cmd = (
+                f'"{parent_exe}" -m uvicorn vipercapture.main:app --host 127.0.0.1 --port 8000'
+            )
+            child_cmd = (
+                f'"{child_exe}" -m uvicorn vipercapture.main:app --host 127.0.0.1 --port 8000'
+            )
+            with (
+                mock.patch.object(launch.sys, "platform", "win32"),
+                mock.patch.object(launch, "_get_parent_pid", return_value=100),
+                mock.patch.object(launch, "_get_pid_commandline", return_value=parent_cmd),
+            ):
+                self.assertEqual(launch._classify_pid_kind(200, child_cmd, root_dir=root), "server")
+                self.assertIsNone(
+                    launch._classify_pid_kind(200, child_cmd, root_dir=other_root)
+                )
 
     def test_launch_prints_without_unicode_error_under_cp437(self) -> None:
         env = os.environ.copy()
