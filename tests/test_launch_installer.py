@@ -657,11 +657,65 @@ class FindUvTests(unittest.TestCase):
                 mock.patch.object(launch.sys, "platform", "win32"),
                 mock.patch.object(launch, "_get_parent_pid", return_value=100),
                 mock.patch.object(launch, "_get_pid_commandline", return_value=parent_cmd),
+                mock.patch.object(
+                    launch,
+                    "_get_process_start_time",
+                    side_effect=lambda pid: 1000 if pid == 100 else 2000,
+                ),
             ):
                 self.assertEqual(launch._classify_pid_kind(200, child_cmd, root_dir=root), "server")
                 self.assertIsNone(
                     launch._classify_pid_kind(200, child_cmd, root_dir=other_root)
                 )
+
+            # Parent PID reuse: a parent started AFTER the child must not authorize it.
+            with (
+                mock.patch.object(launch.sys, "platform", "win32"),
+                mock.patch.object(launch, "_get_parent_pid", return_value=100),
+                mock.patch.object(launch, "_get_pid_commandline", return_value=parent_cmd),
+                mock.patch.object(
+                    launch,
+                    "_get_process_start_time",
+                    side_effect=lambda pid: 3000 if pid == 100 else 2000,
+                ),
+                mock.patch.object(launch, "_has_matching_server_record", return_value=False),
+            ):
+                self.assertIsNone(launch._classify_pid_kind(200, child_cmd, root_dir=root))
+
+            # Orphaned worker whose parent exited stays classifiable via its runtime record.
+            with (
+                mock.patch.object(launch.sys, "platform", "win32"),
+                mock.patch.object(launch, "_get_parent_pid", return_value=None),
+                mock.patch.object(launch, "_has_matching_server_record", return_value=True),
+            ):
+                self.assertEqual(launch._classify_pid_kind(200, child_cmd, root_dir=root), "server")
+
+    def test_stop_server_terminates_windows_child_worker_on_failed_handshake(self) -> None:
+        server = mock.Mock()
+        server.pid = 100
+        server.poll.return_value = None
+        server.wait.return_value = 0
+        worker_identity = launch.ProcessIdentity(200, 12345, "python.exe -m uvicorn vipercapture.main:app", "server")
+        terminated: list[int] = []
+        cleared: list[int] = []
+        alive_state = {100: False, 200: True}
+
+        def fake_terminate(identity: launch.ProcessIdentity, **_kwargs: object) -> tuple[bool, str | None]:
+            terminated.append(identity.pid)
+            alive_state[identity.pid] = False
+            return True, None
+
+        with (
+            mock.patch.object(launch, "_capture_process_identity", return_value=worker_identity),
+            mock.patch.object(launch, "_request_server_shutdown", return_value=False),
+            mock.patch.object(launch, "_terminate_process", side_effect=fake_terminate),
+            mock.patch.object(launch, "_is_process_alive", side_effect=lambda pid: alive_state.get(pid, False)),
+            mock.patch.object(launch, "_clear_server_record", side_effect=cleared.append),
+        ):
+            launch.stop_server(server, announce=False, worker_pid=200)
+        self.assertEqual(terminated, [200])
+        server.terminate.assert_called_once()
+        self.assertEqual(set(cleared), {100, 200})
 
     def test_launch_prints_without_unicode_error_under_cp437(self) -> None:
         env = os.environ.copy()
@@ -1296,7 +1350,86 @@ class InstallScriptTests(unittest.TestCase):
             shim_config = bin_dir / "vipercapture.shim"
             shim_file = shim_config if shim_config.is_file() else (bin_dir / "vipercapture.cmd")
             shim_text = shim_file.read_text(encoding="utf-8")
-            self.assertIn(str(real_dir / "python.cmd"), shim_text)
+            self.assertIn(str(Path(sys.executable).resolve()), shim_text)
+            self.assertNotIn("python.cmd", shim_text)
+
+    @unittest.skipIf(sys.platform != "win32", "install.ps1 requires Windows PowerShell")
+    def test_windows_install_script_handles_brackets_direct_argv_and_cmd_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            bracket_home = root / "Viper[1]"
+            sibling_dir = root / "Viper1" / "app"
+            sibling_dir.mkdir(parents=True)
+            sentinel = sibling_dir / "sentinel.txt"
+            sentinel.write_text("untouched", encoding="utf-8")
+            bin_dir = bracket_home / "bin"
+            source = root / "src[1]"
+            source.mkdir()
+            (source / "launch.py").write_text(
+                "import json, sys; print(json.dumps(sys.argv[1:]))\n",
+                encoding="utf-8",
+            )
+
+            env = os.environ.copy()
+            env["VIPERCAPTURE_HOME"] = str(bracket_home)
+            env["VIPERCAPTURE_BIN_DIR"] = str(bin_dir)
+            env["VIPERCAPTURE_SOURCE"] = str(source)
+            env["VIPERCAPTURE_PYTHON"] = sys.executable
+            env["VIPERCAPTURE_SKIP_USER_PATH"] = "1"
+            script = ROOT / "scripts" / "install.ps1"
+
+            ran = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    f"Get-Content -LiteralPath '{str(script)}' -Raw | Invoke-Expression",
+                ],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "untouched")
+
+            # Direct native exe argv round-trip including empty arg, quotes, and trailing backslash.
+            exe_path = bin_dir / "vipercapture.exe"
+            self.assertTrue(exe_path.is_file())
+            argv_in = ["", 'say "hi"', r"C:\dir\\", "https://example.com/?a=1&b=2&x=%TEMP%", "<h1>hi</h1>"]
+            direct = subprocess.run(
+                [str(exe_path), *argv_in],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(direct.returncode, 0, direct.stdout + direct.stderr)
+            self.assertEqual(json.loads(direct.stdout.strip()), argv_in)
+
+            # Forced .cmd fallback removes prior .exe and .shim and works cleanly.
+            fallback_env = env.copy()
+            fallback_env["VIPERCAPTURE_FORCE_CMD_SHIM"] = "1"
+            fb = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    f"Get-Content -LiteralPath '{str(script)}' -Raw | Invoke-Expression",
+                ],
+                env=fallback_env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(fb.returncode, 0, fb.stdout + fb.stderr)
+            self.assertFalse(exe_path.exists())
+            self.assertFalse((bin_dir / "vipercapture.shim").exists())
+            self.assertTrue((bin_dir / "vipercapture.cmd").is_file())
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "untouched")
 
 
 OLD_SHA = "a" * 40
@@ -1377,6 +1510,7 @@ class UpdateTests(unittest.TestCase):
                     fetch=fetch,
                     home=home,
                     path_env="",
+                    platform_name="linux",
                     shell="/bin/bash",
                     server_running=lambda: False,
                     executable="/usr/bin/python3",
@@ -1459,6 +1593,7 @@ class UpdateTests(unittest.TestCase):
                     fetch=self._fetch(_archive(source)),
                     home=home,
                     path_env="",
+                    platform_name="linux",
                     shell="/bin/bash",
                     server_running=lambda: False,
                     executable="/usr/bin/python3",
@@ -1491,6 +1626,7 @@ class UpdateTests(unittest.TestCase):
                     fetch=fetch,
                     home=home,
                     path_env="",
+                    platform_name="linux",
                     shell="/bin/bash",
                     server_running=lambda: False,
                     executable="/usr/bin/python3",
@@ -1780,6 +1916,7 @@ class UpdateTests(unittest.TestCase):
                 fetch=self._fetch(_archive(source)),
                 home=home,
                 path_env="",
+                platform_name="linux",
                 shell="/bin/bash",
                 server_running=lambda: False,
                 executable="/usr/bin/python3",
@@ -1803,6 +1940,7 @@ class UpdateTests(unittest.TestCase):
                 archive_url="https://example.com/fork.tar.gz",
                 home=home,
                 path_env="",
+                platform_name="linux",
                 shell="/bin/bash",
                 server_running=lambda: False,
                 executable="/usr/bin/python3",
@@ -1830,6 +1968,7 @@ class UpdateTests(unittest.TestCase):
                 fetch=fetch,
                 home=home,
                 path_env="",
+                platform_name="linux",
                 shell="/bin/bash",
                 server_running=lambda: False,
                 executable="/usr/bin/python3",

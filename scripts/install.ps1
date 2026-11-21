@@ -47,27 +47,38 @@
     function Add-SessionPath {
         param([string]$Directory)
         $entries = Split-PathEntries $env:Path
-        if (Test-PathContains $entries $Directory) {
+        $target = Format-NormalizedPathEntry $Directory
+        if ($entries.Count -gt 0 -and (Format-NormalizedPathEntry $entries[0]) -ieq $target) {
             return $false
         }
-        $env:Path = if ($entries.Count -gt 0) {
-            (@($Directory) + $entries) -join ";"
+        $remaining = @($entries | Where-Object { (Format-NormalizedPathEntry $_) -ine $target })
+        $env:Path = if ($remaining.Count -gt 0) {
+            (@($Directory) + $remaining) -join ";"
         } else {
             $Directory
         }
         return $true
     }
 
-    function Test-Python311 {
+    function Resolve-PythonCandidate {
         param([string]$Executable, [string[]]$PrefixArgs = @())
         $previousPreference = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
         try {
             $global:LASTEXITCODE = 1
-            & $Executable @PrefixArgs -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" *> $null
-            return $LASTEXITCODE -eq 0
+            $raw = & $Executable @PrefixArgs -c "import json, sys; sys.exit(1) if sys.version_info < (3, 11) else print(json.dumps(sys.executable))" 2>$null
+            if ($LASTEXITCODE -ne 0 -or -not $raw) {
+                return $null
+            }
+            $line = ($raw | Select-Object -Last 1)
+            if (-not $line) { return $null }
+            $resolved = [string]($line | ConvertFrom-Json)
+            if (-not $resolved -or -not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+                return $null
+            }
+            return (Get-Item -LiteralPath $resolved).FullName
         } catch {
-            return $false
+            return $null
         } finally {
             $ErrorActionPreference = $previousPreference
         }
@@ -75,28 +86,30 @@
 
     function Resolve-Python {
         if ($env:VIPERCAPTURE_PYTHON) {
-            if (-not (Test-Python311 $env:VIPERCAPTURE_PYTHON @())) {
+            $resolved = Resolve-PythonCandidate $env:VIPERCAPTURE_PYTHON @()
+            if (-not $resolved) {
                 throw "VIPERCAPTURE_PYTHON is not Python 3.11 or newer: $($env:VIPERCAPTURE_PYTHON)"
             }
-            return $env:VIPERCAPTURE_PYTHON
+            return $resolved
         }
         $py = Get-Command py -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($py -and $py.Source -and (Test-Python311 $py.Source @("-3"))) {
-            $resolved = & $py.Source -3 -c "import sys; print(sys.executable)" | Select-Object -First 1
-            if ($LASTEXITCODE -eq 0 -and $resolved) { return ([string]$resolved).Trim() }
+        if ($py -and $py.Source) {
+            $resolved = Resolve-PythonCandidate $py.Source @("-3")
+            if ($resolved) { return $resolved }
         }
         foreach ($name in @("python", "python3")) {
             $commands = Get-Command $name -CommandType Application -All -ErrorAction SilentlyContinue
             foreach ($cmd in $commands) {
-                if ($cmd -and $cmd.Source -and (Test-Python311 $cmd.Source @())) {
-                    return $cmd.Source
+                if ($cmd -and $cmd.Source) {
+                    $resolved = Resolve-PythonCandidate $cmd.Source @()
+                    if ($resolved) { return $resolved }
                 }
             }
         }
         $uv = Get-Command uv -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
         if (-not $uv) {
             $uvPath = Join-Path $env:USERPROFILE ".local\bin\uv.exe"
-            if (Test-Path $uvPath) { $uv = Get-Command $uvPath -ErrorAction SilentlyContinue }
+            if (Test-Path -LiteralPath $uvPath) { $uv = Get-Command $uvPath -ErrorAction SilentlyContinue }
         }
         if (-not $uv) {
             Write-Host "  Python 3.11+ was not found. Installing uv to provide Python 3.12..."
@@ -104,7 +117,7 @@
             $uv = Get-Command uv -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
             if (-not $uv) {
                 $uvPath = Join-Path $env:USERPROFILE ".local\bin\uv.exe"
-                if (Test-Path $uvPath) { $uv = Get-Command $uvPath -ErrorAction SilentlyContinue }
+                if (Test-Path -LiteralPath $uvPath) { $uv = Get-Command $uvPath -ErrorAction SilentlyContinue }
             }
         } else {
             Write-Host "  Python 3.11+ was not found. Using uv to install Python 3.12..."
@@ -115,19 +128,21 @@
         if ($LASTEXITCODE -ne 0) { throw "uv failed to install Python 3.12." }
         $found = & $uv.Source python find 3.12 | Select-Object -First 1
         if ($LASTEXITCODE -ne 0 -or -not $found) { throw "uv did not provide Python 3.12." }
-        return ([string]$found).Trim()
+        $resolved = Resolve-PythonCandidate ([string]$found).Trim() @()
+        if (-not $resolved) { throw "uv did not provide a usable Python 3.12 executable." }
+        return $resolved
     }
 
     function Copy-FilteredTree {
         param([string]$Source, [string]$Destination)
         $exclude = @(".git", ".venv", "node_modules", "__pycache__", ".pytest_cache")
-        New-Item -ItemType Directory -Force -Path $Destination | Out-Null
-        Get-ChildItem -Force $Source | Where-Object { $exclude -notcontains $_.Name } | ForEach-Object {
+        [System.IO.Directory]::CreateDirectory($Destination) | Out-Null
+        Get-ChildItem -LiteralPath $Source -Force | Where-Object { $exclude -notcontains $_.Name } | ForEach-Object {
             $target = Join-Path $Destination $_.Name
             if ($_.PSIsContainer) {
                 Copy-FilteredTree $_.FullName $target
             } else {
-                Copy-Item $_.FullName -Destination $target -Force
+                Copy-Item -LiteralPath $_.FullName -Destination $target -Force
             }
         }
     }
@@ -135,30 +150,31 @@
     function Copy-SourceTree {
         param([string]$Source, [string]$Destination)
         $saved = $null
-        if (Test-Path (Join-Path $Destination ".venv")) {
+        $destVenv = Join-Path $Destination ".venv"
+        if (Test-Path -LiteralPath $destVenv) {
             $saved = Join-Path ([System.IO.Path]::GetTempPath()) ("vipercapture-venv-" + [guid]::NewGuid().ToString("n"))
-            New-Item -ItemType Directory -Path $saved | Out-Null
-            Move-Item (Join-Path $Destination ".venv") (Join-Path $saved "venv")
+            [System.IO.Directory]::CreateDirectory($saved) | Out-Null
+            Move-Item -LiteralPath $destVenv -Destination (Join-Path $saved "venv")
         }
         try {
-            if (Test-Path $Destination) { Remove-Item -Recurse -Force $Destination }
+            if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Recurse -Force }
             Copy-FilteredTree $Source $Destination
             if ($saved) {
-                Move-Item (Join-Path $saved "venv") (Join-Path $Destination ".venv")
-                Remove-Item -Recurse -Force $saved
+                Move-Item -LiteralPath (Join-Path $saved "venv") -Destination $destVenv
+                Remove-Item -LiteralPath $saved -Recurse -Force
                 $saved = $null
             }
         } catch {
             if ($saved) {
-                New-Item -ItemType Directory -Force -Path $Destination | Out-Null
-                if (-not (Test-Path (Join-Path $Destination ".venv"))) {
-                    Move-Item (Join-Path $saved "venv") (Join-Path $Destination ".venv")
+                [System.IO.Directory]::CreateDirectory($Destination) | Out-Null
+                if (-not (Test-Path -LiteralPath $destVenv)) {
+                    Move-Item -LiteralPath (Join-Path $saved "venv") -Destination $destVenv
                 }
-                Remove-Item -Recurse -Force $saved -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $saved -Recurse -Force -ErrorAction SilentlyContinue
             }
             throw
         }
-        if (-not (Test-Path (Join-Path $Destination "launch.py"))) {
+        if (-not (Test-Path -LiteralPath (Join-Path $Destination "launch.py"))) {
             throw "The installed files do not include launch.py."
         }
     }
@@ -170,31 +186,31 @@
 
     $Python = Resolve-Python
     $Temp = Join-Path ([System.IO.Path]::GetTempPath()) ("vipercapture-install-" + [guid]::NewGuid().ToString("n"))
-    New-Item -ItemType Directory -Path $Temp | Out-Null
+    [System.IO.Directory]::CreateDirectory($Temp) | Out-Null
     try {
         if ($env:VIPERCAPTURE_SOURCE) {
             $Source = $env:VIPERCAPTURE_SOURCE
-            if (-not (Test-Path (Join-Path $Source "launch.py"))) {
+            if (-not (Test-Path -LiteralPath (Join-Path $Source "launch.py"))) {
                 throw "VIPERCAPTURE_SOURCE does not contain launch.py: $Source"
             }
             Write-Host "  Installing from $Source"
-        } elseif ($ScriptPath -and (Test-Path (Join-Path (Split-Path $ScriptPath -Parent) "..\launch.py"))) {
-            $Source = (Resolve-Path (Join-Path (Split-Path $ScriptPath -Parent) "..")).Path
+        } elseif ($ScriptPath -and (Test-Path -LiteralPath (Join-Path (Split-Path $ScriptPath -Parent) "..\launch.py"))) {
+            $Source = (Get-Item -LiteralPath (Join-Path (Split-Path $ScriptPath -Parent) "..")).FullName
             Write-Host "  Installing from $Source"
         } else {
             Write-Host "  Downloading ViperCapture ($Ref)..."
             $Zip = Join-Path $Temp "src.zip"
             Invoke-WebRequest -Uri $ArchiveUrl -OutFile $Zip
-            Expand-Archive -Path $Zip -DestinationPath $Temp
-            $Extracted = Get-ChildItem $Temp -Directory | Select-Object -First 1
-            if (-not $Extracted -or -not (Test-Path (Join-Path $Extracted.FullName "launch.py"))) {
+            Expand-Archive -LiteralPath $Zip -DestinationPath $Temp
+            $Extracted = Get-ChildItem -LiteralPath $Temp -Directory | Select-Object -First 1
+            if (-not $Extracted -or -not (Test-Path -LiteralPath (Join-Path $Extracted.FullName "launch.py"))) {
                 throw "The downloaded archive does not include launch.py."
             }
             $Source = $Extracted.FullName
         }
         Copy-SourceTree $Source $App
     } finally {
-        if (Test-Path $Temp) { Remove-Item -Recurse -Force $Temp }
+        if (Test-Path -LiteralPath $Temp) { Remove-Item -LiteralPath $Temp -Recurse -Force }
     }
 
     function Find-CscCompiler {
@@ -211,6 +227,45 @@
         return $null
     }
 
+    function Write-AtomicUtf8Lines {
+        param([string]$Path, [string[]]$Lines)
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        $tmpPath = "$Path.tmp." + [guid]::NewGuid().ToString("n")
+        try {
+            [System.IO.File]::WriteAllLines($tmpPath, $Lines, $utf8NoBom)
+            if (Test-Path -LiteralPath $Path) {
+                [System.IO.File]::Replace($tmpPath, $Path, [NullString]::Value)
+            } else {
+                [System.IO.File]::Move($tmpPath, $Path)
+            }
+        } catch {
+            if (Test-Path -LiteralPath $tmpPath) {
+                Remove-Item -LiteralPath $tmpPath -Force -ErrorAction SilentlyContinue
+            }
+            throw
+        }
+    }
+
+    function Get-StrictOemEncoding {
+        $codePage = $null
+        try {
+            $raw = & $Python -c "import ctypes; print(int(ctypes.windll.kernel32.GetOEMCP()))" 2>$null
+            if ($LASTEXITCODE -eq 0 -and $raw) {
+                $codePage = [int]([string]($raw | Select-Object -First 1)).Trim()
+            }
+        } catch {
+            $codePage = $null
+        }
+        if (-not $codePage) {
+            $codePage = [System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage
+        }
+        return [System.Text.Encoding]::GetEncoding(
+            $codePage,
+            [System.Text.EncoderFallback]::ExceptionFallback,
+            [System.Text.DecoderFallback]::ExceptionFallback
+        )
+    }
+
     function Write-WindowsShim {
         param([string]$BinDir, [string]$Python, [string]$Launch)
 
@@ -219,11 +274,10 @@
         $configPath = Join-Path $BinDir "vipercapture.shim"
         $cmdPath = Join-Path $BinDir "vipercapture.cmd"
 
-        $csc = Find-CscCompiler
+        $csc = if ($env:VIPERCAPTURE_FORCE_CMD_SHIM -eq "1") { $null } else { Find-CscCompiler }
         if ($csc) {
-            [System.IO.File]::WriteAllLines($configPath, [string[]]@($Python, $Launch), $utf8NoBom)
             $buildTemp = Join-Path ([System.IO.Path]::GetTempPath()) ("vipercapture-shim-" + [guid]::NewGuid().ToString("n"))
-            New-Item -ItemType Directory -Path $buildTemp | Out-Null
+            [System.IO.Directory]::CreateDirectory($buildTemp) | Out-Null
             try {
                 $csPath = Join-Path $buildTemp "ViperCaptureShim.cs"
                 $builtExe = Join-Path $buildTemp "vipercapture.exe"
@@ -273,39 +327,39 @@ internal static class ViperCaptureShim
 
     public static int Main(string[] args)
     {
-        string exeDir = Path.GetDirectoryName(typeof(ViperCaptureShim).Assembly.Location);
-        string configPath = Path.Combine(exeDir, "vipercapture.shim");
-        if (!File.Exists(configPath))
-        {
-            Console.Error.WriteLine("Missing ViperCapture shim config: " + configPath);
-            return 1;
-        }
-        string[] lines = File.ReadAllLines(configPath, new UTF8Encoding(false));
-        if (lines.Length < 2 || string.IsNullOrWhiteSpace(lines[0]) || string.IsNullOrWhiteSpace(lines[1]))
-        {
-            Console.Error.WriteLine("Invalid ViperCapture shim config: " + configPath);
-            return 1;
-        }
-        string python = lines[0].Trim();
-        string launchScript = lines[1].Trim();
-
-        var sb = new StringBuilder();
-        sb.Append(QuoteArg(launchScript));
-        for (int i = 0; i < args.Length; i++)
-        {
-            sb.Append(' ');
-            sb.Append(QuoteArg(args[i]));
-        }
-
-        var psi = new ProcessStartInfo
-        {
-            FileName = python,
-            Arguments = sb.ToString(),
-            UseShellExecute = false,
-        };
-        Console.CancelKeyPress += (sender, e) => { e.Cancel = true; };
         try
         {
+            string exeDir = Path.GetDirectoryName(typeof(ViperCaptureShim).Assembly.Location);
+            string configPath = Path.Combine(exeDir, "vipercapture.shim");
+            if (!File.Exists(configPath))
+            {
+                Console.Error.WriteLine("Missing ViperCapture shim config: " + configPath);
+                return 1;
+            }
+            string[] lines = File.ReadAllLines(configPath, new UTF8Encoding(false));
+            if (lines.Length < 2 || string.IsNullOrWhiteSpace(lines[0]) || string.IsNullOrWhiteSpace(lines[1]))
+            {
+                Console.Error.WriteLine("Invalid ViperCapture shim config: " + configPath);
+                return 1;
+            }
+            string python = lines[0].Trim();
+            string launchScript = lines[1].Trim();
+
+            var sb = new StringBuilder();
+            sb.Append(QuoteArg(launchScript));
+            for (int i = 0; i < args.Length; i++)
+            {
+                sb.Append(' ');
+                sb.Append(QuoteArg(args[i]));
+            }
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = python,
+                Arguments = sb.ToString(),
+                UseShellExecute = false,
+            };
+            Console.CancelKeyPress += (sender, e) => { e.Cancel = true; };
             using (var proc = Process.Start(psi))
             {
                 if (proc == null) return 1;
@@ -324,17 +378,23 @@ internal static class ViperCaptureShim
                 [System.IO.File]::WriteAllText($csPath, $csSource, $utf8NoBom)
                 $previousPreference = $ErrorActionPreference
                 $ErrorActionPreference = "Continue"
+                $compiled = $false
                 try {
                     $global:LASTEXITCODE = 1
                     & $csc /nologo /optimize+ /target:exe "/out:$builtExe" $csPath *> $null
                     $compiled = ($LASTEXITCODE -eq 0) -and (Test-Path -LiteralPath $builtExe)
+                } catch {
+                    $compiled = $false
                 } finally {
                     $ErrorActionPreference = $previousPreference
                 }
                 if ($compiled) {
+                    Write-AtomicUtf8Lines -Path $configPath -Lines @($Python, $Launch)
                     try {
                         Copy-Item -LiteralPath $builtExe -Destination $exePath -Force
-                    } catch {
+                    } catch [System.IO.IOException] {
+                        if (-not (Test-Path -LiteralPath $exePath)) { throw }
+                    } catch [System.UnauthorizedAccessException] {
                         if (-not (Test-Path -LiteralPath $exePath)) { throw }
                     }
                     if (Test-Path -LiteralPath $cmdPath) {
@@ -349,22 +409,33 @@ internal static class ViperCaptureShim
             }
         }
 
-        # Fallback when .NET Framework csc.exe is unavailable: remove any stale
-        # .exe shim so Windows does not prefer it over the .cmd fallback, and
-        # encode the batch file in the OEM code page used by cmd.exe.
+        # Fallback when .NET Framework csc.exe is unavailable: confirm any prior
+        # .exe shim is removed first so PATHEXT cannot shadow the .cmd fallback.
         if (Test-Path -LiteralPath $exePath) {
             Remove-Item -LiteralPath $exePath -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $exePath) {
+                throw "Cannot replace locked vipercapture.exe with the batch fallback. Stop running instances with 'vipercapture kill' and rerun the installer."
+            }
         }
         if (Test-Path -LiteralPath $configPath) {
             Remove-Item -LiteralPath $configPath -Force -ErrorAction SilentlyContinue
         }
-        $oemCodePage = [System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage
-        $oemEncoding = [System.Text.Encoding]::GetEncoding($oemCodePage)
-        $cmdText = "@echo off`r`n`"$Python`" `"$Launch`" %*`r`n"
-        [System.IO.File]::WriteAllText($cmdPath, $cmdText, $oemEncoding)
+        foreach ($value in @($Python, $Launch)) {
+            if ($value -match "[\r\n%`"]") {
+                throw "The Windows batch fallback cannot represent path: $value"
+            }
+        }
+        $oemEncoding = Get-StrictOemEncoding
+        $cmdText = "@echo off`r`nsetlocal disabledelayedexpansion`r`n`"$Python`" `"$Launch`" %*`r`n"
+        try {
+            $bytes = $oemEncoding.GetBytes($cmdText)
+        } catch [System.Text.EncoderFallbackException] {
+            throw "The install path cannot be encoded in the Windows console OEM code page without .NET Framework csc.exe."
+        }
+        [System.IO.File]::WriteAllBytes($cmdPath, $bytes)
     }
 
-    New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
+    [System.IO.Directory]::CreateDirectory($BinDir) | Out-Null
     $BinDir = (Get-Item -LiteralPath $BinDir).FullName
     $Launch = Join-Path $App "launch.py"
     Write-WindowsShim -BinDir $BinDir -Python $Python -Launch $Launch
@@ -373,9 +444,11 @@ internal static class ViperCaptureShim
     if ($env:VIPERCAPTURE_SKIP_USER_PATH -ne "1") {
         $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
         $UserEntries = Split-PathEntries $UserPath
-        if (-not (Test-PathContains $UserEntries $BinDir)) {
-            $Updated = if ($UserEntries.Count -gt 0) {
-                (@($BinDir) + $UserEntries) -join ";"
+        $TargetBin = Format-NormalizedPathEntry $BinDir
+        if ($UserEntries.Count -eq 0 -or (Format-NormalizedPathEntry $UserEntries[0]) -ine $TargetBin) {
+            $RemainingUser = @($UserEntries | Where-Object { (Format-NormalizedPathEntry $_) -ine $TargetBin })
+            $Updated = if ($RemainingUser.Count -gt 0) {
+                (@($BinDir) + $RemainingUser) -join ";"
             } else {
                 $BinDir
             }

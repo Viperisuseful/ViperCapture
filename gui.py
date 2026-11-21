@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -344,38 +345,115 @@ def _replace(state: GuiState, **changes: object) -> GuiState:
     return GuiState(**data)  # type: ignore[arg-type]
 
 
+def _char_width(char: str) -> int:
+    if not char:
+        return 0
+    if unicodedata.combining(char):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+
+
+def _display_width(text: str) -> int:
+    return sum(_char_width(ch) for ch in text)
+
+
 def _clip(text: str, width: int) -> str:
+    """Keep the trailing end of text within ``width`` terminal display cells."""
     if width < 1:
         return ""
-    if len(text) <= width:
+    if _display_width(text) <= width:
         return text
     if width == 1:
         return "…"
-    return "…" + text[-(width - 1) :]
+    budget = width - 1
+    kept: list[str] = []
+    used = 0
+    for ch in reversed(text):
+        w = _char_width(ch)
+        if used + w > budget:
+            break
+        kept.append(ch)
+        used += w
+    return "…" + "".join(reversed(kept))
+
+
+def _clip_right(text: str, width: int) -> str:
+    """Keep the leading prefix of text within ``width`` terminal display cells."""
+    if width < 1:
+        return ""
+    if _display_width(text) <= width:
+        return text
+    if width == 1:
+        return "…"
+    budget = width - 1
+    kept: list[str] = []
+    used = 0
+    for ch in text:
+        w = _char_width(ch)
+        if used + w > budget:
+            break
+        kept.append(ch)
+        used += w
+    return "".join(kept) + "…"
+
+
+def _ljust_cells(text: str, width: int) -> str:
+    clipped = _clip_right(text, width)
+    pad = max(0, width - _display_width(clipped))
+    return clipped + " " * pad
+
+
+def _split_word_cells(word: str, width: int) -> list[str]:
+    pieces: list[str] = []
+    current: list[str] = []
+    used = 0
+    for ch in word:
+        w = _char_width(ch)
+        if w > width:
+            continue
+        if current and used + w > width:
+            pieces.append("".join(current))
+            current = [ch]
+            used = w
+        else:
+            current.append(ch)
+            used += w
+    if current:
+        pieces.append("".join(current))
+    return pieces or [""]
 
 
 def _wrap(text: str, width: int) -> list[str]:
     if width < 8:
-        return [text[:width]]
+        return [_clip_right(text, max(1, width))]
     words = text.split()
     if not words:
         return [""]
     lines: list[str] = []
     current = ""
+    current_width = 0
     for word in words:
-        while len(word) > width:
-            piece = word[:width]
-            word = word[width:]
+        word_width = _display_width(word)
+        if word_width > width:
             if current:
                 lines.append(current)
                 current = ""
-            lines.append(piece)
-        candidate = word if not current else f"{current} {word}"
-        if len(candidate) <= width:
-            current = candidate
+                current_width = 0
+            chunks = _split_word_cells(word, width)
+            lines.extend(chunks[:-1])
+            current = chunks[-1]
+            current_width = _display_width(current)
+            continue
+        if not current:
+            current = word
+            current_width = word_width
+        elif current_width + 1 + word_width <= width:
+            current = f"{current} {word}"
+            current_width += 1 + word_width
         else:
             lines.append(current)
             current = word
+            current_width = word_width
     if current:
         lines.append(current)
     return lines
@@ -505,6 +583,38 @@ def _frame_origin(rows: int, block_len: int, logo_rows: int) -> int:
     return max(1, (rows - block_len - logo_rows) // 2)
 
 
+def _render_tiny_frame(size: launch.WindowSize, state: GuiState, *, clear: bool) -> bytes:
+    """Minimal frame when the physical terminal is smaller than 20x8."""
+    cols = max(1, size.cols)
+    rows = max(1, size.rows)
+    parts: list[bytes] = []
+    if clear:
+        parts.append(b"\x1b[2J\x1b[H")
+    else:
+        for erase_row in range(1, rows + 1):
+            parts.append(f"\x1b[{erase_row};1H\x1b[2K".encode("ascii"))
+    lines: list[str] = [_clip_right("ViperCapture", cols)]
+    if rows >= 2:
+        lines.append(_clip(state.url or "example.com", cols))
+    if rows >= 3:
+        if state.busy:
+            lines.append(_clip_right("Cancelling" if state.cancelling else "Capturing", cols))
+        elif state.error:
+            lines.append(_clip_right(state.error, cols))
+        elif state.saved:
+            lines.append(_clip_right(f"Saved {state.saved}", cols))
+        else:
+            lines.append(_clip_right(f"{state.output} {page_label(state.full_page)}", cols))
+    if rows >= 4:
+        lines.append(_clip_right(footer(state, max_width=cols), cols))
+    for row_index, text in enumerate(lines[:rows], start=1):
+        width = _display_width(text)
+        col = max(1, (cols - width) // 2 + 1)
+        parts.append(f"\x1b[{row_index};{col}H".encode("ascii"))
+        parts.append(text.encode("utf-8"))
+    return b"".join(parts)
+
+
 def render_frame(
     size: launch.WindowSize,
     state: GuiState,
@@ -517,6 +627,8 @@ def render_frame(
     logo_rows: int | None = None,
     origin: int | None = None,
 ) -> bytes:
+    if size.cols < 20 or size.rows < 8:
+        return _render_tiny_frame(size, state, clear=clear)
     cols, rows = _screen_bounds(size)
     if logo is None:
         logo, auto_cols, auto_rows = _logo_placement(size, protocol, png)
@@ -550,7 +662,7 @@ def render_frame(
         if row > rows:
             break
         shown = visible(line)
-        col = max(1, (cols - len(shown)) // 2 + 1)
+        col = max(1, (cols - _display_width(shown)) // 2 + 1)
         parts.append(f"\x1b[{row};{col}H".encode("ascii"))
         parts.append(line.encode("utf-8"))
         row += 1
@@ -571,17 +683,17 @@ def _color_panel(state: GuiState, width: int, plain: list[str]) -> list[str]:
             if state.url:
                 shown = _clip(state.url, editable_width)
             else:
-                shown = "example.com"[:editable_width]
-            pad = " " * max(0, editable_width - len(shown))
+                shown = _clip_right("example.com", editable_width)
+            pad = " " * max(0, editable_width - _display_width(shown))
             caret = "\x1b[7m \x1b[0m"
             if state.url:
                 body = shown + caret + pad
             else:
                 body = caret + f"\x1b[2m{shown}\x1b[0m" + pad
         elif state.error and index >= 2 and not state.busy:
-            body = f"\x1b[31m{text.ljust(inner)}\x1b[0m"
+            body = f"\x1b[31m{_ljust_cells(text, inner)}\x1b[0m"
         else:
-            body = text.ljust(inner)
+            body = _ljust_cells(text, inner)
         lines.append(bar + body + " \x1b[34m│\x1b[0m")
     lines.append(bottom)
     return lines
@@ -826,7 +938,15 @@ def _close_connection(connection: http.client.HTTPConnection) -> None:
     try:
         connection.close()
     except OSError:
-        return
+        pass
+    if sock is not None and hasattr(sock, "_real_close"):
+        # On Windows, HTTPResponse holds a makefile() io_ref on the socket so
+        # sock.close() defers closesocket() and leaves a worker thread blocked
+        # in recv_into() until timeout.
+        try:
+            sock._real_close()
+        except OSError:
+            pass
 
 
 class _CaptureResponse:
@@ -1316,6 +1436,7 @@ def run_capture_gui(viewport: tuple[int, int], directory: Path | None = None) ->
     launch.ensure_playwright()
     state = GuiState(viewport=viewport)
     started: subprocess.Popen[object] | None = None
+    worker_pid: int | None = None
     log_handle: object | None = None
     protocol = launch.choose_graphics_protocol()
     entered = False
@@ -1342,6 +1463,10 @@ def run_capture_gui(viewport: tuple[int, int], directory: Path | None = None) ->
                 drawer.draw(state)
                 _pause_for_quit()
                 return 1
+            if shutdown_token:
+                worker_pid = launch._record_endpoint_server_process(
+                    started.pid, shutdown_token, launch.PORT
+                )
             state = _replace(state, busy=False, progress=0)
         return _run_keys(state, directory, drawer, started_server=started is not None)
     except KeyboardInterrupt:
@@ -1351,7 +1476,7 @@ def run_capture_gui(viewport: tuple[int, int], directory: Path | None = None) ->
             _leave(protocol)
         _restore_windows_vt(vt_mode)
         if started is not None:
-            launch.stop_server(started, announce=False)
+            launch.stop_server(started, announce=False, worker_pid=worker_pid)
         if log_handle is not None:
             log_handle.close()  # type: ignore[union-attr]
 

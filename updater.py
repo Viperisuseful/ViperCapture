@@ -382,7 +382,13 @@ def write_shim(
             if any(char in python for char in "\r\n") or any(char in launch_text for char in "\r\n"):
                 raise UpdateError("The Windows command path cannot contain a newline.")
             config_path = path.with_suffix(".shim")
-            config_path.write_text(f"{python}\n{launch_text}\n", encoding="utf-8", newline="\n")
+            temporary = config_path.with_suffix(".shim.tmp")
+            try:
+                temporary.write_text(f"{python}\n{launch_text}\n", encoding="utf-8", newline="\n")
+                temporary.replace(config_path)
+            except Exception:
+                temporary.unlink(missing_ok=True)
+                raise
             return created
         text = f"@echo off\r\n{cmd_quote(python)} {cmd_quote(str(launch))} %*\r\n"
         chosen = encoding or cmd_encoding()

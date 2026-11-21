@@ -884,19 +884,24 @@ def stop_server(
     announce: bool = True,
     host: str = HOST,
     port: int = PORT,
+    worker_pid: int | None = None,
 ) -> None:
-    if server.poll() is not None:
-        _clear_server_record(server.pid)
+    if server.poll() is not None and (worker_pid is None or not _is_process_alive(worker_pid)):
+        if not _is_process_alive(server.pid):
+            _clear_server_record(server.pid)
+        if worker_pid is not None and worker_pid != server.pid and not _is_process_alive(worker_pid):
+            _clear_server_record(worker_pid)
         return
     if announce:
         print("\n  Stopping server...")
-    endpoint_pid = _is_vipercapture_endpoint(host=host, port=port)
-    worker_pid: int | None = None
-    if endpoint_pid is not None and (
-        endpoint_pid == server.pid or _is_descendant_pid(endpoint_pid, server.pid)
-    ):
-        worker_pid = endpoint_pid
-    target_pid = worker_pid if worker_pid is not None else server.pid
+    resolved_worker = worker_pid
+    if resolved_worker is None:
+        endpoint_pid = _is_vipercapture_endpoint(host=host, port=port)
+        if endpoint_pid is not None and (
+            endpoint_pid == server.pid or _is_descendant_pid(endpoint_pid, server.pid)
+        ):
+            resolved_worker = endpoint_pid
+    target_pid = resolved_worker if resolved_worker is not None else server.pid
     identity = _capture_process_identity(target_pid)
     requested = bool(
         identity is not None
@@ -904,16 +909,35 @@ def stop_server(
         and _request_server_shutdown(identity, host=host, port=port)
     )
     if not requested:
-        server.terminate()
+        if resolved_worker is not None and resolved_worker != server.pid:
+            if identity is not None and identity.kind == "server":
+                _terminate_process(identity, host=host, port=port)
+        if server.poll() is None:
+            server.terminate()
     try:
         server.wait(timeout=shutdown_grace_seconds())
     except subprocess.TimeoutExpired:
-        server.kill()
-        server.wait(timeout=5)
+        if resolved_worker is not None and resolved_worker != server.pid and _is_process_alive(resolved_worker):
+            worker_identity = _capture_process_identity(resolved_worker)
+            if worker_identity is not None and worker_identity.kind == "server":
+                _terminate_process(worker_identity, host=host, port=port)
+        if server.poll() is None:
+            server.kill()
+            server.wait(timeout=5)
     finally:
-        _clear_server_record(server.pid)
-        if worker_pid is not None and worker_pid != server.pid:
-            _clear_server_record(worker_pid)
+        # Ensure a Windows venvlauncher child worker never outlives its launcher.
+        if (
+            resolved_worker is not None
+            and resolved_worker != server.pid
+            and _is_process_alive(resolved_worker)
+        ):
+            worker_identity = identity if (identity is not None and identity.pid == resolved_worker) else _capture_process_identity(resolved_worker)
+            if worker_identity is not None and worker_identity.kind == "server":
+                _terminate_process(worker_identity, host=host, port=port)
+        if not _is_process_alive(server.pid):
+            _clear_server_record(server.pid)
+        if resolved_worker is not None and resolved_worker != server.pid and not _is_process_alive(resolved_worker):
+            _clear_server_record(resolved_worker)
     if announce:
         print("  Server stopped.")
 
@@ -1263,6 +1287,26 @@ def _is_vipercapture_endpoint(
     return pid
 
 
+def _has_matching_server_record(pid: int, root_dir: Path = ROOT) -> bool:
+    """True when this installation wrote a live runtime record matching pid and start time."""
+    if pid <= 0:
+        return False
+    started = _get_process_start_time(pid)
+    if started is None:
+        return False
+    try:
+        record = json.loads(_server_record_path(pid).read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        return False
+    return bool(
+        isinstance(record, dict)
+        and record.get("service") == "vipercapture"
+        and record.get("install_id") == _installation_id(root_dir)
+        and record.get("pid") == pid
+        and record.get("start_time") == started
+    )
+
+
 def _classify_pid_kind(pid: int, command: str, root_dir: Path = ROOT) -> str | None:
     """Classify a process command, including Windows venvlauncher child uvicorn workers."""
     kind = _vipercapture_process_kind(command, root_dir=root_dir)
@@ -1273,12 +1317,26 @@ def _classify_pid_kind(pid: int, command: str, root_dir: Path = ROOT) -> str | N
         if len(argv) >= 4 and argv[1:4] == ["-m", "uvicorn", "vipercapture.main:app"]:
             parent_pid = _get_parent_pid(pid)
             if parent_pid is not None:
-                parent_command = _get_pid_commandline(parent_pid)
-                if (
-                    parent_command
-                    and _vipercapture_process_kind(parent_command, root_dir=root_dir) == "server"
-                ):
-                    return "server"
+                parent_start = _get_process_start_time(parent_pid)
+                child_start = _get_process_start_time(pid)
+                start_order_ok = (
+                    parent_start is None
+                    or child_start is None
+                    or (
+                        isinstance(parent_start, int)
+                        and isinstance(child_start, int)
+                        and parent_start <= child_start
+                    )
+                )
+                if start_order_ok:
+                    parent_command = _get_pid_commandline(parent_pid)
+                    if (
+                        parent_command
+                        and _vipercapture_process_kind(parent_command, root_dir=root_dir) == "server"
+                    ):
+                        return "server"
+            if _has_matching_server_record(pid, root_dir=root_dir):
+                return "server"
     return None
 
 
@@ -1410,13 +1468,14 @@ def _find_vipercapture_candidate_pids(
         # Every other listener must independently pass exact command matching.
         for pid in listening_pids - {endpoint_pid}:
             cmd = _get_pid_commandline(pid)
-            if cmd and _matches_vipercapture_command(cmd, root_dir=root_dir):
+            if cmd and _classify_pid_kind(pid, cmd, root_dir=root_dir) is not None:
                 pids.add(pid)
 
     # 2. Process inspection by command line for this specific installation
     if sys.platform == "win32":
         try:
             ps_script = (
+                "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
                 "Get-CimInstance Win32_Process | ForEach-Object { "
                 "$cmd = $_.CommandLine; "
                 "if ($cmd -and ($cmd -match 'vipercapture' -or $cmd -match 'launch\\.py' -or $cmd -match 'gui\\.py')) { "
@@ -1426,7 +1485,8 @@ def _find_vipercapture_candidate_pids(
             out = subprocess.check_output(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
                 text=True,
-                errors="ignore",
+                encoding="utf-8",
+                errors="replace",
                 timeout=10,
             )
             for line in out.splitlines():
@@ -1437,7 +1497,7 @@ def _find_vipercapture_candidate_pids(
                 try:
                     proc_id = int(parts[0])
                     cmd = parts[1] if len(parts) > 1 else ""
-                    if proc_id not in exclude_pids and _matches_vipercapture_command(cmd, root_dir=root_dir):
+                    if proc_id not in exclude_pids and _classify_pid_kind(proc_id, cmd, root_dir=root_dir) is not None:
                         pids.add(proc_id)
                 except ValueError:
                     pass
@@ -1522,11 +1582,15 @@ def _get_pid_commandline(pid: int) -> str | None:
         return None
     if sys.platform == "win32":
         try:
-            ps_script = f"(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').CommandLine"
+            ps_script = (
+                "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
+                f"(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').CommandLine"
+            )
             out = subprocess.check_output(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
                 text=True,
-                errors="ignore",
+                encoding="utf-8",
+                errors="replace",
                 timeout=5,
             )
             return out.strip() or None
@@ -1619,12 +1683,16 @@ def _new_server_environment() -> tuple[dict[str, str], str]:
 
 
 def _prune_stale_server_records(root_dir: Path = ROOT) -> None:
-    """Remove runtime server records belonging to exited processes of this install."""
+    """Best-effort cleanup of runtime records belonging to exited processes of this install."""
     runtime_dir = Path.home() / ".vipercapture" / "runtime"
-    if not runtime_dir.is_dir():
+    try:
+        if not runtime_dir.is_dir():
+            return
+        candidates = list(runtime_dir.glob("server-*.json"))
+    except OSError:
         return
     install_id = _installation_id(root_dir)
-    for path in runtime_dir.glob("server-*.json"):
+    for path in candidates:
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError, UnicodeError):
@@ -1634,10 +1702,24 @@ def _prune_stale_server_records(root_dir: Path = ROOT) -> None:
         pid = record.get("pid")
         start_time = record.get("start_time")
         if type(pid) is not int or pid <= 0:
-            path.unlink(missing_ok=True)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
             continue
-        if not _is_process_alive(pid) or _get_process_start_time(pid) != start_time:
-            path.unlink(missing_ok=True)
+        alive = _is_process_alive(pid)
+        if not alive:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
+        current_start = _get_process_start_time(pid)
+        if current_start is not None and current_start != start_time:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _record_server_process(pid: int, token: str, port: int = PORT) -> bool:
@@ -1921,9 +2003,29 @@ def kill_all_instances(port: int = PORT) -> int:
 
     priority = {"server": 0, "launcher": 1, "gui": 1}
     active_server_pid = _is_vipercapture_endpoint(port=port)
+    parent_map = _windows_parent_map() if sys.platform == "win32" else {}
+
+    def _ancestor_depth(pid: int) -> int:
+        depth = 0
+        seen = {pid}
+        cur = pid
+        while cur in parent_map and parent_map[cur] > 4:
+            cur = parent_map[cur]
+            if cur in seen:
+                break
+            seen.add(cur)
+            if cur in processes:
+                depth += 1
+        return depth
+
     ordered = sorted(
         processes.values(),
-        key=lambda item: (priority[item.kind], 0 if item.pid == active_server_pid else 1, item.pid),
+        key=lambda item: (
+            priority[item.kind],
+            0 if item.pid == active_server_pid else 1,
+            -_ancestor_depth(item.pid),
+            item.pid,
+        ),
     )
 
     for identity in ordered:
@@ -2057,6 +2159,7 @@ def wait_for_shutdown(
     *,
     on_resize: Callable[[], None] | None = None,
     announce: bool = True,
+    worker_pid: int | None = None,
 ) -> bool:
     """Block until Esc twice, Ctrl+C, or the server exits.
 
@@ -2072,11 +2175,16 @@ def wait_for_shutdown(
     except KeyboardInterrupt:
         pass
     exited = server.poll() is not None
-    stop_server(server, announce=announce)
+    stop_server(server, announce=announce, worker_pid=worker_pid)
     return exited
 
 
-def present_running_server(server: subprocess.Popen[object], log_path: Path) -> None:
+def present_running_server(
+    server: subprocess.Popen[object],
+    log_path: Path,
+    *,
+    worker_pid: int | None = None,
+) -> None:
     """Full-screen status here, request log in another window of this terminal."""
     screen: StatusScreen | None = None
     # Alternate-screen and image escapes belong on a terminal. Redirected
@@ -2087,14 +2195,20 @@ def present_running_server(server: subprocess.Popen[object], log_path: Path) -> 
         print(ready_banner())
         if not open_request_window(log_path, os.getpid()):
             print(f"  Requests: {log_path}")
-        wait_for_shutdown(server)
+        if worker_pid is not None:
+            wait_for_shutdown(server, worker_pid=worker_pid)
+        else:
+            wait_for_shutdown(server)
         return
     try:
         screen.enter()
         if not open_request_window(log_path, os.getpid()):
             screen.note = f"Requests: {log_path}"
             screen.draw()
-        exited = wait_for_shutdown(server, on_resize=screen.draw, announce=False)
+        if worker_pid is not None:
+            exited = wait_for_shutdown(server, on_resize=screen.draw, announce=False, worker_pid=worker_pid)
+        else:
+            exited = wait_for_shutdown(server, on_resize=screen.draw, announce=False)
     finally:
         screen.leave()
     if exited:
@@ -2470,6 +2584,47 @@ def in_project_venv(prefix: str | Path | None = None, venv: str | Path | None = 
 
 # ── Setup steps ───────────────────────────────────────────────
 
+def _acquire_venv_lock(lock_path: Path, timeout: float = 120.0) -> int | None:
+    """Serialize concurrent .venv creation per installation."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+            return fd
+        except FileExistsError:
+            try:
+                holder = int(lock_path.read_text(encoding="ascii").strip())
+                if holder > 0 and not _is_process_alive(holder):
+                    lock_path.unlink(missing_ok=True)
+                    continue
+            except (OSError, ValueError):
+                try:
+                    if time.time() - lock_path.stat().st_mtime > timeout:
+                        lock_path.unlink(missing_ok=True)
+                        continue
+                except OSError:
+                    continue
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.2)
+        except OSError:
+            return None
+
+
+def _release_venv_lock(lock_path: Path, fd: int | None) -> None:
+    if fd is None:
+        return
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        lock_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def ensure_venv() -> None:
     """
     If the venv doesn't exist yet, create it.
@@ -2478,23 +2633,31 @@ def ensure_venv() -> None:
     """
     venv_dir = ROOT / ".venv"
     if not VENV_PYTHON.exists():
-        uv = find_uv()
-        installer = "uv" if uv else "venv"
-        print(f"  [1/3] Creating Python environment with {installer} (first run only)...")
-        command = venv_command(sys.executable, venv_dir, uv)
-        result = subprocess.run([str(c) for c in command])
-        if result.returncode != 0:
-            # A failed stdlib venv (for example when ensurepip is missing) can
-            # leave Scripts/python.exe behind and wedge later launches.
-            shutil.rmtree(venv_dir, ignore_errors=True)
-            print(f"\n  ERROR ({installer} venv): command exited with code {result.returncode}")
-            print(f"  Command: {' '.join(str(c) for c in command)}")
-            if not uv:
-                print(
-                    "  Install uv (https://docs.astral.sh/uv/) or ensure Python's "
-                    "venv/ensurepip module is installed, then rerun."
-                )
-            wait_and_exit(1)
+        lock_path = ROOT / ".venv.lock"
+        lock_fd = _acquire_venv_lock(lock_path)
+        try:
+            if not VENV_PYTHON.exists():
+                existed_before = venv_dir.exists()
+                uv = find_uv()
+                installer = "uv" if uv else "venv"
+                print(f"  [1/3] Creating Python environment with {installer} (first run only)...")
+                command = venv_command(sys.executable, venv_dir, uv)
+                result = subprocess.run([str(c) for c in command])
+                if result.returncode != 0:
+                    if not existed_before:
+                        shutil.rmtree(venv_dir, ignore_errors=True)
+                    print(f"\n  ERROR ({installer} venv): command exited with code {result.returncode}")
+                    print(f"  Command: {' '.join(str(c) for c in command)}")
+                    if VENV_PYTHON.exists():
+                        print(f"  Note: incomplete environment files remain in {venv_dir}; delete that folder before rerunning.")
+                    if not uv:
+                        print(
+                            "  Install uv (https://docs.astral.sh/uv/) or ensure Python's "
+                            "venv/ensurepip module is installed, then rerun."
+                        )
+                    wait_and_exit(1)
+        finally:
+            _release_venv_lock(lock_path, lock_fd)
 
     if not in_project_venv():
         # Hand off to the venv Python — this process becomes just a waiter.
@@ -2794,9 +2957,10 @@ def main() -> None:
     else:
         print("  Waiting for server to be ready...", end="", flush=True)
     ready = False
+    worker_pid: int | None = None
     for _ in range(30):
         if port_open():
-            _record_endpoint_server_process(server.pid, shutdown_token, PORT)
+            worker_pid = _record_endpoint_server_process(server.pid, shutdown_token, PORT)
             ready = True
             break
         if server.poll() is not None:
@@ -2821,7 +2985,7 @@ def main() -> None:
         else:
             print("  Check the output above for details.")
         if server.poll() is None:
-            server.terminate()
+            stop_server(server, announce=False, worker_pid=worker_pid)
         if log_handle is not None:
             log_handle.close()
         wait_and_exit(1)
@@ -2832,10 +2996,10 @@ def main() -> None:
         if one_window:
             show_terminal_logo()
             print(ready_banner())
-            if wait_for_shutdown(server):
+            if wait_for_shutdown(server, worker_pid=worker_pid):
                 print("\n  Server exited.")
         else:
-            present_running_server(server, log_path)
+            present_running_server(server, log_path, worker_pid=worker_pid)
     finally:
         if log_handle is not None:
             log_handle.close()
