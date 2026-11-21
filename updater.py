@@ -377,6 +377,19 @@ def write_shim(
     created = not path.exists()
     path.parent.mkdir(parents=True, exist_ok=True)
     if platform_name == "win32":
+        if path.suffix.lower() == ".exe":
+            launch_text = str(launch)
+            if any(char in python for char in "\r\n") or any(char in launch_text for char in "\r\n"):
+                raise UpdateError("The Windows command path cannot contain a newline.")
+            config_path = path.with_suffix(".shim")
+            temporary = config_path.with_suffix(".shim.tmp")
+            try:
+                temporary.write_text(f"{python}\n{launch_text}\n", encoding="utf-8", newline="\n")
+                temporary.replace(config_path)
+            except Exception:
+                temporary.unlink(missing_ok=True)
+                raise
+            return created
         text = f"@echo off\r\n{cmd_quote(python)} {cmd_quote(str(launch))} %*\r\n"
         chosen = encoding or cmd_encoding()
         try:
@@ -398,6 +411,11 @@ def write_shim(
 
 
 def read_shim_text(path: Path, platform_name: str) -> str:
+    if platform_name == "win32" and path.suffix.lower() == ".exe":
+        config_path = path.with_suffix(".shim")
+        if config_path.is_file():
+            return config_path.read_text(encoding="utf-8", errors="replace")
+        return ""
     data = path.read_bytes()
     if platform_name == "win32":
         for encoding in (cmd_encoding(), "utf-8"):
@@ -416,7 +434,11 @@ def shims_for_install(
     home: Path,
 ) -> list[Path]:
     launch = str(app / "launch.py")
-    names = ("vipercapture.cmd", "vipercapture") if platform_name == "win32" else ("vipercapture",)
+    names = (
+        ("vipercapture.exe", "vipercapture.cmd", "vipercapture")
+        if platform_name == "win32"
+        else ("vipercapture",)
+    )
     found: list[Path] = []
     seen: set[Path] = set()
     for directory in path_env.split(os.pathsep):
@@ -440,6 +462,9 @@ def shims_for_install(
     if found:
         return found
     if platform_name == "win32":
+        exe_shim = app.parent / "bin" / "vipercapture.exe"
+        if exe_shim.is_file():
+            return [exe_shim]
         return [app.parent / "bin" / "vipercapture.cmd"]
     return [home / ".local" / "bin" / "vipercapture"]
 

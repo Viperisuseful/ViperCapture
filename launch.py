@@ -884,73 +884,156 @@ def stop_server(
     announce: bool = True,
     host: str = HOST,
     port: int = PORT,
+    worker_pid: int | None = None,
 ) -> None:
-    if server.poll() is not None:
-        _clear_server_record(server.pid)
+    if server.poll() is not None and (worker_pid is None or not _is_process_alive(worker_pid)):
+        if not _is_process_alive(server.pid):
+            _clear_server_record(server.pid)
+        if worker_pid is not None and worker_pid != server.pid and not _is_process_alive(worker_pid):
+            _clear_server_record(worker_pid)
         return
     if announce:
         print("\n  Stopping server...")
-    identity = _capture_process_identity(server.pid)
+    resolved_worker = worker_pid
+    if resolved_worker is None:
+        endpoint_pid = _is_vipercapture_endpoint(host=host, port=port)
+        if endpoint_pid is not None and (
+            endpoint_pid == server.pid or _is_descendant_pid(endpoint_pid, server.pid)
+        ):
+            resolved_worker = endpoint_pid
+    target_pid = resolved_worker if resolved_worker is not None else server.pid
+    identity = _capture_process_identity(target_pid)
     requested = bool(
         identity is not None
         and identity.kind == "server"
         and _request_server_shutdown(identity, host=host, port=port)
     )
     if not requested:
-        server.terminate()
+        if resolved_worker is not None and resolved_worker != server.pid:
+            if identity is not None and identity.kind == "server":
+                _terminate_process(identity, host=host, port=port)
+        if server.poll() is None:
+            server.terminate()
     try:
         server.wait(timeout=shutdown_grace_seconds())
     except subprocess.TimeoutExpired:
-        server.kill()
-        server.wait(timeout=5)
+        if resolved_worker is not None and resolved_worker != server.pid and _is_process_alive(resolved_worker):
+            worker_identity = _capture_process_identity(resolved_worker)
+            if worker_identity is not None and worker_identity.kind == "server":
+                _terminate_process(worker_identity, host=host, port=port)
+        if server.poll() is None:
+            server.kill()
+            server.wait(timeout=5)
     finally:
-        _clear_server_record(server.pid)
+        # Ensure a Windows venvlauncher child worker never outlives its launcher.
+        if (
+            resolved_worker is not None
+            and resolved_worker != server.pid
+            and _is_process_alive(resolved_worker)
+        ):
+            worker_identity = identity if (identity is not None and identity.pid == resolved_worker) else _capture_process_identity(resolved_worker)
+            if worker_identity is not None and worker_identity.kind == "server":
+                _terminate_process(worker_identity, host=host, port=port)
+        if not _is_process_alive(server.pid):
+            _clear_server_record(server.pid)
+        if resolved_worker is not None and resolved_worker != server.pid and not _is_process_alive(resolved_worker):
+            _clear_server_record(resolved_worker)
     if announce:
         print("  Server stopped.")
+
+
+def _windows_parent_map() -> dict[int, int]:
+    """Return {pid: ppid} on Windows via CreateToolhelp32Snapshot."""
+    if sys.platform != "win32":
+        return {}
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        TH32CS_SNAPPROCESS = 0x00000002
+        INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_wchar * 260),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_snapshot = kernel32.CreateToolhelp32Snapshot
+        create_snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        create_snapshot.restype = wintypes.HANDLE
+        process_first = kernel32.Process32FirstW
+        process_first.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+        process_first.restype = wintypes.BOOL
+        process_next = kernel32.Process32NextW
+        process_next.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+        process_next.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        hSnapshot = create_snapshot(TH32CS_SNAPPROCESS, 0)
+        if not hSnapshot or hSnapshot == INVALID_HANDLE_VALUE:
+            return {}
+        try:
+            pe = PROCESSENTRY32W()
+            pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            parents: dict[int, int] = {}
+            success = process_first(hSnapshot, ctypes.byref(pe))
+            while success:
+                parents[pe.th32ProcessID] = pe.th32ParentProcessID
+                success = process_next(hSnapshot, ctypes.byref(pe))
+            return parents
+        finally:
+            close_handle(hSnapshot)
+    except Exception:
+        return {}
+
+
+def _get_parent_pid(pid: int) -> int | None:
+    if pid <= 0:
+        return None
+    if sys.platform == "win32":
+        ppid = _windows_parent_map().get(pid)
+        return ppid if ppid and ppid > 4 else None
+    return None
+
+
+def _is_descendant_pid(child_pid: int, ancestor_pid: int) -> bool:
+    if child_pid <= 0 or ancestor_pid <= 0 or child_pid == ancestor_pid:
+        return False
+    if sys.platform == "win32":
+        parents = _windows_parent_map()
+        seen: set[int] = {child_pid}
+        cur = child_pid
+        while cur in parents and parents[cur] > 4:
+            cur = parents[cur]
+            if cur == ancestor_pid:
+                return True
+            if cur in seen:
+                break
+            seen.add(cur)
+    return False
 
 
 def _get_process_ancestors() -> set[int]:
     """Return the set of PIDs covering current process and all its ancestors."""
     ancestors = {os.getpid()}
     if sys.platform == "win32":
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            TH32CS_SNAPPROCESS = 0x00000002
-
-            class PROCESSENTRY32(ctypes.Structure):
-                _fields_ = [
-                    ("dwSize", wintypes.DWORD),
-                    ("cntUsage", wintypes.DWORD),
-                    ("th32ProcessID", wintypes.DWORD),
-                    ("th32DefaultHeapID", ctypes.c_size_t),
-                    ("th32ModuleID", wintypes.DWORD),
-                    ("cntThreads", wintypes.DWORD),
-                    ("th32ParentProcessID", wintypes.DWORD),
-                    ("pcPriClassBase", wintypes.LONG),
-                    ("dwFlags", wintypes.DWORD),
-                    ("szExeFile", ctypes.c_char * 260),
-                ]
-
-            kernel32 = ctypes.windll.kernel32
-            hSnapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-            if hSnapshot and hSnapshot != -1:
-                pe = PROCESSENTRY32()
-                pe.dwSize = ctypes.sizeof(PROCESSENTRY32)
-                parents: dict[int, int] = {}
-                success = kernel32.Process32First(hSnapshot, ctypes.byref(pe))
-                while success:
-                    parents[pe.th32ProcessID] = pe.th32ParentProcessID
-                    success = kernel32.Process32Next(hSnapshot, ctypes.byref(pe))
-                kernel32.CloseHandle(hSnapshot)
-
-                cur = os.getpid()
-                while cur in parents and parents[cur] > 4 and parents[cur] not in ancestors:
-                    cur = parents[cur]
-                    ancestors.add(cur)
-        except Exception:
-            pass
+        parents = _windows_parent_map()
+        cur = os.getpid()
+        while cur in parents and parents[cur] > 4 and parents[cur] not in ancestors:
+            cur = parents[cur]
+            ancestors.add(cur)
     elif sys.platform == "linux":
         try:
             cur = os.getpid()
@@ -1204,6 +1287,59 @@ def _is_vipercapture_endpoint(
     return pid
 
 
+def _has_matching_server_record(pid: int, root_dir: Path = ROOT) -> bool:
+    """True when this installation wrote a live runtime record matching pid and start time."""
+    if pid <= 0:
+        return False
+    started = _get_process_start_time(pid)
+    if started is None:
+        return False
+    try:
+        record = json.loads(_server_record_path(pid).read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        return False
+    return bool(
+        isinstance(record, dict)
+        and record.get("service") == "vipercapture"
+        and record.get("install_id") == _installation_id(root_dir)
+        and record.get("pid") == pid
+        and record.get("start_time") == started
+    )
+
+
+def _classify_pid_kind(pid: int, command: str, root_dir: Path = ROOT) -> str | None:
+    """Classify a process command, including Windows venvlauncher child uvicorn workers."""
+    kind = _vipercapture_process_kind(command, root_dir=root_dir)
+    if kind is not None:
+        return kind
+    if sys.platform == "win32":
+        argv = _split_process_command(command)
+        if len(argv) >= 4 and argv[1:4] == ["-m", "uvicorn", "vipercapture.main:app"]:
+            parent_pid = _get_parent_pid(pid)
+            if parent_pid is not None:
+                parent_start = _get_process_start_time(parent_pid)
+                child_start = _get_process_start_time(pid)
+                start_order_ok = (
+                    parent_start is None
+                    or child_start is None
+                    or (
+                        isinstance(parent_start, int)
+                        and isinstance(child_start, int)
+                        and parent_start <= child_start
+                    )
+                )
+                if start_order_ok:
+                    parent_command = _get_pid_commandline(parent_pid)
+                    if (
+                        parent_command
+                        and _vipercapture_process_kind(parent_command, root_dir=root_dir) == "server"
+                    ):
+                        return "server"
+            if _has_matching_server_record(pid, root_dir=root_dir):
+                return "server"
+    return None
+
+
 def _capture_process_identity(pid: int, root_dir: Path = ROOT) -> ProcessIdentity | None:
     """Atomically-enough bind a PID to its start time and exact command identity."""
     if pid <= 0:
@@ -1214,7 +1350,7 @@ def _capture_process_identity(pid: int, root_dir: Path = ROOT) -> ProcessIdentit
     command = _get_pid_commandline(pid)
     if not command:
         return None
-    kind = _vipercapture_process_kind(command, root_dir=root_dir)
+    kind = _classify_pid_kind(pid, command, root_dir=root_dir)
     if kind is None:
         return None
     started_after = _get_process_start_time(pid)
@@ -1233,7 +1369,7 @@ def _process_identity_matches(identity: ProcessIdentity, root_dir: Path = ROOT) 
         return False
     if _split_process_command(command) != _split_process_command(identity.command):
         return False
-    if _vipercapture_process_kind(command, root_dir=root_dir) != identity.kind:
+    if _classify_pid_kind(identity.pid, command, root_dir=root_dir) != identity.kind:
         return False
     return _get_process_start_time(identity.pid) == identity.start_time
 
@@ -1332,13 +1468,14 @@ def _find_vipercapture_candidate_pids(
         # Every other listener must independently pass exact command matching.
         for pid in listening_pids - {endpoint_pid}:
             cmd = _get_pid_commandline(pid)
-            if cmd and _matches_vipercapture_command(cmd, root_dir=root_dir):
+            if cmd and _classify_pid_kind(pid, cmd, root_dir=root_dir) is not None:
                 pids.add(pid)
 
     # 2. Process inspection by command line for this specific installation
     if sys.platform == "win32":
         try:
             ps_script = (
+                "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
                 "Get-CimInstance Win32_Process | ForEach-Object { "
                 "$cmd = $_.CommandLine; "
                 "if ($cmd -and ($cmd -match 'vipercapture' -or $cmd -match 'launch\\.py' -or $cmd -match 'gui\\.py')) { "
@@ -1348,7 +1485,8 @@ def _find_vipercapture_candidate_pids(
             out = subprocess.check_output(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
                 text=True,
-                errors="ignore",
+                encoding="utf-8",
+                errors="replace",
                 timeout=10,
             )
             for line in out.splitlines():
@@ -1359,7 +1497,7 @@ def _find_vipercapture_candidate_pids(
                 try:
                     proc_id = int(parts[0])
                     cmd = parts[1] if len(parts) > 1 else ""
-                    if proc_id not in exclude_pids and _matches_vipercapture_command(cmd, root_dir=root_dir):
+                    if proc_id not in exclude_pids and _classify_pid_kind(proc_id, cmd, root_dir=root_dir) is not None:
                         pids.add(proc_id)
                 except ValueError:
                     pass
@@ -1444,11 +1582,15 @@ def _get_pid_commandline(pid: int) -> str | None:
         return None
     if sys.platform == "win32":
         try:
-            ps_script = f"(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').CommandLine"
+            ps_script = (
+                "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
+                f"(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').CommandLine"
+            )
             out = subprocess.check_output(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
                 text=True,
-                errors="ignore",
+                encoding="utf-8",
+                errors="replace",
                 timeout=5,
             )
             return out.strip() or None
@@ -1540,7 +1682,48 @@ def _new_server_environment() -> tuple[dict[str, str], str]:
     return env, token
 
 
+def _prune_stale_server_records(root_dir: Path = ROOT) -> None:
+    """Best-effort cleanup of runtime records belonging to exited processes of this install."""
+    runtime_dir = Path.home() / ".vipercapture" / "runtime"
+    try:
+        if not runtime_dir.is_dir():
+            return
+        candidates = list(runtime_dir.glob("server-*.json"))
+    except OSError:
+        return
+    install_id = _installation_id(root_dir)
+    for path in candidates:
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            continue
+        if not isinstance(record, dict) or record.get("install_id") != install_id:
+            continue
+        pid = record.get("pid")
+        start_time = record.get("start_time")
+        if type(pid) is not int or pid <= 0:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
+        alive = _is_process_alive(pid)
+        if not alive:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
+        current_start = _get_process_start_time(pid)
+        if current_start is not None and current_start != start_time:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def _record_server_process(pid: int, token: str, port: int = PORT) -> bool:
+    _prune_stale_server_records()
     started = _get_process_start_time(pid)
     if started is None:
         return False
@@ -1565,6 +1748,23 @@ def _record_server_process(pid: int, token: str, port: int = PORT) -> bool:
         return True
     except OSError:
         return False
+
+
+def _record_endpoint_server_process(
+    launcher_pid: int,
+    token: str,
+    port: int = PORT,
+    *,
+    host: str = HOST,
+) -> int | None:
+    """Record the listening worker PID when a Windows venvlauncher spawns a child."""
+    endpoint_pid = _is_vipercapture_endpoint(host=host, port=port)
+    if endpoint_pid is None:
+        return None
+    if endpoint_pid != launcher_pid and _is_descendant_pid(endpoint_pid, launcher_pid):
+        _record_server_process(endpoint_pid, token, port)
+        return endpoint_pid
+    return endpoint_pid if endpoint_pid == launcher_pid else None
 
 
 def _clear_server_record(pid: int) -> None:
@@ -1802,7 +2002,31 @@ def kill_all_instances(port: int = PORT) -> int:
     failed_pids: dict[int, str] = {}
 
     priority = {"server": 0, "launcher": 1, "gui": 1}
-    ordered = sorted(processes.values(), key=lambda item: (priority[item.kind], item.pid))
+    active_server_pid = _is_vipercapture_endpoint(port=port)
+    parent_map = _windows_parent_map() if sys.platform == "win32" else {}
+
+    def _ancestor_depth(pid: int) -> int:
+        depth = 0
+        seen = {pid}
+        cur = pid
+        while cur in parent_map and parent_map[cur] > 4:
+            cur = parent_map[cur]
+            if cur in seen:
+                break
+            seen.add(cur)
+            if cur in processes:
+                depth += 1
+        return depth
+
+    ordered = sorted(
+        processes.values(),
+        key=lambda item: (
+            priority[item.kind],
+            0 if item.pid == active_server_pid else 1,
+            -_ancestor_depth(item.pid),
+            item.pid,
+        ),
+    )
 
     for identity in ordered:
         pid = identity.pid
@@ -1813,6 +2037,8 @@ def kill_all_instances(port: int = PORT) -> int:
             permission_errors.append(pid)
         else:
             failed_pids[pid] = reason or "unknown error"
+
+    _prune_stale_server_records()
 
     # Wait briefly for port to close if listening server was targeted
     deadline = time.monotonic() + 3.0
@@ -1933,6 +2159,7 @@ def wait_for_shutdown(
     *,
     on_resize: Callable[[], None] | None = None,
     announce: bool = True,
+    worker_pid: int | None = None,
 ) -> bool:
     """Block until Esc twice, Ctrl+C, or the server exits.
 
@@ -1948,11 +2175,16 @@ def wait_for_shutdown(
     except KeyboardInterrupt:
         pass
     exited = server.poll() is not None
-    stop_server(server, announce=announce)
+    stop_server(server, announce=announce, worker_pid=worker_pid)
     return exited
 
 
-def present_running_server(server: subprocess.Popen[object], log_path: Path) -> None:
+def present_running_server(
+    server: subprocess.Popen[object],
+    log_path: Path,
+    *,
+    worker_pid: int | None = None,
+) -> None:
     """Full-screen status here, request log in another window of this terminal."""
     screen: StatusScreen | None = None
     # Alternate-screen and image escapes belong on a terminal. Redirected
@@ -1963,14 +2195,20 @@ def present_running_server(server: subprocess.Popen[object], log_path: Path) -> 
         print(ready_banner())
         if not open_request_window(log_path, os.getpid()):
             print(f"  Requests: {log_path}")
-        wait_for_shutdown(server)
+        if worker_pid is not None:
+            wait_for_shutdown(server, worker_pid=worker_pid)
+        else:
+            wait_for_shutdown(server)
         return
     try:
         screen.enter()
         if not open_request_window(log_path, os.getpid()):
             screen.note = f"Requests: {log_path}"
             screen.draw()
-        exited = wait_for_shutdown(server, on_resize=screen.draw, announce=False)
+        if worker_pid is not None:
+            exited = wait_for_shutdown(server, on_resize=screen.draw, announce=False, worker_pid=worker_pid)
+        else:
+            exited = wait_for_shutdown(server, on_resize=screen.draw, announce=False)
     finally:
         screen.leave()
     if exited:
@@ -1991,12 +2229,20 @@ def _req_hash() -> str:
     return hashlib.md5(req.read_bytes()).hexdigest() if req.exists() else ""
 
 
-def find_uv() -> str | None:
+def find_uv(*, home: Path | None = None) -> str | None:
     """Return the uv executable when it should be used, otherwise None."""
     flag = os.environ.get("VIPERCAPTURE_USE_UV", "").strip().lower()
     if flag in {"0", "false", "no", "off"}:
         return None
-    return shutil.which("uv")
+    found = shutil.which("uv")
+    if found:
+        return found
+    base = Path.home() if home is None else home
+    name = "uv.exe" if os.name == "nt" else "uv"
+    for candidate in (base / ".local" / "bin" / name, base / ".cargo" / "bin" / name):
+        if candidate.is_file() and (os.name == "nt" or os.access(candidate, os.X_OK)):
+            return str(candidate)
+    return None
 
 
 def venv_command(python: str, venv_dir: Path, uv: str | None) -> list[str]:
@@ -2308,6 +2554,16 @@ def _venv_has_pip(python: str) -> bool:
     return result.returncode == 0
 
 
+def _bootstrap_venv_pip(python: str) -> bool:
+    """Bootstrap pip inside a venv created without it (for example by uv venv)."""
+    result = subprocess.run(
+        [python, "-m", "ensurepip", "--upgrade"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0 and _venv_has_pip(python)
+
+
 def in_project_venv(prefix: str | Path | None = None, venv: str | Path | None = None) -> bool:
     """True when this process is the project venv, not the base interpreter.
 
@@ -2328,18 +2584,80 @@ def in_project_venv(prefix: str | Path | None = None, venv: str | Path | None = 
 
 # ── Setup steps ───────────────────────────────────────────────
 
+def _acquire_venv_lock(lock_path: Path, timeout: float = 120.0) -> int | None:
+    """Serialize concurrent .venv creation per installation."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+            return fd
+        except FileExistsError:
+            try:
+                holder = int(lock_path.read_text(encoding="ascii").strip())
+                if holder > 0 and not _is_process_alive(holder):
+                    lock_path.unlink(missing_ok=True)
+                    continue
+            except (OSError, ValueError):
+                try:
+                    if time.time() - lock_path.stat().st_mtime > timeout:
+                        lock_path.unlink(missing_ok=True)
+                        continue
+                except OSError:
+                    continue
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.2)
+        except OSError:
+            return None
+
+
+def _release_venv_lock(lock_path: Path, fd: int | None) -> None:
+    if fd is None:
+        return
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        lock_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def ensure_venv() -> None:
     """
     If the venv doesn't exist yet, create it.
     If we're not running from the venv Python, re-launch with it so
     all subsequent imports and subprocess calls use the right Python.
     """
+    venv_dir = ROOT / ".venv"
     if not VENV_PYTHON.exists():
-        uv = find_uv()
-        installer = "uv" if uv else "venv"
-        print(f"  [1/3] Creating Python environment with {installer} (first run only)...")
-        command = venv_command(sys.executable, ROOT / ".venv", uv)
-        run(*command, label=f"{installer} venv")
+        lock_path = ROOT / ".venv.lock"
+        lock_fd = _acquire_venv_lock(lock_path)
+        try:
+            if not VENV_PYTHON.exists():
+                existed_before = venv_dir.exists()
+                uv = find_uv()
+                installer = "uv" if uv else "venv"
+                print(f"  [1/3] Creating Python environment with {installer} (first run only)...")
+                command = venv_command(sys.executable, venv_dir, uv)
+                result = subprocess.run([str(c) for c in command])
+                if result.returncode != 0:
+                    if not existed_before:
+                        shutil.rmtree(venv_dir, ignore_errors=True)
+                    print(f"\n  ERROR ({installer} venv): command exited with code {result.returncode}")
+                    print(f"  Command: {' '.join(str(c) for c in command)}")
+                    if VENV_PYTHON.exists():
+                        print(f"  Note: incomplete environment files remain in {venv_dir}; delete that folder before rerunning.")
+                    if not uv:
+                        print(
+                            "  Install uv (https://docs.astral.sh/uv/) or ensure Python's "
+                            "venv/ensurepip module is installed, then rerun."
+                        )
+                    wait_and_exit(1)
+        finally:
+            _release_venv_lock(lock_path, lock_fd)
 
     if not in_project_venv():
         # Hand off to the venv Python — this process becomes just a waiter.
@@ -2356,7 +2674,7 @@ def ensure_deps() -> None:
     """
     current_hash = _req_hash()
     if DEPS_STAMP.exists() and DEPS_STAMP.read_text().strip() == current_hash:
-        print("  [2/3] Python packages already up to date — skipping.")
+        print("  [2/3] Python packages already up to date - skipping.")
         return
 
     uv = find_uv()
@@ -2367,9 +2685,11 @@ def ensure_deps() -> None:
         print("  [2/3] Installing Python packages with uv...")
     else:
         if not _venv_has_pip(python):
-            print("\n  ERROR: pip is not available in .venv and uv was not found.")
-            print("  Install uv (https://docs.astral.sh/uv/) or delete .venv and rerun.")
-            wait_and_exit(1)
+            print("  [2/3] Bootstrapping pip in .venv...")
+            if not _bootstrap_venv_pip(python):
+                print("\n  ERROR: pip is not available in .venv and uv was not found.")
+                print("  Install uv (https://docs.astral.sh/uv/) or delete .venv and rerun.")
+                wait_and_exit(1)
         print("  [2/3] Installing Python packages...")
 
     intel_macos = is_intel_macos()
@@ -2413,7 +2733,7 @@ def ensure_playwright() -> None:
         PLAYWRIGHT_STAMP.exists()
         and PLAYWRIGHT_STAMP.read_text().strip() == playwright_stamp
     ):
-        print("  [3/3] Playwright browsers already installed — skipping.")
+        print("  [3/3] Playwright browsers already installed - skipping.")
         return
 
     print("  [3/3] Installing Playwright browsers...")
@@ -2556,7 +2876,18 @@ def use_one_window(one_window: bool, platform_name: str | None = None) -> bool:
     return one_window or platform_name == "win32"
 
 
+def _configure_console_streams() -> None:
+    """Prevent UnicodeEncodeError on legacy Windows OEM code pages (for example cp437)."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except Exception:
+                pass
+
+
 def main() -> None:
+    _configure_console_streams()
     # Parsed before the venv re-exec so --help and update do not install
     # dependencies or start the server. ensure_venv re-runs this file with
     # the same arguments when the command is a normal launch.
@@ -2626,8 +2957,10 @@ def main() -> None:
     else:
         print("  Waiting for server to be ready...", end="", flush=True)
     ready = False
+    worker_pid: int | None = None
     for _ in range(30):
         if port_open():
+            worker_pid = _record_endpoint_server_process(server.pid, shutdown_token, PORT)
             ready = True
             break
         if server.poll() is not None:
@@ -2652,7 +2985,7 @@ def main() -> None:
         else:
             print("  Check the output above for details.")
         if server.poll() is None:
-            server.terminate()
+            stop_server(server, announce=False, worker_pid=worker_pid)
         if log_handle is not None:
             log_handle.close()
         wait_and_exit(1)
@@ -2663,10 +2996,10 @@ def main() -> None:
         if one_window:
             show_terminal_logo()
             print(ready_banner())
-            if wait_for_shutdown(server):
+            if wait_for_shutdown(server, worker_pid=worker_pid):
                 print("\n  Server exited.")
         else:
-            present_running_server(server, log_path)
+            present_running_server(server, log_path, worker_pid=worker_pid)
     finally:
         if log_handle is not None:
             log_handle.close()

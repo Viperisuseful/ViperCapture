@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -344,44 +345,121 @@ def _replace(state: GuiState, **changes: object) -> GuiState:
     return GuiState(**data)  # type: ignore[arg-type]
 
 
+def _char_width(char: str) -> int:
+    if not char:
+        return 0
+    if unicodedata.combining(char):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+
+
+def _display_width(text: str) -> int:
+    return sum(_char_width(ch) for ch in text)
+
+
 def _clip(text: str, width: int) -> str:
+    """Keep the trailing end of text within ``width`` terminal display cells."""
     if width < 1:
         return ""
-    if len(text) <= width:
+    if _display_width(text) <= width:
         return text
     if width == 1:
         return "…"
-    return "…" + text[-(width - 1) :]
+    budget = width - 1
+    kept: list[str] = []
+    used = 0
+    for ch in reversed(text):
+        w = _char_width(ch)
+        if used + w > budget:
+            break
+        kept.append(ch)
+        used += w
+    return "…" + "".join(reversed(kept))
+
+
+def _clip_right(text: str, width: int) -> str:
+    """Keep the leading prefix of text within ``width`` terminal display cells."""
+    if width < 1:
+        return ""
+    if _display_width(text) <= width:
+        return text
+    if width == 1:
+        return "…"
+    budget = width - 1
+    kept: list[str] = []
+    used = 0
+    for ch in text:
+        w = _char_width(ch)
+        if used + w > budget:
+            break
+        kept.append(ch)
+        used += w
+    return "".join(kept) + "…"
+
+
+def _ljust_cells(text: str, width: int) -> str:
+    clipped = _clip_right(text, width)
+    pad = max(0, width - _display_width(clipped))
+    return clipped + " " * pad
+
+
+def _split_word_cells(word: str, width: int) -> list[str]:
+    pieces: list[str] = []
+    current: list[str] = []
+    used = 0
+    for ch in word:
+        w = _char_width(ch)
+        if w > width:
+            continue
+        if current and used + w > width:
+            pieces.append("".join(current))
+            current = [ch]
+            used = w
+        else:
+            current.append(ch)
+            used += w
+    if current:
+        pieces.append("".join(current))
+    return pieces or [""]
 
 
 def _wrap(text: str, width: int) -> list[str]:
     if width < 8:
-        return [text[:width]]
+        return [_clip_right(text, max(1, width))]
     words = text.split()
     if not words:
         return [""]
     lines: list[str] = []
     current = ""
+    current_width = 0
     for word in words:
-        while len(word) > width:
-            piece = word[:width]
-            word = word[width:]
+        word_width = _display_width(word)
+        if word_width > width:
             if current:
                 lines.append(current)
                 current = ""
-            lines.append(piece)
-        candidate = word if not current else f"{current} {word}"
-        if len(candidate) <= width:
-            current = candidate
+                current_width = 0
+            chunks = _split_word_cells(word, width)
+            lines.extend(chunks[:-1])
+            current = chunks[-1]
+            current_width = _display_width(current)
+            continue
+        if not current:
+            current = word
+            current_width = word_width
+        elif current_width + 1 + word_width <= width:
+            current = f"{current} {word}"
+            current_width += 1 + word_width
         else:
             lines.append(current)
             current = word
+            current_width = word_width
     if current:
         lines.append(current)
     return lines
 
 
-def panel_lines(state: GuiState, width: int) -> list[str]:
+def panel_lines(state: GuiState, width: int, *, max_extra_lines: int | None = None) -> list[str]:
     """The input panel, without ANSI, so tests can read the words."""
     inner = max(12, width - 4)
     if state.url:
@@ -402,20 +480,41 @@ def panel_lines(state: GuiState, width: int) -> list[str]:
             label = "Starting"
         lines.append(_clip(f"{label}  {progress_bar(state.progress, min(20, inner - 14))}", inner))
     elif state.error:
-        lines.extend(_wrap(state.error, inner)[:3])
+        limit = 3 if max_extra_lines is None else max(1, min(3, max_extra_lines))
+        lines.extend(_wrap(state.error, inner)[:limit])
     elif state.saved:
-        lines.extend(_wrap(f"Saved {state.saved}", inner)[:2])
+        limit = 2 if max_extra_lines is None else max(1, min(2, max_extra_lines))
+        lines.extend(_wrap(f"Saved {state.saved}", inner)[:limit])
     return lines
 
 
-def footer(state: GuiState) -> str:
+def footer(state: GuiState, *, max_width: int | None = None) -> str:
     if state.busy and state.cancelling:
-        return "waiting for the capture to stop    ctrl+c quit"
-    if state.busy:
-        return "esc cancel"
-    if state.saved:
-        return "enter capture again    esc quit"
-    return "tab format    ctrl+p page    enter capture    esc quit"
+        candidates = (
+            "waiting for the capture to stop    ctrl+c quit",
+            "stopping...  ctrl+c quit",
+            "ctrl+c quit",
+        )
+    elif state.busy:
+        candidates = ("esc cancel",)
+    elif state.saved:
+        candidates = (
+            "enter capture again    esc quit",
+            "enter again  esc quit",
+            "enter  esc",
+        )
+    else:
+        candidates = (
+            "tab format    ctrl+p page    enter capture    esc quit",
+            "tab fmt  ^p page  enter go  esc quit",
+            "tab  ^p  enter  esc",
+        )
+    if max_width is None:
+        return candidates[0]
+    for text in candidates:
+        if len(text) <= max_width:
+            return text
+    return _clip(candidates[-1], max(1, max_width))
 
 
 def _screen_bounds(size: launch.WindowSize) -> tuple[int, int]:
@@ -444,23 +543,76 @@ def _logo_placement(
     return logo, logo_cols, logo_rows
 
 
-def _wordmark(cols: int, *, image: bool) -> tuple[str, ...]:
+def _wordmark(cols: int, *, image: bool, rows: int | None = None) -> tuple[str, ...]:
     if image:
         return ()
-    if cols < 64:
+    if cols < 64 or (rows is not None and rows < 15):
         return ("ViperCapture",)
     return tuple(styled_ascii_logo())
 
 
-def _frame_block(state: GuiState, cols: int, *, image: bool) -> list[str]:
+def _frame_block(
+    state: GuiState,
+    cols: int,
+    *,
+    image: bool,
+    rows: int | None = None,
+) -> list[str]:
     panel_width = min(72, cols - 4)
-    plain = panel_lines(state, panel_width)
+    max_extra: int | None = None
+    if rows is not None and rows < 12:
+        max_extra = max(1, rows - 6)
+    plain = panel_lines(state, panel_width, max_extra_lines=max_extra)
     colored = _color_panel(state, panel_width, plain)
-    return [*_wordmark(cols, image=image), "", *colored, "", f"\x1b[2m{footer(state)}\x1b[0m"]
+    mark = _wordmark(cols, image=image, rows=rows)
+    if rows is not None and len(mark) > 1 and (len(mark) + len(colored) + 3) > rows:
+        mark = ("ViperCapture",)
+    footer_line = f"\x1b[2m{footer(state, max_width=max(8, cols - 2))}\x1b[0m"
+    full_block = [*mark, "", *colored, "", footer_line]
+    if rows is not None and len(full_block) > rows:
+        compact_block = [*mark, *colored, footer_line]
+        if len(compact_block) <= rows:
+            return compact_block
+        if rows <= len(colored) + 1:
+            return [*colored, footer_line]
+        return compact_block
+    return full_block
 
 
 def _frame_origin(rows: int, block_len: int, logo_rows: int) -> int:
     return max(1, (rows - block_len - logo_rows) // 2)
+
+
+def _render_tiny_frame(size: launch.WindowSize, state: GuiState, *, clear: bool) -> bytes:
+    """Minimal frame when the physical terminal is smaller than 20x8."""
+    cols = max(1, size.cols)
+    rows = max(1, size.rows)
+    parts: list[bytes] = []
+    if clear:
+        parts.append(b"\x1b[2J\x1b[H")
+    else:
+        for erase_row in range(1, rows + 1):
+            parts.append(f"\x1b[{erase_row};1H\x1b[2K".encode("ascii"))
+    lines: list[str] = [_clip_right("ViperCapture", cols)]
+    if rows >= 2:
+        lines.append(_clip(state.url or "example.com", cols))
+    if rows >= 3:
+        if state.busy:
+            lines.append(_clip_right("Cancelling" if state.cancelling else "Capturing", cols))
+        elif state.error:
+            lines.append(_clip_right(state.error, cols))
+        elif state.saved:
+            lines.append(_clip_right(f"Saved {state.saved}", cols))
+        else:
+            lines.append(_clip_right(f"{state.output} {page_label(state.full_page)}", cols))
+    if rows >= 4:
+        lines.append(_clip_right(footer(state, max_width=cols), cols))
+    for row_index, text in enumerate(lines[:rows], start=1):
+        width = _display_width(text)
+        col = max(1, (cols - width) // 2 + 1)
+        parts.append(f"\x1b[{row_index};{col}H".encode("ascii"))
+        parts.append(text.encode("utf-8"))
+    return b"".join(parts)
 
 
 def render_frame(
@@ -475,6 +627,8 @@ def render_frame(
     logo_rows: int | None = None,
     origin: int | None = None,
 ) -> bytes:
+    if size.cols < 20 or size.rows < 8:
+        return _render_tiny_frame(size, state, clear=clear)
     cols, rows = _screen_bounds(size)
     if logo is None:
         logo, auto_cols, auto_rows = _logo_placement(size, protocol, png)
@@ -487,7 +641,8 @@ def render_frame(
     if logo_cols is None:
         logo_cols = 0
     logo_bytes = logo or b""
-    block = _frame_block(state, cols, image=logo_rows > 0)
+    available_rows = max(1, rows - (logo_rows + 1 if logo_rows else 0))
+    block = _frame_block(state, cols, image=logo_rows > 0, rows=available_rows)
     if origin is None:
         origin = _frame_origin(rows, len(block), logo_rows)
     parts: list[bytes] = []
@@ -507,7 +662,7 @@ def render_frame(
         if row > rows:
             break
         shown = visible(line)
-        col = max(1, (cols - len(shown)) // 2 + 1)
+        col = max(1, (cols - _display_width(shown)) // 2 + 1)
         parts.append(f"\x1b[{row};{col}H".encode("ascii"))
         parts.append(line.encode("utf-8"))
         row += 1
@@ -524,39 +679,58 @@ def _color_panel(state: GuiState, width: int, plain: list[str]) -> list[str]:
         if index == 1:
             body = _colored_summary(state, inner)
         elif index == 0 and not state.busy:
-            shown = text[: inner - 1]
-            pad = " " * (inner - 1 - len(shown))
+            editable_width = max(1, inner - 1)
+            if state.url:
+                shown = _clip(state.url, editable_width)
+            else:
+                shown = _clip_right("example.com", editable_width)
+            pad = " " * max(0, editable_width - _display_width(shown))
             caret = "\x1b[7m \x1b[0m"
             if state.url:
                 body = shown + caret + pad
             else:
                 body = caret + f"\x1b[2m{shown}\x1b[0m" + pad
         elif state.error and index >= 2 and not state.busy:
-            body = f"\x1b[31m{text.ljust(inner)}\x1b[0m"
+            body = f"\x1b[31m{_ljust_cells(text, inner)}\x1b[0m"
         else:
-            body = text.ljust(inner)
+            body = _ljust_cells(text, inner)
         lines.append(bar + body + " \x1b[34m│\x1b[0m")
     lines.append(bottom)
     return lines
 
 
-def _colored_summary(state: GuiState, inner: int) -> str:
+def _colored_formats(state: GuiState, separator: str) -> tuple[str, int]:
     pieces: list[str] = []
     visible_len = 0
     for index, name in enumerate(FORMATS):
         if index:
-            pieces.append("   ")
-            visible_len += 3
+            pieces.append(separator)
+            visible_len += len(separator)
         if name == state.output:
             pieces.append(f"\x1b[1;34m{name}\x1b[0m")
         else:
             pieces.append(f"\x1b[2m{name}\x1b[0m")
         visible_len += len(name)
-    tail = f"    {page_label(state.full_page)}    {state.viewport[0]}x{state.viewport[1]}"
-    pieces.append(tail)
-    visible_len += len(tail)
-    pad = max(0, inner - visible_len)
-    return "".join(pieces) + " " * pad
+    return "".join(pieces), visible_len
+
+
+def _colored_summary(state: GuiState, inner: int) -> str:
+    mode = page_label(state.full_page)
+    dims = f"{state.viewport[0]}x{state.viewport[1]}"
+    for fmt_sep, tail_sep in (("   ", "    "), (" ", "  ")):
+        colored_fmts, fmt_len = _colored_formats(state, fmt_sep)
+        tail = f"{tail_sep}{mode}{tail_sep}{dims}"
+        total = fmt_len + len(tail)
+        if total <= inner:
+            return colored_fmts + tail + " " * (inner - total)
+    short_mode = "full" if state.full_page else "view"
+    active = f"\x1b[1;34m{state.output}\x1b[0m"
+    for tail in (f"  {mode}  {dims}", f"  {short_mode}  {dims}", f"  {dims}", ""):
+        total = len(state.output) + len(tail)
+        if total <= inner:
+            return active + tail + " " * (inner - total)
+    clipped = _clip(state.output, inner)
+    return f"\x1b[1;34m{clipped}\x1b[0m" + " " * max(0, inner - len(clipped))
 
 
 class _Cancelled(Exception):
@@ -764,7 +938,15 @@ def _close_connection(connection: http.client.HTTPConnection) -> None:
     try:
         connection.close()
     except OSError:
-        return
+        pass
+    if sock is not None and hasattr(sock, "_real_close"):
+        # On Windows, HTTPResponse holds a makefile() io_ref on the socket so
+        # sock.close() defers closesocket() and leaves a worker thread blocked
+        # in recv_into() until timeout.
+        try:
+            sock._real_close()
+        except OSError:
+            pass
 
 
 class _CaptureResponse:
@@ -890,7 +1072,8 @@ class _Drawer:
             self._logo, self._logo_cols, self._logo_rows = _logo_placement(size, protocol, png)
             self._key = key
         cols, rows = _screen_bounds(size)
-        block_len = len(_frame_block(state, cols, image=self._logo_rows > 0))
+        available_rows = max(1, rows - (self._logo_rows + 1 if self._logo_rows else 0))
+        block_len = len(_frame_block(state, cols, image=self._logo_rows > 0, rows=available_rows))
         origin = _frame_origin(rows, block_len, self._logo_rows)
         full = size_changed or origin != self._origin
         self._origin = origin
@@ -953,7 +1136,7 @@ def _leave(protocol: str | None) -> None:
     sys.stdout.buffer.flush()
 
 
-def _start_server() -> tuple[subprocess.Popen[object], object]:
+def _start_server() -> tuple[subprocess.Popen[object], object, str]:
     log_path = Path.home() / ".vipercapture" / "requests.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -978,7 +1161,7 @@ def _start_server() -> tuple[subprocess.Popen[object], object]:
     except Exception:
         log_handle.close()
         raise
-    return server, log_handle
+    return server, log_handle, shutdown_token
 
 
 def _wait_until_ready(
@@ -986,12 +1169,16 @@ def _wait_until_ready(
     deadline: float,
     server: subprocess.Popen[object],
     drawer: _Drawer,
+    *,
+    shutdown_token: str = "",
 ) -> GuiState:
     tick = 0
     while time.monotonic() < deadline:
         if launch.application_shutdown_requested():
             raise KeyboardInterrupt
         if launch.port_open():
+            if shutdown_token:
+                launch._record_endpoint_server_process(server.pid, shutdown_token, launch.PORT)
             return state
         if server.poll() is not None:
             break
@@ -1249,6 +1436,7 @@ def run_capture_gui(viewport: tuple[int, int], directory: Path | None = None) ->
     launch.ensure_playwright()
     state = GuiState(viewport=viewport)
     started: subprocess.Popen[object] | None = None
+    worker_pid: int | None = None
     log_handle: object | None = None
     protocol = launch.choose_graphics_protocol()
     entered = False
@@ -1258,12 +1446,27 @@ def run_capture_gui(viewport: tuple[int, int], directory: Path | None = None) ->
         _enter()
         entered = True
         if not launch.port_open():
-            started, log_handle = _start_server()
-            state = _wait_until_ready(state, time.monotonic() + 30, started, drawer)
+            started_info = _start_server()
+            if len(started_info) == 3:
+                started, log_handle, shutdown_token = started_info
+            else:
+                started, log_handle = started_info  # type: ignore[misc]
+                shutdown_token = ""
+            state = _wait_until_ready(
+                state,
+                time.monotonic() + 30,
+                started,
+                drawer,
+                shutdown_token=shutdown_token,
+            )
             if state.error:
                 drawer.draw(state)
                 _pause_for_quit()
                 return 1
+            if shutdown_token:
+                worker_pid = launch._record_endpoint_server_process(
+                    started.pid, shutdown_token, launch.PORT
+                )
             state = _replace(state, busy=False, progress=0)
         return _run_keys(state, directory, drawer, started_server=started is not None)
     except KeyboardInterrupt:
@@ -1273,7 +1476,7 @@ def run_capture_gui(viewport: tuple[int, int], directory: Path | None = None) ->
             _leave(protocol)
         _restore_windows_vt(vt_mode)
         if started is not None:
-            launch.stop_server(started, announce=False)
+            launch.stop_server(started, announce=False, worker_pid=worker_pid)
         if log_handle is not None:
             log_handle.close()  # type: ignore[union-attr]
 

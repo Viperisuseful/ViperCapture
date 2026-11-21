@@ -1279,45 +1279,7 @@ def _is_descendant_process(child_pid: int, ancestor_pid: int) -> bool:
     if child_pid == ancestor_pid:
         return True
     if sys.platform == "win32":
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            TH32CS_SNAPPROCESS = 0x00000002
-
-            class PROCESSENTRY32(ctypes.Structure):
-                _fields_ = [
-                    ("dwSize", wintypes.DWORD),
-                    ("cntUsage", wintypes.DWORD),
-                    ("th32ProcessID", wintypes.DWORD),
-                    ("th32DefaultHeapID", ctypes.c_size_t),
-                    ("th32ModuleID", wintypes.DWORD),
-                    ("cntThreads", wintypes.DWORD),
-                    ("th32ParentProcessID", wintypes.DWORD),
-                    ("pcPriClassBase", wintypes.LONG),
-                    ("dwFlags", wintypes.DWORD),
-                    ("szExeFile", ctypes.c_char * 260),
-                ]
-
-            kernel32 = ctypes.windll.kernel32
-            hSnapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-            if hSnapshot and hSnapshot != -1:
-                pe = PROCESSENTRY32()
-                pe.dwSize = ctypes.sizeof(PROCESSENTRY32)
-                parents: dict[int, int] = {}
-                success = kernel32.Process32First(hSnapshot, ctypes.byref(pe))
-                while success:
-                    parents[pe.th32ProcessID] = pe.th32ParentProcessID
-                    success = kernel32.Process32Next(hSnapshot, ctypes.byref(pe))
-                kernel32.CloseHandle(hSnapshot)
-
-                cur = child_pid
-                while cur in parents and parents[cur] > 4:
-                    cur = parents[cur]
-                    if cur == ancestor_pid:
-                        return True
-        except Exception:
-            pass
+        return launch._is_descendant_pid(child_pid, ancestor_pid)
     elif sys.platform == "linux":
         try:
             cur = child_pid
