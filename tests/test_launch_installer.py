@@ -996,7 +996,7 @@ class InstallScriptTests(unittest.TestCase):
     @unittest.skipIf(sys.platform != "win32", "install.ps1 requires Windows PowerShell")
     def test_windows_install_script_updates_current_powershell_session_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             home = root / "install-home"
             bin_dir = root / "bin"
             source = root / "source"
@@ -1043,7 +1043,8 @@ class InstallScriptTests(unittest.TestCase):
                 "New-Item -ItemType Directory -Force -Path $venv | Out-Null\n"
                 "Set-Content -Path (Join-Path $venv 'marker') -Value 'keep'\n"
                 f"Get-Content -LiteralPath '{str(script)}' -Raw | Invoke-Expression\n"
-                "$matches = @($env:Path -split ';' | Where-Object { $_ -and $_.Trim().Trim('\"').TrimEnd('\\', '/') -ieq $env:VIPERCAPTURE_BIN_DIR.TrimEnd('\\', '/') })\n"
+                "$expectedBin = (Get-Item -LiteralPath $env:VIPERCAPTURE_BIN_DIR).FullName.TrimEnd('\\', '/')\n"
+                "$matches = @($env:Path -split ';' | Where-Object { $_ -and $_.Trim().Trim('\"').TrimEnd('\\', '/') -ieq $expectedBin })\n"
                 "Write-Output \"PATH_COUNT=$($matches.Count)\"\n"
             )
             ran = subprocess.run(
@@ -1067,7 +1068,7 @@ class InstallScriptTests(unittest.TestCase):
     @unittest.skipIf(sys.platform != "win32", "install.ps1 requires Windows PowerShell")
     def test_windows_install_script_silences_store_stub_and_finds_later_python(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             home = root / "install-home"
             bin_dir = root / "bin"
             source = root / "source"
