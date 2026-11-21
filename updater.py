@@ -20,7 +20,7 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Callable
 
 DEFAULT_REPO = "Viperisuseful/ViperCapture"
@@ -390,7 +390,17 @@ def write_shim(
                 temporary.unlink(missing_ok=True)
                 raise
             return created
-        text = f"@echo off\r\n{cmd_quote(python)} {cmd_quote(str(launch))} %*\r\n"
+        venv_python = PureWindowsPath(str(launch)).parent / ".venv" / "Scripts" / "python.exe"
+        text = (
+            "@echo off\r\n"
+            "setlocal disabledelayedexpansion\r\n"
+            f'if /i not "%~1"=="update" if exist {cmd_quote(str(venv_python))} goto :venv\r\n'
+            f"{cmd_quote(python)} {cmd_quote(str(launch))} %*\r\n"
+            "exit /b %ERRORLEVEL%\r\n"
+            ":venv\r\n"
+            f"{cmd_quote(str(venv_python))} {cmd_quote(str(launch))} %*\r\n"
+            "exit /b %ERRORLEVEL%\r\n"
+        )
         chosen = encoding or cmd_encoding()
         try:
             data = text.encode(chosen)
@@ -403,8 +413,16 @@ def write_shim(
             ) from exc
         path.write_bytes(data)
     else:
+        venv_python = launch.parent / ".venv" / "bin" / "python"
+        quoted_venv = f"{shell_single_quote(str(venv_python))} {shell_single_quote(str(launch))}"
         quoted = f"{shell_single_quote(python)} {shell_single_quote(str(launch))}"
-        text = f"#!/bin/sh\nexec {quoted} \"$@\"\n"
+        text = (
+            "#!/bin/sh\n"
+            f'if [ "${{1:-}}" != "update" ] && [ -x {shell_single_quote(str(venv_python))} ]; then\n'
+            f'    exec {quoted_venv} "$@"\n'
+            "fi\n"
+            f'exec {quoted} "$@"\n'
+        )
         path.write_text(text, encoding="utf-8", newline="")
         path.chmod(0o755)
     return created

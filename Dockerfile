@@ -4,8 +4,7 @@ FROM python:3.12-slim@sha256:d657ab0ade19f404a6ccc883ab399540de667aff751748ce23c
 COPY --from=ghcr.io/astral-sh/uv:0.12.10@sha256:2bb3ebca0a796a155094a27773d290c4b074572e6107f171d88d086682fd2500 \
     /uv /uvx /bin/
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
+ENV PYTHONUNBUFFERED=1 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     UV_SYSTEM_PYTHON=1
 
@@ -23,9 +22,10 @@ RUN apt-get update \
 
 COPY --chown=vipercapture:vipercapture . .
 USER vipercapture
+RUN python -m compileall -q vipercapture launch.py
 ENV VIPERCAPTURE_DATA_DIR=/data
 EXPOSE 8000
 VOLUME ["/data"]
 HEALTHCHECK --interval=30s --timeout=3s --start-period=30s --retries=3 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=2)" || exit 1
-CMD ["uvicorn", "vipercapture.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+  CMD python -c "import http.client; c = http.client.HTTPConnection('127.0.0.1', 8000, timeout=2); c.request('GET', '/ready'); raise SystemExit(0 if c.getresponse().status == 200 else 1)" || exit 1
+CMD ["uvicorn", "vipercapture.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--ws", "none"]

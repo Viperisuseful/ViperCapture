@@ -3,14 +3,9 @@
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 from html import escape
 from io import BytesIO
-
-from lxml import html as lxml_html
-from markdown_it import MarkdownIt
-from markdownify import markdownify
-from pypdf import PdfReader
-from pypdf.errors import PdfReadError
 
 from .render_contract import ExtractMode, OutputFormat, PdfMode, RenderRequest
 from .render_engine import (
@@ -39,7 +34,11 @@ PAPER_INCHES = {
 }
 
 
-MARKDOWN = MarkdownIt("commonmark", {"html": True})
+@lru_cache(maxsize=1)
+def _markdown_renderer():
+    from markdown_it import MarkdownIt
+
+    return MarkdownIt("commonmark", {"html": True})
 
 
 def _base_element(request: RenderRequest) -> str:
@@ -55,7 +54,7 @@ def input_document(request: RenderRequest) -> str:
     body = (
         request.html
         if request.html is not None
-        else MARKDOWN.render(request.markdown or "")
+        else _markdown_renderer().render(request.markdown or "")
     )
     base = _base_element(request)
     return (
@@ -66,6 +65,7 @@ def input_document(request: RenderRequest) -> str:
 
 def _article_html(document_html: str) -> str:
     try:
+        from lxml import html as lxml_html
         from readability import Document
 
         article = Document(document_html).summary(html_partial=True)
@@ -82,6 +82,9 @@ def _article_html(document_html: str) -> str:
 
 
 def _validate_pdf(pdf: bytes, *, single_page: bool) -> int:
+    from pypdf import PdfReader
+    from pypdf.errors import PdfReadError
+
     try:
         pages = len(PdfReader(BytesIO(pdf)).pages)
     except (PdfReadError, OSError, ValueError) as exc:
@@ -367,6 +370,8 @@ async def render_document_output(
         if request.output is OutputFormat.HTML:
             body = selected_html.encode("utf-8")
             return RenderArtifact(body, "text/html; charset=utf-8", "vipercapture.html")
+        from markdownify import markdownify
+
         markdown = await _settled_thread(
             markdownify,
             selected_html,

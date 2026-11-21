@@ -1031,6 +1031,8 @@ def server_command() -> list[str]:
         launch.HOST,
         "--port",
         str(launch.PORT),
+        "--ws",
+        "none",
     ]
 
 
@@ -1185,7 +1187,7 @@ def _wait_until_ready(
         tick += 1
         state = _replace(state, busy=True, progress=tick, saved="", error="")
         drawer.draw(state)
-        time.sleep(0.1)
+        time.sleep(0.05)
     return _replace(
         state,
         busy=False,

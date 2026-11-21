@@ -18,8 +18,6 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
 from .async_jobs import _ensure_private_directory
 
 MAX_BASELINES_PER_PROJECT = 100
@@ -109,6 +107,8 @@ class Metrics:
 
 class ControlPlane:
     def __init__(self, path: Path, *, encryption_secret: str) -> None:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
         self.path = path
         secret = encryption_secret.encode()
         self._cipher = AESGCM(hashlib.sha256(secret).digest())

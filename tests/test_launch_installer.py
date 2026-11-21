@@ -2493,6 +2493,70 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
             {"WT_PROFILE_ID": "1", "VIPERCAPTURE_SIXEL": "true"}
         ))
 
+    def test_launch_defers_heavy_stdlib_imports_on_startup(self) -> None:
+        code = (
+            "import sys, launch; "
+            "loaded = [m for m in ('importlib.metadata', 'urllib.request', 'webbrowser', 'zlib') if m in sys.modules]; "
+            "assert not loaded, loaded"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_shims_prefer_project_venv_except_for_update(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = Path(tmp) / "app"
+            launch_path = app / "launch.py"
+            posix_shim = Path(tmp) / "vipercapture"
+            updater.write_shim(posix_shim, "/usr/bin/python3", launch_path, "linux")
+            posix_text = posix_shim.read_text(encoding="utf-8")
+            self.assertIn('!= "update"', posix_text)
+            self.assertIn(str(app / ".venv" / "bin" / "python"), posix_text)
+            self.assertIn("/usr/bin/python3", posix_text)
+
+            cmd_shim = Path(tmp) / "vipercapture.cmd"
+            updater.write_shim(
+                cmd_shim,
+                r"C:\Python\python.exe",
+                Path(r"C:\ViperCapture\app\launch.py"),
+                "win32",
+                encoding="cp1252",
+            )
+            cmd_text = cmd_shim.read_bytes().decode("cp1252")
+            self.assertIn('if /i not "%~1"=="update"', cmd_text)
+            self.assertIn(r"C:\ViperCapture\app\.venv\Scripts\python.exe", cmd_text)
+            self.assertIn(r"C:\Python\python.exe", cmd_text)
+
+    @unittest.skipIf(sys.platform != "win32", "Windows native TCP/process checks")
+    def test_windows_native_port_and_cmdline_probes(self) -> None:
+        import socket
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(1)
+            open_port = srv.getsockname()[1]
+            listeners = launch._windows_tcp_listener_pids(open_port, host="127.0.0.1")
+            self.assertIsNotNone(listeners)
+            self.assertIn(os.getpid(), listeners)
+            self.assertTrue(launch.port_open("127.0.0.1", open_port))
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as unused:
+            unused.bind(("127.0.0.1", 0))
+            closed_port = unused.getsockname()[1]
+        started = time.perf_counter()
+        self.assertFalse(launch.port_open("127.0.0.1", closed_port))
+        self.assertLess(time.perf_counter() - started, 0.5)
+
+        handled, cmdline = launch._windows_pid_commandline(os.getpid())
+        self.assertTrue(handled)
+        self.assertIsNotNone(cmdline)
+        self.assertIn("python", cmdline.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

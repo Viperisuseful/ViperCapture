@@ -764,5 +764,103 @@ class LocalServerStartupTests(unittest.TestCase):
             clear_mock.assert_called_once_with(100)
 
 
+class FastValidationTests(unittest.TestCase):
+    def test_simple_payload_validates_without_importing_pydantic(self) -> None:
+        from vipercapture.capture_cli import _fast_validate_simple_payload
+
+        self.assertTrue(_fast_validate_simple_payload(_payload(EXAMPLE_ARGV)))
+        self.assertTrue(
+            _fast_validate_simple_payload(_payload(["--html", "<h1>ok</h1>", "--full-page=false"]))
+        )
+        # Complex or invalid payloads must fall back to full Pydantic validation.
+        self.assertFalse(_fast_validate_simple_payload(_payload(["https://example.com", "--quality", "40"])))
+        self.assertFalse(_fast_validate_simple_payload(_payload(["https://example.com", "--viewport", "0", "100"])))
+        self.assertFalse(_fast_validate_simple_payload(_payload(["https://example.com", "--timezone", "UTC"])))
+        self.assertFalse(_fast_validate_simple_payload({"url": "https://bad..host", "output": "png"}))
+        self.assertFalse(_fast_validate_simple_payload({"url": "http://999.999.999.999", "output": "png"}))
+        self.assertFalse(_fast_validate_simple_payload({"url": "http://example.123", "output": "png"}))
+        self.assertFalse(_fast_validate_simple_payload({"url": "https://example.com", "output": "png", "cache_key": "k"}))
+        try:
+            import pydantic  # noqa: F401
+        except ImportError:
+            pydantic_available = False
+        else:
+            pydantic_available = True
+        if pydantic_available:
+            with self.assertRaises(ValueError):
+                validate_payload({"url": "http://999.999.999.999", "output": "png"})
+            with self.assertRaises(ValueError):
+                validate_payload({"url": "http://example.123", "output": "png"})
+
+    def test_relative_redirect_resolves_against_request_path(self) -> None:
+        from vipercapture.capture_cli import open_response
+
+        seen_paths: list[str] = []
+        redirect_target = ["jobs2"]
+
+        class _RedirectHandler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                seen_paths.append(self.path)
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                self.send_response(302)
+                self.send_header("Location", redirect_target[0])
+                self.end_headers()
+
+            def do_GET(self) -> None:
+                seen_paths.append(self.path)
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _RedirectHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            resp = open_response(
+                f"http://127.0.0.1:{port}/api/v1/jobs",
+                method="POST",
+                payload={"url": "https://example.com"},
+                headers={"Content-Type": "application/json"},
+                timeout=5,
+            )
+            try:
+                self.assertEqual(resp.read(), b"ok")
+            finally:
+                resp.close()
+
+            redirect_target[0] = "//["
+            with self.assertRaises(CaptureError):
+                open_response(
+                    f"http://127.0.0.1:{port}/api/v1/jobs",
+                    method="POST",
+                    payload={"url": "https://example.com"},
+                    headers={"Content-Type": "application/json"},
+                    timeout=5,
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+        self.assertEqual(seen_paths, ["/api/v1/jobs", "/api/v1/jobs2", "/api/v1/jobs"])
+
+    def test_ensure_server_checks_port_open_before_http_probe(self) -> None:
+        from vipercapture.capture_cli import ensure_server
+
+        args = parse_capture_args(["https://example.com", "--no-start"])
+        with (
+            mock.patch.object(launch, "port_open", return_value=False) as port_open,
+            mock.patch.object(launch, "_is_vipercapture_endpoint", side_effect=AssertionError("should not probe")),
+        ):
+            with self.assertRaises(CaptureError):
+                ensure_server(args)
+        port_open.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

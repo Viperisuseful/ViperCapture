@@ -6,10 +6,12 @@ import io
 import json
 import zipfile
 from dataclasses import dataclass
-
-from PIL import Image, ImageChops, ImageDraw, ImageOps, UnidentifiedImageError
+from typing import TYPE_CHECKING
 
 from .render_errors import RenderError
+
+if TYPE_CHECKING:
+    from PIL import Image
 
 MAX_DIFF_INPUT_BYTES = 20 * 1024 * 1024
 # Pillow expands compressed inputs into several simultaneous RGBA/mask
@@ -38,6 +40,8 @@ class VisualDiff:
 
 
 def _open_image(body: bytes, label: str) -> Image.Image:
+    from PIL import Image, ImageOps, UnidentifiedImageError
+
     if not body or len(body) > MAX_DIFF_INPUT_BYTES:
         raise RenderError(
             "diff_input_invalid",
@@ -68,6 +72,8 @@ def compare_images(
     pixel_threshold: int = 0,
     max_difference_ratio: float = 0,
 ) -> VisualDiff:
+    from PIL import Image, ImageChops, ImageDraw
+
     if not 0 <= pixel_threshold <= 255:
         raise ValueError("pixel_threshold must be between 0 and 255")
     if not 0 <= max_difference_ratio <= 1:
