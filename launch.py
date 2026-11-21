@@ -40,7 +40,6 @@ _LAZY_MODULES = frozenset({
     "socket",
     "struct",
     "subprocess",
-    "urllib",
     "webbrowser",
     "zlib",
 })
@@ -50,11 +49,6 @@ def _mod(name: str):
     existing = globals().get(name)
     if existing is not None:
         return existing
-    if name == "urllib":
-        import urllib.request
-
-        globals()["urllib"] = urllib
-        return urllib
     loaded = __import__(name)
     globals()[name] = loaded
     return loaded
@@ -1568,6 +1562,28 @@ class ProcessIdentity:
         )
 
 
+def _local_http_request(
+    method: str,
+    path: str,
+    *,
+    host: str,
+    port: int,
+    timeout: float,
+    headers: dict[str, str],
+    body: bytes | None = None,
+) -> tuple[int, bytes]:
+    """Send one direct local HTTP request without importing urllib/proxy stacks."""
+    import http.client
+
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        conn.request(method, path, body=body, headers=headers)
+        resp = conn.getresponse()
+        return resp.status, resp.read(16 * 1024)
+    finally:
+        conn.close()
+
+
 def _is_vipercapture_endpoint(
     host: str = HOST,
     port: int = PORT,
@@ -1579,31 +1595,17 @@ def _is_vipercapture_endpoint(
     """Return the one PID claimed by a verified ViperCapture endpoint."""
     json = _mod("json")
     try:
-        if "urllib" in globals():
-            urllib_req = globals()["urllib"].request
-            url = f"http://{host}:{port}/__vipercapture__/identity"
-            req = urllib_req.Request(url, headers={"User-Agent": "ViperCapture-Probe"})
-            with urllib_req.urlopen(req, timeout=timeout) as resp:
-                if resp.status != 200:
-                    return None
-                data = json.loads(resp.read().decode("utf-8"))
-        else:
-            import http.client
-
-            conn = http.client.HTTPConnection(host, port, timeout=timeout)
-            try:
-                conn.request(
-                    "GET",
-                    "/__vipercapture__/identity",
-                    headers={"User-Agent": "ViperCapture-Probe"},
-                )
-                resp = conn.getresponse()
-                raw = resp.read(16 * 1024)
-                if resp.status != 200:
-                    return None
-                data = json.loads(raw.decode("utf-8"))
-            finally:
-                conn.close()
+        status, raw = _local_http_request(
+            "GET",
+            "/__vipercapture__/identity",
+            host=host,
+            port=port,
+            timeout=timeout,
+            headers={"User-Agent": "ViperCapture-Probe"},
+        )
+        if status != 200:
+            return None
+        data = json.loads(raw.decode("utf-8"))
     except (OSError, ValueError, UnicodeError, Exception):
         return None
     if not isinstance(data, dict):
@@ -2188,31 +2190,18 @@ def _request_server_shutdown(
             "Content-Type": "application/json",
             "X-ViperCapture-Shutdown-Token": record["token"],
         }
-        if "urllib" in globals():
-            urllib_req = globals()["urllib"].request
-            request = urllib_req.Request(
-                f"http://{host}:{port}/__vipercapture__/shutdown",
-                data=b"{}",
-                method="POST",
-                headers=req_headers,
-            )
-            with urllib_req.urlopen(request, timeout=timeout) as response:
-                if response.status != 200:
-                    return False
-                payload = json.loads(response.read().decode("utf-8"))
-        else:
-            import http.client
-
-            conn = http.client.HTTPConnection(host, port, timeout=timeout)
-            try:
-                conn.request("POST", "/__vipercapture__/shutdown", body=b"{}", headers=req_headers)
-                response = conn.getresponse()
-                raw = response.read(16 * 1024)
-                if response.status != 200:
-                    return False
-                payload = json.loads(raw.decode("utf-8"))
-            finally:
-                conn.close()
+        status, raw = _local_http_request(
+            "POST",
+            "/__vipercapture__/shutdown",
+            host=host,
+            port=port,
+            timeout=timeout,
+            headers=req_headers,
+            body=b"{}",
+        )
+        if status != 200:
+            return False
+        payload = json.loads(raw.decode("utf-8"))
         return bool(
             isinstance(payload, dict)
             and payload.get("stopping") is True

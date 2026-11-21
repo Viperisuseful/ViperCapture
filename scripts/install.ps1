@@ -402,12 +402,23 @@ internal static class ViperCaptureShim
                 }
                 if ($compiled) {
                     Write-AtomicUtf8Lines -Path $configPath -Lines @($Python, $Launch)
+                    $oldExe = "$exePath.old"
+                    if (Test-Path -LiteralPath $oldExe) {
+                        Remove-Item -LiteralPath $oldExe -Force -ErrorAction SilentlyContinue
+                    }
                     try {
                         Copy-Item -LiteralPath $builtExe -Destination $exePath -Force
-                    } catch [System.IO.IOException] {
+                    } catch [System.IO.IOException], [System.UnauthorizedAccessException] {
                         if (-not (Test-Path -LiteralPath $exePath)) { throw }
-                    } catch [System.UnauthorizedAccessException] {
-                        if (-not (Test-Path -LiteralPath $exePath)) { throw }
+                        try {
+                            Move-Item -LiteralPath $exePath -Destination $oldExe -Force
+                            Copy-Item -LiteralPath $builtExe -Destination $exePath -Force
+                            Remove-Item -LiteralPath $oldExe -Force -ErrorAction SilentlyContinue
+                        } catch {
+                            if (-not (Test-Path -LiteralPath $exePath) -and (Test-Path -LiteralPath $oldExe)) {
+                                Move-Item -LiteralPath $oldExe -Destination $exePath -Force -ErrorAction SilentlyContinue
+                            }
+                        }
                     }
                     if (Test-Path -LiteralPath $cmdPath) {
                         Remove-Item -LiteralPath $cmdPath -Force -ErrorAction SilentlyContinue

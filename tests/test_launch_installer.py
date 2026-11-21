@@ -2146,44 +2146,25 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
             self.assertFalse(launch._process_identity_matches(identity))
 
     def test_endpoint_probe_requires_service_install_and_owner_pid(self) -> None:
-        class Response:
-            status = 200
-
-            def __init__(self, payload: dict[str, object]) -> None:
-                self.payload = payload
-
-            def read(self) -> bytes:
-                return json.dumps(self.payload).encode()
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
         valid = {
             "service": "vipercapture",
             "install_id": launch._installation_id(),
             "pid": 4321,
         }
-        with mock.patch("launch.urllib.request.urlopen", return_value=Response(valid)):
+        with mock.patch("launch._local_http_request", return_value=(200, json.dumps(valid).encode())):
             self.assertEqual(launch._is_vipercapture_endpoint(expected_pids={4321}), 4321)
             self.assertIsNone(launch._is_vipercapture_endpoint(expected_pids={9999}))
 
         generic = {"ready": True}
-        with mock.patch("launch.urllib.request.urlopen", return_value=Response(generic)):
+        with mock.patch("launch._local_http_request", return_value=(200, json.dumps(generic).encode())):
             self.assertIsNone(launch._is_vipercapture_endpoint(expected_pids={4321}))
 
         wrong_install = {**valid, "install_id": "another-install"}
-        with mock.patch("launch.urllib.request.urlopen", return_value=Response(wrong_install)):
+        with mock.patch("launch._local_http_request", return_value=(200, json.dumps(wrong_install).encode())):
             self.assertIsNone(launch._is_vipercapture_endpoint(expected_pids={4321}))
 
     def test_endpoint_probe_rejects_malformed_json(self) -> None:
-        response = mock.MagicMock()
-        response.status = 200
-        response.read.return_value = b"not-json"
-        response.__enter__.return_value = response
-        with mock.patch("launch.urllib.request.urlopen", return_value=response):
+        with mock.patch("launch._local_http_request", return_value=(200, b"not-json")):
             self.assertIsNone(launch._is_vipercapture_endpoint(expected_pids={4321}))
 
     def test_darwin_ancestor_walk_uses_each_discovered_parent(self) -> None:
@@ -2425,18 +2406,6 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
         server.wait.assert_called_once_with(timeout=30.0)
 
     def test_server_shutdown_handshake_uses_identity_bound_secret(self) -> None:
-        class Response:
-            status = 200
-
-            def read(self) -> bytes:
-                return b'{"stopping": true, "pid": 12345}'
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
         identity = launch.ProcessIdentity(12345, "start", "command", "server")
         record = {
             "service": "vipercapture",
@@ -2451,12 +2420,18 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
             path.write_text(json.dumps(record), encoding="utf-8")
             with (
                 mock.patch("launch._server_record_path", return_value=path),
-                mock.patch("launch.urllib.request.urlopen", return_value=Response()) as open_url,
+                mock.patch(
+                    "launch._local_http_request",
+                    return_value=(200, b'{"stopping": true, "pid": 12345}'),
+                ) as request_mock,
             ):
                 self.assertTrue(launch._request_server_shutdown(identity, port=9123))
-        request = open_url.call_args.args[0]
-        self.assertEqual(request.get_header("X-vipercapture-shutdown-token"), "secret-token")
-        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(request_mock.call_args.args[:2], ("POST", "/__vipercapture__/shutdown"))
+        self.assertEqual(request_mock.call_args.kwargs["port"], 9123)
+        self.assertEqual(
+            request_mock.call_args.kwargs["headers"]["X-ViperCapture-Shutdown-Token"],
+            "secret-token",
+        )
 
     def test_server_shutdown_handshake_rejects_stale_record(self) -> None:
         identity = launch.ProcessIdentity(12345, "new-start", "command", "server")
@@ -2472,10 +2447,10 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
             }), encoding="utf-8")
             with (
                 mock.patch("launch._server_record_path", return_value=path),
-                mock.patch("launch.urllib.request.urlopen") as open_url,
+                mock.patch("launch._local_http_request") as request_mock,
             ):
                 self.assertFalse(launch._request_server_shutdown(identity))
-        open_url.assert_not_called()
+        request_mock.assert_not_called()
 
     def test_server_grace_period_defaults_to_thirty_seconds_and_is_bounded(self) -> None:
         self.assertEqual(launch.shutdown_grace_seconds({}), 30.0)
@@ -2564,6 +2539,21 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
         self.assertTrue(handled)
         self.assertIsNotNone(cmdline)
         self.assertIn("python", cmdline.lower())
+
+    def test_updater_extracts_and_upgrades_windows_exe_shim(self) -> None:
+        source = updater._extract_windows_shim_source(ROOT)
+        self.assertIsNotNone(source)
+        self.assertIn("class ViperCaptureShim", source or "")
+        self.assertIn(".venv", source or "")
+
+        if sys.platform == "win32" and updater._find_csc_compiler() is not None:
+            with tempfile.TemporaryDirectory() as tmp:
+                exe_path = Path(tmp) / "vipercapture.exe"
+                exe_path.write_bytes(b"old-shim-without-venv-marker")
+                self.assertTrue(updater._upgrade_windows_exe_shim(exe_path, ROOT))
+                self.assertIn(updater._WINDOWS_SHIM_VENV_MARKER, exe_path.read_bytes())
+                # Second call detects the marker and skips recompilation.
+                self.assertFalse(updater._upgrade_windows_exe_shim(exe_path, ROOT))
 
 
 if __name__ == "__main__":
