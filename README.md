@@ -8,24 +8,25 @@
 
 <p align="center"><img src="./.github/readme/hero.webp" width="100%" alt="ViperCapture web UI in dark mode with https://www.wikipedia.org, PNG output at 1280x720, full page off, GPU rendering off, and cookie consent set to reject non-essential on the left, and a finished capture of the Wikipedia portal in the Result panel on the right"></p>
 
-ViperCapture renders a URL, raw HTML, or Markdown on your own machine. Call it from the JSON API, the CLI, the terminal menu, or the web UI to get screenshots, PDFs, video, rendered HTML, Markdown, or page metadata.
+ViperCapture renders web pages on your own machine. The JSON API and the `vipercapture capture` command take a URL, raw HTML, or Markdown and return screenshots, PDFs, video, rendered HTML, Markdown, or page metadata. The web UI and the terminal menu capture a URL in a few keystrokes.
 
-If you are migrating from ScreenshotOne or Urlbox, drop-in adapters accept their common request formats at `GET /take` and `POST /compat/urlbox/v1/render/{sync,async}`. See the [compatibility matrix](docs/compatibility.md) and the [migration guide](docs/migration-screenshotone-urlbox.md) for what matches.
+If you are moving from ScreenshotOne or Urlbox, compatibility adapters at `GET /take` and `POST /compat/urlbox/v1/render/{sync,async}` accept their common request options. The [compatibility matrix](docs/compatibility.md) lists what matches, and the [migration guide](docs/migration-screenshotone-urlbox.md) covers the rest.
 
 ## What you get
 
 - **Three browser engines.** Render with Chromium, Firefox, or WebKit in a fresh isolated context per request.
 - **Images, PDFs, video, and page data.** Output PNG, JPEG, WebP, AVIF, PDF, rendered HTML, Markdown, JSON metadata with CSS-selector extraction, or WebM, MP4, and GIF video. One page load can return a ZIP with side artifacts and up to five named thumbnails.
-- **Actions, waits, and cleanup.** Click, hover, fill, select, scroll, wait on selectors or images, and assert page content before capture. Built-in cleanup blocks ads, trackers, chat widgets, and cookie banners with vendored AutoConsent rules.
-- **Async jobs, schedules, and webhooks.** Queue durable work at `POST /v1/jobs`, batch up to 100 items at `POST /v1/jobs/bulk`, or run five-field cron schedules in any IANA timezone with HMAC-SHA256 signed webhooks.
+- **Actions, waits, and cleanup.** Click, hover, fill, select, scroll, wait on selectors or images, and assert page content before capture. Built-in rules block ads, trackers, and chat widgets, and the vendored AutoConsent rules answer cookie consent dialogs.
+- **Async jobs, schedules, and webhooks.** Queue durable work at `POST /v1/jobs`, batch up to 100 items at `POST /v1/jobs/bulk`, or run five-field cron schedules in any IANA timezone. Set a webhook secret to get HMAC-SHA256 signed callbacks. The bundled job and schedule store runs on Linux, macOS, and Docker, so native Windows needs Docker or an external store. See [async jobs](docs/async-jobs.md).
 - **Local or S3-compatible storage.** Save job results locally or write them to AWS S3, Cloudflare R2, MinIO, or Backblaze B2.
 - **Visual diffs and baselines.** Compare two images at `POST /v1/diff` for a ZIP report with pixel counts and a highlighted diff image, or store project baselines.
-- **Projects and API keys.** Enable the optional control plane for hashed API keys, quotas, encrypted browser profiles, Prometheus metrics, and OTLP tracing.
+- **Projects and API keys.** Enable the optional control plane for hashed API keys, quotas, and encrypted browser profiles.
+- **Metrics and tracing.** `GET /metrics` serves Prometheus metrics, and setting `OTEL_EXPORTER_OTLP_ENDPOINT` turns on OTLP tracing.
 - **MIT licensed.** The JSON API follows semantic versioning, and the self-hosted engine runs with no hosted account.
 
 ## Install
 
-Direct installs need Python 3.11 or newer, plus a full FFmpeg build on `PATH` with `libvpx`, `libvpx-vp9`, and `libx264` if you render video. The Docker image includes FFmpeg. See [self-hosting](docs/self-hosting.md) for Intel macOS builds, terminal options, and production settings.
+Video output needs a full FFmpeg build on `PATH` with the `libvpx`, `libvpx-vp9`, and `libx264` encoders. Get it from your package manager or the [FFmpeg download page](https://ffmpeg.org/download.html). The Docker image includes FFmpeg. See [self-hosting](docs/self-hosting.md) for Intel macOS builds, terminal options, and production settings.
 
 ### Command line
 
@@ -41,6 +42,8 @@ On Windows PowerShell:
 irm https://raw.githubusercontent.com/Viperisuseful/ViperCapture/master/scripts/install.ps1 | iex
 ```
 
+The installers add `vipercapture` to your `PATH`. When Python 3.11 or newer is missing, they install [uv](https://docs.astral.sh/uv/) and Python 3.12 for it.
+
 Run `vipercapture`. On Linux and macOS, open a new terminal first. The first run creates a private environment, installs Python dependencies with Chromium, Firefox, and WebKit, starts the API at `http://127.0.0.1:8000/v1`, and opens the web UI at `http://127.0.0.1:8000`.
 
 | Command | Action |
@@ -53,21 +56,23 @@ Run `vipercapture`. On Linux and macOS, open a new terminal first. The first run
 
 ### Docker
 
-Build and run with Compose:
+Run the published image:
+
+```bash
+docker run --rm --init -p 127.0.0.1:8000:8000 ghcr.io/viperisuseful/vipercapture:1.1.0
+```
+
+Or build and run with Compose from a clone of this repository:
 
 ```bash
 docker compose up --build
 ```
 
-Or pull a published image:
-
-```bash
-docker pull ghcr.io/viperisuseful/vipercapture:1.1.0
-```
-
 Compose binds to loopback by default and keeps durable queue state, encryption keys, schedules, cache entries, and local artifacts in a named volume.
 
 ### From source
+
+This path needs Python 3.11 or newer.
 
 ```bash
 git clone https://github.com/Viperisuseful/ViperCapture.git

@@ -9,7 +9,7 @@ remain separate.
 ## Install locally
 
 Use Python 3.11 or newer and install a full FFmpeg build through the operating
-system package manager. Confirm `ffmpeg -encoders` lists `libvpx`, `libvpx-vp9`,
+system package manager or the [FFmpeg download page](https://ffmpeg.org/download.html). Confirm `ffmpeg -encoders` lists `libvpx`, `libvpx-vp9`,
 and `libx264`; GPU video additionally requires the vendor encoder and driver.
 
 End users install the `vipercapture` command and then run it (open a new terminal first on Linux and macOS; on Windows PowerShell the current session's `Path` is updated automatically).
@@ -37,7 +37,8 @@ Firefox, and WebKit, starts the application, and opens the local interface.
 Press Esc twice or Ctrl+C to stop it. `vipercapture update` downloads the
 latest published version and keeps the virtualenv, `.env.local`, saved
 jobs, and presets. It is the same Python command on Linux, macOS, and
-Windows. On Windows, stop the running server before updating. `vipercapture --gui` opens a
+Windows. On Windows, stop the running server before updating. The update does
+not use sudo or a distro package manager. `vipercapture --gui` opens a
 full-screen capture menu in the same terminal and does not open a log
 window. Tab switches PNG, GIF, and MP4. Ctrl+P switches between the full
 page and the 1920x1080 viewport. The menu sends `VIPERCAPTURE_ADMIN_TOKEN`
@@ -153,9 +154,10 @@ them on one line if the shell does not continue a trailing backslash.
 When the local server is not already running, `capture` starts it and leaves it
 listening. Stop that process with `vipercapture kill`.
 
-A synchronous request returns the artifact directly. The
-`X-ViperCapture-*` headers include the request ID, queue and render timing,
-dimensions, navigation status, and cache outcome.
+A synchronous request returns the artifact directly, with `X-Request-Id`
+and `X-ViperCapture-*` headers for queue and render timing, dimensions,
+navigation status, and cache outcome. See
+[diagnostic response headers](#read-diagnostic-response-headers).
 
 For work that must survive a dropped connection, send the same render object to
 `POST /v1/jobs`. Poll
@@ -240,7 +242,8 @@ outbox survives process restarts.
 
 ## Secure the service
 
-Keep the service on loopback, enable `VIPERCAPTURE_ADMIN_TOKEN`, or put every
+Keep the service on loopback, set both `VIPERCAPTURE_ADMIN_TOKEN` and
+`VIPERCAPTURE_CONTROL_SECRET` (each at least 32 bytes), or put every
 route behind the same authenticated, rate-limited reverse proxy. When the
 control plane is disabled, job and schedule UUIDs identify resources but do
 not provide access control. Hosted mode rejects targets and redirects that
