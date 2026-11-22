@@ -9,7 +9,7 @@ remain separate.
 ## Install locally
 
 Use Python 3.11 or newer and install a full FFmpeg build through the operating
-system package manager. Confirm `ffmpeg -encoders` lists `libvpx`, `libvpx-vp9`,
+system package manager or the [FFmpeg download page](https://ffmpeg.org/download.html). Confirm `ffmpeg -encoders` lists `libvpx`, `libvpx-vp9`,
 and `libx264`; GPU video additionally requires the vendor encoder and driver.
 
 End users install the `vipercapture` command and then run it (open a new terminal first on Linux and macOS; on Windows PowerShell the current session's `Path` is updated automatically).
@@ -37,7 +37,8 @@ Firefox, and WebKit, starts the application, and opens the local interface.
 Press Esc twice or Ctrl+C to stop it. `vipercapture update` downloads the
 latest published version and keeps the virtualenv, `.env.local`, saved
 jobs, and presets. It is the same Python command on Linux, macOS, and
-Windows. On Windows, stop the running server before updating. `vipercapture --gui` opens a
+Windows. On Windows, stop the running server before updating. The update does
+not use sudo or a distro package manager. `vipercapture --gui` opens a
 full-screen capture menu in the same terminal and does not open a log
 window. Tab switches PNG, GIF, and MP4. Ctrl+P switches between the full
 page and the 1920x1080 viewport. The menu sends `VIPERCAPTURE_ADMIN_TOKEN`
@@ -82,6 +83,203 @@ brew install openssl@3 rust
 
 MacPorts: `sudo port install openssl rust`. Rust is only needed at build time.
 Linux, Windows, and Apple Silicon keep binary wheels (`cryptography>=50.0.0`).
+
+### Stop running instances
+
+`vipercapture kill` stops all running instances of ViperCapture (API server, GUI menu, and background workers) on Windows, macOS, and Linux. The API server receives an authenticated graceful-shutdown request and gets 30 seconds to close active work and browser processes before force escalation; set `VIPERCAPTURE_KILL_GRACE_SECONDS` to adjust that window (5–300 seconds).
+
+### Terminal display
+
+On Linux and macOS, Ghostty and Kitty open request logs in another window and
+show a full-screen status view in this one. The terminal graphics logo is drawn for Kitty,
+Ghostty, iTerm2, WezTerm, foot, mlterm, and Contour. Terminals without a reliably detectable graphics protocol, including Windows Terminal, display a styled two-tone block ASCII wordmark. Windows Terminal does not expose a supported Sixel capability/version variable; users who know their active native or WSL session supports Sixel can opt in with `VIPERCAPTURE_SIXEL=1`. WezTerm
+uses the Kitty graphics protocol when `enable_kitty_graphics = true`, and the
+iTerm2 image protocol otherwise. Override the `--gui` viewport with
+`vipercapture --gui --viewport 1280 720`.
+On Ubuntu and other apt-based systems, the first launch may ask for your
+password so Playwright can install the libraries its browsers need. Other
+Linux systems download the browsers and leave system packages alone.
+
+### Run from a clone
+
+To work from a clone instead, install uv if you can
+([installation guide](https://docs.astral.sh/uv/getting-started/installation/)):
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+On Windows, use `irm https://astral.sh/uv/install.ps1 | iex` in PowerShell.
+Then run:
+
+```bash
+git clone https://github.com/Viperisuseful/ViperCapture.git
+cd ViperCapture
+python launch.py
+```
+
+`python launch.py` is the same startup path the `vipercapture` command runs.
+The launcher prefers uv when it is on `PATH`: it creates `.venv` and installs
+from `requirements.txt`. If uv is missing, it falls back to the standard
+library `venv` module and pip. Set `VIPERCAPTURE_USE_UV=0` to force that pip
+path even when uv is installed.
+
+### Run with Docker
+
+```bash
+docker compose up --build
+```
+
+Stable container images are also published to GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/viperisuseful/vipercapture:1.1.0
+```
+
+By default, Compose binds only to loopback. It keeps durable queue state,
+encryption keys, schedules, cache entries, and local artifacts in a named
+volume. Read the production section below before exposing the service to
+a network. Set separate `VIPERCAPTURE_ADMIN_TOKEN` and
+`VIPERCAPTURE_CONTROL_SECRET` values to enable the built-in project control
+plane before exposing API routes to multiple tenants.
+
+## Send render requests
+
+`vipercapture capture` prints the saved path on stdout. A failure is one JSON object on stderr. Exit 0
+means the file was written, 2 means the command was rejected, and 1 means
+the capture or the network failed. `--full-page=false` and `--no-full-page`
+are the same flag. Action flags run in the order you write them, after
+`--wait` and `--delay-ms`. PowerShell and cmd take these same flags; put
+them on one line if the shell does not continue a trailing backslash.
+When the local server is not already running, `capture` starts it and leaves it
+listening. Stop that process with `vipercapture kill`.
+
+A synchronous request returns the artifact directly, with `X-Request-Id`
+and `X-ViperCapture-*` headers for queue and render timing, dimensions,
+navigation status, and cache outcome. See
+[diagnostic response headers](#read-diagnostic-response-headers).
+
+For work that must survive a dropped connection, send the same render object to
+`POST /v1/jobs`. Poll
+`GET /v1/jobs/{id}`, download `GET /v1/jobs/{id}/result`, or receive a signed
+callback by setting `delivery.webhook_url`. Related orchestration endpoints:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /v1/jobs/bulk` | Best-effort submission of up to 100 independently idempotent jobs |
+| `POST/GET/PATCH/DELETE /v1/schedules` | Encrypted five-field cron schedules with IANA time zones |
+| `POST /v1/signed-url` | Mint an expiring HMAC render link |
+| `GET /v1/render/signed` | Render through a verified signed link |
+| `POST /v1/diff` | Compare two images and download a deterministic report ZIP |
+| `PUT/GET/POST /v1/baselines` | Store project baselines and compare review bundles |
+| `POST/DELETE /v1/profiles` | Manage encrypted Playwright storage-state profiles |
+| `POST /v1/profiles/import` | Import pasted Cookie headers or browser-exported session files |
+| `GET /take` | ScreenshotOne-compatible common-options adapter |
+| `POST /compat/urlbox/v1/render/{sync,async}` | Urlbox-compatible adapters |
+
+## Use proxies, sessions, and CAPTCHA hooks
+
+Self-hosted renders can route an isolated browser context through an HTTP,
+HTTPS, SOCKS4, or SOCKS5 proxy. Keep credentials in separate fields instead of
+embedding them in the proxy URL:
+
+```json
+{
+  "url": "https://example.com",
+  "network": {
+    "proxy": {
+      "server": "socks5://proxy.example:1080",
+      "username": "account-zone-residential",
+      "password": "secret"
+    }
+  }
+}
+```
+
+With the project control plane enabled, `POST /v1/profiles/import` normalizes
+Playwright storage state, Cookie-Editor JSON, Netscape `cookies.txt`, or a
+pasted Cookie header into an encrypted profile. Pass its returned `id` as
+`profile_id` on later renders. Imports preserve local storage and partitioned
+cookies where the export format supports them.
+
+ViperCapture detects common blocking CAPTCHA and bot interstitials but does not
+solve or bypass them. This repository is the standard Playwright product. For
+Patchright plus Turnstile complete-when-possible / harder challenge handling,
+use the [ViperCapture Stealth](https://github.com/Viperisuseful/ViperCapture-Stealth)
+fork (0.1.0-beta). It is not a universal Cloudflare bypass; see that
+repository's [README](https://github.com/Viperisuseful/ViperCapture-Stealth#stealth-mode--patchright)
+for how-to. The default `captcha.action` is `error`; use `capture` to
+render the challenge as-is. Operators may configure their own approved async
+handler with `VIPERCAPTURE_CAPTCHA_HANDLER_FACTORY` and opt in per request with
+`captcha.action: "external"`. See the [API guide](api.md) for the handler
+contract and timeout behavior. Alternatively, an authorized caller can use an
+external tool independently, then start a fresh render with short-lived,
+target-scoped session state. ViperCapture ships no provider integration,
+credentials, endorsement, solver, or bypass service. If a site you
+administer challenges the renderer, use the least-privilege
+[Cloudflare/WAF authorization guide](site-access.md).
+
+## Configure storage and webhooks
+
+Set `VIPERCAPTURE_S3_BUCKET` to store job results through the built-in S3
+adapter instead of local files. It uses standard AWS credential resolution.
+R2 and MinIO also need an endpoint URL and, where appropriate, path-style
+addressing. The `docker-compose.s3.yml` overlay provides a complete local MinIO
+example:
+
+```bash
+export MINIO_ROOT_PASSWORD='replace-with-at-least-a-long-random-secret'
+docker compose -f docker-compose.yml -f docker-compose.s3.yml up --build
+```
+
+Set `VIPERCAPTURE_WEBHOOK_SECRET` to enable callbacks. Each callback contains
+canonical JSON signed with HMAC-SHA256 in
+`X-ViperCapture-Webhook-Signature`. Timestamp and event-ID headers support
+verification and deduplication. Private callback targets are rejected unless
+the operator explicitly opts in. Public DNS results stay pinned for the life
+of the callback connection to prevent rebinding, and the encrypted delivery
+outbox survives process restarts.
+
+## Secure the service
+
+Keep the service on loopback, set both `VIPERCAPTURE_ADMIN_TOKEN` and
+`VIPERCAPTURE_CONTROL_SECRET` (each at least 32 bytes), or put every
+route behind the same authenticated, rate-limited reverse proxy. When the
+control plane is disabled, job and schedule UUIDs identify resources but do
+not provide access control. Hosted mode rejects targets and redirects that
+resolve to private addresses during validation, along with unsafe subresources,
+cross-origin credential headers, proxy use, and cross-site cookies. Browser DNS
+can change after validation, so deployments also need host or container egress
+rules to block rebinding. Self-host mode allows internal pages and
+proxies; isolate Chromium with that boundary in mind.
+
+JavaScript actions are disabled unless `VIPERCAPTURE_ALLOW_SCRIPTS=1`. Render
+inputs can contain credentials and private page data. Async and scheduled inputs
+are AES-GCM encrypted and erased at terminal job states, but diagnostic console
+output and browser video can still record sensitive page content. Treat those
+artifacts accordingly.
+
+## Verify an installation
+
+```bash
+uv venv
+uv pip install -r requirements.txt
+.venv/bin/python -m playwright install --with-deps chromium firefox webkit
+npm ci --prefix frontend && npm run lint --prefix frontend && npm run build --prefix frontend
+.venv/bin/python scripts/smoke.py
+```
+
+Without uv, use `python -m venv .venv` and
+`.venv/bin/python -m pip install -r requirements.txt` instead, then the same
+Playwright, frontend, and smoke commands. On Windows, use
+`.venv\Scripts\python -m pip install -r requirements.txt` and
+`.venv\Scripts\python` for Playwright and smoke, and omit `--with-deps` from
+the Playwright command. On macOS, omit `--with-deps`.
+The smoke command starts a temporary local server and verifies Chromium,
+Firefox, WebKit, OpenAPI, health, and output dimensions. Pass
+`--base-url http://host:port` to check an existing deployment instead. For an
+authenticated deployment, set `VIPERCAPTURE_SMOKE_TOKEN` to an API or
+administrator token.
 
 ## Configure a production deployment
 
