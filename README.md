@@ -17,7 +17,7 @@ If you are moving from ScreenshotOne or Urlbox, compatibility adapters at `GET /
 - **Three browser engines.** Render with Chromium, Firefox, or WebKit in a fresh isolated context per request.
 - **Images, PDFs, video, and page data.** Output PNG, JPEG, WebP, AVIF, PDF, rendered HTML, Markdown, JSON metadata with CSS-selector extraction, or WebM, MP4, and GIF video. One page load can return a ZIP with side artifacts and up to five named thumbnails.
 - **Actions, waits, and cleanup.** Click, hover, fill, select, scroll, wait on selectors or images, and assert page content before capture. Built-in rules block ads, trackers, and chat widgets, and the vendored AutoConsent rules answer cookie consent dialogs.
-- **Async jobs, schedules, and webhooks.** Queue durable work at `POST /v1/jobs`, batch up to 100 items at `POST /v1/jobs/bulk`, or run five-field cron schedules in any IANA timezone. Set a webhook secret to get HMAC-SHA256 signed callbacks. The bundled job and schedule store runs on Linux, macOS, and Docker, so native Windows needs Docker or an external store. See [async jobs](docs/async-jobs.md).
+- **Async jobs, schedules, and webhooks.** Queue durable work at `POST /v1/jobs`, batch up to 100 items at `POST /v1/jobs/bulk`, or run five-field cron schedules in any IANA timezone. Set a webhook secret to get HMAC-SHA256 signed callbacks. The bundled job and schedule stores run on Linux, macOS, and Docker. Native Windows needs Docker, or external job, artifact, and schedule providers plus `VIPERCAPTURE_JOB_SECRET`, as described in [async jobs](docs/async-jobs.md).
 - **Local or S3-compatible storage.** Save job results locally or write them to AWS S3, Cloudflare R2, MinIO, or Backblaze B2.
 - **Visual diffs and baselines.** Compare two images at `POST /v1/diff` for a ZIP report with pixel counts and a highlighted diff image, or store project baselines.
 - **Projects and API keys.** Enable the optional control plane for hashed API keys, quotas, and encrypted browser profiles.
@@ -42,7 +42,7 @@ On Windows PowerShell:
 irm https://raw.githubusercontent.com/Viperisuseful/ViperCapture/master/scripts/install.ps1 | iex
 ```
 
-The installers add `vipercapture` to your `PATH`. When Python 3.11 or newer is missing, they install [uv](https://docs.astral.sh/uv/) and Python 3.12 for it.
+The installers add `vipercapture` to your `PATH`. If they can't find Python 3.11 or newer, they use [uv](https://docs.astral.sh/uv/) to install Python 3.12, and install uv first if needed.
 
 Run `vipercapture`. On Linux and macOS, open a new terminal first. The first run creates a private environment, installs Python dependencies with Chromium, Firefox, and WebKit, starts the API at `http://127.0.0.1:8000/v1`, and opens the web UI at `http://127.0.0.1:8000`.
 
