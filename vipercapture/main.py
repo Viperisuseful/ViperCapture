@@ -1943,10 +1943,6 @@ async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
         else None
     )
     control = getattr(app.state, "control", None)
-    # Keep queued jobs queued, without spending an attempt, while the
-    # browser that failed to start at boot is unavailable.
-    if not await _await_browser_startup(app):
-        raise JobDeferred(5.0)
     project_acquired = False
     if project_id is not None and control is not None:
         project_acquired = await control.acquire_worker(project_id)
@@ -1969,6 +1965,10 @@ async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
                     filename=cached.filename,
                     render_ms=round((time.perf_counter() - started) * 1000),
                 )
+        # Keep queued jobs queued, without spending an attempt, while the
+        # browser that failed to start at boot is unavailable.
+        if not await _await_browser_startup(app):
+            raise JobDeferred(5.0)
         queue_started = time.perf_counter()
         await app.state.capture_slots.acquire()
         slot_queue_ms = round((time.perf_counter() - queue_started) * 1000)
