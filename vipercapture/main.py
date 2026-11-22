@@ -9,6 +9,7 @@ import signal
 import sys
 import threading
 import time
+import traceback
 from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
 from functools import lru_cache
@@ -614,10 +615,21 @@ def _remove_browser_from_pool(app: FastAPI, engine: BrowserEngine, browser: Brow
         _sync_primary_browser(app)
 
 
+async def _await_browser_startup(app: FastAPI) -> bool:
+    """Wait for the background Chromium start. False means it failed."""
+    startup = getattr(app.state, "browser_startup", None)
+    if startup is None:
+        return True
+    with suppress(Exception):
+        await asyncio.shield(startup)
+    return getattr(app.state, "playwright", None) is not None
+
+
 async def _browser_for(app: FastAPI, engine: BrowserEngine) -> Browser:
     browsers = getattr(app.state, "browsers", None)
     if browsers is None:
         return app.state.browser
+    await _await_browser_startup(app)
     target = _pool_size_for(engine)
     async with app.state.browser_restart_lock:
         pool = _connected_pool(app, engine)
@@ -810,7 +822,15 @@ async def lifespan(app: FastAPI):
     )
 
     async def _start_playwright_and_browser() -> tuple[Playwright, Browser]:
-        pw: Playwright = await async_playwright().start()
+        # Shutdown can now arrive mid-handshake. Let start() finish so the
+        # driver process can be stopped instead of left running.
+        starting = asyncio.ensure_future(async_playwright().start())
+        try:
+            pw: Playwright = await asyncio.shield(starting)
+        except asyncio.CancelledError:
+            with suppress(Exception):
+                await (await starting).stop()
+            raise
         try:
             launched = await _launch_browser(pw)
         except BaseException:
@@ -821,40 +841,44 @@ async def lifespan(app: FastAPI):
 
     pw_task = asyncio.create_task(_start_playwright_and_browser())
     cache_task = asyncio.create_task(render_cache.start())
-    tasks_to_wait: list[asyncio.Task[object]] = [pw_task, cache_task]
+    # Only a required hardware GPU must be verified before the port opens.
+    # Otherwise Chromium starts in the background and renders wait for it.
+    browser_blocks_startup = GPU_MODE == "required"
+    tasks_to_wait: list[asyncio.Task[object]] = [cache_task]
+    if browser_blocks_startup:
+        tasks_to_wait.insert(0, pw_task)
     if control_task is not None:
         tasks_to_wait.append(control_task)
-    try:
-        results = await asyncio.gather(*tasks_to_wait, return_exceptions=True)
-    except BaseException:
-        for task in tasks_to_wait:
-            if not task.done():
-                task.cancel()
-        settled = await asyncio.gather(*tasks_to_wait, return_exceptions=True)
-        pw_settled = settled[0]
+
+    async def _discard_browser_startup() -> None:
+        if not pw_task.done():
+            pw_task.cancel()
+        (pw_settled,) = await asyncio.gather(pw_task, return_exceptions=True)
         if not isinstance(pw_settled, BaseException):
             pw_started, browser_started = pw_settled
             with suppress(Exception):
                 await browser_started.close()
             with suppress(Exception):
                 await pw_started.stop()
+
+    try:
+        results = await asyncio.gather(*tasks_to_wait, return_exceptions=True)
+    except BaseException:
+        for task in tasks_to_wait:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks_to_wait, return_exceptions=True)
+        await _discard_browser_startup()
         raise
-    pw_result = results[0]
     first_error = next((item for item in results if isinstance(item, BaseException)), None)
     if first_error is not None:
-        if not isinstance(pw_result, BaseException):
-            pw_started, browser_started = pw_result
-            with suppress(Exception):
-                await browser_started.close()
-            with suppress(Exception):
-                await pw_started.stop()
+        await _discard_browser_startup()
         raise first_error
 
-    playwright, browser = pw_result
-    app.state.playwright = playwright
-    app.state.device_descriptors = dict(playwright.devices)
-    app.state.browser = browser
-    app.state.browsers = {BrowserEngine.CHROMIUM: [browser]}
+    app.state.playwright = None
+    app.state.device_descriptors = None
+    app.state.browser = None
+    app.state.browsers = {BrowserEngine.CHROMIUM: []}
     app.state.browser_rr = {BrowserEngine.CHROMIUM: 0}
     app.state.browser_in_flight = {}
     app.state.browser_growing = {}
@@ -871,8 +895,9 @@ async def lifespan(app: FastAPI):
     app.state.async_result_slots = asyncio.Semaphore(MAX_ASYNC_RESULT_DOWNLOADS)
     app.state.browser_restart_lock = asyncio.Lock()
     app.state.browser_recycle_lock = asyncio.Lock()
-    app.state.browser_render_counts = {id(browser): 0}
+    app.state.browser_render_counts = {}
     app.state.retired_browsers = []
+    app.state.warmup_task = None
     app.state.async_jobs = None
     app.state.schedules = None
     app.state.render_cache = render_cache
@@ -894,7 +919,26 @@ async def lifespan(app: FastAPI):
                     target_browser, GPU_MODE
                 )
 
-    app.state.warmup_task = asyncio.create_task(_warm_initial_browser(browser))
+    def _adopt_initial_browser(started: tuple[Playwright, Browser]) -> None:
+        app.state.playwright, browser = started
+        app.state.device_descriptors = dict(app.state.playwright.devices)
+        _register_browser(app, BrowserEngine.CHROMIUM, browser)
+        app.state.warmup_task = asyncio.create_task(_warm_initial_browser(browser))
+
+    async def _finish_browser_startup() -> None:
+        try:
+            started = await pw_task
+        except Exception:
+            print("ERROR: Chromium failed to start.", file=sys.stderr)
+            traceback.print_exc()
+            raise
+        _adopt_initial_browser(started)
+
+    if browser_blocks_startup:
+        _adopt_initial_browser(results[0])
+        app.state.browser_startup = None
+    else:
+        app.state.browser_startup = asyncio.create_task(_finish_browser_startup())
     app.state.webhooks = (
         WebhookDispatcher(
             secret=WEBHOOK_SECRET,
@@ -1020,6 +1064,12 @@ async def lifespan(app: FastAPI):
             settling = list(getattr(app.state, "settling_captures", ()))
             if settling:
                 leftover_settlers = await _wait_for_settling_captures(settling)
+            browser_startup = getattr(app.state, "browser_startup", None)
+            if browser_startup is not None:
+                browser_startup.cancel()
+                await asyncio.gather(browser_startup, return_exceptions=True)
+            if app.state.playwright is None:
+                await _discard_browser_startup()
             warmup_task = getattr(app.state, "warmup_task", None)
             if warmup_task is not None and not warmup_task.done():
                 warmup_task.cancel()
@@ -1044,7 +1094,8 @@ async def lifespan(app: FastAPI):
                 closed_browser_ids.add(id(active_browser))
                 with suppress(Exception):
                     await asyncio.wait_for(active_browser.close(), timeout=5)
-            await playwright.stop()
+            if app.state.playwright is not None:
+                await app.state.playwright.stop()
             if leftover_settlers:
                 _cancel_settling_operations(leftover_settlers)
                 await asyncio.gather(*leftover_settlers, return_exceptions=True)
@@ -1892,6 +1943,10 @@ async def _render_async_image(payload: RenderRequest) -> RenderedArtifact:
         else None
     )
     control = getattr(app.state, "control", None)
+    # Keep queued jobs queued, without spending an attempt, while the
+    # browser that failed to start at boot is unavailable.
+    if not await _await_browser_startup(app):
+        raise JobDeferred(5.0)
     project_acquired = False
     if project_id is not None and control is not None:
         project_acquired = await control.acquire_worker(project_id)
@@ -3148,6 +3203,13 @@ if not HOSTED:
         mode = payload.get("mode") if isinstance(payload, dict) else None
         if mode not in {"off", "auto"}:
             raise HTTPException(status_code=422, detail="GPU mode must be off or auto")
+        if not await _await_browser_startup(app):
+            raise RenderError(
+                "browser_unavailable",
+                "The chromium browser is not installed or could not start.",
+                503,
+                False,
+            )
         if mode == app.state.gpu_mode:
             return {"gpu": await _gpu_config(app)}
 

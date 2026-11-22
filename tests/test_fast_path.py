@@ -309,6 +309,92 @@ def test_lifespan_cancellation_closes_launched_browser() -> None:
     assert pw_stopped is True
 
 
+def test_lifespan_serves_before_chromium_starts_and_renders_wait_for_it() -> None:
+    import asyncio
+    from types import SimpleNamespace
+    import vipercapture.main as main_mod
+
+    launch_gate = asyncio.Event()
+    closed: list[str] = []
+
+    class FakeBrowser:
+        def is_connected(self) -> bool:
+            return True
+
+        async def close(self) -> None:
+            closed.append("browser")
+
+    class FakePlaywright:
+        devices = {}
+
+        async def stop(self) -> None:
+            closed.append("playwright")
+
+    class FakePlaywrightCtx:
+        async def start(self) -> FakePlaywright:
+            return FakePlaywright()
+
+    async def gated_launch_browser(_pw) -> FakeBrowser:
+        await launch_gate.wait()
+        return FakeBrowser()
+
+    async def no_cache_start(_self) -> None:
+        return None
+
+    async def run() -> None:
+        fake_app = SimpleNamespace(state=SimpleNamespace())
+        with (
+            mock.patch.object(main_mod, "async_playwright", return_value=FakePlaywrightCtx()),
+            mock.patch.object(main_mod, "_launch_browser", side_effect=gated_launch_browser),
+            mock.patch.object(main_mod.RenderCache, "start", no_cache_start),
+            mock.patch.object(main_mod, "CONTROL_ENABLED", False),
+            mock.patch.object(main_mod, "ASYNC_JOBS_ENABLED", False),
+            mock.patch.object(main_mod, "SCHEDULES_ENABLED", False),
+            mock.patch.object(main_mod, "GPU_MODE", "off"),
+            mock.patch.object(main_mod, "BROWSER_POOL_SIZE", 1),
+        ):
+            lifespan = main_mod.lifespan(fake_app)  # type: ignore[arg-type]
+            await asyncio.wait_for(lifespan.__aenter__(), timeout=2)
+            assert main_mod._chromium_ready(fake_app) is False  # type: ignore[arg-type]
+            pending = asyncio.create_task(
+                main_mod._browser_for(fake_app, main_mod.BrowserEngine.CHROMIUM)  # type: ignore[arg-type]
+            )
+            await asyncio.sleep(0)
+            assert not pending.done()
+            launch_gate.set()
+            browser = await asyncio.wait_for(pending, timeout=2)
+            assert isinstance(browser, FakeBrowser)
+            assert fake_app.state.browser is browser
+            assert main_mod._chromium_ready(fake_app) is True  # type: ignore[arg-type]
+            await lifespan.__aexit__(None, None, None)
+
+    asyncio.run(run())
+    assert closed == ["browser", "playwright"]
+
+
+def test_async_job_defers_without_attempt_when_chromium_failed_to_start() -> None:
+    import asyncio
+    import pytest
+    import vipercapture.main as main_mod
+    from vipercapture.async_jobs import JobDeferred
+
+    async def failed_start() -> None:
+        raise RuntimeError("chromium missing")
+
+    async def run() -> None:
+        startup = asyncio.ensure_future(failed_start())
+        await asyncio.gather(startup, return_exceptions=True)
+        with (
+            mock.patch.object(main_mod.app.state, "browser_startup", startup, create=True),
+            mock.patch.object(main_mod.app.state, "playwright", None, create=True),
+            mock.patch.object(main_mod, "current_job", return_value=None),
+        ):
+            with pytest.raises(JobDeferred):
+                await main_mod._render_async_image(mock.Mock())
+
+    asyncio.run(run())
+
+
 def test_render_cache_indexed_put_evicts_without_rescanning_disk() -> None:
     import asyncio
     import tempfile
