@@ -133,7 +133,7 @@ docker compose up --build
 Stable container images are also published to GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/viperisuseful/vipercapture:1.1.0
+docker pull ghcr.io/viperisuseful/vipercapture:1.1.1
 ```
 
 By default, Compose binds only to loopback. It keeps durable queue state,
