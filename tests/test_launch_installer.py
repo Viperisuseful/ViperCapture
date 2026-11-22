@@ -776,6 +776,7 @@ class InstallerCommandTests(unittest.TestCase):
                     "/opt/uv",
                     "pip",
                     "install",
+                    "--compile-bytecode",
                     "--python",
                     "/venv/bin/python",
                     "-r",

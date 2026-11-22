@@ -2660,6 +2660,7 @@ def deps_commands(
                 uv,
                 "pip",
                 "install",
+                "--compile-bytecode",
                 "--python",
                 python,
                 "-r",
