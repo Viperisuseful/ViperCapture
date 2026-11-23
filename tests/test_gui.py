@@ -492,6 +492,33 @@ class GuiFrameTests(TestCase):
         self.assertEqual(sent.count(b"a=T,f=100"), 1)
         self.assertIn(b"https://news.example/story", sent)
 
+    def test_windows_drawer_places_the_inline_image_with_the_cursor_visible(self) -> None:
+        png = launch.LOGO_PNG.read_bytes()
+        size = launch.WindowSize(100, 40)
+        output = io.BytesIO()
+        stdout = mock.Mock(buffer=output)
+        drawer = gui._Drawer()
+        with (
+            mock.patch.object(gui.os, "name", "nt"),
+            mock.patch.object(gui, "_window_size", return_value=size),
+            mock.patch.object(launch, "choose_graphics_protocol", return_value="iterm2") as choose,
+            mock.patch.object(launch, "_logo_png", return_value=png),
+            mock.patch.object(gui.sys, "stdout", stdout),
+        ):
+            drawer.draw(gui.GuiState())
+            initial = output.getvalue()
+            drawer.draw(gui.GuiState(url="example.org"))
+
+        cols, rows = launch.logo_cells(size)
+        col = (size.cols - cols) // 2 + 1
+        row = (size.rows - 7 - rows) // 2
+        image = launch.iterm2_image_sequence(png, width=cols, height=rows)
+        choose.assert_called_with(alternate_screen=True)
+        self.assertIn(b"enter capture", initial)
+        self.assertTrue(initial.endswith(f"\x1b[?25h\x1b[{row};{col}H".encode() + image + b"\x1b[?25l"))
+        self.assertIn(b"example.org", output.getvalue()[len(initial):])
+        self.assertEqual(output.getvalue().count(b"\x1b]1337;File="), 1)
+
     def test_a_dead_server_is_reported_without_waiting_out_the_clock(self) -> None:
         class Server:
             def poll(self) -> int:
@@ -630,7 +657,7 @@ class GuiRuntimeTests(TestCase):
             mock.patch.object(gui.launch, "ensure_deps"),
             mock.patch.object(gui.launch, "ensure_playwright"),
             mock.patch.object(gui.launch, "port_open", return_value=True),
-            mock.patch.object(gui.launch, "choose_graphics_protocol", return_value=None),
+            mock.patch.object(gui.launch, "choose_graphics_protocol", return_value=None) as choose,
             mock.patch.object(gui, "_enable_windows_vt", side_effect=enable),
             mock.patch.object(gui, "_restore_windows_vt", side_effect=restore),
             mock.patch.object(gui, "_enter", side_effect=lambda: order.append("enter")),
@@ -638,6 +665,7 @@ class GuiRuntimeTests(TestCase):
             mock.patch.object(gui, "_run_keys", return_value=0),
         ):
             code = gui.run_capture_gui((1920, 1080), directory=Path("."))
+        choose.assert_called_once_with(alternate_screen=True)
         self.assertEqual(code, 0)
         self.assertEqual(order, ["enable", "enter", "leave", ("restore", 7)])
 

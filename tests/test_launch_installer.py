@@ -112,6 +112,12 @@ class TerminalLogoTests(unittest.TestCase):
         )
         self.assertEqual(
             launch.choose_graphics_protocol(
+                platform_name="win32", is_tty=True, environ=wezterm, kitty_graphics=True
+            ),
+            "kitty",
+        )
+        self.assertEqual(
+            launch.choose_graphics_protocol(
                 platform_name="linux", is_tty=True, environ=wezterm, kitty_graphics=True
             ),
             "kitty",
@@ -153,6 +159,20 @@ class TerminalLogoTests(unittest.TestCase):
             ),
             "sixel",
         )
+
+    def test_windows_wezterm_uses_iterm2_in_the_alternate_screen(self) -> None:
+        for term in ("xterm-256color", "xterm-kitty"):
+            with self.subTest(term=term):
+                self.assertEqual(
+                    launch.choose_graphics_protocol(
+                        platform_name="win32",
+                        is_tty=True,
+                        environ={"TERM_PROGRAM": "WezTerm", "TERM": term},
+                        kitty_graphics=True,
+                        alternate_screen=True,
+                    ),
+                    "iterm2",
+                )
 
     def test_wezterm_kitty_graphics_follows_the_config_flag(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

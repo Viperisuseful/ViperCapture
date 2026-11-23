@@ -649,11 +649,17 @@ def render_frame(
     if clear:
         parts.append(b"\x1b[2J\x1b[H")
     row = max(1, origin)
+    windows_image = b""
     if logo_rows:
         if clear and logo_bytes:
             col = max(1, (cols - logo_cols) // 2 + 1)
-            parts.append(f"\x1b[{row};{col}H".encode("ascii"))
-            parts.append(logo_bytes)
+            placement = f"\x1b[{row};{col}H".encode("ascii") + logo_bytes
+            if os.name == "nt" and protocol == "iterm2":
+                # ConPTY forwards the cursor position for an inline image only
+                # while the cursor is visible. Draw it after the text updates.
+                windows_image = b"\x1b[?25h" + placement + b"\x1b[?25l"
+            else:
+                parts.append(placement)
         row += logo_rows + 1
     if not clear:
         for erase_row in range(min(row, rows), rows + 1):
@@ -666,6 +672,7 @@ def render_frame(
         parts.append(f"\x1b[{row};{col}H".encode("ascii"))
         parts.append(line.encode("utf-8"))
         row += 1
+    parts.append(windows_image)
     return b"".join(parts)
 
 
@@ -1066,7 +1073,7 @@ class _Drawer:
 
     def draw(self, state: GuiState) -> None:
         size = _window_size()
-        protocol = launch.choose_graphics_protocol()
+        protocol = launch.choose_graphics_protocol(alternate_screen=True)
         png = launch._logo_png() if protocol else None
         key = (size.cols, size.rows, size.xpixels, size.ypixels, protocol)
         size_changed = key != self._key
@@ -1082,6 +1089,7 @@ class _Drawer:
         frame = render_frame(
             size,
             state,
+            protocol=protocol,
             clear=full,
             logo=self._logo if full else b"",
             logo_cols=self._logo_cols,
@@ -1440,7 +1448,7 @@ def run_capture_gui(viewport: tuple[int, int], directory: Path | None = None) ->
     started: subprocess.Popen[object] | None = None
     worker_pid: int | None = None
     log_handle: object | None = None
-    protocol = launch.choose_graphics_protocol()
+    protocol = launch.choose_graphics_protocol(alternate_screen=True)
     entered = False
     drawer = _Drawer()
     vt_mode = _enable_windows_vt()
