@@ -366,13 +366,11 @@ def choose_graphics_protocol(
     is_tty: bool | None = None,
     environ: Mapping[str, str] | None = None,
     kitty_graphics: bool | None = None,
+    alternate_screen: bool = False,
 ) -> str | None:
-    """Pick kitty, iterm2, or sixel. The operating system does not disable images.
-
-    ``platform_name`` does not turn images off. Windows Terminal and WezTerm
-    on Windows use the same rules as every other operating system.
-    """
-    _ = platform_name
+    """Pick the image protocol supported by the terminal and its console host."""
+    if platform_name is None:
+        platform_name = sys.platform
     if is_tty is None:
         is_tty = sys.stdout.isatty()
     if environ is None:
@@ -382,6 +380,9 @@ def choose_graphics_protocol(
     term = environ.get("TERM", "")
     if environ.get("TMUX") or term.startswith(("screen", "tmux")):
         return None
+    if alternate_screen and platform_name == "win32" and _is_wezterm(environ):
+        # ConPTY can drop or misplace Kitty images in the alternate screen.
+        return "iterm2"
     if _is_kitty(environ) or _is_ghostty(environ):
         return "kitty"
     if _is_iterm2(environ):
