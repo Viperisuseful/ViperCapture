@@ -2306,7 +2306,7 @@ class GuiCouncilHardeningTests(TestCase):
             proxy_sock.listen(1)
             proxy_port = proxy_sock.getsockname()[1]
 
-            png_body = b"\x89PNG\r\n\x1a\ntls-in-tls-ok"
+            png_body = b"\x89PNG\r\n\x1a\n" + (b"T" * 131_072)
 
             def _run_dest() -> None:
                 raw, _ = dest_sock.accept()
@@ -2391,9 +2391,97 @@ class GuiCouncilHardeningTests(TestCase):
                     )
                     with gui._open_capture(req, timeout=5.0, cancel=None) as resp:
                         self.assertEqual(resp.status, 200)
-                        self.assertEqual(resp.read(128), png_body)
+                        body = gui.read_capture(resp)
+                        self.assertEqual(len(body), len(png_body))
+                        self.assertEqual(body, png_body)
             finally:
                 td.join(timeout=3.0)
                 tp.join(timeout=3.0)
                 dest_sock.close()
                 proxy_sock.close()
+
+    def test_round6_idna_http_proxy_optimize_png_warning_and_history_path_sanitization(self) -> None:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading as _threading
+
+        # 1. HTTP forward proxy with IDNA hostname sends ASCII punycode target & Host header
+        seen: list[tuple[str, str]] = []
+
+        class _IdnaProxyHandler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(length)
+                seen.append((self.path, self.headers.get("Host", "")))
+                body = b"\x89PNG\r\n\x1a\nidna-ok"
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _IdnaProxyHandler)
+        t = _threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            proxy_port = srv.server_address[1]
+            with (
+                mock.patch.object(
+                    gui.urllib.request,
+                    "getproxies",
+                    return_value={"http": f"http://127.0.0.1:{proxy_port}"},
+                ),
+                mock.patch.object(gui.urllib.request, "proxy_bypass_environment", return_value=False),
+                mock.patch.object(gui.urllib.request, "proxy_bypass", return_value=False),
+            ):
+                req = gui.urllib.request.Request(
+                    "http://münchen.example:8080/v1/render?x=1",
+                    data=b"{}",
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with gui._open_capture(req, timeout=5.0, cancel=None) as resp:
+                    self.assertEqual(resp.status, 200)
+                    self.assertEqual(gui.read_capture(resp), b"\x89PNG\r\n\x1a\nidna-ok")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        self.assertEqual(seen, [("http://xn--mnchen-3ya.example:8080/v1/render?x=1", "xn--mnchen-3ya.example:8080")])
+
+        # 2. Preset optimizePng: false warns for PNG and WebP
+        _st, ignored = gui.apply_preset_settings_with_warnings(
+            gui.GuiState(),
+            {"output": "png", "optimizePng": False},
+        )
+        self.assertIn("optimizePng", ignored)
+
+        # 3. Capture History sanitizes saved rec.path containing terminal escapes
+        rec = gui.CaptureRecord(
+            url="https://example.com",
+            output="png",
+            path="/tmp/bad\x1b]52;c;ZGF0YQ==\x07dir/shot.png",
+            size_bytes=123,
+            duration_ms=40,
+            timestamp="12:00:00",
+        )
+        frame = gui.render_frame(
+            launch.WindowSize(80, 24),
+            gui.GuiState(drawer="history", captures=(rec,)),
+        ).decode("utf-8")
+        self.assertNotIn("\x1b]52", frame)
+        self.assertNotIn("\x07", frame)
+
+        # 4. Pre-cancelled CancelFlag aborts _create_connection_cancellable before connect
+        pre_cancel = gui.CancelFlag()
+        pre_cancel.abort()
+        with self.assertRaises(gui._Cancelled):
+            gui._create_connection_cancellable(
+                "127.0.0.1",
+                1,
+                5.0,
+                live_sock=[None],
+                cancel=pre_cancel,
+                abort_cb=lambda: None,
+            )

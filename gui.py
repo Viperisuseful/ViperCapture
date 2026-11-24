@@ -1821,6 +1821,9 @@ def apply_preset_settings_with_warnings(
     # Detect behavior-changing Web UI preset options that the TUI does not model.
     if settings.get("preserveViewportWidth") is True:
         ignored.append("preserveViewportWidth")
+    effective_output = str(changes.get("output", state.output))
+    if settings.get("optimizePng") is False and effective_output in {"png", "webp"}:
+        ignored.append("optimizePng")
     if isinstance(settings.get("headers"), str) and settings["headers"].strip():
         ignored.append("headers")
     if isinstance(settings.get("customCss"), str) and settings["customCss"].strip():
@@ -2659,7 +2662,7 @@ def _drawer_panel_history(
         item = state.captures[idx]
         is_sel = idx == selected
         prefix = "▸ " if is_sel else "  "
-        host = urllib.parse.urlparse(item.url).hostname or item.url
+        host = sanitize_terminal_text(urllib.parse.urlparse(item.url).hostname or item.url)
         ext = output_extension(item.output, diagnostics=item.diagnostics)
         meta = f"{ext} {format_bytes(item.size_bytes)} {format_duration(item.duration_ms)}"
         host_w = max(6, inner - 2 - len(meta) - 2)
@@ -2676,7 +2679,7 @@ def _drawer_panel_history(
         f"{format_bytes(rec.size_bytes)} · {format_duration(rec.duration_ms)}"
     )
     body.append(f"\x1b[2m{_ljust_cells(meta_line, inner)}\x1b[0m")
-    body.append(f"\x1b[2m{_ljust_cells(rec.path, inner)}\x1b[0m")
+    body.append(f"\x1b[2m{_ljust_cells(sanitize_terminal_text(rec.path), inner)}\x1b[0m")
     if preview_rows > 0:
         preview_offset = len(body) + 1  # +1 for top border line
         for _ in range(preview_rows):
@@ -3393,15 +3396,19 @@ def _proxy_for_url(url: str, scheme: str, hostname: str, port: int | None = None
     return proxy_url
 
 
-def _close_socket(sock: socket.socket | None) -> None:
+def _close_socket(sock: object | None) -> None:
     if sock is None:
         return
+    force = getattr(sock, "force_close", None)
+    if callable(force):
+        force()
+        return
     try:
-        sock.shutdown(socket.SHUT_RDWR)
+        sock.shutdown(socket.SHUT_RDWR)  # type: ignore[attr-defined]
     except OSError:
         pass
     try:
-        sock.close()
+        sock.close()  # type: ignore[attr-defined]
     except OSError:
         pass
 
@@ -3456,6 +3463,11 @@ class _TlsInTlsRawIO(io.RawIOBase):
     def readinto(self, b: bytearray | memoryview) -> int:  # type: ignore[override]
         return self._sock.recv_into(b)
 
+    def close(self) -> None:
+        if not self.closed:
+            super().close()
+            self._sock._release_io()
+
 
 class _TlsInTlsSocket:
     """True TLS-in-TLS socket over an outer SSLSocket via ssl.MemoryBIO."""
@@ -3474,6 +3486,8 @@ class _TlsInTlsSocket:
             self._out_bio,
             server_hostname=server_hostname,
         )
+        self._io_refs = 0
+        self._close_requested = False
         self._closed = False
 
     def _flush_out(self) -> None:
@@ -3537,10 +3551,16 @@ class _TlsInTlsSocket:
         return count
 
     def makefile(self, mode: str = "rb", buffering: int = -1) -> object:
+        self._io_refs += 1
         raw = _TlsInTlsRawIO(self)
         if buffering == 0:
             return raw
         return io.BufferedReader(raw, buffer_size=buffering if buffering > 0 else io.DEFAULT_BUFFER_SIZE)
+
+    def _release_io(self) -> None:
+        self._io_refs = max(0, self._io_refs - 1)
+        if self._io_refs == 0 and self._close_requested:
+            self.force_close()
 
     def settimeout(self, timeout: float | None) -> None:
         self._outer.settimeout(timeout)
@@ -3551,11 +3571,59 @@ class _TlsInTlsSocket:
     def shutdown(self, how: int) -> None:
         self._outer.shutdown(how)
 
-    def close(self) -> None:
+    def force_close(self) -> None:
         if self._closed:
             return
         self._closed = True
         _close_socket(self._outer)
+
+    def close(self) -> None:
+        self._close_requested = True
+        if self._io_refs <= 0:
+            self.force_close()
+
+
+def _create_connection_cancellable(
+    host: str,
+    port: int,
+    timeout: float,
+    *,
+    live_sock: list[object | None],
+    cancel: CancelFlag | None,
+    abort_cb: Callable[[], None],
+) -> socket.socket:
+    if cancel is not None:
+        cancel.bind(abort_cb)
+    if cancel is not None and cancel.requested:
+        raise _Cancelled()
+    last_err: OSError | None = None
+    infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    if not infos:
+        raise OSError(f"Could not resolve host {host!r}")
+    for af, socktype, proto, _canonname, sa in infos:
+        if cancel is not None and cancel.requested:
+            raise _Cancelled()
+        sock: socket.socket | None = None
+        try:
+            sock = socket.socket(af, socktype, proto)
+            sock.settimeout(timeout)
+            live_sock[0] = sock
+            if cancel is not None and cancel.requested:
+                raise _Cancelled()
+            sock.connect(sa)
+            return sock
+        except _Cancelled:
+            _close_socket(sock)
+            raise
+        except OSError as exc:
+            last_err = exc
+            _close_socket(sock)
+            if live_sock[0] is sock:
+                live_sock[0] = None
+            if cancel is not None and cancel.requested:
+                raise _Cancelled() from None
+    assert last_err is not None
+    raise last_err
 
 
 def _wrap_tls_cancellable(
@@ -3622,15 +3690,14 @@ def _open_capture(
                 creds = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
                 proxy_headers["Proxy-Authorization"] = f"Basic {creds}"
 
-            sock: socket.socket = socket.create_connection(
-                (ascii_proxy_host, proxy_port),
-                timeout=timeout,
+            sock: socket.socket = _create_connection_cancellable(
+                ascii_proxy_host,
+                proxy_port,
+                timeout,
+                live_sock=live_sock,
+                cancel=cancel,
+                abort_cb=_abort_active,
             )
-            live_sock[0] = sock
-            if cancel is not None:
-                cancel.bind(_abort_active)
-            if cancel is not None and cancel.requested:
-                raise _Cancelled()
 
             if proxy_parsed.scheme == "https":
                 sock = _wrap_tls_cancellable(
@@ -3676,15 +3743,19 @@ def _open_capture(
                 else:
                     connection = http.client.HTTPConnection(ascii_proxy_host, proxy_port, timeout=timeout)
                 connection.sock = sock
-                request_target = request.full_url
+                dest_authority = f"{dest_host_hdr}:{parsed.port}" if parsed.port is not None else dest_host_hdr
+                request_target = f"{parsed.scheme}://{dest_authority}{path}"
+                headers["Host"] = dest_authority
                 headers.update(proxy_headers)
         elif parsed.scheme == "https":
-            raw_sock = socket.create_connection((ascii_dest_host, port), timeout=timeout)
-            live_sock[0] = raw_sock
-            if cancel is not None:
-                cancel.bind(_abort_active)
-            if cancel is not None and cancel.requested:
-                raise _Cancelled()
+            raw_sock = _create_connection_cancellable(
+                ascii_dest_host,
+                port,
+                timeout,
+                live_sock=live_sock,
+                cancel=cancel,
+                abort_cb=_abort_active,
+            )
             tls_sock = _wrap_tls_cancellable(
                 raw_sock,
                 _default_ssl_context(),
@@ -3695,9 +3766,16 @@ def _open_capture(
             connection = http.client.HTTPSConnection(ascii_dest_host, port, timeout=timeout)
             connection.sock = tls_sock
         else:
+            raw_sock = _create_connection_cancellable(
+                ascii_dest_host,
+                port,
+                timeout,
+                live_sock=live_sock,
+                cancel=cancel,
+                abort_cb=_abort_active,
+            )
             connection = http.client.HTTPConnection(ascii_dest_host, port, timeout=timeout)
-            if cancel is not None:
-                cancel.bind(_abort_active)
+            connection.sock = raw_sock
 
         connection.request(
             request.get_method(),
