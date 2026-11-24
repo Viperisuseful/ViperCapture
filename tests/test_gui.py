@@ -2485,3 +2485,54 @@ class GuiCouncilHardeningTests(TestCase):
                 cancel=pre_cancel,
                 abort_cb=lambda: None,
             )
+
+        # 5. Cancelling right after connection.sock is assigned must NOT auto-reopen or send POST
+        posts_received: list[str] = []
+
+        class _NoPostHandler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(length)
+                posts_received.append(self.path)
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        no_post_srv = ThreadingHTTPServer(("127.0.0.1", 0), _NoPostHandler)
+        t_np = _threading.Thread(target=no_post_srv.serve_forever, daemon=True)
+        t_np.start()
+        try:
+            np_port = no_post_srv.server_address[1]
+            race_cancel = gui.CancelFlag()
+            orig_request = gui.http.client.HTTPConnection.request
+            reconnect_called = False
+
+            def _cancelling_request(conn_self, *args, **kwargs):
+                race_cancel.abort()
+                return orig_request(conn_self, *args, **kwargs)
+
+            def _forbid_connect(_conn_self):
+                nonlocal reconnect_called
+                reconnect_called = True
+                raise AssertionError("HTTPConnection.connect must not reopen after cancel")
+
+            with (
+                mock.patch.object(gui.http.client.HTTPConnection, "request", _cancelling_request),
+                mock.patch.object(gui.http.client.HTTPConnection, "connect", _forbid_connect),
+            ):
+                req = gui.urllib.request.Request(
+                    f"http://127.0.0.1:{np_port}/v1/render",
+                    data=b"{}",
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(gui._Cancelled):
+                    gui._open_capture(req, timeout=5.0, cancel=race_cancel)
+        finally:
+            no_post_srv.shutdown()
+            no_post_srv.server_close()
+        self.assertFalse(reconnect_called)
+        self.assertEqual(posts_received, [])

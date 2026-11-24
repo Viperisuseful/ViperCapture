@@ -3777,6 +3777,9 @@ def _open_capture(
             connection = http.client.HTTPConnection(ascii_dest_host, port, timeout=timeout)
             connection.sock = raw_sock
 
+        connection.auto_open = 0
+        if cancel is not None and cancel.requested:
+            raise _Cancelled()
         connection.request(
             request.get_method(),
             request_target,
