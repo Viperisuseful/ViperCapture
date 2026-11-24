@@ -913,10 +913,10 @@ def _config_credential_for_server(
     if not isinstance(raw, str) or not raw.strip():
         return ""
     cfg_server = cfg.get("server")
-    if isinstance(cfg_server, str) and cfg_server.strip() and server is not None:
+    if isinstance(cfg_server, str) and cfg_server.strip():
         cfg_origin = _server_origin(cfg_server)
         target_origin = _server_origin(server)
-        if cfg_origin is not None and target_origin is not None and cfg_origin != target_origin:
+        if cfg_origin is None or target_origin is None or cfg_origin != target_origin:
             return ""
     return _header_token(raw)
 
@@ -1223,18 +1223,16 @@ def payload_to_preset_settings(payload: dict[str, object]) -> dict[str, object]:
         if isinstance(env.get("media"), str):
             settings["media"] = env["media"]
 
-    cleanup = payload.get("cleanup")
-    if isinstance(cleanup, dict):
-        if isinstance(cleanup.get("consent_mode"), str):
-            settings["consent"] = cleanup["consent_mode"]
-        if cleanup.get("block_ads"):
-            settings["blockAds"] = True
-        if cleanup.get("block_trackers"):
-            settings["blockTrackers"] = True
-        if cleanup.get("block_chats"):
-            settings["blockChats"] = True
-        if cleanup.get("block_newsletters"):
-            settings["blockNewsletters"] = True
+    cleanup = payload.get("cleanup") if isinstance(payload.get("cleanup"), dict) else {}
+    settings["consent"] = (
+        cleanup["consent_mode"]
+        if isinstance(cleanup.get("consent_mode"), str) and cleanup["consent_mode"] in _CONSENT
+        else "none"
+    )
+    settings["blockAds"] = bool(cleanup.get("block_ads", False))
+    settings["blockTrackers"] = bool(cleanup.get("block_trackers", False))
+    settings["blockChats"] = bool(cleanup.get("block_chats", False))
+    settings["blockNewsletters"] = bool(cleanup.get("block_newsletters", False))
 
     if isinstance(payload.get("custom_css"), str):
         settings["customCss"] = payload["custom_css"]
@@ -1257,6 +1255,7 @@ def preset_settings_to_payload(settings: dict[str, object]) -> dict[str, object]
     """Convert either a Web UI PresetSettings dict or a RenderRequest dict into RenderRequest shape."""
     web_keys = {
         "width", "height", "fullPage", "preserveViewportWidth", "lazyLoad", "optimizePng",
+        "quality", "transparent", "locale", "timezone", "device", "consent", "orientation", "media",
         "videoDuration", "videoFps", "videoBitrate", "videoScroll",
         "waitEvent", "waitDelay", "waitSelector", "waitText", "waitTimeout",
         "blockAds", "blockTrackers", "blockChats", "blockNewsletters",
@@ -1264,7 +1263,8 @@ def preset_settings_to_payload(settings: dict[str, object]) -> dict[str, object]
         "clipEnabled", "clipX", "clipY", "clipWidth", "clipHeight",
         "extractMode", "pdfMode", "paperSize", "pdfMargin", "density",
     }
-    if not (set(settings.keys()) & web_keys):
+    is_flat_preset = bool(set(settings.keys()) & web_keys) or isinstance(settings.get("diagnostics"), bool)
+    if not is_flat_preset:
         copied = copy.deepcopy(settings)
         if "headers" in copied:
             decoded_headers = _decode_preset_headers(copied.get("headers"))
@@ -1331,9 +1331,9 @@ def preset_settings_to_payload(settings: dict[str, object]) -> dict[str, object]
             video["duration_ms"] = int(round(float(settings["videoDuration"]) * 1000))
         if isinstance(settings.get("videoFps"), int):
             video["fps"] = int(settings["videoFps"])
-        if fmt != "gif" and isinstance(settings.get("videoBitrate"), int):
+        if isinstance(settings.get("videoBitrate"), int):
             video["bitrate_mbps"] = int(settings["videoBitrate"])
-        if not full_page and settings.get("videoScroll"):
+        if settings.get("videoScroll"):
             video["scroll"] = True
         if full_page and fmt in {"webm", "gif"} and settings.get("transparent"):
             video["transparent_background"] = True
@@ -2181,16 +2181,56 @@ def _fast_validate_simple_payload(payload: dict[str, object]) -> bool:
     return True
 
 
+_FALLBACK_DICT_SECTIONS = frozenset({
+    "viewport", "environment", "network", "assertions", "delivery", "diagnostics",
+    "deterministic", "certification", "image", "wait_for", "cleanup", "captcha", "headers",
+})
+_FALLBACK_NULLABLE_DICT_SECTIONS = frozenset({"slices", "video", "clip", "pdf"})
+_FALLBACK_LIST_SECTIONS = frozenset({"actions", "fail_on_status"})
+_FALLBACK_NULLABLE_LIST_SECTIONS = frozenset({"viewports", "elements", "side_outputs"})
+_FALLBACK_NULLABLE_STR_FIELDS = frozenset({
+    "url", "html", "markdown", "base_url", "profile_id", "cache_key", "selector", "custom_css",
+})
+_FALLBACK_BOOL_FIELDS = frozenset({
+    "full_page", "stealth", "cache", "include_shadow_dom", "preserve_viewport_width",
+    "save_profile", "proceed_on_captcha",
+})
+_FALLBACK_ALLOWED_KEYS = (
+    _FALLBACK_DICT_SECTIONS
+    | _FALLBACK_NULLABLE_DICT_SECTIONS
+    | _FALLBACK_LIST_SECTIONS
+    | _FALLBACK_NULLABLE_LIST_SECTIONS
+    | _FALLBACK_NULLABLE_STR_FIELDS
+    | _FALLBACK_BOOL_FIELDS
+    | frozenset({"output", "engine", "lazy_load", "profile", "extract_mode"})
+)
+
+
 def _validate_payload_fallback(payload: dict[str, object]) -> None:
     """Stdlib fallback validator used when Pydantic/RenderRequest is unavailable."""
     if not isinstance(payload, dict):
         raise ValueError("Render payload must be a JSON object.")
+    unknown = sorted(set(payload.keys()) - _FALLBACK_ALLOWED_KEYS)
+    if unknown:
+        raise ValueError(f"Unknown render request field(s): {', '.join(unknown)}")
     sources = sum(1 for k in ("url", "html", "markdown") if k in payload and payload[k] is not None)
     if sources != 1:
         raise ValueError("Render payload must specify exactly one of url, html, or markdown.")
-    for src_key in ("url", "html", "markdown"):
-        if src_key in payload and payload[src_key] is not None and not isinstance(payload[src_key], str):
-            raise ValueError(f"{src_key} must be a string.")
+    for str_key in _FALLBACK_NULLABLE_STR_FIELDS:
+        if str_key in payload and payload[str_key] is not None and not isinstance(payload[str_key], str):
+            raise ValueError(f"{str_key} must be a string.")
+    for dict_key in _FALLBACK_DICT_SECTIONS:
+        if dict_key in payload and not isinstance(payload[dict_key], dict):
+            raise ValueError(f"{dict_key} must be an object.")
+    for ndict_key in _FALLBACK_NULLABLE_DICT_SECTIONS:
+        if ndict_key in payload and payload[ndict_key] is not None and not isinstance(payload[ndict_key], dict):
+            raise ValueError(f"{ndict_key} must be an object or null.")
+    for list_key in _FALLBACK_LIST_SECTIONS:
+        if list_key in payload and not isinstance(payload[list_key], list):
+            raise ValueError(f"{list_key} must be a list.")
+    for nlist_key in _FALLBACK_NULLABLE_LIST_SECTIONS:
+        if nlist_key in payload and payload[nlist_key] is not None and not isinstance(payload[nlist_key], list):
+            raise ValueError(f"{nlist_key} must be a list or null.")
     if "output" in payload:
         out = payload["output"]
         if not isinstance(out, str) or out not in _FORMATS:
@@ -2199,15 +2239,7 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
         eng = payload["engine"]
         if not isinstance(eng, str) or eng not in _ENGINES:
             raise ValueError(f"engine must be one of: {', '.join(_ENGINES)}")
-    for bool_key in (
-        "full_page",
-        "stealth",
-        "cache",
-        "include_shadow_dom",
-        "preserve_viewport_width",
-        "save_profile",
-        "proceed_on_captcha",
-    ):
+    for bool_key in _FALLBACK_BOOL_FIELDS:
         if bool_key in payload and type(payload[bool_key]) is not bool:
             raise ValueError(f"{bool_key} must be a boolean.")
     if "lazy_load" in payload and (not isinstance(payload["lazy_load"], str) or payload["lazy_load"] not in _LAZY):
@@ -2218,8 +2250,7 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
         raise ValueError(f"extract_mode must be one of: {', '.join(_EXTRACT)}")
     if "viewport" in payload:
         vp = payload["viewport"]
-        if not isinstance(vp, dict):
-            raise ValueError("viewport must be an object.")
+        assert isinstance(vp, dict)
         for dim in ("width", "height"):
             if dim in vp and (not _is_int(vp[dim]) or vp[dim] < 1):  # type: ignore[operator]
                 raise ValueError(f"viewport.{dim} must be a positive integer.")
@@ -2227,34 +2258,38 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
             raise ValueError("viewport.device_scale_factor must be a positive number.")
     if "environment" in payload:
         env = payload["environment"]
-        if not isinstance(env, dict):
-            raise ValueError("environment must be an object.")
+        assert isinstance(env, dict)
         if "device" in env and (not isinstance(env["device"], str) or env["device"] not in _DEVICES):
             raise ValueError("environment.device is invalid.")
-        if "color_scheme" in env and (not isinstance(env["color_scheme"], str) or env["color_scheme"] not in _COLOR_SCHEMES):
+        if "color_scheme" in env and env["color_scheme"] is not None and (
+            not isinstance(env["color_scheme"], str) or env["color_scheme"] not in _COLOR_SCHEMES
+        ):
             raise ValueError("environment.color_scheme is invalid.")
-        if "reduced_motion" in env and (not isinstance(env["reduced_motion"], str) or env["reduced_motion"] not in _REDUCED_MOTION):
+        if "reduced_motion" in env and env["reduced_motion"] is not None and (
+            not isinstance(env["reduced_motion"], str) or env["reduced_motion"] not in _REDUCED_MOTION
+        ):
             raise ValueError("environment.reduced_motion is invalid.")
-        if "media" in env and (not isinstance(env["media"], str) or env["media"] not in _MEDIA):
+        if "media" in env and env["media"] is not None and (
+            not isinstance(env["media"], str) or env["media"] not in _MEDIA
+        ):
             raise ValueError("environment.media is invalid.")
     if "wait_for" in payload:
         wf = payload["wait_for"]
-        if not isinstance(wf, dict):
-            raise ValueError("wait_for must be an object.")
+        assert isinstance(wf, dict)
         if "event" in wf and (not isinstance(wf["event"], str) or wf["event"] not in _WAIT_EVENTS):
             raise ValueError("wait_for.event is invalid.")
         if "selector_state" in wf and (not isinstance(wf["selector_state"], str) or wf["selector_state"] not in _WAIT_STATES):
             raise ValueError("wait_for.selector_state is invalid.")
     if "actions" in payload:
         acts = payload["actions"]
-        if not isinstance(acts, list):
-            raise ValueError("actions must be a list.")
+        assert isinstance(acts, list)
         for act in acts:
             if not isinstance(act, dict) or not isinstance(act.get("type"), str) or act["type"] not in _FAST_ALL_ACTIONS:
                 raise ValueError("Each action must be an object with a valid type.")
     if "headers" in payload:
         hdrs = payload["headers"]
-        if not isinstance(hdrs, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in hdrs.items()):
+        assert isinstance(hdrs, dict)
+        if not all(isinstance(k, str) and isinstance(v, str) for k, v in hdrs.items()):
             raise ValueError("headers must be a mapping of string names to string values.")
 
 

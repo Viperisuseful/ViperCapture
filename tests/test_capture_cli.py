@@ -1200,12 +1200,60 @@ class NewCaptureFeaturesTests(unittest.TestCase):
                 self.assertEqual(main(["--no-config", "--dry-run", "https://example.com", "--cookie-file", str(part_file)]), 2)
             self.assertIn("partitionKey", stderr.getvalue())
 
-            # 3. Malformed --from-json with non-string enum (list) exits 2 cleanly even without pydantic
+            # 3. Malformed --from-json with non-string enum/section types exits 2 even without pydantic,
+            # while nullable environment fields (color_scheme: null) remain valid
             bad_json = Path(tmp) / "bad.json"
             bad_json.write_text(json.dumps({"url": "https://example.com", "engine": ["chromium"]}), encoding="utf-8")
-            stderr = io.StringIO()
-            with mock.patch.dict(sys.modules, {"pydantic": None}), mock.patch("sys.stderr", stderr):
-                self.assertEqual(main(["--no-config", "--dry-run", "--from-json", str(bad_json)]), 2)
+            bad_img_json = Path(tmp) / "bad_img.json"
+            bad_img_json.write_text(json.dumps({"url": "https://example.com", "image": []}), encoding="utf-8")
+            bad_pdf_json = Path(tmp) / "bad_pdf.json"
+            bad_pdf_json.write_text(json.dumps({"url": "https://example.com", "output": "pdf", "pdf": []}), encoding="utf-8")
+            null_env_json = Path(tmp) / "null_env.json"
+            null_env_json.write_text(
+                json.dumps({"url": "https://example.com", "environment": {"color_scheme": None}}),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(sys.modules, {"pydantic": None}):
+                for bad_path in (bad_json, bad_img_json, bad_pdf_json):
+                    stderr = io.StringIO()
+                    with mock.patch("sys.stderr", stderr):
+                        self.assertEqual(main(["--no-config", "--dry-run", "--from-json", str(bad_path)]), 2)
+                stdout = io.StringIO()
+                with mock.patch("sys.stdout", stdout):
+                    self.assertEqual(main(["--no-config", "--dry-run", "--from-json", str(null_env_json)]), 0)
+
+            # 3a. Malformed config.toml server fails closed for credentials
+            from vipercapture.capture_cli import _config_credential_for_server, payload_to_preset_settings, preset_settings_to_payload
+            self.assertEqual(
+                _config_credential_for_server(
+                    {"server": "capture.internal", "api_key": "secret-key"},
+                    "api_key",
+                    "https://other.example",
+                ),
+                "",
+            )
+
+            # 3a2. Flat CLI presets with only quality/locale/diagnostics/GIF bitrate round-trip cleanly & preserve cleanup defaults
+            for cli_payload, expected_check in (
+                ({"output": "jpeg", "image": {"quality": 72}}, lambda p: p["image"]["quality"] == 72),
+                ({"output": "png", "environment": {"locale": "fr-FR"}}, lambda p: p["environment"]["locale"] == "fr-FR"),
+                ({"output": "png", "diagnostics": {"bundle": True}}, lambda p: p["diagnostics"]["bundle"] is True),
+                (
+                    {"output": "gif", "full_page": False, "video": {"bitrate_mbps": 3}},
+                    lambda p: p["video"]["bitrate_mbps"] == 3 and p["full_page"] is False,
+                ),
+            ):
+                saved = payload_to_preset_settings(cli_payload)
+                self.assertEqual(saved["consent"], "none")
+                self.assertFalse(saved["blockAds"])
+                self.assertFalse(saved["blockTrackers"])
+                self.assertFalse(saved["blockChats"])
+                self.assertFalse(saved["blockNewsletters"])
+                reloaded = preset_settings_to_payload(saved)
+                self.assertTrue(expected_check(reloaded), f"Failed round-trip for {cli_payload}: {reloaded}")
+                # Also verify minimal flat presets without cleanup keys still decode properly
+            self.assertEqual(preset_settings_to_payload({"output": "jpeg", "quality": 72})["image"], {"quality": 72})
+            self.assertEqual(preset_settings_to_payload({"output": "png", "diagnostics": True})["diagnostics"], {"bundle": True})
 
             # 3b. Batch idempotency key derivation stays <= 128 chars for max-length keys
             from vipercapture.capture_cli import derive_batch_idempotency_key
