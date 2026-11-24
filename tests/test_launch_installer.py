@@ -2773,10 +2773,10 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
                 }),
                 encoding="utf-8",
             )
-            terminated_ports: list[int] = []
+            terminated_endpoints: list[tuple[str, int]] = []
 
-            def _fake_terminate(ident, *, port=launch.PORT, **_kwargs):
-                terminated_ports.append(port)
+            def _fake_terminate(ident, *, host=launch.HOST, port=launch.PORT, **_kwargs):
+                terminated_endpoints.append((host, port))
                 return True, None
 
             with (
@@ -2790,7 +2790,40 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
             ):
                 code = launch.kill_all_instances()
             self.assertEqual(code, 0)
-            self.assertEqual(terminated_ports, [9100])
+            self.assertEqual(terminated_endpoints, [(launch.HOST, 9100)])
+
+            # IPv6 bind (--host ::1 --port 9100) uses ::1 for graceful HTTP shutdown
+            ipv6_identity = launch.ProcessIdentity(
+                pid=42425,
+                kind="server",
+                command="python -m uvicorn vipercapture.main:app --host ::1 --port 9100",
+                start_time="12346",
+            )
+            (runtime_dir / "server-42425.json").write_text(
+                json.dumps({
+                    "service": "vipercapture",
+                    "install_id": launch._installation_id(),
+                    "pid": 42425,
+                    "host": "::1",
+                    "port": 9100,
+                    "start_time": "12346",
+                    "token": "secret-shutdown-token",
+                }),
+                encoding="utf-8",
+            )
+            terminated_endpoints.clear()
+            with (
+                mock.patch("launch.Path.home", return_value=fake_home),
+                mock.patch("launch.find_vipercapture_processes", return_value={42425: ipv6_identity}),
+                mock.patch("launch._is_vipercapture_endpoint", return_value=None),
+                mock.patch("launch.port_open", return_value=False),
+                mock.patch("launch._terminate_process", side_effect=_fake_terminate),
+                mock.patch("launch._prune_stale_server_records"),
+                mock.patch("sys.stdout", io.StringIO()),
+            ):
+                code = launch.kill_all_instances()
+            self.assertEqual(code, 0)
+            self.assertEqual(terminated_endpoints, [("::1", 9100)])
 
 
 if __name__ == "__main__":

@@ -1231,6 +1231,16 @@ def cmd_bulk(argv: list[str]) -> int:
     if args.poll_ms < 1:
         return fail("--poll-ms must be 1 or greater.", exit_code=2)
 
+    output_dir: Path | None = None
+    if args.wait:
+        output_dir = Path(args.output_dir) if args.output_dir else Path.cwd()
+        if output_dir.exists() and not output_dir.is_dir():
+            return fail(f"--output-dir is not a directory: {output_dir}", exit_code=2)
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return fail(f"Cannot create --output-dir {output_dir}: {exc}", exit_code=2)
+
     load_local_env()
     try:
         root = api_root(args.server)
@@ -1303,8 +1313,7 @@ def cmd_bulk(argv: list[str]) -> int:
                         write_line(sys.stdout, f"  [{entry.get('index')}] FAILED: {msg}")
             return 0 if failed_total == 0 else 1
 
-        output_dir = Path(args.output_dir) if args.output_dir else Path.cwd()
-        output_dir.mkdir(parents=True, exist_ok=True)
+        assert output_dir is not None
         deadline = time.monotonic() + float(args.request_timeout)
         get_headers = _auth_headers(args, started_server=started)
         downloaded: list[dict[str, object]] = []

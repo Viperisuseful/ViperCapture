@@ -180,6 +180,9 @@ class _ApiMockHandler(BaseHTTPRequestHandler):
         if path == "/v1/render":
             self._send_bytes(200, b"\x89PNG\r\n\x1a\nrendered", "image/png", headers={"Content-Disposition": 'attachment; filename="rendered.png"'})
             return
+        if path == "/v1/jobs":
+            self._send_json(202, {"id": "job-async-1", "status": "queued", "status_url": "/v1/jobs/job-async-1"})
+            return
         if path == "/v1/diff":
             passed = state.get("diff_passed", True)
             ratio = 0.0 if passed else 0.12
@@ -1303,6 +1306,101 @@ class CliCouncilHardeningTests(unittest.TestCase):
         code, stdout, stderr = self._run(["status", "--server", self.server, "--json"])
         self.assertEqual(code, 0, stderr)
         self.assertIsNone(json.loads(stdout)["server_version"])
+
+    def test_round7_empty_download_preserves_file_pdf_preset_bulk_dir_template_and_open_count(self) -> None:
+        from vipercapture import capture_cli
+
+        # 1. Empty download fails without deleting pre-existing destination file
+        with tempfile.TemporaryDirectory() as tmp:
+            existing = Path(tmp) / "existing.png"
+            existing.write_bytes(b"original-artifact")
+
+            class _EmptyResp:
+                headers: dict[str, str] = {}
+
+                def read(self, _n: int = -1) -> bytes:
+                    return b""
+
+            with self.assertRaises(capture_cli.CaptureError):
+                capture_cli.write_response(_EmptyResp(), existing)
+            self.assertTrue(existing.is_file())
+            self.assertEqual(existing.read_bytes(), b"original-artifact")
+
+        # 2. Saved Web UI PDF presets omit preserve_viewport_width, selector, and clip
+        pdf_payload = capture_cli.preset_settings_to_payload({
+            "output": "pdf",
+            "fullPage": False,
+            "preserveViewportWidth": True,
+            "selector": "#invoice",
+            "clipEnabled": True,
+        })
+        self.assertNotIn("preserve_viewport_width", pdf_payload)
+        self.assertNotIn("selector", pdf_payload)
+        self.assertNotIn("clip", pdf_payload)
+        capture_cli.validate_payload({**pdf_payload, "url": "https://example.org"})
+
+        # 3. bulk --wait with --output-dir pointing to an existing regular file fails BEFORE submitting
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = Path(tmp) / "existing.txt"
+            blocker.write_text("file", encoding="utf-8")
+            before_count = len(self.httpd.requests)  # type: ignore[attr-defined]
+            code, _stdout, stderr = self._run([
+                "bulk", "--url", "https://example.org",
+                "--wait", "--json",
+                "--output-dir", str(blocker),
+                "--server", self.server,
+            ])
+            self.assertEqual(code, 2)
+            self.assertIn("--output-dir", stderr)
+            self.assertEqual(len(self.httpd.requests), before_count)  # type: ignore[attr-defined]
+
+        # 4. AttributeError in --output-template ('{host.missing}{ext}') exits 2 cleanly;
+        #    --async --no-wait skips template resolution consistently for single-URL captures
+        buf_out, buf_err = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdout", buf_out), mock.patch("sys.stderr", buf_err):
+            code = capture_cli.main([
+                "https://example.org",
+                "--no-config", "--no-start",
+                "--output-template", "{host.missing}{ext}",
+                "--server", self.server,
+            ])
+        self.assertEqual(code, 2)
+        self.assertIn("Invalid --output-template", buf_err.getvalue())
+
+        buf_out, buf_err = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdout", buf_out), mock.patch("sys.stderr", buf_err):
+            code = capture_cli.main([
+                "https://example.org",
+                "--async", "--no-wait",
+                "--output-template", "{missing}{ext}",
+                "--server", self.server,
+                "--json",
+            ])
+        self.assertEqual(code, 0, buf_err.getvalue())
+
+        # 5. Multi-URL --open failure does NOT double-count results
+        with tempfile.TemporaryDirectory() as tmp:
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with (
+                mock.patch("sys.stdout", buf_out),
+                mock.patch("sys.stderr", buf_err),
+                mock.patch.object(
+                    capture_cli,
+                    "open_saved_file",
+                    side_effect=capture_cli.CaptureError("opener failed"),
+                ),
+            ):
+                code = capture_cli.main([
+                    "https://one.example", "https://two.example",
+                    "--open", "--output-dir", tmp,
+                    "--server", self.server,
+                    "--json",
+                ])
+            self.assertEqual(code, 1)
+            doc = json.loads(buf_out.getvalue())
+            self.assertEqual(doc["count"], 2)
+            self.assertEqual(doc["succeeded"], 0)
+            self.assertEqual(doc["failed"], 2)
 
 
 if __name__ == "__main__":

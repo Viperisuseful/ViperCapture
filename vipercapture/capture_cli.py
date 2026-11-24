@@ -1306,7 +1306,7 @@ def preset_settings_to_payload(settings: dict[str, object]) -> dict[str, object]
         full_page = False
     if not full_page:
         payload["full_page"] = False
-    if full_page and not selector and not clip_enabled and _coerce_bool(settings.get("preserveViewportWidth"), False):
+    if is_image and full_page and not selector and not clip_enabled and _coerce_bool(settings.get("preserveViewportWidth"), False):
         payload["preserve_viewport_width"] = True
 
     viewport: dict[str, object] = {}
@@ -1319,14 +1319,14 @@ def preset_settings_to_payload(settings: dict[str, object]) -> dict[str, object]
     if viewport:
         payload["viewport"] = viewport
 
-    if clip_enabled and (is_image or not full_page):
+    if is_image and clip_enabled:
         payload["clip"] = {
             "x": float(settings.get("clipX", 0)),
             "y": float(settings.get("clipY", 0)),
             "width": float(settings.get("clipWidth", 640)),
             "height": float(settings.get("clipHeight", 480)),
         }
-    elif selector and (is_image or not full_page):
+    elif is_image and selector:
         payload["selector"] = selector
 
     image: dict[str, object] = {}
@@ -2369,7 +2369,7 @@ def render_output_template(
             format=fmt,
             ext=ext,
         )
-    except (KeyError, ValueError, IndexError) as exc:
+    except (KeyError, ValueError, IndexError, AttributeError) as exc:
         raise ValueError(
             f"Invalid --output-template {template!r}: {exc}. "
             "Supported placeholders: {host}, {index}, {slug}, {timestamp}, {format}, {ext}."
@@ -2913,13 +2913,12 @@ def write_response(response, path: Path | None) -> int:
     try:
         with os.fdopen(descriptor, "wb") as handle:
             total = _read_bounded(response, handle)
+        if total <= 0:
+            raise CaptureError("The API returned an empty capture.")
         os.replace(temporary, path)
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
-    if total <= 0:
-        path.unlink(missing_ok=True)
-        raise CaptureError("The API returned an empty capture.")
     return total
 
 
@@ -3420,7 +3419,7 @@ def _execute_one(
 
 def execute(args: argparse.Namespace, payload: dict[str, object], *, started_server: bool) -> int:
     root = api_root(args.server)
-    output = resolve_output(args, payload)
+    output = None if (args.async_job and getattr(args, "no_wait", False)) else resolve_output(args, payload)
     response_headers, total, async_job_doc = _execute_one(
         args,
         payload,
@@ -3705,6 +3704,8 @@ def run_capture(args: argparse.Namespace) -> int:
                 else:
                     assert target_path is not None
                     shown = display_path(target_path)
+                    if getattr(args, "open_output", False):
+                        open_saved_file(target_path)
                     results.append({
                         "ok": True,
                         "url": item_payload.get("url"),
@@ -3713,8 +3714,6 @@ def run_capture(args: argparse.Namespace) -> int:
                         "bytes": total,
                         "media_type": _media_type(headers),
                     })
-                    if getattr(args, "open_output", False):
-                        open_saved_file(target_path)
                     if not args.json and not args.quiet:
                         write_line(sys.stdout, shown)
             except CaptureError as exc:

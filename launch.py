@@ -2143,7 +2143,7 @@ def _prune_stale_server_records(root_dir: Path = ROOT) -> None:
                 pass
 
 
-def _record_server_process(pid: int, token: str, port: int = PORT) -> bool:
+def _record_server_process(pid: int, token: str, port: int = PORT, *, host: str = HOST) -> bool:
     _prune_stale_server_records()
     started = _get_process_start_time(pid)
     if started is None:
@@ -2152,6 +2152,7 @@ def _record_server_process(pid: int, token: str, port: int = PORT) -> bool:
         "service": "vipercapture",
         "install_id": _installation_id(),
         "pid": pid,
+        "host": host,
         "port": port,
         "start_time": started,
         "token": token,
@@ -2183,7 +2184,7 @@ def _record_endpoint_server_process(
     if endpoint_pid is None:
         return None
     if endpoint_pid != launcher_pid and _is_descendant_pid(endpoint_pid, launcher_pid):
-        _record_server_process(endpoint_pid, token, port)
+        _record_server_process(endpoint_pid, token, port, host=host)
         return endpoint_pid
     return endpoint_pid if endpoint_pid == launcher_pid else None
 
@@ -2409,13 +2410,41 @@ def _terminate_process(
     return False, "survived_sigkill"
 
 
-def _verified_server_record_port(identity: ProcessIdentity, *, root_dir: Path = ROOT) -> int | None:
-    """Return the port recorded for a verified server runtime record, if any."""
+def _connect_host_from_command(command: str) -> str | None:
+    """Infer a local connect host from a recorded uvicorn command line."""
+    try:
+        tokens = _mod("shlex").split(command, posix=sys.platform != "win32")
+    except ValueError:
+        tokens = command.split()
+    for idx, token in enumerate(tokens):
+        raw_host: str | None = None
+        if token == "--host" and idx + 1 < len(tokens):
+            raw_host = tokens[idx + 1]
+        elif token.startswith("--host="):
+            raw_host = token.split("=", 1)[1]
+        if raw_host:
+            cleaned = raw_host.strip().strip("[]")
+            if cleaned in {"::", "::1"}:
+                return "::1"
+            if cleaned in {"0.0.0.0", "127.0.0.1", "localhost"}:
+                return "127.0.0.1"
+            if _is_loopback_bind_host(cleaned):
+                return cleaned
+            return "127.0.0.1"
+    return None
+
+
+def _verified_server_record_endpoint(
+    identity: ProcessIdentity,
+    *,
+    root_dir: Path = ROOT,
+) -> tuple[str | None, int | None]:
+    """Return the ``(host, port)`` recorded for a verified server runtime record, if any."""
     json = _mod("json")
     try:
         record = json.loads(_server_record_path(identity.pid).read_text(encoding="utf-8"))
         if not isinstance(record, dict):
-            return None
+            return None, None
         record_port = record.get("port")
         if (
             record.get("service") == "vipercapture"
@@ -2426,10 +2455,18 @@ def _verified_server_record_port(identity: ProcessIdentity, *, root_dir: Path = 
             and not isinstance(record_port, bool)
             and 1 <= record_port <= 65535
         ):
-            return record_port
+            raw_host = record.get("host")
+            record_host: str | None = None
+            if isinstance(raw_host, str) and raw_host.strip():
+                cleaned = raw_host.strip().strip("[]")
+                if _is_loopback_bind_host(cleaned):
+                    record_host = cleaned
+            if record_host is None:
+                record_host = _connect_host_from_command(identity.command)
+            return record_host, record_port
     except (OSError, ValueError, UnicodeError):
-        return None
-    return None
+        return None, None
+    return None, None
 
 
 def kill_all_instances(port: int = PORT) -> int:
@@ -2480,12 +2517,18 @@ def kill_all_instances(port: int = PORT) -> int:
 
     for identity in ordered:
         pid = identity.pid
+        target_host = HOST
         target_port = port
         if identity.kind == "server":
-            recorded_port = _verified_server_record_port(identity)
+            recorded_host, recorded_port = _verified_server_record_endpoint(identity)
+            if recorded_host is not None:
+                target_host = recorded_host
             if recorded_port is not None:
                 target_port = recorded_port
-        success, reason = _terminate_process(identity, port=target_port)
+        if target_host != HOST:
+            success, reason = _terminate_process(identity, host=target_host, port=target_port)
+        else:
+            success, reason = _terminate_process(identity, port=target_port)
         if success:
             killed.append(pid)
         elif reason == "access_denied":
@@ -3708,7 +3751,7 @@ def main() -> None:
             daemon=True,
         )
         log_tee_thread.start()
-    _record_server_process(server.pid, shutdown_token, bind_port)
+    _record_server_process(server.pid, shutdown_token, bind_port, host=connect_host)
 
     # ── Wait for port (50ms poll, 30s max) ──────────────────────
     # One-window mode inherits uvicorn's output, so progress dots would
