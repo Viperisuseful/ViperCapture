@@ -2675,7 +2675,10 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
         file_token = "f" * 40
         env_token = "e" * 40
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp) / "app"
+            fake_home = Path(tmp) / "home"
+            root.mkdir()
+            fake_home.mkdir()
             (root / ".env.local").write_text(
                 f'VIPERCAPTURE_ADMIN_TOKEN="{file_token}"\n'
                 f'VIPERCAPTURE_SHUTDOWN_TOKEN="spoofed"\n',
@@ -2699,7 +2702,21 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
                 override_env, _ = launch._new_server_environment()
                 self.assertEqual(override_env.get("VIPERCAPTURE_ADMIN_TOKEN"), env_token)
 
-            # End-to-end launch.main() with --host 0.0.0.0 succeeds when token is only in .env.local.
+            # Lowercase .env.local key works case-insensitively on Windows (os.name == "nt").
+            (root / ".env.local").write_text(
+                f'vipercapture_admin_token="{file_token}"\n',
+                encoding="utf-8",
+            )
+            with (
+                mock.patch("launch.ROOT", root),
+                mock.patch("launch.os.name", "nt"),
+                mock.patch.dict(os.environ, clean_env, clear=True),
+            ):
+                nt_env, _ = launch._new_server_environment()
+                self.assertEqual(nt_env.get("VIPERCAPTURE_ADMIN_TOKEN"), file_token)
+
+            # End-to-end launch.main() with --host 0.0.0.0 succeeds when token is only in .env.local
+            # without touching the real user's ~/.vipercapture/requests.log.
             captured_popen_env: dict[str, str] = {}
 
             class _StopLaunch(RuntimeError):
@@ -2707,12 +2724,17 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
 
             def _fake_popen(*_args, **kwargs):
                 captured_popen_env.update(kwargs.get("env") or {})
+                stdout_handle = kwargs.get("stdout")
+                if hasattr(stdout_handle, "close"):
+                    stdout_handle.close()
                 raise _StopLaunch()
 
             fake_subproc = mock.MagicMock(Popen=_fake_popen, STDOUT=-2, PIPE=-1)
             real_mod = launch._mod
             with (
                 mock.patch("launch.ROOT", root),
+                mock.patch("launch.Path.home", return_value=fake_home),
+                mock.patch("launch.os.name", "nt"),
                 mock.patch.dict(os.environ, clean_env, clear=True),
                 mock.patch("launch.sys.argv", ["launch.py", "--host", "0.0.0.0", "--port", "9000"]),
                 mock.patch("launch.ensure_venv"),
@@ -2727,6 +2749,48 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
                 with self.assertRaises(_StopLaunch):
                     launch.main()
             self.assertEqual(captured_popen_env.get("VIPERCAPTURE_ADMIN_TOKEN"), file_token)
+            self.assertTrue((fake_home / ".vipercapture" / "requests.log").is_file())
+
+    def test_kill_uses_recorded_custom_port_for_graceful_shutdown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp) / "home"
+            runtime_dir = fake_home / ".vipercapture" / "runtime"
+            runtime_dir.mkdir(parents=True)
+            identity = launch.ProcessIdentity(
+                pid=42424,
+                kind="server",
+                command="python -m uvicorn vipercapture.main:app --port 9100",
+                start_time="12345",
+            )
+            (runtime_dir / "server-42424.json").write_text(
+                json.dumps({
+                    "service": "vipercapture",
+                    "install_id": launch._installation_id(),
+                    "pid": 42424,
+                    "port": 9100,
+                    "start_time": "12345",
+                    "token": "secret-shutdown-token",
+                }),
+                encoding="utf-8",
+            )
+            terminated_ports: list[int] = []
+
+            def _fake_terminate(ident, *, port=launch.PORT, **_kwargs):
+                terminated_ports.append(port)
+                return True, None
+
+            with (
+                mock.patch("launch.Path.home", return_value=fake_home),
+                mock.patch("launch.find_vipercapture_processes", return_value={42424: identity}),
+                mock.patch("launch._is_vipercapture_endpoint", return_value=None),
+                mock.patch("launch.port_open", return_value=False),
+                mock.patch("launch._terminate_process", side_effect=_fake_terminate),
+                mock.patch("launch._prune_stale_server_records"),
+                mock.patch("sys.stdout", io.StringIO()),
+            ):
+                code = launch.kill_all_instances()
+            self.assertEqual(code, 0)
+            self.assertEqual(terminated_ports, [9100])
 
 
 if __name__ == "__main__":

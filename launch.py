@@ -2072,6 +2072,8 @@ def _load_local_env_into(env: dict[str, str], root_dir: Path | None = None) -> N
     except OSError:
         return
     re_mod = _mod("re")
+    case_insensitive = os.name == "nt"
+    existing_upper = {k.upper() for k in env} if case_insensitive else set()
     for raw_line in raw_text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -2079,7 +2081,15 @@ def _load_local_env_into(env: dict[str, str], root_dir: Path | None = None) -> N
         key, separator, value = line.partition("=")
         key = key.strip()
         if separator and re_mod.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
-            env.setdefault(key, value.strip().strip("\"'"))
+            cleaned_val = value.strip().strip("\"'")
+            if case_insensitive:
+                upper_key = key.upper()
+                if upper_key in existing_upper:
+                    continue
+                env[upper_key] = cleaned_val
+                existing_upper.add(upper_key)
+            else:
+                env.setdefault(key, cleaned_val)
 
 
 def _new_server_environment() -> tuple[dict[str, str], str]:
@@ -2399,6 +2409,29 @@ def _terminate_process(
     return False, "survived_sigkill"
 
 
+def _verified_server_record_port(identity: ProcessIdentity, *, root_dir: Path = ROOT) -> int | None:
+    """Return the port recorded for a verified server runtime record, if any."""
+    json = _mod("json")
+    try:
+        record = json.loads(_server_record_path(identity.pid).read_text(encoding="utf-8"))
+        if not isinstance(record, dict):
+            return None
+        record_port = record.get("port")
+        if (
+            record.get("service") == "vipercapture"
+            and record.get("install_id") == _installation_id(root_dir)
+            and record.get("pid") == identity.pid
+            and record.get("start_time") == identity.start_time
+            and isinstance(record_port, int)
+            and not isinstance(record_port, bool)
+            and 1 <= record_port <= 65535
+        ):
+            return record_port
+    except (OSError, ValueError, UnicodeError):
+        return None
+    return None
+
+
 def kill_all_instances(port: int = PORT) -> int:
     """Terminate all running ViperCapture instances with orderly shutdown and verified escalation."""
     print()
@@ -2447,7 +2480,12 @@ def kill_all_instances(port: int = PORT) -> int:
 
     for identity in ordered:
         pid = identity.pid
-        success, reason = _terminate_process(identity, port=port)
+        target_port = port
+        if identity.kind == "server":
+            recorded_port = _verified_server_record_port(identity)
+            if recorded_port is not None:
+                target_port = recorded_port
+        success, reason = _terminate_process(identity, port=target_port)
         if success:
             killed.append(pid)
         elif reason == "access_denied":

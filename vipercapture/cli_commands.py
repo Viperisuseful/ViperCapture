@@ -245,12 +245,15 @@ def _ensure_render_namespace(args: argparse.Namespace) -> argparse.Namespace:
 def _has_render_flags(args: argparse.Namespace) -> bool:
     check_fields = (
         "url", "target", "html", "html_file", "markdown", "markdown_file",
-        "from_json", "preset", "format", "engine", "full_page", "viewport",
+        "base_url", "from_json", "preset", "format", "engine", "full_page", "viewport",
         "scale", "device", "selector", "clip", "preserve_viewport_width",
         "lazy_load", "profile", "cache", "cache_key", "named_viewport",
         "slice_height", "slice_overlap", "wait_selector", "wait_text",
         "wait_event", "wait_state", "wait_images", "delay_ms", "timeout_ms",
-        "steps", "color_scheme", "reduced_motion", "media", "locale",
+        "steps", "click", "fill", "hover", "press", "press_on", "select",
+        "hide", "scroll", "scroll_to", "pause", "js", "js_file",
+        "action_delay", "action_timeout", "action_wait", "action_wait_text",
+        "color_scheme", "reduced_motion", "media", "locale", "timezone",
         "css", "css_file", "javascript", "user_agent", "header", "cookie",
         "cookie_file", "block_url", "block_resource", "geolocation",
         "geo_accuracy", "proxy", "proxy_username", "proxy_password",
@@ -351,19 +354,20 @@ def cmd_status(argv: list[str]) -> int:
     running = health_status == 200 and isinstance(health_doc, dict)
     ready_status: int | None = None
     ready_doc: dict[str, object] | None = None
+    cfg_status: int | None = None
     config_doc: dict[str, object] | None = None
     if running:
         ready_status, ready_doc, _ = _probe_json_allow_error_body(root + "/ready", headers, 5.0)
-        _cfg_status, config_doc, _ = _probe_json_allow_error_body(root + "/app-config", headers, 5.0)
+        cfg_status, config_doc, _ = _probe_json_allow_error_body(root + "/app-config", headers, 5.0)
 
     is_ready = bool(ready_status == 200 and isinstance(ready_doc, dict) and ready_doc.get("ready"))
     cli_ver = read_version()
     server_ver: str | None = None
-    if isinstance(config_doc, dict) and isinstance(config_doc.get("version"), str) and config_doc["version"].strip():
+    if cfg_status == 200 and isinstance(config_doc, dict) and isinstance(config_doc.get("version"), str) and config_doc["version"].strip():
         server_ver = config_doc["version"].strip()
     elif running:
-        _oa_status, oa_doc, _ = _probe_json_allow_error_body(root + "/openapi.json", headers, 5.0)
-        if isinstance(oa_doc, dict) and isinstance(oa_doc.get("info"), dict):
+        oa_status, oa_doc, _ = _probe_json_allow_error_body(root + "/openapi.json", headers, 5.0)
+        if oa_status == 200 and isinstance(oa_doc, dict) and isinstance(oa_doc.get("info"), dict):
             oa_ver = oa_doc["info"].get("version")
             if isinstance(oa_ver, str) and oa_ver.strip():
                 server_ver = oa_ver.strip()

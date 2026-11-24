@@ -1294,13 +1294,19 @@ def preset_settings_to_payload(settings: dict[str, object]) -> dict[str, object]
     fmt = str(settings.get("output") or "png").lower()
     fmt = _FORMAT_ALIASES.get(fmt, fmt)
     payload["output"] = fmt
+    is_image = fmt in {"png", "jpeg", "webp", "avif"}
+    is_video = fmt in {"webm", "mp4", "gif"}
+    selector = str(settings.get("selector") or "").strip()
+    clip_enabled = _coerce_bool(settings.get("clipEnabled"), False)
     if "fullPage" in settings:
         full_page = _coerce_bool(settings["fullPage"], True)
-        if not full_page:
-            payload["full_page"] = False
     else:
         full_page = True
-    if full_page and _coerce_bool(settings.get("preserveViewportWidth"), False):
+    if is_image and (selector or clip_enabled):
+        full_page = False
+    if not full_page:
+        payload["full_page"] = False
+    if full_page and not selector and not clip_enabled and _coerce_bool(settings.get("preserveViewportWidth"), False):
         payload["preserve_viewport_width"] = True
 
     viewport: dict[str, object] = {}
@@ -1313,19 +1319,16 @@ def preset_settings_to_payload(settings: dict[str, object]) -> dict[str, object]
     if viewport:
         payload["viewport"] = viewport
 
-    selector = str(settings.get("selector") or "").strip()
-    if selector and not full_page:
-        payload["selector"] = selector
-    if _coerce_bool(settings.get("clipEnabled"), False) and not full_page:
+    if clip_enabled and (is_image or not full_page):
         payload["clip"] = {
             "x": float(settings.get("clipX", 0)),
             "y": float(settings.get("clipY", 0)),
             "width": float(settings.get("clipWidth", 640)),
             "height": float(settings.get("clipHeight", 480)),
         }
+    elif selector and (is_image or not full_page):
+        payload["selector"] = selector
 
-    is_image = fmt in {"png", "jpeg", "webp", "avif"}
-    is_video = fmt in {"webm", "mp4", "gif"}
     image: dict[str, object] = {}
     if fmt in {"jpeg", "webp", "avif"} and isinstance(settings.get("quality"), int) and not isinstance(settings.get("quality"), bool):
         image["quality"] = int(settings["quality"])
@@ -1370,7 +1373,11 @@ def preset_settings_to_payload(settings: dict[str, object]) -> dict[str, object]
         if pdf:
             payload["pdf"] = pdf
 
-    if fmt in {"html", "markdown"} and settings.get("extractMode") in _EXTRACT:
+    side_outputs = settings.get("side_outputs")
+    has_text_side = isinstance(side_outputs, list) and any(
+        str(item).lower() in {"html", "markdown", "md"} for item in side_outputs
+    )
+    if (fmt in {"html", "markdown"} or has_text_side) and settings.get("extractMode") in _EXTRACT:
         payload["extract_mode"] = settings["extractMode"]
 
     wait_for: dict[str, object] = {}
@@ -2334,8 +2341,8 @@ def artifact_is_archive(payload: dict[str, object]) -> bool:
         or payload.get("slices")
         or payload.get("side_outputs")
         or thumbnails
-        or (isinstance(diagnostics, dict) and diagnostics.get("bundle"))
-        or (isinstance(certification, dict) and certification.get("enabled"))
+        or (isinstance(diagnostics, dict) and _coerce_bool(diagnostics.get("bundle"), False))
+        or (isinstance(certification, dict) and _coerce_bool(certification.get("enabled"), False))
     )
 
 
@@ -3600,6 +3607,8 @@ def run_capture(args: argparse.Namespace) -> int:
         if multi_urls is not None:
             if args.output:
                 raise ValueError("Use --output-dir (and optionally --output-template) instead of --output for multi-URL captures.")
+            if getattr(args, "copy_output", False):
+                raise ValueError("--copy is only supported for single-URL captures.")
             normalized_urls = [normalize_url(u) for u in multi_urls]
             distinct_hosts = {(urlsplit(u).hostname or "").lower() for u in normalized_urls}
             allow_default_cookie_domain = len(distinct_hosts) <= 1
@@ -3636,6 +3645,8 @@ def run_capture(args: argparse.Namespace) -> int:
         else:
             payload = build_payload(args, stdin_cache=stdin_cache)
             validate_payload(payload)
+            if not args.dry_run and not (args.async_job and getattr(args, "no_wait", False)):
+                resolve_output(args, payload)
             payloads = None
     except ValueError as exc:
         return fail(str(exc), exit_code=2)
@@ -3729,6 +3740,8 @@ def run_capture(args: argparse.Namespace) -> int:
                 }),
             )
         return 0 if failures == 0 else 1
+    except ValueError as exc:
+        return fail(str(exc), exit_code=2)
     except CaptureError as exc:
         return fail(str(exc), status=exc.status, code=exc.code, body=exc.body, exit_code=exc.exit_code)
     except OSError as exc:

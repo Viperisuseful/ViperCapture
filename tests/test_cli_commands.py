@@ -97,8 +97,9 @@ class _ApiMockHandler(BaseHTTPRequestHandler):
             self._send_json(200, doc)
             return
         if path == "/openapi.json":
+            oa_status = state.get("openapi_status", 200)
             if state.get("openapi_version") is not None:
-                self._send_json(200, {"openapi": "3.1.0", "info": {"title": "ViperCapture", "version": state["openapi_version"]}})
+                self._send_json(oa_status, {"openapi": "3.1.0", "info": {"title": "ViperCapture", "version": state["openapi_version"]}})
                 return
             self._send_json(404, {"error": {"code": "not_found", "message": "Not found"}})
             return
@@ -1223,6 +1224,85 @@ class CliCouncilHardeningTests(unittest.TestCase):
             saved_vid = json.loads(stdout)["settings"]
             self.assertIs(saved_vid["videoScroll"], False)
             self.assertIs(saved_vid["transparent"], False)
+
+    def test_round6_crop_presets_bulk_timezone_template_copy_extract_archive_and_openapi_status(self) -> None:
+        from vipercapture import capture_cli
+
+        # 1. Web UI crop presets with fullPage=True force full_page=False and keep selector / clip
+        sel_payload = capture_cli.preset_settings_to_payload({
+            "output": "png",
+            "fullPage": True,
+            "selector": "#invoice",
+        })
+        self.assertIs(sel_payload.get("full_page"), False)
+        self.assertEqual(sel_payload.get("selector"), "#invoice")
+
+        clip_payload = capture_cli.preset_settings_to_payload({
+            "output": "png",
+            "fullPage": True,
+            "clipEnabled": True,
+            "clipX": 10,
+            "clipY": 20,
+            "clipWidth": 200,
+            "clipHeight": 100,
+        })
+        self.assertIs(clip_payload.get("full_page"), False)
+        self.assertEqual(clip_payload.get("clip"), {"x": 10.0, "y": 20.0, "width": 200.0, "height": 100.0})
+
+        # 2. Preset replay preserves extract_mode for side_outputs containing markdown/html
+        side_payload = capture_cli.preset_settings_to_payload({
+            "output": "png",
+            "side_outputs": ["markdown"],
+            "extractMode": "article",
+        })
+        self.assertEqual(side_payload.get("extract_mode"), "article")
+
+        # 3. Direct JSON diagnostics.bundle = "false" is NOT treated as a zip archive
+        self.assertFalse(capture_cli.artifact_is_archive({"output": "png", "diagnostics": {"bundle": "false"}}))
+        self.assertFalse(capture_cli.artifact_is_archive({"output": "png", "certification": {"enabled": "0"}}))
+
+        # 4. bulk --url ... --timezone Asia/Tokyo preserves environment.timezone
+        code, _stdout, stderr = self._run([
+            "bulk", "--url", "https://example.org",
+            "--timezone", "Asia/Tokyo",
+            "--server", self.server,
+            "--json",
+        ])
+        self.assertEqual(code, 0, stderr)
+        bulk_req = next(r for r in reversed(self.httpd.requests) if r["path"] == "/v1/jobs/bulk")  # type: ignore[attr-defined]
+        bulk_body = json.loads(bulk_req["body"].decode("utf-8"))
+        self.assertEqual(bulk_body["items"][0]["render"]["environment"]["timezone"], "Asia/Tokyo")
+
+        # 5. Single-URL mistyped --output-template exits 2 cleanly (no uncaught ValueError)
+        buf_out, buf_err = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdout", buf_out), mock.patch("sys.stderr", buf_err):
+            code = capture_cli.main([
+                "https://example.org",
+                "--output-template", "{missing}{ext}",
+                "--server", self.server,
+            ])
+        self.assertEqual(code, 2)
+        self.assertIn("missing", buf_err.getvalue())
+
+        # 6. Multi-URL --copy exits 2 before capturing
+        with tempfile.TemporaryDirectory() as tmp:
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with mock.patch("sys.stdout", buf_out), mock.patch("sys.stderr", buf_err):
+                code = capture_cli.main([
+                    "https://one.example", "https://two.example",
+                    "--copy", "--output-dir", tmp,
+                    "--server", self.server,
+                ])
+            self.assertEqual(code, 2)
+            self.assertIn("--copy", buf_err.getvalue())
+
+        # 7. status ignores non-200 /openapi.json error bodies
+        self.httpd.state["app_config_version"] = None  # type: ignore[attr-defined]
+        self.httpd.state["openapi_version"] = "edge-build"  # type: ignore[attr-defined]
+        self.httpd.state["openapi_status"] = 502  # type: ignore[attr-defined]
+        code, stdout, stderr = self._run(["status", "--server", self.server, "--json"])
+        self.assertEqual(code, 0, stderr)
+        self.assertIsNone(json.loads(stdout)["server_version"])
 
 
 if __name__ == "__main__":
