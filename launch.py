@@ -3407,26 +3407,27 @@ def parse_cli(argv: list[str] | None = None) -> CliArgs:
             viewport = (_viewport_edge(args[index + 1]), _viewport_edge(args[index + 2]))
             index += 3
             continue
+        gui_flags = {"-h", "--help", "--gui", "--one-window", "--viewport", "--output-dir", "--server", "--preset", "--url"}
         if arg == "--output-dir":
-            if index + 1 >= len(args) or not args[index + 1].strip() or args[index + 1].startswith("-"):
+            if index + 1 >= len(args) or not args[index + 1].strip() or args[index + 1].lower() in gui_flags:
                 _reject_arg("--output-dir needs a directory path.")
             output_dir = args[index + 1]
             index += 2
             continue
         if arg == "--server":
-            if index + 1 >= len(args) or not args[index + 1].strip() or args[index + 1].startswith("-"):
+            if index + 1 >= len(args) or not args[index + 1].strip() or args[index + 1].lower() in gui_flags:
                 _reject_arg("--server needs an http:// or https:// URL.")
             server = _validate_server_url(args[index + 1])
             index += 2
             continue
         if arg == "--preset":
-            if index + 1 >= len(args) or not args[index + 1].strip() or args[index + 1].startswith("-"):
+            if index + 1 >= len(args) or not args[index + 1].strip() or args[index + 1].lower() in gui_flags:
                 _reject_arg("--preset needs a preset name.")
             preset = args[index + 1].strip()
             index += 2
             continue
         if arg == "--url":
-            if index + 1 >= len(args) or not args[index + 1].strip() or args[index + 1].startswith("-"):
+            if index + 1 >= len(args) or not args[index + 1].strip() or args[index + 1].lower() in gui_flags:
                 _reject_arg("--url needs a website link.")
             url = args[index + 1].strip()
             index += 2

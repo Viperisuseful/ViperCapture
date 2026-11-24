@@ -632,7 +632,7 @@ def format_seconds_short(ms: int) -> str:
         return "0s"
     if ms % 1000 == 0:
         return f"{ms // 1000}s"
-    return f"{ms / 1000:.1f}s"
+    return f"{ms / 1000:.3f}".rstrip("0").rstrip(".") + "s"
 
 
 def format_bytes(size: int) -> str:
@@ -1753,14 +1753,22 @@ def apply_preset_settings_with_warnings(
     if d_val is not None:
         changes["scale"] = int(d_val) if d_val.is_integer() else d_val
 
+    eff_output = str(changes.get("output", state.output))
+    is_image_output = eff_output in IMAGE_FORMATS
+
     if isinstance(settings.get("fullPage"), bool):
         changes["full_page"] = settings["fullPage"]
 
     if isinstance(settings.get("selector"), str):
         sel = sanitize_terminal_text(settings["selector"]).strip()
-        changes["selector"] = sel
-        if sel:
-            changes["full_page"] = False
+        if is_image_output:
+            changes["selector"] = sel
+            if sel:
+                changes["full_page"] = False
+        else:
+            changes["selector"] = ""
+    elif not is_image_output:
+        changes["selector"] = ""
 
     q_val = _in_range_number(settings.get("quality"), 1, 100)
     if q_val is not None:
@@ -1856,7 +1864,7 @@ def apply_preset_settings_with_warnings(
         ignored.append("headers")
     if isinstance(settings.get("customCss"), str) and settings["customCss"].strip():
         ignored.append("customCss")
-    if settings.get("clipEnabled") is True:
+    if is_image_output and settings.get("clipEnabled") is True:
         ignored.append("clip")
     if isinstance(settings.get("locale"), str) and settings["locale"].strip():
         ignored.append("locale")
@@ -1904,6 +1912,13 @@ def apply_preset_settings(state: GuiState, settings: Mapping[str, object]) -> Gu
     return updated
 
 
+def _safe_read_error_body(exc: urllib.error.HTTPError, limit: int = 64 * 1024) -> bytes:
+    try:
+        return exc.read(limit)
+    except (TimeoutError, OSError, http.client.HTTPException):
+        return b""
+
+
 def _json_request(
     url: str,
     *,
@@ -1934,9 +1949,9 @@ def _json_request(
             status = getattr(response, "status", None)
             if status is None:
                 status = getattr(response, "code", 200)
-            body = response.read(512 * 1024)
+            body = response.read(4 * 1024 * 1024)
     except urllib.error.HTTPError as exc:
-        raw = exc.read(64 * 1024)
+        raw = _safe_read_error_body(exc, 64 * 1024)
         return exc.code, None, error_text(exc.code, raw)
     except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, UnicodeError) as exc:
         return 0, None, str(exc) or "Could not reach server."
@@ -3081,7 +3096,7 @@ def read_capture(
         try:
             block = read(64 * 1024)
         except (TimeoutError, OSError, http.client.HTTPException):
-            if cancel is not None and cancel.requested:
+            if cancel is not None and cancel.is_requested():
                 raise _Cancelled() from None
             raise
         if not block:
@@ -3102,19 +3117,22 @@ class CancelFlag:
         self._lock = threading.Lock()
         self._close: Callable[[], None] | None = None
 
+    def is_requested(self) -> bool:
+        with self._lock:
+            return self.requested
+
     def bind(self, close: Callable[[], None]) -> None:
         with self._lock:
             self._close = close
-            requested = self.requested
-        if requested:
-            _safe_close(close)
+            if self.requested:
+                _safe_close(close)
 
     def abort(self) -> None:
         with self._lock:
-            self.requested = True
             close = self._close
-        if close is not None:
-            _safe_close(close)
+            if close is not None:
+                _safe_close(close)
+            self.requested = True
 
 
 def _safe_close(close: Callable[[], None]) -> None:
@@ -3251,12 +3269,12 @@ def perform_capture(
     except _Cancelled:
         return _cancelled_state(state)
     except urllib.error.HTTPError as exc:
-        if cancel is not None and cancel.requested:
+        if cancel is not None and cancel.is_requested():
             return _cancelled_state(state)
-        detail = error_text(exc.code, exc.read(64 * 1024))
+        detail = error_text(exc.code, _safe_read_error_body(exc, 64 * 1024))
         return _replace(state, busy=False, cancelling=False, error=detail)
     except urllib.error.URLError:
-        if cancel is not None and cancel.requested:
+        if cancel is not None and cancel.is_requested():
             return _cancelled_state(state)
         return _replace(
             state,
@@ -3265,7 +3283,7 @@ def perform_capture(
             error="The API server did not answer. Check that ViperCapture is running.",
         )
     except (TimeoutError, OSError, http.client.HTTPException, ValueError) as exc:
-        if cancel is not None and cancel.requested:
+        if cancel is not None and cancel.is_requested():
             return _cancelled_state(state)
         return _replace(state, busy=False, cancelling=False, error=sanitize_terminal_text(str(exc)))
     wall_ms = max(1, round((time.monotonic() - started_at) * 1000))
@@ -3985,7 +4003,7 @@ def _open_capture(
         raise
     except Exception:
         _abort_active()
-        if cancel is not None and cancel.requested:
+        if cancel is not None and cancel.is_requested():
             raise _Cancelled() from None
         raise
     return _CaptureResponse(response, connection)

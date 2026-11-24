@@ -2695,3 +2695,77 @@ class GuiCouncilHardeningTests(TestCase):
             gui._default_ssl_context().minimum_version,
             gui.ssl.TLSVersion.TLSv1_2,
         )
+
+    def test_round9_cancel_close_ordering_slow_http_error_pdf_selector_large_presets_and_timing_display(self) -> None:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading as _threading
+
+        # 1. CancelFlag.abort() closes the bound socket BEFORE requested becomes True (zero open-socket window)
+        order: list[str] = []
+        cf = gui.CancelFlag()
+        cf.bind(lambda: order.append(f"close:requested={cf.requested}"))
+        cf.abort()
+        self.assertEqual(order, ["close:requested=False"])
+        self.assertTrue(cf.is_requested())
+
+        # 2. Slow HTTP 503 error body timing out during /app-config does NOT crash fetch_app_config()
+        release_503 = _threading.Event()
+        large_presets = [
+            {"name": f"big-{i}", "settings": {"output": "png", "customCss": "a" * 110_000}}
+            for i in range(5)
+        ]
+
+        class _R9Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == "/app-config":
+                    self.send_response(503)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", "100")
+                    self.end_headers()
+                    release_503.wait(timeout=2.0)
+                    return
+                if self.path == "/local/presets":
+                    body = json.dumps({"presets": large_presets}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _R9Handler)
+        t_srv = _threading.Thread(target=srv.serve_forever, daemon=True)
+        t_srv.start()
+        try:
+            port = srv.server_address[1]
+            self.assertIsNone(gui.fetch_app_config(f"http://127.0.0.1:{port}", timeout=0.15))
+
+            # 3. Valid >512 KiB preset list (5 x 110 KB = ~550 KB) parses without truncation
+            presets, err = gui.fetch_presets(f"http://127.0.0.1:{port}", timeout=5.0)
+            self.assertEqual(err, "")
+            self.assertEqual(len(presets), 5)
+        finally:
+            release_503.set()
+            srv.shutdown()
+            srv.server_close()
+
+        # 4. Web UI PDF preset retaining an image selector clears selector so capture is not blocked
+        pdf_state, _ignored = gui.apply_preset_settings_with_warnings(
+            gui.GuiState(url="https://example.com"),
+            {"output": "pdf", "selector": "main", "fullPage": True},
+        )
+        self.assertEqual(pdf_state.output, "pdf")
+        self.assertEqual(pdf_state.selector, "")
+        self.assertEqual(gui.validate_capture_state(pdf_state), "")
+
+        # 5. Fractional timing display preserves sub-tenth precision (250ms -> 0.25s, 1ms -> 0.001s)
+        self.assertEqual(gui.format_seconds_short(0), "0s")
+        self.assertEqual(gui.format_seconds_short(250), "0.25s")
+        self.assertEqual(gui.format_seconds_short(1), "0.001s")
+        self.assertEqual(gui.format_seconds_short(1500), "1.5s")
+        self.assertEqual(gui.format_seconds_short(3000), "3s")
