@@ -1585,7 +1585,13 @@ def _json_request(
         headers["Content-Type"] = "application/json"
         data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    open_fn = urllib.request.urlopen if opener is None else opener
+    if opener is None:
+        if is_local_server(url):
+            open_fn: object = urllib.request.build_opener(urllib.request.ProxyHandler({})).open
+        else:
+            open_fn = urllib.request.urlopen
+    else:
+        open_fn = opener
     try:
         with open_fn(req, timeout=timeout) as response:  # type: ignore[operator]
             status = getattr(response, "status", None)
@@ -3074,6 +3080,7 @@ class _Drawer:
         self._key: tuple[int, int, int, int, str | None] | None = None
         self._origin: int | None = None
         self._last_drawer: str | None = None
+        self._last_drawer_sig: tuple[object, ...] | None = None
         self._last_preview: str | None = None
         self._has_image = False
         self._logo = b""
@@ -3101,11 +3108,20 @@ class _Drawer:
         preview_target = ""
         if state.drawer == "history" and state.captures:
             preview_target = state.captures[state.drawer_index % len(state.captures)].path
-        drawer_changed = state.drawer != self._last_drawer
+        drawer_sig = (
+            state.drawer,
+            bool(state.error),
+            bool(state.notice),
+            state.editing_field,
+            len(state.presets),
+            len(state.captures),
+        )
+        drawer_changed = state.drawer != self._last_drawer or drawer_sig != self._last_drawer_sig
         preview_changed = preview_target != self._last_preview
         full = size_changed or origin != self._origin or drawer_changed or preview_changed
         self._origin = origin
         self._last_drawer = state.drawer
+        self._last_drawer_sig = drawer_sig
         self._last_preview = preview_target
         frame = render_frame(
             size,
@@ -3512,6 +3528,8 @@ def _drain_windows_escape(msvcrt_mod: object) -> list[str]:
             keys = keys_from_bytes(pending, b"")
             if keys:
                 return keys
+            if not pending:
+                return []
             if pending.startswith(_PASTE_START):
                 deadline = time.monotonic() + 0.25
             else:

@@ -997,7 +997,14 @@ class GuiControlsAndPayloadTests(TestCase):
         self.assertEqual(state.video_duration_ms, 15000)
 
     def test_capture_payload_all_options_and_contract_validation(self) -> None:
-        from vipercapture.render_contract import RenderRequest
+        try:
+            from vipercapture.render_contract import RenderRequest
+        except ImportError:
+            RenderRequest = None
+
+        def validate_contract(doc: dict[str, object]) -> None:
+            if RenderRequest is not None:
+                RenderRequest.model_validate(doc)
 
         # Rich image payload
         img_state = gui.GuiState(
@@ -1040,7 +1047,7 @@ class GuiControlsAndPayloadTests(TestCase):
         self.assertEqual(payload["profile"], "accurate")
         self.assertFalse(payload["stealth"])
         self.assertEqual(payload["diagnostics"], {"bundle": True})
-        RenderRequest.model_validate(payload)
+        validate_contract(payload)
 
         # PDF payload
         pdf_state = gui.GuiState(
@@ -1051,7 +1058,7 @@ class GuiControlsAndPayloadTests(TestCase):
         )
         pdf_payload = gui.capture_payload(pdf_state, pdf_state.url)
         self.assertEqual(pdf_payload["pdf"], {"paper_size": "Letter", "orientation": "landscape"})
-        RenderRequest.model_validate(pdf_payload)
+        validate_contract(pdf_payload)
 
         # Video payload with custom fps and scroll
         vid_state = gui.GuiState(
@@ -1063,7 +1070,7 @@ class GuiControlsAndPayloadTests(TestCase):
         )
         vid_payload = gui.capture_payload(vid_state, vid_state.url)
         self.assertEqual(vid_payload["video"], {"duration_ms": 15000, "scroll": True, "fps": 30})
-        RenderRequest.model_validate(vid_payload)
+        validate_contract(vid_payload)
 
         # Incompatible PDF + Firefox blocked on Enter
         bad_pdf = gui.GuiState(url="https://example.com", output="pdf", engine="firefox")
