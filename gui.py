@@ -340,10 +340,33 @@ def normalize_url(text: str) -> str:
     return value
 
 
+def _normalize_http_url(url: str) -> str:
+    """Normalize an http(s) URL to ASCII-safe IDNA host and percent-encoded path."""
+    cleaned = url.strip()
+    try:
+        parsed = urllib.parse.urlsplit(cleaned)
+    except ValueError:
+        return cleaned
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        return cleaned
+    host_hdr = _host_for_header(parsed.hostname)
+    port = parsed.port
+    auth = ""
+    if parsed.username is not None:
+        auth = parsed.username
+        if parsed.password is not None:
+            auth = f"{auth}:{parsed.password}"
+        auth = f"{auth}@"
+    netloc = f"{auth}{host_hdr}:{port}" if port is not None else f"{auth}{host_hdr}"
+    encoded_path = urllib.parse.quote(parsed.path, safe="/:@!$&'()*+,;=-._~%")
+    encoded_query = urllib.parse.quote(parsed.query, safe="=&/:@!$'()*+,;=-._~%?") if parsed.query else ""
+    return urllib.parse.urlunsplit((parsed.scheme.lower(), netloc, encoded_path, encoded_query, ""))
+
+
 def server_base_url(server: str | None) -> str:
     if not server:
         return launch.URL.rstrip("/")
-    return server.strip().rstrip("/")
+    return _normalize_http_url(server).rstrip("/")
 
 
 def is_local_server(base_url: str) -> bool:
@@ -1479,7 +1502,7 @@ def load_url_history(path: Path | None = None, *, limit: int = HISTORY_LIMIT) ->
     target = history_file_path() if path is None else path
     try:
         raw = json.loads(target.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return ()
     if not isinstance(raw, list):
         return ()
@@ -1653,6 +1676,11 @@ def open_in_viewer(path: str | Path) -> bool:
         return False
 
 
+def _ms_to_preset_seconds(ms: int, *, minimum: float = 0.0) -> int | float:
+    secs = max(minimum, round(ms / 1000.0, 3))
+    return int(secs) if float(secs).is_integer() else secs
+
+
 def state_to_preset_settings(state: GuiState) -> dict[str, object]:
     """Serialize ``GuiState`` into Web UI-compatible preset settings."""
     cleanup_cfg = effective_cleanup(state)
@@ -1671,10 +1699,10 @@ def state_to_preset_settings(state: GuiState) -> dict[str, object]:
         "quality": state.quality,
         "transparent": state.transparent,
         "diagnostics": state.diagnostics,
-        "videoDuration": max(1, round(state.video_duration_ms / 1000)),
+        "videoDuration": _ms_to_preset_seconds(state.video_duration_ms, minimum=1.0),
         "videoFps": state.video_fps,
         "videoScroll": state.video_scroll,
-        "waitDelay": round(state.wait_delay_ms / 1000, 1),
+        "waitDelay": _ms_to_preset_seconds(state.wait_delay_ms, minimum=0.0),
         "waitSelector": state.wait_selector,
         "consent": consent,
         "blockAds": block_ads,
@@ -1889,9 +1917,13 @@ def _json_request(
     if payload is not None:
         headers["Content-Type"] = "application/json"
         data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        normalized_url = _normalize_http_url(url)
+    except ValueError as exc:
+        return 0, None, str(exc) or "Invalid server URL."
+    req = urllib.request.Request(normalized_url, data=data, headers=headers, method=method)
     if opener is None:
-        if is_local_server(url):
+        if is_local_server(normalized_url):
             open_fn: object = urllib.request.build_opener(urllib.request.ProxyHandler({})).open
         else:
             open_fn = urllib.request.urlopen
@@ -1906,7 +1938,7 @@ def _json_request(
     except urllib.error.HTTPError as exc:
         raw = exc.read(64 * 1024)
         return exc.code, None, error_text(exc.code, raw)
-    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, UnicodeError) as exc:
         return 0, None, str(exc) or "Could not reach server."
     try:
         parsed = json.loads(body.decode("utf-8")) if body else {}
@@ -3026,6 +3058,20 @@ def read_capture(
     limit: int = MAX_CAPTURE_BYTES,
     cancel: "CancelFlag | None" = None,
 ) -> bytes:
+    expected_length: int | None = None
+    status = getattr(response, "status", None)
+    if status is None:
+        status = getattr(response, "code", 200)
+    transfer_encoding = (_response_header(response, "Transfer-Encoding") or "").lower()
+    if status not in {204, 304} and "chunked" not in transfer_encoding:
+        raw_length = (_response_header(response, "Content-Length") or "").strip()
+        if raw_length:
+            try:
+                parsed_length = int(raw_length)
+                if parsed_length >= 0:
+                    expected_length = parsed_length
+            except ValueError:
+                expected_length = None
     chunks: list[bytes] = []
     total = 0
     read = getattr(response, "read")
@@ -3044,7 +3090,10 @@ def read_capture(
         if total > limit:
             raise ValueError("The capture is larger than 200 MB.")
         chunks.append(block)
-    return b"".join(chunks)
+    data = b"".join(chunks)
+    if expected_length is not None and total < expected_length:
+        raise http.client.IncompleteRead(data, expected_length - total)
+    return data
 
 
 class CancelFlag:
@@ -3450,7 +3499,85 @@ def _host_for_header(hostname: str) -> str:
 
 
 def _default_ssl_context() -> ssl.SSLContext:
-    return ssl.create_default_context()
+    ctx = ssl.create_default_context()
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    return ctx
+
+
+class _CancellableSocket:
+    def __init__(self, sock: object, cancel: CancelFlag | None) -> None:
+        self._sock = sock
+        self._cancel = cancel
+
+    def _check_cancel(self) -> None:
+        cancel = self._cancel
+        if cancel is not None:
+            with cancel._lock:
+                if cancel.requested:
+                    raise _Cancelled()
+
+    def send(self, data: object, *args: object) -> int:
+        self._check_cancel()
+        return self._sock.send(data, *args)  # type: ignore[attr-defined, no-any-return]
+
+    def sendall(self, data: object, *args: object) -> None:
+        self._check_cancel()
+        self._sock.sendall(data, *args)  # type: ignore[attr-defined]
+
+    def recv(self, bufsize: int, *args: object) -> bytes:
+        self._check_cancel()
+        return self._sock.recv(bufsize, *args)  # type: ignore[attr-defined, no-any-return]
+
+    def recv_into(self, buffer: bytearray | memoryview, *args: object) -> int:
+        self._check_cancel()
+        return self._sock.recv_into(buffer, *args)  # type: ignore[attr-defined, no-any-return]
+
+    def makefile(self, *args: object, **kwargs: object) -> object:
+        return self._sock.makefile(*args, **kwargs)  # type: ignore[attr-defined]
+
+    def shutdown(self, how: int) -> None:
+        self._sock.shutdown(how)  # type: ignore[attr-defined]
+
+    def close(self) -> None:
+        self._sock.close()  # type: ignore[attr-defined]
+
+    def force_close(self) -> None:
+        _close_socket(self._sock)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._sock, name)
+
+
+class _CancellableHTTPConnection(http.client.HTTPConnection):
+    auto_open = 0
+
+    def __init__(self, *args: object, cancel: CancelFlag | None = None, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self._cancel = cancel
+
+    def send(self, data: object) -> None:
+        cancel = self._cancel
+        if cancel is not None:
+            with cancel._lock:
+                if cancel.requested:
+                    raise _Cancelled()
+        super().send(data)  # type: ignore[arg-type]
+
+
+class _CancellableHTTPSConnection(http.client.HTTPSConnection):
+    auto_open = 0
+
+    def __init__(self, *args: object, cancel: CancelFlag | None = None, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self._cancel = cancel
+
+    def send(self, data: object) -> None:
+        cancel = self._cancel
+        if cancel is not None:
+            with cancel._lock:
+                if cancel.requested:
+                    raise _Cancelled()
+        super().send(data)  # type: ignore[arg-type]
 
 
 class _TlsInTlsRawIO(io.RawIOBase):
@@ -3583,6 +3710,62 @@ class _TlsInTlsSocket:
             self.force_close()
 
 
+def _resolve_host_cancellable(
+    host: str,
+    port: int,
+    timeout: float,
+    *,
+    cancel: CancelFlag | None,
+    abort_cb: Callable[[], None],
+) -> list[tuple[socket.AddressFamily, socket.SocketKind, int, str, tuple[object, ...]]]:
+    if cancel is not None and cancel.requested:
+        raise _Cancelled()
+    done = threading.Event()
+    wake = threading.Event()
+    outcome: dict[str, object] = {}
+
+    def _worker() -> None:
+        try:
+            outcome["infos"] = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+        except BaseException as exc:  # noqa: BLE001
+            outcome["error"] = exc
+        finally:
+            done.set()
+            wake.set()
+
+    def _wake_and_abort() -> None:
+        wake.set()
+        abort_cb()
+
+    if cancel is not None:
+        cancel.bind(_wake_and_abort)
+    try:
+        if cancel is not None and cancel.requested:
+            raise _Cancelled()
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+        deadline = time.monotonic() + max(0.05, float(timeout))
+        while True:
+            if cancel is not None and cancel.requested:
+                raise _Cancelled()
+            if done.is_set():
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"Timed out resolving host {host!r}")
+            wake.wait(timeout=remaining)
+            wake.clear()
+        if cancel is not None and cancel.requested:
+            raise _Cancelled()
+        err = outcome.get("error")
+        if isinstance(err, BaseException):
+            raise err
+        return outcome.get("infos", [])  # type: ignore[return-value]
+    finally:
+        if cancel is not None:
+            cancel.bind(abort_cb)
+
+
 def _create_connection_cancellable(
     host: str,
     port: int,
@@ -3597,7 +3780,13 @@ def _create_connection_cancellable(
     if cancel is not None and cancel.requested:
         raise _Cancelled()
     last_err: OSError | None = None
-    infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    infos = _resolve_host_cancellable(
+        host,
+        port,
+        timeout,
+        cancel=cancel,
+        abort_cb=abort_cb,
+    )
     if not infos:
         raise OSError(f"Could not resolve host {host!r}")
     for af, socktype, proto, _canonname, sa in infos:
@@ -3657,9 +3846,9 @@ def _open_capture(
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     ascii_dest_host = _ascii_host(parsed.hostname)
     dest_host_hdr = _host_for_header(parsed.hostname)
-    path = parsed.path or "/"
+    path = urllib.parse.quote(parsed.path or "/", safe="/:@!$&'()*+,;=-._~%")
     if parsed.query:
-        path = f"{path}?{parsed.query}"
+        path = f"{path}?{urllib.parse.quote(parsed.query, safe='=&/:@!$()*+,;=-._~%?')}"
     headers = _outgoing_headers(request)
     request_target = path
     proxy_raw = _proxy_for_url(request.full_url, parsed.scheme, parsed.hostname, port)
@@ -3717,6 +3906,8 @@ def _open_capture(
                     connect_lines.append(f"{hdr_name}: {hdr_val}")
                 connect_lines.append("")
                 connect_lines.append("")
+                if cancel is not None and cancel.requested:
+                    raise _Cancelled()
                 sock.sendall("\r\n".join(connect_lines).encode("ascii"))
                 status_code, reason = _read_tunnel_response(sock)
                 if status_code != 200:
@@ -3735,14 +3926,14 @@ def _open_capture(
                         live_sock=live_sock,
                         cancel=cancel,
                     )
-                connection = http.client.HTTPSConnection(ascii_dest_host, port, timeout=timeout)
-                connection.sock = tunnel_sock  # type: ignore[assignment]
+                connection = _CancellableHTTPSConnection(ascii_dest_host, port, timeout=timeout, cancel=cancel)
+                connection.sock = _CancellableSocket(tunnel_sock, cancel)  # type: ignore[assignment]
             else:
                 if proxy_parsed.scheme == "https":
-                    connection = http.client.HTTPSConnection(ascii_proxy_host, proxy_port, timeout=timeout)
+                    connection = _CancellableHTTPSConnection(ascii_proxy_host, proxy_port, timeout=timeout, cancel=cancel)
                 else:
-                    connection = http.client.HTTPConnection(ascii_proxy_host, proxy_port, timeout=timeout)
-                connection.sock = sock
+                    connection = _CancellableHTTPConnection(ascii_proxy_host, proxy_port, timeout=timeout, cancel=cancel)
+                connection.sock = _CancellableSocket(sock, cancel)  # type: ignore[assignment]
                 dest_authority = f"{dest_host_hdr}:{parsed.port}" if parsed.port is not None else dest_host_hdr
                 request_target = f"{parsed.scheme}://{dest_authority}{path}"
                 headers["Host"] = dest_authority
@@ -3763,8 +3954,8 @@ def _open_capture(
                 live_sock=live_sock,
                 cancel=cancel,
             )
-            connection = http.client.HTTPSConnection(ascii_dest_host, port, timeout=timeout)
-            connection.sock = tls_sock
+            connection = _CancellableHTTPSConnection(ascii_dest_host, port, timeout=timeout, cancel=cancel)
+            connection.sock = _CancellableSocket(tls_sock, cancel)  # type: ignore[assignment]
         else:
             raw_sock = _create_connection_cancellable(
                 ascii_dest_host,
@@ -3774,8 +3965,8 @@ def _open_capture(
                 cancel=cancel,
                 abort_cb=_abort_active,
             )
-            connection = http.client.HTTPConnection(ascii_dest_host, port, timeout=timeout)
-            connection.sock = raw_sock
+            connection = _CancellableHTTPConnection(ascii_dest_host, port, timeout=timeout, cancel=cancel)
+            connection.sock = _CancellableSocket(raw_sock, cancel)  # type: ignore[assignment]
 
         connection.auto_open = 0
         if cancel is not None and cancel.requested:

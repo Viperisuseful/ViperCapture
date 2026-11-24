@@ -3322,6 +3322,8 @@ def _validate_server_url(token: str) -> str:
     import urllib.parse
 
     value = token.strip()
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        _reject_arg(f"Invalid server URL: {token}")
     try:
         parsed = urllib.parse.urlsplit(value)
         port = parsed.port
@@ -3339,7 +3341,17 @@ def _validate_server_url(token: str) -> str:
         or (port is not None and not (1 <= port <= 65535))
     ):
         _reject_arg(f"Invalid server URL: {token}")
-    return value.rstrip("/")
+    hostname = parsed.hostname
+    if ":" in hostname:
+        ascii_host = f"[{hostname}]"
+    else:
+        try:
+            ascii_host = hostname.encode("idna").decode("ascii")
+        except UnicodeError:
+            _reject_arg(f"Invalid server URL: {token}")
+    netloc = f"{ascii_host}:{port}" if port is not None else ascii_host
+    encoded_path = urllib.parse.quote(parsed.path, safe="/:@!$&'()*+,;=-._~%").rstrip("/")
+    return urllib.parse.urlunsplit((parsed.scheme.lower(), netloc, encoded_path, "", "")).rstrip("/")
 
 
 def parse_cli(argv: list[str] | None = None) -> CliArgs:
@@ -3396,25 +3408,25 @@ def parse_cli(argv: list[str] | None = None) -> CliArgs:
             index += 3
             continue
         if arg == "--output-dir":
-            if index + 1 >= len(args) or not args[index + 1].strip():
+            if index + 1 >= len(args) or not args[index + 1].strip() or args[index + 1].startswith("-"):
                 _reject_arg("--output-dir needs a directory path.")
             output_dir = args[index + 1]
             index += 2
             continue
         if arg == "--server":
-            if index + 1 >= len(args) or not args[index + 1].strip():
+            if index + 1 >= len(args) or not args[index + 1].strip() or args[index + 1].startswith("-"):
                 _reject_arg("--server needs an http:// or https:// URL.")
             server = _validate_server_url(args[index + 1])
             index += 2
             continue
         if arg == "--preset":
-            if index + 1 >= len(args) or not args[index + 1].strip():
+            if index + 1 >= len(args) or not args[index + 1].strip() or args[index + 1].startswith("-"):
                 _reject_arg("--preset needs a preset name.")
             preset = args[index + 1].strip()
             index += 2
             continue
         if arg == "--url":
-            if index + 1 >= len(args) or not args[index + 1].strip():
+            if index + 1 >= len(args) or not args[index + 1].strip() or args[index + 1].startswith("-"):
                 _reject_arg("--url needs a website link.")
             url = args[index + 1].strip()
             index += 2

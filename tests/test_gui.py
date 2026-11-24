@@ -2536,3 +2536,162 @@ class GuiCouncilHardeningTests(TestCase):
             no_post_srv.server_close()
         self.assertFalse(reconnect_called)
         self.assertEqual(posts_received, [])
+
+    def test_round8_cancel_send_dns_truncation_unicode_preset_precision_and_history(self) -> None:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import socket as _socket
+        import tempfile as _tempfile
+        import threading as _threading
+        import time as _time
+
+        # 1. Cancel recorded (requested=True) BEFORE close callback runs still prevents POST write
+        posts_received: list[str] = []
+
+        class _R8Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == "/caf%C3%A9/app-config":
+                    body = json.dumps({"presets": True, "output_formats": ["png"]}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+            def do_POST(self) -> None:
+                if self.path == "/truncated/v1/render":
+                    length = int(self.headers.get("Content-Length", "0"))
+                    self.rfile.read(length)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/markdown")
+                    self.send_header("Content-Length", "100")
+                    self.end_headers()
+                    self.wfile.write(b"# Partial")
+                    self.close_connection = True
+                    return
+                length = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(length)
+                posts_received.append(self.path)
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _R8Handler)
+        t_srv = _threading.Thread(target=srv.serve_forever, daemon=True)
+        t_srv.start()
+        try:
+            port = srv.server_address[1]
+            # Simulate abort() setting requested=True BEFORE _safe_close runs, while worker is inside HTTPConnection.send
+            race_cancel = gui.CancelFlag()
+            orig_send = gui.http.client.HTTPConnection.send
+
+            def _send_after_requested(conn_self, data):
+                with race_cancel._lock:
+                    race_cancel.requested = True
+                return orig_send(conn_self, data)
+
+            with mock.patch.object(gui.http.client.HTTPConnection, "send", _send_after_requested):
+                req = gui.urllib.request.Request(
+                    f"http://127.0.0.1:{port}/v1/render",
+                    data=b"{}",
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(gui._Cancelled):
+                    gui._open_capture(req, timeout=5.0, cancel=race_cancel)
+            self.assertEqual(posts_received, [])
+
+            # 2. Incomplete download (Content-Length: 100, only 9 bytes before EOF) fails instead of saving
+            with _tempfile.TemporaryDirectory() as tmp:
+                out_dir = Path(tmp)
+                st = gui.GuiState(url="https://example.com", output="markdown")
+                res = gui.perform_capture(
+                    st,
+                    directory=out_dir,
+                    endpoint=f"http://127.0.0.1:{port}/truncated/v1/render",
+                )
+                self.assertTrue(res.error)
+                self.assertEqual(list(out_dir.iterdir()), [])
+
+            # 3. Unicode hostname and Unicode path prefix normalize cleanly without UnicodeEncodeError
+            self.assertEqual(
+                gui.server_base_url(f"http://例子.test:{port}/café/"),
+                f"http://xn--fsqu00a.test:{port}/caf%C3%A9",
+            )
+            cfg = gui.fetch_app_config(f"http://127.0.0.1:{port}/café")
+            self.assertIsNotNone(cfg)
+            self.assertEqual(cfg.get("presets"), True)  # type: ignore[union-attr]
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+        # 4. Esc / cancel.abort() immediately releases a capture blocked in DNS (getaddrinfo)
+        dns_release = _threading.Event()
+        dns_entered = _threading.Event()
+
+        def _blocking_getaddrinfo(*_args, **_kwargs):
+            dns_entered.set()
+            dns_release.wait(timeout=10.0)
+            return []
+
+        dns_cancel = gui.CancelFlag()
+        dns_error: list[BaseException] = []
+
+        def _run_dns() -> None:
+            try:
+                gui._create_connection_cancellable(
+                    "slow.invalid",
+                    80,
+                    10.0,
+                    live_sock=[None],
+                    cancel=dns_cancel,
+                    abort_cb=lambda: None,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                dns_error.append(exc)
+
+        with mock.patch.object(_socket, "getaddrinfo", _blocking_getaddrinfo):
+            worker = _threading.Thread(target=_run_dns, daemon=True)
+            worker.start()
+            self.assertTrue(dns_entered.wait(timeout=2.0))
+            t0 = _time.monotonic()
+            dns_cancel.abort()
+            worker.join(timeout=2.0)
+            elapsed = _time.monotonic() - t0
+            dns_release.set()
+        self.assertFalse(worker.is_alive())
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(len(dns_error), 1)
+        self.assertIsInstance(dns_error[0], gui._Cancelled)
+
+        # 5. Preset save/load preserves sub-second videoDuration (1.5s) and waitDelay (0.25s)
+        loaded, ignored = gui.apply_preset_settings_with_warnings(
+            gui.GuiState(),
+            {"videoDuration": 1.5, "waitDelay": 0.25},
+        )
+        self.assertEqual(ignored, ())
+        self.assertEqual(loaded.video_duration_ms, 1500)
+        self.assertEqual(loaded.wait_delay_ms, 250)
+        saved_settings = gui.state_to_preset_settings(loaded)
+        self.assertEqual(saved_settings["videoDuration"], 1.5)
+        self.assertEqual(saved_settings["waitDelay"], 0.25)
+        reloaded = gui.apply_preset_settings(gui.GuiState(), saved_settings)
+        self.assertEqual(reloaded.video_duration_ms, 1500)
+        self.assertEqual(reloaded.wait_delay_ms, 250)
+
+        # 6. Invalid UTF-8 bytes in history file return empty tuple instead of crashing startup
+        with _tempfile.TemporaryDirectory() as tmp:
+            bad_hist = Path(tmp) / "gui_history.json"
+            bad_hist.write_bytes(b"\xff")
+            self.assertEqual(gui.load_url_history(bad_hist), ())
+
+        # 7. Default SSL context explicitly enforces TLS 1.2+
+        self.assertGreaterEqual(
+            gui._default_ssl_context().minimum_version,
+            gui.ssl.TLSVersion.TLSv1_2,
+        )

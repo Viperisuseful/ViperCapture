@@ -2647,6 +2647,10 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
 
     def test_validate_server_url_rejects_query_and_fragment_delimiters(self) -> None:
         self.assertEqual(launch._validate_server_url("https://example.com/api/"), "https://example.com/api")
+        self.assertEqual(
+            launch._validate_server_url("http://例子.test:8000/café/"),
+            "http://xn--fsqu00a.test:8000/caf%C3%A9",
+        )
         for bad in (
             "https://example.com?",
             "https://example.com#",
@@ -2656,6 +2660,18 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
             with self.subTest(url=bad):
                 with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit) as ctx:
                     launch._validate_server_url(bad)
+                self.assertEqual(ctx.exception.code, 2)
+
+    def test_gui_flags_reject_missing_value_followed_by_flag(self) -> None:
+        for argv in (
+            ["--gui", "--output-dir", "--preset", "example.com"],
+            ["--gui", "--preset", "--url", "example.com"],
+            ["--gui", "--url", "--server", "http://127.0.0.1:8000"],
+            ["--gui", "--server", "--preset", "default"],
+        ):
+            with self.subTest(argv=argv):
+                with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit) as ctx:
+                    launch.parse_cli(argv)
                 self.assertEqual(ctx.exception.code, 2)
 
 
