@@ -893,6 +893,8 @@ def parse_capture_args(argv: list[str]) -> argparse.Namespace:
 
 
 def _server_origin(server: str | None) -> tuple[str, str, int] | None:
+    if not server or not isinstance(server, str):
+        return None
     try:
         root = api_root(server)
     except ValueError:
@@ -1098,14 +1100,28 @@ _PRESET_CLI_EXTRAS = (
 )
 
 
+def _coerce_bool(value: object, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in _TRUE or lowered in {"t", "y"}:
+            return True
+        if lowered in _FALSE or lowered in {"f", "n"}:
+            return False
+    return default
+
+
 def payload_to_preset_settings(payload: dict[str, object]) -> dict[str, object]:
     """Serialize a CLI render payload into Web UI PresetSettings keys while preserving CLI extras."""
     settings: dict[str, object] = {}
     fmt = str(payload.get("output") or "png").lower()
     settings["output"] = _FORMAT_ALIASES.get(fmt, fmt)
     if "full_page" in payload:
-        settings["fullPage"] = bool(payload["full_page"])
-    if payload.get("preserve_viewport_width"):
+        settings["fullPage"] = _coerce_bool(payload["full_page"], True)
+    if _coerce_bool(payload.get("preserve_viewport_width"), False):
         settings["preserveViewportWidth"] = True
 
     vp = payload.get("viewport")
@@ -1229,10 +1245,10 @@ def payload_to_preset_settings(payload: dict[str, object]) -> dict[str, object]:
         if isinstance(cleanup.get("consent_mode"), str) and cleanup["consent_mode"] in _CONSENT
         else "none"
     )
-    settings["blockAds"] = bool(cleanup.get("block_ads", False))
-    settings["blockTrackers"] = bool(cleanup.get("block_trackers", False))
-    settings["blockChats"] = bool(cleanup.get("block_chats", False))
-    settings["blockNewsletters"] = bool(cleanup.get("block_newsletters", False))
+    settings["blockAds"] = _coerce_bool(cleanup.get("block_ads"), False)
+    settings["blockTrackers"] = _coerce_bool(cleanup.get("block_trackers"), False)
+    settings["blockChats"] = _coerce_bool(cleanup.get("block_chats"), False)
+    settings["blockNewsletters"] = _coerce_bool(cleanup.get("block_newsletters"), False)
 
     if isinstance(payload.get("custom_css"), str):
         settings["customCss"] = payload["custom_css"]

@@ -112,9 +112,10 @@ def config_path() -> Path:
 def _normalize_section(raw: dict[str, object]) -> dict[str, object]:
     values: dict[str, object] = {}
     for raw_key, item in raw.items():
-        if isinstance(item, dict):
-            continue
         key = str(raw_key).strip().replace("-", "_")
+        is_known = key == "viewport" or key in _STR_KEYS or key in _BOOL_KEYS or key in _INT_KEYS or key in _FLOAT_KEYS
+        if isinstance(item, dict) and not is_known:
+            continue
         if key == "viewport":
             if isinstance(item, list) and len(item) == 2 and all(type(v) is int for v in item):
                 values["viewport"] = [int(item[0]), int(item[1])]

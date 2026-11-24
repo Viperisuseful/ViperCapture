@@ -1222,7 +1222,7 @@ class NewCaptureFeaturesTests(unittest.TestCase):
                 with mock.patch("sys.stdout", stdout):
                     self.assertEqual(main(["--no-config", "--dry-run", "--from-json", str(null_env_json)]), 0)
 
-            # 3a. Malformed config.toml server fails closed for credentials
+            # 3a. Malformed config.toml server or missing (None) target fails closed for credentials
             from vipercapture.capture_cli import _config_credential_for_server, payload_to_preset_settings, preset_settings_to_payload
             self.assertEqual(
                 _config_credential_for_server(
@@ -1232,6 +1232,21 @@ class NewCaptureFeaturesTests(unittest.TestCase):
                 ),
                 "",
             )
+            self.assertEqual(
+                _config_credential_for_server(
+                    {"server": "https://prod.example", "api_key": "secret-key"},
+                    "api_key",
+                    None,
+                ),
+                "",
+            )
+            # String false cleanup booleans (e.g. from --from-json) must serialize as False, not True
+            str_false_saved = payload_to_preset_settings({
+                "output": "png",
+                "cleanup": {"consent_mode": "none", "block_ads": "false", "block_trackers": "0"},
+            })
+            self.assertFalse(str_false_saved["blockAds"])
+            self.assertFalse(str_false_saved["blockTrackers"])
 
             # 3a2. Flat CLI presets with only quality/locale/diagnostics/GIF bitrate round-trip cleanly & preserve cleanup defaults
             for cli_payload, expected_check in (

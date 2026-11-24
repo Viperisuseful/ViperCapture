@@ -905,6 +905,10 @@ class CliConfigTests(unittest.TestCase):
             bad.write_text("viewport = [1280]\n", encoding="utf-8")
             with self.assertRaises(ValueError):
                 load_cli_config(bad)
+            table_server = Path(tmp) / "table_server.toml"
+            table_server.write_text('api_key = "secret"\n[server]\nurl = "https://example.com"\n', encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load_cli_config(table_server)
 
     def test_toml_fallback_handles_multiline_arrays_and_trailing_commas(self) -> None:
         doc = _fallback_toml_loads(
