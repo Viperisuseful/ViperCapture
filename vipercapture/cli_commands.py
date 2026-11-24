@@ -47,6 +47,7 @@ from vipercapture.capture_cli import (
     open_raw_response,
     open_response,
     open_response_with_retries,
+    payload_to_preset_settings,
     public_payload,
     read_response_bytes,
     resolve_api_url,
@@ -80,6 +81,9 @@ FAST_NO_VENV_SUBCOMMANDS = frozenset({"version", "logs", "completion"})
 _OPEN_JOBS = frozenset({"queued", "running"})
 _ADMIN_SCOPES = ("render", "jobs", "schedules", "profiles", "baselines")
 _MAX_VERIFY_MEMBER_BYTES = 512 * 1024 * 1024
+_MAX_MANIFEST_BYTES = 64 * 1024
+_MAX_SIG_BYTES = 4 * 1024
+_MAX_DIFF_REPORT_BYTES = 64 * 1024
 _BASELINE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 
 
@@ -243,7 +247,10 @@ def _has_render_flags(args: argparse.Namespace) -> bool:
         "timestamp_ms", "seed", "wait_for_fonts", "certify", "profile_id",
         "save_profile", "webhook",
     )
-    return any(getattr(args, field, None) not in (None, [], False) for field in check_fields)
+    return any(
+        getattr(args, field, None) is not None and getattr(args, field, None) != []
+        for field in check_fields
+    )
 
 
 def _read_binary_file(path_str: str, label: str = "file") -> tuple[str, bytes]:
@@ -298,9 +305,8 @@ def cmd_status(argv: list[str]) -> int:
         prog="vipercapture status",
         description="Inspect ViperCapture server health, readiness, version, GPU, and async jobs.",
     )
-    _add_common_client_flags(parser, include_no_start=False)
+    _add_common_client_flags(parser, include_no_start=False, include_api_key=False)
     args = parser.parse_args(argv)
-    load_local_env()
     try:
         root = api_root(args.server)
     except ValueError as exc:
@@ -317,7 +323,8 @@ def cmd_status(argv: list[str]) -> int:
         if local_port_open:
             local_pid = launch._is_vipercapture_endpoint(host=host, port=port)
 
-    headers = _auth_headers(args)
+    # /health, /ready, and /app-config are public routes; never send ambient credentials.
+    headers = {"Accept": "application/json"}
     health_status, health_doc, health_err = _probe_json_allow_error_body(root + "/health", headers, 5.0)
     running = health_status == 200 and isinstance(health_doc, dict)
     ready_status: int | None = None
@@ -604,11 +611,9 @@ def cmd_preset(argv: list[str]) -> int:
                 return fail("Preset name must be 1-40 characters.", exit_code=2)
             _ensure_render_namespace(args)
             try:
-                settings = build_payload(args, require_source=False)
+                settings = payload_to_preset_settings(build_payload(args, require_source=False))
             except ValueError as exc:
                 return fail(str(exc), exit_code=2)
-            for source_key in ("url", "html", "markdown"):
-                settings.pop(source_key, None)
             resp = open_response(
                 root + "/local/presets",
                 method="POST",
@@ -652,10 +657,32 @@ def cmd_preset(argv: list[str]) -> int:
 # ── diff & baseline helpers ───────────────────────────────────
 
 
+def _read_zip_member_bounded(
+    archive: zipfile.ZipFile,
+    name: str,
+    max_bytes: int,
+    *,
+    error_code: str = "bundle_invalid",
+) -> bytes:
+    info = archive.getinfo(name)
+    if info.file_size > max_bytes:
+        raise CaptureError(f"Archive entry {name!r} exceeds maximum allowed size ({max_bytes} bytes).", code=error_code)
+    with archive.open(info, "r") as handle:
+        data = handle.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise CaptureError(f"Archive entry {name!r} exceeds maximum allowed size ({max_bytes} bytes).", code=error_code)
+    return data
+
+
 def _parse_diff_zip_report(bundle_bytes: bytes) -> dict[str, object]:
     try:
         with zipfile.ZipFile(io.BytesIO(bundle_bytes), "r") as archive:
-            raw = archive.read("report.json")
+            raw = _read_zip_member_bounded(
+                archive,
+                "report.json",
+                _MAX_DIFF_REPORT_BYTES,
+                error_code="diff_report_too_large",
+            )
         parsed = json.loads(raw.decode("utf-8"))
         return parsed if isinstance(parsed, dict) else {}
     except (zipfile.BadZipFile, KeyError, UnicodeDecodeError, json.JSONDecodeError):
@@ -1243,6 +1270,7 @@ def cmd_bulk(argv: list[str]) -> int:
         download_failures = failed_total
 
         tasks: list[tuple[int, dict[str, object], str]] = []
+        used_stems: set[str] = set()
         for entry in all_results:
             if not entry.get("accepted") or not isinstance(entry.get("job"), dict):
                 downloaded.append({
@@ -1254,13 +1282,22 @@ def cmd_bulk(argv: list[str]) -> int:
             idx = int(entry.get("index", 0))
             item_id = entry.get("id")
             if isinstance(item_id, str) and item_id:
-                label = item_id
+                base_stem = safe_filename(item_id)
             else:
                 render_obj = items[idx]["render"] if idx < len(items) else {}
                 url_val = render_obj.get("url") if isinstance(render_obj, dict) else None
                 host = urlsplit(str(url_val)).hostname if url_val else "item"
-                label = f"{safe_filename(host or 'item')}-{idx + 1}"
-            tasks.append((idx, entry["job"], label))
+                base_stem = safe_filename(f"{safe_filename(host or 'item')}-{idx + 1}")
+            stem = base_stem
+            if stem.lower() in used_stems:
+                candidate = safe_filename(f"{base_stem}-{idx + 1}")
+                suffix_num = 2
+                while candidate.lower() in used_stems:
+                    candidate = safe_filename(f"{base_stem}-{idx + 1}-{suffix_num}")
+                    suffix_num += 1
+                stem = candidate
+            used_stems.add(stem.lower())
+            tasks.append((idx, entry["job"], stem))
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(args.concurrency, max(1, len(tasks)))) as pool:
             future_map = {
@@ -1877,26 +1914,27 @@ def _decode_b64_bytes(text: str) -> bytes:
         return base64.b64decode(cleaned + padding)
 
 
-def _load_ed25519_public_key(raw_spec: str):
+def _load_ed25519_public_key(raw_spec: str, *, allow_file: bool = True):
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
     text = raw_spec.strip()
-    candidate_path = Path(text)
-    if candidate_path.is_file():
-        text = candidate_path.read_text(encoding="utf-8-sig").strip()
+    if allow_file:
+        candidate_path = Path(text)
+        if candidate_path.is_file():
+            text = candidate_path.read_text(encoding="utf-8-sig").strip()
 
-    if "-----BEGIN" in text:
-        loaded = serialization.load_pem_public_key(text.encode("utf-8"))
-        if not isinstance(loaded, Ed25519PublicKey):
-            raise ValueError("Public key PEM is not an Ed25519 key.")
-        raw_pub = loaded.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-        return loaded, base64.urlsafe_b64encode(raw_pub).decode("ascii").rstrip("=")
+        if "-----BEGIN" in text:
+            loaded = serialization.load_pem_public_key(text.encode("utf-8"))
+            if not isinstance(loaded, Ed25519PublicKey):
+                raise ValueError("Public key PEM is not an Ed25519 key.")
+            raw_pub = loaded.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+            return loaded, base64.urlsafe_b64encode(raw_pub).decode("ascii").rstrip("=")
 
-    if text.startswith("{"):
-        parsed = json.loads(text)
-        if isinstance(parsed, dict) and isinstance(parsed.get("public_key"), str):
-            text = parsed["public_key"].strip()
+        if text.startswith("{"):
+            parsed = json.loads(text)
+            if isinstance(parsed, dict) and isinstance(parsed.get("public_key"), str):
+                text = parsed["public_key"].strip()
 
     key_bytes = _decode_b64_bytes(text)
     if len(key_bytes) != 32:
@@ -1910,6 +1948,7 @@ def verify_certified_bundle(
     bundle_path: Path,
     *,
     public_key_spec: str,
+    allow_key_file: bool = True,
 ) -> dict[str, object]:
     """Verify a --certify ZIP bundle's Ed25519 signature, manifest, and SHA-256 hash."""
     from cryptography.exceptions import InvalidSignature
@@ -1917,7 +1956,10 @@ def verify_certified_bundle(
     if not bundle_path.is_file():
         raise CaptureError(f"Bundle not found: {bundle_path}", code="bundle_not_found")
     try:
-        public_key, expected_key_b64 = _load_ed25519_public_key(public_key_spec)
+        public_key, expected_key_b64 = _load_ed25519_public_key(
+            public_key_spec,
+            allow_file=allow_key_file,
+        )
     except Exception as exc:
         raise CaptureError(f"Invalid public key: {exc}", code="invalid_public_key") from exc
 
@@ -1932,11 +1974,8 @@ def verify_certified_bundle(
                     "Bundle is missing manifest.json or manifest.sig.",
                     code="bundle_invalid",
                 )
-            for info in infos:
-                if info.file_size > _MAX_VERIFY_MEMBER_BYTES:
-                    raise CaptureError("Bundle entry exceeds maximum verification size.", code="bundle_invalid")
-            manifest_raw = archive.read("manifest.json")
-            sig_raw = archive.read("manifest.sig")
+            manifest_raw = _read_zip_member_bounded(archive, "manifest.json", _MAX_MANIFEST_BYTES)
+            sig_raw = _read_zip_member_bounded(archive, "manifest.sig", _MAX_SIG_BYTES)
 
             try:
                 manifest = json.loads(manifest_raw.decode("utf-8"))
@@ -1995,10 +2034,26 @@ def verify_certified_bundle(
                     f"Bundle contains unexpected uncertified entries: {', '.join(extra_entries)}",
                     code="bundle_tampered",
                 )
+            if type(expected_bytes) is not int or expected_bytes < 0 or expected_bytes > _MAX_VERIFY_MEMBER_BYTES:
+                raise CaptureError("Certified artifact byte length is invalid.", code="manifest_invalid")
 
-            artifact_bytes = archive.read(filename)
-            actual_sha = hashlib.sha256(artifact_bytes).hexdigest()
-            if type(expected_bytes) is not int or len(artifact_bytes) != expected_bytes:
+            artifact_info = archive.getinfo(filename)
+            if artifact_info.file_size > _MAX_VERIFY_MEMBER_BYTES:
+                raise CaptureError("Bundle entry exceeds maximum verification size.", code="bundle_invalid")
+
+            digest = hashlib.sha256()
+            actual_bytes = 0
+            with archive.open(artifact_info, "r") as handle:
+                while True:
+                    chunk = handle.read(64 * 1024)
+                    if not chunk:
+                        break
+                    actual_bytes += len(chunk)
+                    if actual_bytes > _MAX_VERIFY_MEMBER_BYTES:
+                        raise CaptureError("Bundle entry exceeds maximum verification size.", code="bundle_invalid")
+                    digest.update(chunk)
+            actual_sha = digest.hexdigest()
+            if actual_bytes != expected_bytes:
                 raise CaptureError("Certified artifact byte length mismatch.", code="artifact_tampered")
             if not isinstance(expected_sha, str) or actual_sha != expected_sha.lower():
                 raise CaptureError("Certified artifact SHA-256 digest mismatch.", code="artifact_tampered")
@@ -2013,7 +2068,7 @@ def verify_certified_bundle(
                 "artifact": {
                     "filename": filename,
                     "media_type": artifact.get("media_type"),
-                    "bytes": len(artifact_bytes),
+                    "bytes": actual_bytes,
                     "sha256": actual_sha,
                 },
             }
@@ -2036,7 +2091,9 @@ def cmd_verify(argv: list[str]) -> int:
     load_local_env()
 
     key_spec = args.public_key
+    allow_key_file = True
     if not key_spec:
+        allow_key_file = False
         try:
             root = api_root(args.server)
         except ValueError as exc:
@@ -2046,7 +2103,7 @@ def cmd_verify(argv: list[str]) -> int:
                 root + "/v1/certification/public-key",
                 method="GET",
                 payload=None,
-                headers=_auth_headers(args),
+                headers={"Accept": "application/json"},
                 timeout=15.0,
             )
             try:
@@ -2061,7 +2118,11 @@ def cmd_verify(argv: list[str]) -> int:
         key_spec = fetched.strip()
 
     try:
-        result = verify_certified_bundle(Path(args.bundle), public_key_spec=key_spec)
+        result = verify_certified_bundle(
+            Path(args.bundle),
+            public_key_spec=key_spec,
+            allow_key_file=allow_key_file,
+        )
     except CaptureError as exc:
         return fail(str(exc), status=exc.status, code=exc.code, body=exc.body, exit_code=exc.exit_code)
 

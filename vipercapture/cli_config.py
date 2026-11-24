@@ -177,7 +177,8 @@ def _parse_toml_scalar(raw: str) -> object:
         inner = value[1:-1].strip()
         if not inner:
             return []
-        return [_parse_toml_scalar(part) for part in inner.split(",")]
+        parts = [part.strip() for part in inner.split(",") if part.strip()]
+        return [_parse_toml_scalar(part) for part in parts]
     if re.fullmatch(r"[+-]?\d+", value):
         return int(value)
     if re.fullmatch(r"[+-]?(?:\d+\.\d*|\.\d+|\d+[eE][+-]?\d+|\d+\.\d*[eE][+-]?\d+)", value):
@@ -189,8 +190,12 @@ def _fallback_toml_loads(text: str) -> dict[str, object]:
     """Minimal TOML subset parser used only on Python <3.11 without tomli."""
     root: dict[str, object] = {}
     current: dict[str, object] = root
-    for line_no, raw_line in enumerate(text.splitlines(), start=1):
-        line = _strip_toml_comment(raw_line).strip()
+    raw_lines = text.splitlines()
+    idx = 0
+    while idx < len(raw_lines):
+        line_no = idx + 1
+        line = _strip_toml_comment(raw_lines[idx]).strip()
+        idx += 1
         if not line:
             continue
         if line.startswith("[") and line.endswith("]"):
@@ -211,8 +216,23 @@ def _fallback_toml_loads(text: str) -> dict[str, object]:
         key = key_raw.strip()
         if not re.fullmatch(r"[A-Za-z0-9_-]+", key):
             raise ValueError(f"line {line_no}: invalid key {key!r}")
+        val_text = val_raw.strip()
+        # Accumulate multiline arrays (e.g. viewport = [\n  1440,\n  900,\n])
+        if val_text.startswith("[") and not val_text.endswith("]"):
+            parts = [val_text]
+            while idx < len(raw_lines):
+                nxt = _strip_toml_comment(raw_lines[idx]).strip()
+                idx += 1
+                if not nxt:
+                    continue
+                parts.append(nxt)
+                if nxt.endswith("]"):
+                    break
+            val_text = " ".join(parts)
+            if not val_text.endswith("]"):
+                raise ValueError(f"line {line_no}: unterminated array")
         try:
-            current[key] = _parse_toml_scalar(val_raw)
+            current[key] = _parse_toml_scalar(val_text)
         except (ValueError, SyntaxError) as exc:
             raise ValueError(f"line {line_no}: {exc}") from exc
     return root

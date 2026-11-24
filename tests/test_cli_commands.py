@@ -6,6 +6,7 @@ import base64
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -18,8 +19,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import launch
 from vipercapture import cli_commands
-from vipercapture.cli_config import load_cli_config, read_version
-from vipercapture.render_engine import RenderArtifact, _certify_artifact, certification_public_key
+from vipercapture.cli_config import _fallback_toml_loads, load_cli_config, read_version
 
 
 def _make_diff_zip(passed: bool = True, ratio: float = 0.0) -> bytes:
@@ -101,11 +101,12 @@ class _ApiMockHandler(BaseHTTPRequestHandler):
             return
         if path.startswith("/v1/jobs/") and path.endswith("/result"):
             job_id = path.split("/")[3]
+            safe_id = job_id if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", job_id) else "artifact"
             self._send_bytes(
                 200,
-                f"ARTIFACT-{job_id}".encode("utf-8"),
+                f"ARTIFACT-{safe_id}".encode("utf-8"),
                 "image/png",
-                headers={"Content-Disposition": f'attachment; filename="{job_id}.png"'},
+                headers={"Content-Disposition": f'attachment; filename="{safe_id}.png"'},
             )
             return
         if path.startswith("/v1/jobs/"):
@@ -362,7 +363,7 @@ class CliCommandsTests(unittest.TestCase):
             "projects": [],
             "job_polls": {},
             "diff_passed": True,
-            "cert_public_key": certification_public_key(self.cert_secret),
+            "cert_public_key": "",
         }
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
@@ -460,7 +461,38 @@ class CliCommandsTests(unittest.TestCase):
         ])
         self.assertEqual(code, 0, stderr)
         self.assertNotIn("super-secret-hdr", stdout)
-        self.assertEqual(json.loads(stdout)["settings"]["headers"]["Authorization"], "***")
+        saved_headers = json.loads(json.loads(stdout)["settings"]["headers"])
+        self.assertEqual(saved_headers["Authorization"], "***")
+
+        # Web UI format preset with JSON-string headers (including X-Access-Token) must redact on show & list
+        self.httpd.state["presets"].append({  # type: ignore[attr-defined]
+            "name": "webui-secret",
+            "settings": {
+                "output": "png",
+                "headers": json.dumps({
+                    "Authorization": "Bearer webui-secret-tok",
+                    "Cookie": "sid=cookie-secret",
+                    "X-Access-Token": "access-secret",
+                    "X-Trace": "visible",
+                }),
+            },
+        })
+        code, stdout, stderr = self._run(["preset", "list", "--server", self.server, "--json"])
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn("webui-secret-tok", stdout)
+        self.assertNotIn("cookie-secret", stdout)
+        self.assertNotIn("access-secret", stdout)
+        self.assertIn("visible", stdout)
+
+        code, stdout, stderr = self._run(["preset", "show", "webui-secret", "--server", self.server, "--json"])
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn("webui-secret-tok", stdout)
+        self.assertNotIn("cookie-secret", stdout)
+        self.assertNotIn("access-secret", stdout)
+        shown_hdrs = json.loads(json.loads(stdout)["settings"]["headers"])
+        self.assertEqual(shown_hdrs["Authorization"], "***")
+        self.assertEqual(shown_hdrs["X-Access-Token"], "***")
+        self.assertEqual(shown_hdrs["X-Trace"], "visible")
 
         code, stdout, stderr = self._run(["preset", "list", "--server", self.server])
         self.assertEqual(code, 0, stderr)
@@ -720,12 +752,14 @@ class CliCommandsTests(unittest.TestCase):
         try:
             from cryptography.hazmat.primitives import serialization
             from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+            from vipercapture.render_engine import RenderArtifact, _certify_artifact, certification_public_key
         except ImportError:
-            self.skipTest("cryptography not installed")
+            self.skipTest("cryptography or render_engine dependencies not installed")
 
         artifact = RenderArtifact(b"\x89PNG\r\n\x1a\ncertified-image", "image/png", "capture.png")
         bundle_bytes = _certify_artifact(artifact, self.cert_secret)
         pub_b64 = certification_public_key(self.cert_secret)
+        self.httpd.state["cert_public_key"] = pub_b64  # type: ignore[attr-defined]
 
         with tempfile.TemporaryDirectory() as tmp:
             bundle_path = Path(tmp) / "certified.zip"
@@ -860,6 +894,145 @@ class CliConfigTests(unittest.TestCase):
             bad.write_text("viewport = [1280]\n", encoding="utf-8")
             with self.assertRaises(ValueError):
                 load_cli_config(bad)
+
+    def test_toml_fallback_handles_multiline_arrays_and_trailing_commas(self) -> None:
+        doc = _fallback_toml_loads(
+            '[capture]\n'
+            'viewport = [\n'
+            '  1920,\n'
+            '  1080,\n'
+            ']\n'
+            'format = "png"\n'
+        )
+        self.assertEqual(doc["capture"]["viewport"], [1920, 1080])  # type: ignore[index]
+        self.assertEqual(doc["capture"]["format"], "png")  # type: ignore[index]
+
+
+class CliCouncilHardeningTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _ApiMockHandler)
+        self.httpd.requests = []  # type: ignore[attr-defined]
+        self.httpd.state = {  # type: ignore[attr-defined]
+            "ready": True,
+            "gpu_mode": "off",
+            "presets": [],
+            "baselines": {},
+            "schedules": {},
+            "projects": [],
+            "job_polls": {},
+            "diff_passed": True,
+            "cert_public_key": "",
+        }
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        host, port = self.httpd.server_address[:2]
+        self.server = f"http://{host}:{port}"
+
+    def tearDown(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def _run(self, argv: list[str]) -> tuple[int, str, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch("sys.stdout", stdout),
+            mock.patch("sys.stderr", stderr),
+            mock.patch("vipercapture.cli_commands.load_local_env"),
+            mock.patch("vipercapture.capture_cli.is_local_default", return_value=False),
+        ):
+            code = cli_commands.main(argv)
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_status_never_sends_authorization_headers(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"VIPERCAPTURE_ADMIN_TOKEN": "admin-secret", "VIPERCAPTURE_API_KEY": "api-secret"},
+            clear=False,
+        ):
+            code, stdout, stderr = self._run(["status", "--server", self.server, "--json"])
+        self.assertEqual(code, 0, stderr)
+        self.assertTrue(json.loads(stdout)["running"])
+        for req in self.httpd.requests:  # type: ignore[attr-defined]
+            self.assertNotIn("Authorization", req["headers"])
+
+    def test_companion_command_uses_api_key_from_config_toml(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "config.toml"
+            cfg.write_text('api_key = "cfg-project-key"\n', encoding="utf-8")
+            with mock.patch.dict(
+                os.environ,
+                {"VIPERCAPTURE_CONFIG": str(cfg), "VIPERCAPTURE_API_KEY": "", "VIPERCAPTURE_ADMIN_TOKEN": ""},
+                clear=False,
+            ):
+                code, _stdout, stderr = self._run(["baseline", "list", "--server", self.server, "--json"])
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(self.httpd.requests[-1]["headers"].get("Authorization"), "Bearer cfg-project-key")  # type: ignore[attr-defined]
+
+    def test_bulk_deduplicates_colliding_ids_and_detects_no_full_page(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            envelope = Path(tmp) / "bulk.json"
+            envelope.write_text(
+                json.dumps({
+                    "items": [
+                        {"id": "dup/item", "render": {"url": "https://a.example", "output": "png"}},
+                        {"id": "dup:item", "render": {"url": "https://b.example", "output": "png"}},
+                    ]
+                }),
+                encoding="utf-8",
+            )
+            out_dir = Path(tmp) / "out"
+            code, stdout, stderr = self._run([
+                "bulk", str(envelope),
+                "--no-full-page",
+                "--wait", "--poll-ms", "1",
+                "--output-dir", str(out_dir),
+                "--server", self.server,
+                "--json",
+            ])
+            self.assertEqual(code, 0, stderr)
+            doc = json.loads(stdout)
+            self.assertEqual(doc["succeeded"], 2)
+            saved_paths = [r["path"] for r in doc["results"]]
+            self.assertEqual(len(set(saved_paths)), 2)
+            post_req = next(r for r in self.httpd.requests if r["path"] == "/v1/jobs/bulk")  # type: ignore[attr-defined]
+            sent = json.loads(post_req["body"].decode("utf-8"))
+            self.assertFalse(sent["items"][0]["render"]["full_page"])
+
+    def test_diff_rejects_oversized_report_json(self) -> None:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("report.json", "{" + (" " * (cli_commands._MAX_DIFF_REPORT_BYTES + 1024)) + "}")
+        with self.assertRaises(cli_commands.CaptureError) as ctx:
+            cli_commands._parse_diff_zip_report(buf.getvalue())
+        self.assertEqual(ctx.exception.code, "diff_report_too_large")
+
+    def test_verify_server_key_does_not_probe_filesystem_and_rejects_oversized_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # Server-supplied key that looks like a file path must NOT call Path.is_file()
+            with mock.patch.object(Path, "is_file", side_effect=AssertionError("should not probe path")):
+                try:
+                    cli_commands._load_ed25519_public_key(r"\\attacker\share\key.pem", allow_file=False)
+                except ValueError:
+                    pass
+                except cli_commands.CaptureError:
+                    pass
+
+            # Oversized manifest.json must be rejected cleanly
+            bad_zip = Path(tmp) / "bomb.zip"
+            with zipfile.ZipFile(bad_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("manifest.json", b"{" + b" " * (cli_commands._MAX_MANIFEST_BYTES + 2048) + b"}")
+                zf.writestr("manifest.sig", b"A" * 64)
+                zf.writestr("capture.png", b"png")
+            try:
+                from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+            except ImportError:
+                self.skipTest("cryptography not installed")
+            pub_raw = Ed25519PrivateKey.generate().public_key().public_bytes_raw()
+            pub_b64 = base64.urlsafe_b64encode(pub_raw).decode("ascii").rstrip("=")
+            with self.assertRaises(cli_commands.CaptureError) as ctx:
+                cli_commands.verify_certified_bundle(bad_zip, public_key_spec=pub_b64)
+            self.assertEqual(ctx.exception.code, "bundle_invalid")
 
 
 if __name__ == "__main__":

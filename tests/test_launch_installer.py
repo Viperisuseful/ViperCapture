@@ -2640,6 +2640,21 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
         port_open.assert_called_once()
         mod_mock.assert_called_once_with("webbrowser")
 
+    def test_verify_command_runs_ensure_deps_when_cryptography_is_missing(self) -> None:
+        with (
+            mock.patch("launch.sys.argv", ["launch.py", "verify", "bundle.zip", "--public-key", "abc"]),
+            mock.patch("launch.ensure_venv") as ensure_venv,
+            mock.patch("launch.ensure_deps") as ensure_deps,
+            mock.patch("launch._can_import_cryptography", return_value=False),
+            mock.patch("vipercapture.cli_commands.main", return_value=0) as cli_main,
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                launch.main()
+        self.assertEqual(ctx.exception.code, 0)
+        ensure_venv.assert_called_once()
+        ensure_deps.assert_called_once()
+        cli_main.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

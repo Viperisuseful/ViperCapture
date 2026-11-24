@@ -137,10 +137,34 @@ _COOKIE_KEYS = {
 _SENSITIVE_HEADER_NAMES = frozenset({
     "authorization",
     "cookie",
+    "set-cookie",
     "proxy-authorization",
     "x-api-key",
     "x-auth-token",
+    "x-access-token",
+    "x-csrf-token",
+    "x-xsrf-token",
 })
+_SENSITIVE_HEADER_TOKENS = (
+    "auth",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "cookie",
+    "api-key",
+    "apikey",
+    "credential",
+    "session",
+    "private-key",
+)
+
+
+def _is_sensitive_header_name(name: str) -> bool:
+    lowered = name.strip().lower()
+    if lowered in _SENSITIVE_HEADER_NAMES:
+        return True
+    return any(tok in lowered for tok in _SENSITIVE_HEADER_TOKENS)
 _RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
 _OPEN_JOBS = {"queued", "running"}
 _STARTED_SERVER_HANDLE: tuple[object, int | None] | None = None
@@ -207,6 +231,10 @@ class Record(argparse.Action):
 
 
 class CaptureParser(argparse.ArgumentParser):
+    def __init__(self, *args, **kwargs) -> None:
+        kwargs.setdefault("allow_abbrev", False)
+        super().__init__(*args, **kwargs)
+
     def error(self, message: str) -> None:
         self.exit(2, _json_line({"ok": False, "error": message}) + "\n")
 
@@ -313,6 +341,11 @@ def _cookie_dict_to_render_cookie(
     *,
     default_domain: str | None = None,
 ) -> dict[str, object]:
+    if item.get("partitionKey") is not None or item.get("partition_key") is not None:
+        raise ValueError(
+            "Partitioned cookies (partitionKey) cannot be sent via --cookie-file; "
+            "use 'vipercapture profile import' to preserve cookie partitioning."
+        )
     name = str(item.get("name") or "").strip()
     domain = str(item.get("domain") or default_domain or "").strip()
     if not name or not domain:
@@ -511,6 +544,25 @@ def _json_line(document: dict[str, object]) -> str:
     return json.dumps(document, ensure_ascii=False)
 
 
+def _redact_headers_string(raw: str) -> str:
+    stripped = raw.strip()
+    if not stripped:
+        return ""
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return "***"
+    if not isinstance(parsed, dict):
+        return "***"
+    redacted: dict[str, object] = {}
+    for key, val in parsed.items():
+        if _is_sensitive_header_name(str(key)):
+            redacted[str(key)] = "***"
+        else:
+            redacted[str(key)] = val
+    return json.dumps(redacted, ensure_ascii=False)
+
+
 def public_payload(payload: dict[str, object]) -> dict[str, object]:
     """A copy that can be printed. Passwords, cookie values, and auth headers are redacted."""
 
@@ -521,7 +573,9 @@ def public_payload(payload: dict[str, object]) -> dict[str, object]:
                 lowered = str(key).lower()
                 if lowered == "password":
                     printed[key] = "***"
-                elif parent_key == "headers" and lowered in _SENSITIVE_HEADER_NAMES:
+                elif lowered == "headers" and isinstance(item, str):
+                    printed[key] = _redact_headers_string(item)
+                elif parent_key == "headers" and _is_sensitive_header_name(lowered):
                     printed[key] = "***"
                 elif parent_key == "cookies" and lowered == "value":
                     printed[key] = "***"
@@ -870,8 +924,12 @@ def apply_config_defaults(
             setattr(args, key, value)
 
 
-def _read_text(path: str) -> str:
+def _read_text(path: str, *, stdin_cache: dict[str, str] | None = None) -> str:
     if path == "-":
+        if stdin_cache is not None:
+            if "-" not in stdin_cache:
+                stdin_cache["-"] = sys.stdin.read()
+            return stdin_cache["-"]
         return sys.stdin.read()
     file = Path(path)
     if not file.is_file():
@@ -882,11 +940,17 @@ def _read_text(path: str) -> str:
         raise ValueError(f"Could not read {path}: {exc}") from exc
 
 
-def _one_of(left: str | None, right: str | None, message: str) -> str | None:
+def _one_of(
+    left: str | None,
+    right: str | None,
+    message: str,
+    *,
+    stdin_cache: dict[str, str] | None = None,
+) -> str | None:
     if left and right:
         raise ValueError(message)
     if right:
-        return _read_text(right)
+        return _read_text(right, stdin_cache=stdin_cache)
     return left
 
 
@@ -935,6 +999,41 @@ def _local_presets_candidates() -> list[Path]:
     return candidates
 
 
+def _decode_preset_headers(raw_headers: object) -> dict[str, str]:
+    if isinstance(raw_headers, dict):
+        return {str(k): str(v) for k, v in raw_headers.items()}
+    if not isinstance(raw_headers, str) or not raw_headers.strip():
+        return {}
+    text = raw_headers.strip()
+    if text.startswith("{"):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Preset headers JSON is invalid: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("Preset headers JSON must be an object.")
+        return {str(k): str(v) for k, v in parsed.items()}
+    headers: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        name, val = parse_header(line)
+        headers[name] = val
+    return headers
+
+
+def payload_to_preset_settings(payload: dict[str, object]) -> dict[str, object]:
+    """Serialize a CLI render payload so it round-trips cleanly with the Web UI and CLI."""
+    settings = copy.deepcopy(payload)
+    for source_key in ("url", "html", "markdown"):
+        settings.pop(source_key, None)
+    raw_headers = settings.get("headers")
+    if isinstance(raw_headers, dict):
+        settings["headers"] = json.dumps(raw_headers, ensure_ascii=False)
+    return settings
+
+
 def preset_settings_to_payload(settings: dict[str, object]) -> dict[str, object]:
     """Convert either a Web UI PresetSettings dict or a RenderRequest dict into RenderRequest shape."""
     web_keys = {
@@ -947,7 +1046,14 @@ def preset_settings_to_payload(settings: dict[str, object]) -> dict[str, object]
         "extractMode", "pdfMode", "paperSize", "pdfMargin", "density",
     }
     if not (set(settings.keys()) & web_keys):
-        return copy.deepcopy(settings)
+        copied = copy.deepcopy(settings)
+        if "headers" in copied:
+            decoded_headers = _decode_preset_headers(copied.get("headers"))
+            if decoded_headers:
+                copied["headers"] = decoded_headers
+            else:
+                copied.pop("headers", None)
+        return copied
 
     payload: dict[str, object] = {}
     fmt = str(settings.get("output") or "png").lower()
@@ -1086,24 +1192,25 @@ def preset_settings_to_payload(settings: dict[str, object]) -> dict[str, object]
         if statuses:
             payload["fail_on_status"] = statuses
 
-    raw_headers = settings.get("headers")
-    if isinstance(raw_headers, str) and raw_headers.strip():
-        headers: dict[str, str] = {}
-        for line in raw_headers.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            name, val = parse_header(line)
-            headers[name] = val
-        if headers:
-            payload["headers"] = headers
-    elif isinstance(raw_headers, dict) and raw_headers:
-        payload["headers"] = {str(k): str(v) for k, v in raw_headers.items()}
+    decoded_headers = _decode_preset_headers(settings.get("headers"))
+    if decoded_headers:
+        payload["headers"] = decoded_headers
     return payload
 
 
+def _is_loopback_server(server: str | None) -> bool:
+    if not server:
+        return True
+    try:
+        root = api_root(server)
+    except ValueError:
+        return False
+    host = (urlsplit(root).hostname or "").lower()
+    return host in _LOOPBACK_HOSTS
+
+
 def load_preset_payload(name: str, *, server: str | None = None) -> dict[str, object]:
-    """Fetch a named preset from /local/presets or local presets.json fallback."""
+    """Fetch a named preset from /local/presets or local presets.json fallback (loopback only)."""
     target_name = name.strip()
     if not target_name:
         raise ValueError("Preset name cannot be empty.")
@@ -1129,7 +1236,7 @@ def load_preset_payload(name: str, *, server: str | None = None) -> dict[str, ob
         except (CaptureError, ValueError):
             presets = None
 
-    if presets is None:
+    if presets is None and _is_loopback_server(server):
         for candidate in _local_presets_candidates():
             if not candidate.is_file():
                 continue
@@ -1142,6 +1249,11 @@ def load_preset_payload(name: str, *, server: str | None = None) -> dict[str, ob
                 break
 
     if presets is None:
+        if server and not _is_loopback_server(server):
+            raise ValueError(
+                f"Preset {target_name!r} could not be fetched from remote server "
+                "(local presets.json fallback is disabled for remote servers)."
+            )
         raise ValueError(f"Preset {target_name!r} was not found (no reachable server or local presets file).")
     for item in presets:
         if item.get("name") == target_name and isinstance(item.get("settings"), dict):
@@ -1149,7 +1261,12 @@ def load_preset_payload(name: str, *, server: str | None = None) -> dict[str, ob
     raise ValueError(f"Preset {target_name!r} was not found.")
 
 
-def _action_from(kind: str, values: object) -> dict[str, object]:
+def _action_from(
+    kind: str,
+    values: object,
+    *,
+    stdin_cache: dict[str, str] | None = None,
+) -> dict[str, object]:
     if kind == "json":
         try:
             parsed = json.loads(str(values))
@@ -1186,13 +1303,18 @@ def _action_from(kind: str, values: object) -> dict[str, object]:
     if kind == "js":
         return {"type": "javascript", "value": values}
     if kind == "js_file":
-        return {"type": "javascript", "value": _read_text(str(values))}
+        return {"type": "javascript", "value": _read_text(str(values), stdin_cache=stdin_cache)}
     if kind == "pause":
         return {"type": "wait", "delay_ms": int(values)}  # type: ignore[arg-type]
     raise ValueError(f"Unknown action {kind}")
 
 
-def _apply_actions(payload: dict[str, object], steps: list[tuple[str, object]] | None) -> None:
+def _apply_actions(
+    payload: dict[str, object],
+    steps: list[tuple[str, object]] | None,
+    *,
+    stdin_cache: dict[str, str] | None = None,
+) -> None:
     actions: list[dict[str, object]] = []
     delay = 0
     timeout: int | None = None
@@ -1203,7 +1325,7 @@ def _apply_actions(payload: dict[str, object], steps: list[tuple[str, object]] |
         if kind == "action_timeout":
             timeout = int(values)  # type: ignore[arg-type]
             continue
-        action = _action_from(kind, values)
+        action = _action_from(kind, values, stdin_cache=stdin_cache)
         if delay and "delay_ms" not in action:
             action["delay_ms"] = delay
         if timeout is not None and "timeout_ms" not in action:
@@ -1213,7 +1335,11 @@ def _apply_actions(payload: dict[str, object], steps: list[tuple[str, object]] |
         payload["actions"] = actions
 
 
-def _load_base_document(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
+def _load_base_document(
+    args: argparse.Namespace,
+    *,
+    stdin_cache: dict[str, str] | None = None,
+) -> tuple[dict[str, object], bool]:
     base: dict[str, object] = {}
     has_base = False
     preset_name = getattr(args, "preset", None)
@@ -1222,7 +1348,7 @@ def _load_base_document(args: argparse.Namespace) -> tuple[dict[str, object], bo
         has_base = True
     from_json = getattr(args, "from_json", None)
     if from_json:
-        raw = _read_text(from_json)
+        raw = _read_text(from_json, stdin_cache=stdin_cache)
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError as exc:
@@ -1240,11 +1366,13 @@ def build_payload(
     override_url: str | None = None,
     require_source: bool = True,
     base_document: dict[str, object] | None = None,
+    allow_default_cookie_domain: bool = True,
+    stdin_cache: dict[str, str] | None = None,
 ) -> dict[str, object]:
     if base_document is not None:
         base, has_base = copy.deepcopy(base_document), True
     else:
-        base, has_base = _load_base_document(args)
+        base, has_base = _load_base_document(args, stdin_cache=stdin_cache)
 
     payload: dict[str, object] = {}
     cli_target = getattr(args, "target", None)
@@ -1256,8 +1384,8 @@ def build_payload(
             raise ValueError("Pass the URL once, either as the argument or with --url.")
         url = cli_url or cli_target
 
-    html = _one_of(args.html, args.html_file, "Use either --html or --html-file.")
-    markdown = _one_of(args.markdown, args.markdown_file, "Use either --markdown or --markdown-file.")
+    html = _one_of(args.html, args.html_file, "Use either --html or --html-file.", stdin_cache=stdin_cache)
+    markdown = _one_of(args.markdown, args.markdown_file, "Use either --markdown or --markdown-file.", stdin_cache=stdin_cache)
     cli_sources = (url is not None, html is not None, markdown is not None)
     if sum(cli_sources) > 1:
         raise ValueError("Pass a URL, --html, or --markdown.")
@@ -1283,7 +1411,7 @@ def build_payload(
     effective_url = payload.get("url") or base.get("url")
     default_domain: str | None = None
     default_secure = False
-    if isinstance(effective_url, str) and effective_url:
+    if allow_default_cookie_domain and isinstance(effective_url, str) and effective_url:
         parsed_target = urlsplit(effective_url)
         default_domain = parsed_target.hostname
         default_secure = parsed_target.scheme.lower() == "https"
@@ -1360,7 +1488,7 @@ def build_payload(
         for cookie_path in args.cookie_file:
             cookies.extend(
                 parse_cookie_file_content(
-                    _read_text(cookie_path),
+                    _read_text(cookie_path, stdin_cache=stdin_cache),
                     default_domain=default_domain,
                     default_secure=default_secure,
                 )
@@ -1377,7 +1505,7 @@ def build_payload(
     _put(network, "ignore_https_errors", args.ignore_https_errors, False, force_default=has_base)
     if network:
         payload["network"] = network
-    _apply_actions(payload, args.steps)
+    _apply_actions(payload, args.steps, stdin_cache=stdin_cache)
     assertions: dict[str, object] = {}
     if args.assert_includes:
         assertions["content_includes"] = list(args.assert_includes)
@@ -1466,7 +1594,7 @@ def build_payload(
     if args.clip:
         x, y, width, height = args.clip
         payload["clip"] = {"x": x, "y": y, "width": width, "height": height}
-    css = _one_of(args.css, args.css_file, "Use either --css or --css-file.")
+    css = _one_of(args.css, args.css_file, "Use either --css or --css-file.", stdin_cache=stdin_cache)
     if css is not None:
         payload["custom_css"] = css
     if args.fail_on:
@@ -1504,8 +1632,8 @@ def build_payload(
         else:
             raise ValueError("--pdf-margin needs one value or top right bottom left.")
         pdf["margins"] = {"top": top, "right": right, "bottom": bottom, "left": left}
-    header = _one_of(args.pdf_header, args.pdf_header_file, "Use either --pdf-header or --pdf-header-file.")
-    footer = _one_of(args.pdf_footer, args.pdf_footer_file, "Use either --pdf-footer or --pdf-footer-file.")
+    header = _one_of(args.pdf_header, args.pdf_header_file, "Use either --pdf-header or --pdf-header-file.", stdin_cache=stdin_cache)
+    footer = _one_of(args.pdf_footer, args.pdf_footer_file, "Use either --pdf-footer or --pdf-footer-file.", stdin_cache=stdin_cache)
     if header is not None:
         pdf["header_template"] = header
     if footer is not None:
@@ -1672,15 +1800,19 @@ def _fast_validate_simple_payload(payload: dict[str, object]) -> bool:
     if not isinstance(output, str) or output not in _FAST_SIMPLE_OUTPUTS:
         return False
     if "engine" in payload:
-        if payload["engine"] not in _FAST_ENGINES:
+        if not isinstance(payload["engine"], str) or payload["engine"] not in _FAST_ENGINES:
             return False
     if "full_page" in payload and type(payload["full_page"]) is not bool:
         return False
     if "stealth" in payload and type(payload["stealth"]) is not bool:
         return False
-    if "lazy_load" in payload and payload["lazy_load"] not in _FAST_LAZY:
+    if "lazy_load" in payload and (
+        not isinstance(payload["lazy_load"], str) or payload["lazy_load"] not in _FAST_LAZY
+    ):
         return False
-    if "profile" in payload and payload["profile"] not in _FAST_PROFILES:
+    if "profile" in payload and (
+        not isinstance(payload["profile"], str) or payload["profile"] not in _FAST_PROFILES
+    ):
         return False
 
     cache = payload.get("cache", False)
@@ -1712,13 +1844,17 @@ def _fast_validate_simple_payload(payload: dict[str, object]) -> bool:
             "device", "color_scheme", "reduced_motion", "media", "locale"
         }:
             return False
-        if "device" in env and env["device"] not in _FAST_DEVICES:
+        if "device" in env and (not isinstance(env["device"], str) or env["device"] not in _FAST_DEVICES):
             return False
-        if "color_scheme" in env and env["color_scheme"] not in _FAST_COLOR_SCHEMES:
+        if "color_scheme" in env and (
+            not isinstance(env["color_scheme"], str) or env["color_scheme"] not in _FAST_COLOR_SCHEMES
+        ):
             return False
-        if "reduced_motion" in env and env["reduced_motion"] not in _FAST_REDUCED_MOTION:
+        if "reduced_motion" in env and (
+            not isinstance(env["reduced_motion"], str) or env["reduced_motion"] not in _FAST_REDUCED_MOTION
+        ):
             return False
-        if "media" in env and env["media"] not in _FAST_MEDIA:
+        if "media" in env and (not isinstance(env["media"], str) or env["media"] not in _FAST_MEDIA):
             return False
         if "locale" in env:
             loc = env["locale"]
@@ -1731,7 +1867,7 @@ def _fast_validate_simple_payload(payload: dict[str, object]) -> bool:
             "event", "selector", "selector_state", "text", "images", "delay_ms", "timeout_ms"
         }:
             return False
-        if "event" in wf and wf["event"] not in _FAST_WAIT_EVENTS:
+        if "event" in wf and (not isinstance(wf["event"], str) or wf["event"] not in _FAST_WAIT_EVENTS):
             return False
         if "selector" in wf:
             sel = wf["selector"]
@@ -1739,7 +1875,7 @@ def _fast_validate_simple_payload(payload: dict[str, object]) -> bool:
                 return False
         if "selector_state" in wf:
             st = wf["selector_state"]
-            if st not in _FAST_WAIT_STATES:
+            if not isinstance(st, str) or st not in _FAST_WAIT_STATES:
                 return False
             if st != "visible" and "selector" not in wf:
                 return False
@@ -1884,6 +2020,8 @@ def resolve_output(
 ) -> Path | None:
     if not multi and args.output == "-":
         return None
+    if not multi and args.output:
+        return Path(args.output)
     output_dir = getattr(args, "output_dir", None)
     output_template = getattr(args, "output_template", None)
     if multi or output_dir or output_template:
@@ -1891,8 +2029,6 @@ def resolve_output(
         template = output_template or ("{host}-{index}{ext}" if multi else "{host}{ext}")
         filename = render_output_template(template, payload=payload, index=index, timestamp=timestamp)
         return directory / filename
-    if args.output:
-        return Path(args.output)
     fmt = str(payload.get("output", "png"))
     if payload.get("url"):
         stem = urlsplit(str(payload["url"])).hostname or "capture"
@@ -1986,15 +2122,32 @@ def bearer_token(args: argparse.Namespace, *, started_server: bool) -> str:
     if api_key is not None:
         return _header_token(api_key)
     project_key = _header_token(os.environ.get("VIPERCAPTURE_API_KEY", ""))
+    if not project_key and not getattr(args, "no_config", False):
+        try:
+            cfg = load_cli_config()
+        except ValueError:
+            cfg = {}
+        cfg_key = cfg.get("api_key")
+        if isinstance(cfg_key, str) and cfg_key.strip():
+            project_key = _header_token(cfg_key)
     admin = _header_token(os.environ.get("VIPERCAPTURE_ADMIN_TOKEN", ""))
     if started_server and admin:
         return admin
     if project_key:
         return project_key
-    return admin
+    server = getattr(args, "server", None)
+    if server is None or is_local_default(str(server)):
+        return admin
+    return ""
 
 
-def request_headers(args: argparse.Namespace, *, started_server: bool, json_body: bool) -> dict[str, str]:
+def request_headers(
+    args: argparse.Namespace,
+    *,
+    started_server: bool,
+    json_body: bool,
+    idempotency_key: str | None = None,
+) -> dict[str, str]:
     headers = {"Accept": "*/*"}
     if json_body:
         headers["Content-Type"] = "application/json"
@@ -2004,7 +2157,7 @@ def request_headers(args: argparse.Namespace, *, started_server: bool, json_body
     req_id = getattr(args, "request_id", None)
     if req_id:
         headers["X-Request-Id"] = req_id
-    idem = getattr(args, "idempotency_key", None)
+    idem = idempotency_key if idempotency_key is not None else getattr(args, "idempotency_key", None)
     if idem:
         headers["Idempotency-Key"] = idem
     return headers
@@ -2821,10 +2974,16 @@ def _execute_one(
     root: str,
     output: Path | None,
     started_server: bool,
+    idempotency_key: str | None = None,
 ) -> tuple[object, int, dict[str, object] | None]:
     timeout = request_timeout(args, payload)
     retries = max(0, int(getattr(args, "retries", 0) or 0))
     retry_delay_ms = max(0, int(getattr(args, "retry_delay_ms", 500) or 0))
+    effective_idem = idempotency_key if idempotency_key is not None else getattr(args, "idempotency_key", None)
+    if args.async_job and retries > 0 and not effective_idem:
+        import uuid
+
+        effective_idem = f"vc-retry-{uuid.uuid4().hex}"
     if args.verbose and not args.quiet:
         route = "/v1/jobs" if args.async_job else "/v1/render"
         write_line(sys.stderr, f"POST {display_server(root)}{route}")
@@ -2834,7 +2993,12 @@ def _execute_one(
                 root + "/v1/jobs",
                 method="POST",
                 payload=payload,
-                headers=request_headers(args, started_server=started_server, json_body=True),
+                headers=request_headers(
+                    args,
+                    started_server=started_server,
+                    json_body=True,
+                    idempotency_key=effective_idem,
+                ),
                 timeout=min(30.0, timeout),
                 retries=retries,
                 retry_delay_ms=retry_delay_ms,
@@ -2855,6 +3019,7 @@ def _execute_one(
             started_server=started_server,
             retries=retries,
             retry_delay_ms=retry_delay_ms,
+            idempotency_key=effective_idem,
         )
         return response_headers, total, None
 
@@ -2862,7 +3027,12 @@ def _execute_one(
         root + "/v1/render",
         method="POST",
         payload=payload,
-        headers=request_headers(args, started_server=started_server, json_body=True),
+        headers=request_headers(
+            args,
+            started_server=started_server,
+            json_body=True,
+            idempotency_key=effective_idem,
+        ),
         timeout=timeout,
         retries=retries,
         retry_delay_ms=retry_delay_ms,
@@ -2911,6 +3081,7 @@ def _execute_async(
     started_server: bool,
     retries: int = 0,
     retry_delay_ms: int = 500,
+    idempotency_key: str | None = None,
 ) -> tuple[object, int]:
     deadline = time.monotonic() + timeout
     verbose = bool(args.verbose and not args.quiet)
@@ -2918,7 +3089,12 @@ def _execute_async(
         root + "/v1/jobs",
         method="POST",
         payload=payload,
-        headers=request_headers(args, started_server=started_server, json_body=True),
+        headers=request_headers(
+            args,
+            started_server=started_server,
+            json_body=True,
+            idempotency_key=idempotency_key,
+        ),
         timeout=min(30, _remaining(deadline)),
         retries=retries,
         retry_delay_ms=retry_delay_ms,
@@ -3027,27 +3203,73 @@ def _validate_client_options(args: argparse.Namespace) -> None:
         raise ValueError("--copy cannot be used with --output -.")
 
 
+def _validate_single_stdin_source(args: argparse.Namespace) -> None:
+    sources: list[str] = []
+    for attr, flag in (
+        ("urls_file", "--urls-file"),
+        ("from_json", "--from-json"),
+        ("html_file", "--html-file"),
+        ("markdown_file", "--markdown-file"),
+        ("css_file", "--css-file"),
+        ("pdf_header_file", "--pdf-header-file"),
+        ("pdf_footer_file", "--pdf-footer-file"),
+    ):
+        if getattr(args, attr, None) == "-":
+            sources.append(flag)
+    if any(p == "-" for p in (getattr(args, "cookie_file", None) or [])):
+        sources.append("--cookie-file")
+    if any(kind == "js_file" and val == "-" for kind, val in (getattr(args, "steps", None) or [])):
+        sources.append("--js-file")
+    if len(sources) > 1:
+        raise ValueError(f"Only one option can read from stdin ('-'); got {', '.join(sources)}.")
+
+
 def run_capture(args: argparse.Namespace) -> int:
     try:
         apply_config_defaults(args)
         _validate_client_options(args)
+        _validate_single_stdin_source(args)
+        stdin_cache: dict[str, str] = {}
         multi_urls = _collect_multi_urls(args)
+        multi_targets: list[Path | None] | None = None
         if multi_urls is not None:
             if args.output:
                 raise ValueError("Use --output-dir (and optionally --output-template) instead of --output for multi-URL captures.")
-            base_doc, has_base = _load_base_document(args)
+            normalized_urls = [normalize_url(u) for u in multi_urls]
+            distinct_hosts = {(urlsplit(u).hostname or "").lower() for u in normalized_urls}
+            allow_default_cookie_domain = len(distinct_hosts) <= 1
+            base_doc, has_base = _load_base_document(args, stdin_cache=stdin_cache)
             payloads = [
                 build_payload(
                     args,
                     override_url=u,
                     base_document=base_doc if has_base else None,
+                    allow_default_cookie_domain=allow_default_cookie_domain,
+                    stdin_cache=stdin_cache,
                 )
-                for u in multi_urls
+                for u in normalized_urls
             ]
             for item in payloads:
                 validate_payload(item)
+            stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            if not (args.async_job and getattr(args, "no_wait", False)):
+                multi_targets = []
+                seen_paths: set[str] = set()
+                for index, item_payload in enumerate(payloads, start=1):
+                    target_path = resolve_output(args, item_payload, index=index, multi=True, timestamp=stamp)
+                    assert target_path is not None
+                    norm_key = os.path.normcase(str(target_path.resolve()))
+                    if norm_key in seen_paths:
+                        raise ValueError(
+                            f"Multiple URLs resolve to the same output file ({target_path}). "
+                            "Include {index} or {slug} in --output-template."
+                        )
+                    seen_paths.add(norm_key)
+                    multi_targets.append(target_path)
+            else:
+                multi_targets = [None for _ in payloads]
         else:
-            payload = build_payload(args)
+            payload = build_payload(args, stdin_cache=stdin_cache)
             validate_payload(payload)
             payloads = None
     except ValueError as exc:
@@ -3079,11 +3301,12 @@ def run_capture(args: argparse.Namespace) -> int:
             return execute(args, payload, started_server=started)
 
         root = api_root(args.server)
-        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         results: list[dict[str, object]] = []
         failures = 0
-        for index, item_payload in enumerate(payloads, start=1):
-            target_path = resolve_output(args, item_payload, index=index, multi=True, timestamp=stamp)
+        base_idem = getattr(args, "idempotency_key", None)
+        assert multi_targets is not None
+        for index, (item_payload, target_path) in enumerate(zip(payloads, multi_targets), start=1):
+            item_idem = f"{base_idem}-{index}" if base_idem else None
             try:
                 headers, total, job_doc = _execute_one(
                     args,
@@ -3091,6 +3314,7 @@ def run_capture(args: argparse.Namespace) -> int:
                     root=root,
                     output=target_path,
                     started_server=started,
+                    idempotency_key=item_idem,
                 )
                 if job_doc is not None:
                     entry: dict[str, object] = {

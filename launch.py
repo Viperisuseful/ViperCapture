@@ -3539,6 +3539,8 @@ def main() -> None:
             if sub_name == "verify":
                 if not _can_import_cryptography():
                     ensure_venv()
+                    if not _can_import_cryptography():
+                        ensure_deps()
             elif sub_name not in cli_commands.FAST_NO_VENV_SUBCOMMANDS and sub_name != "status":
                 ensure_venv()
         raise SystemExit(cli_commands.main([sub_name, *sub_argv]))
@@ -3586,19 +3588,49 @@ def main() -> None:
     subprocess = _mod("subprocess")
     log_path = Path.home() / ".vipercapture" / "requests.log"
     log_handle = None
+    log_tee_thread = None
     server_env, shutdown_token = _new_server_environment()
     popen_kwargs: dict[str, object] = {"cwd": str(ROOT), "env": server_env}
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    log_handle = open(log_fd, "w", encoding="utf-8", buffering=1)
     if not one_window:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        log_handle = open(log_fd, "w", encoding="utf-8", buffering=1)
         popen_kwargs["stdout"] = log_handle
+        popen_kwargs["stderr"] = subprocess.STDOUT
+    else:
+        popen_kwargs["stdout"] = subprocess.PIPE
         popen_kwargs["stderr"] = subprocess.STDOUT
     server = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "vipercapture.main:app",
          "--host", bind_host, "--port", str(bind_port), "--ws", "none"],
         **popen_kwargs,
     )
+    if one_window and getattr(server, "stdout", None) is not None:
+        import threading
+
+        def _tee_server_output(pipe, handle) -> None:
+            try:
+                for chunk in iter(pipe.readline, b""):
+                    text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk)
+                    try:
+                        handle.write(text)
+                        handle.flush()
+                    except OSError:
+                        pass
+                    try:
+                        sys.stdout.write(text)
+                        sys.stdout.flush()
+                    except OSError:
+                        pass
+            except Exception:
+                pass
+
+        log_tee_thread = threading.Thread(
+            target=_tee_server_output,
+            args=(server.stdout, log_handle),
+            daemon=True,
+        )
+        log_tee_thread.start()
     _record_server_process(server.pid, shutdown_token, bind_port)
 
     # ── Wait for port (50ms poll, 30s max) ──────────────────────
