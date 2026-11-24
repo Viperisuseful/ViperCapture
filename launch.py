@@ -569,6 +569,7 @@ def encode_sixel(width: int, height: int, rgba: bytes) -> bytes:
     while True:
         palette.clear()
         indexes = bytearray(width * height)
+        overflowed = False
         for pixel in range(width * height):
             offset = pixel * 4
             if rgba[offset + 3] < 128:
@@ -580,10 +581,13 @@ def encode_sixel(width: int, height: int, rgba: bytes) -> bytes:
             )
             index = palette.get(color)
             if index is None:
+                if len(palette) >= 255:
+                    overflowed = True
+                    break
                 index = len(palette) + 1
                 palette[color] = index
             indexes[pixel] = index
-        if len(palette) <= 256 or bits == 3:
+        if not overflowed or bits == 2:
             break
         bits -= 1
     parts = [f'\x1bPq"1;1;{width};{height}'.encode("ascii")]
@@ -3313,8 +3317,20 @@ def _validate_server_url(token: str) -> str:
     import urllib.parse
 
     value = token.strip()
-    parsed = urllib.parse.urlsplit(value)
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        _reject_arg(f"Invalid server URL: {token}")
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or (port is not None and not (1 <= port <= 65535))
+    ):
         _reject_arg(f"Invalid server URL: {token}")
     return value.rstrip("/")
 

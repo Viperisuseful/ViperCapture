@@ -1361,6 +1361,7 @@ class GuiDrawerAndActionTests(TestCase):
         ]
         sizes = (
             launch.WindowSize(14, 6),
+            launch.WindowSize(20, 8),
             launch.WindowSize(40, 14),
             launch.WindowSize(80, 24),
             launch.WindowSize(120, 40),
@@ -1379,3 +1380,271 @@ class GuiDrawerAndActionTests(TestCase):
                             size.cols,
                             f"Overflow at {size.cols}x{size.rows} ({state.drawer}): {vis!r}",
                         )
+
+
+class GuiCouncilHardeningTests(TestCase):
+    def test_remote_capture_scoping_never_leaks_admin_token_or_http_key(self) -> None:
+        env = {
+            "VIPERCAPTURE_ADMIN_TOKEN": "admin-secret",
+            "VIPERCAPTURE_API_KEY": "project-key",
+        }
+        # Default local endpoint can use admin when only admin is set
+        self.assertEqual(
+            gui.capture_credential(
+                started_server=False,
+                environ={"VIPERCAPTURE_ADMIN_TOKEN": "admin-secret"},
+                endpoint="http://127.0.0.1:8000/v1/render",
+            ),
+            "admin-secret",
+        )
+        # Remote plain HTTP sends neither admin nor project key
+        self.assertEqual(
+            gui.capture_credential(
+                started_server=False,
+                environ=env,
+                endpoint="http://remote.example/v1/render",
+            ),
+            "",
+        )
+        # Remote HTTPS sends project key, never admin token
+        self.assertEqual(
+            gui.capture_credential(
+                started_server=False,
+                environ=env,
+                endpoint="https://remote.example/v1/render",
+            ),
+            "project-key",
+        )
+        self.assertEqual(
+            gui.capture_credential(
+                started_server=False,
+                environ={"VIPERCAPTURE_ADMIN_TOKEN": "admin-secret"},
+                endpoint="https://remote.example/v1/render",
+            ),
+            "",
+        )
+
+    def test_terminal_control_sequences_stripped_from_errors_and_presets(self) -> None:
+        malicious = b'{"detail":"bad \\u001b]52;c;YWJj\\u0007 \\u001b[31mboom\\u001b[0m\\u0007"}'
+        cleaned = gui.error_text(500, malicious)
+        self.assertNotIn("\x1b", cleaned)
+        self.assertNotIn("\x07", cleaned)
+        self.assertIn("bad", cleaned)
+
+        presets = gui._parse_presets_body(
+            {"presets": [{"name": "Dark\x1b[2J\x1b]0;pwn\x07Mode", "settings": {"output": "png"}}]}
+        )
+        self.assertEqual(len(presets), 1)
+        self.assertEqual(presets[0].name, "DarkMode")
+
+        state = gui.GuiState(error="err\x1b]52;c;ZGF0YQ==\x07msg")
+        frame = gui.render_frame(launch.WindowSize(80, 24), state).decode("utf-8")
+        self.assertNotIn("\x1b]52", frame)
+        self.assertNotIn("\x07", frame)
+
+    def test_oversized_bracketed_paste_and_split_delimiters_never_emit_enter(self) -> None:
+        pending = bytearray()
+        payload = b"\x1b[200~" + (b"https://example.com/" + b"a" * 17_000 + b"\n") + b"\x1b[201~"
+        emitted: list[str] = []
+        # Feed in 256-byte chunks up to the final 10 bytes, then byte-by-byte across the closing delimiter
+        split_at = len(payload) - 10
+        for idx in range(0, split_at, 256):
+            emitted.extend(gui.keys_from_bytes(pending, payload[idx : min(idx + 256, split_at)]))
+        for byte in payload[split_at:]:
+            emitted.extend(gui.keys_from_bytes(pending, bytes([byte])))
+        self.assertNotIn("enter", emitted)
+        self.assertEqual(len(emitted), 1)
+        self.assertTrue(emitted[0].startswith("paste:https://example.com/"))
+        self.assertEqual(len(pending), 0)
+
+    def test_app_config_filters_available_output_formats(self) -> None:
+        state = gui.GuiState(output="mp4")
+        updated = gui.apply_app_config(state, {"output_formats": ["png", "webp", "pdf"]})
+        self.assertEqual(updated.available_formats, ("png", "webp", "pdf"))
+        self.assertEqual(updated.output, "png")
+        cycled, _ = gui.apply_key(updated, "tab")
+        self.assertEqual(cycled.output, "webp")
+        cycled, _ = gui.apply_key(cycled, "tab")
+        self.assertEqual(cycled.output, "pdf")
+        cycled, _ = gui.apply_key(cycled, "tab")
+        self.assertEqual(cycled.output, "png")
+        self.assertNotIn("mp4", updated.available_formats)
+
+    def test_windows_delayed_paste_chunk_stays_in_paste_mode(self) -> None:
+        class FakeMsvcrt:
+            def __init__(self, chunks: list[str]) -> None:
+                self._buf = list(chunks)
+
+            def kbhit(self) -> bool:
+                return bool(self._buf)
+
+            def getwch(self) -> str:
+                return self._buf.pop(0)
+
+        pending = bytearray()
+        first = FakeMsvcrt(list("[200~https://delayed."))
+        self.assertEqual(gui._drain_windows_escape(first, pending), [])
+        self.assertTrue(pending.startswith(gui._PASTE_START))
+        second = FakeMsvcrt(list("example\x1b[201~"))
+        self.assertEqual(gui._drain_windows_escape(second, pending), ["paste:https://delayed.example"])
+        self.assertEqual(len(pending), 0)
+
+    def test_mobile_preset_sends_explicit_1x_dpr_and_preset_preserves_custom_values(self) -> None:
+        mobile = gui.GuiState(url="https://example.com", viewport=(390, 844), device="iphone_14", scale=1)
+        payload = gui.capture_payload(mobile, mobile.url)
+        self.assertEqual(payload["viewport"]["device_scale_factor"], 1)  # type: ignore[index]
+
+        # Web UI preset with float density, 24fps, accept consent, trackers off, and unsupported headers
+        preset_settings = {
+            "output": "mp4",
+            "width": 1280,
+            "height": 720,
+            "density": 1.5,
+            "videoFps": 24,
+            "consent": "accept",
+            "blockAds": True,
+            "blockTrackers": False,
+            "blockChats": False,
+            "blockNewsletters": False,
+            "headers": '{"X-Test":"1"}',
+            "customCss": "body{color:red}",
+        }
+        updated, ignored = gui.apply_preset_settings_with_warnings(gui.GuiState(), preset_settings)
+        self.assertEqual(updated.scale, 1.5)
+        self.assertEqual(updated.video_fps, 24)
+        self.assertIn("headers", ignored)
+        self.assertIn("customCss", ignored)
+        doc = gui.capture_payload(updated, "https://example.com")
+        self.assertEqual(doc["viewport"]["device_scale_factor"], 1.5)  # type: ignore[index]
+        self.assertEqual(doc["video"]["fps"], 24)  # type: ignore[index]
+        self.assertEqual(
+            doc["cleanup"],
+            {
+                "consent_mode": "accept",
+                "block_ads": True,
+                "block_trackers": False,
+                "block_chats": False,
+                "block_newsletters": False,
+            },
+        )
+
+    def test_text_output_validation_allows_empty_markdown_and_rejects_3xx(self) -> None:
+        class RedirectResponse:
+            status = 302
+            headers = {"Content-Type": "text/html"}
+
+            def __init__(self) -> None:
+                self._done = False
+
+            def read(self, _n: int) -> bytes:
+                if self._done:
+                    return b""
+                self._done = True
+                return b"<html>redirect</html>"
+
+            def __enter__(self) -> "RedirectResponse":
+                return self
+
+            def __exit__(self, *_a: object) -> bool:
+                return False
+
+        class EmptyMarkdownResponse:
+            status = 200
+            headers = {"Content-Type": "text/markdown; charset=utf-8"}
+
+            def read(self, _n: int) -> bytes:
+                return b""
+
+            def __enter__(self) -> "EmptyMarkdownResponse":
+                return self
+
+            def __exit__(self, *_a: object) -> bool:
+                return False
+
+        with TemporaryDirectory() as tmp:
+            res_redirect = gui.perform_capture(
+                gui.GuiState(url="https://example.com", output="html", busy=True),
+                directory=Path(tmp),
+                opener=lambda _req, timeout: RedirectResponse(),
+            )
+            self.assertTrue(res_redirect.error)
+            self.assertEqual(res_redirect.saved, "")
+
+            res_empty_md = gui.perform_capture(
+                gui.GuiState(url="https://example.com", output="markdown", busy=True),
+                directory=Path(tmp),
+                opener=lambda _req, timeout: EmptyMarkdownResponse(),
+            )
+            self.assertEqual(res_empty_md.error, "")
+            self.assertTrue(res_empty_md.saved.endswith(".md"))
+
+    def test_editing_url_keeps_ctrl_o_and_ctrl_y_working(self) -> None:
+        with TemporaryDirectory() as tmp:
+            saved_file = Path(tmp) / "shot.png"
+            saved_file.write_bytes(b"\x89PNG\r\n\x1a\n")
+            rec = gui.CaptureRecord(
+                url="https://example.com",
+                output="png",
+                path=str(saved_file),
+                size_bytes=8,
+                duration_ms=50,
+                timestamp="12:00:00",
+            )
+            state = gui.GuiState(url="https://example.com", saved=str(saved_file), captures=(rec,))
+            edited, _ = gui.apply_key(state, "x")
+            self.assertEqual(edited.saved, "")
+            _, act_open = gui.apply_key(edited, "ctrl-o")
+            _, act_copy = gui.apply_key(edited, "ctrl-y")
+            self.assertEqual(act_open, "open_last")
+            self.assertEqual(act_copy, "copy_last")
+
+    def test_sixel_multicolor_gradient_and_oversized_png_budget(self) -> None:
+        import struct
+        import zlib
+
+        def make_png(w: int, h: int, raw_scanlines: bytes) -> bytes:
+            def chunk(kind: bytes, data: bytes) -> bytes:
+                return (
+                    struct.pack(">I", len(data))
+                    + kind
+                    + data
+                    + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+                )
+
+            ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+            return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(raw_scanlines)) + chunk(b"IEND", b"")
+
+        # 64x64 multicolor RGB gradient (>256 unique quantized colors at 5 bits)
+        rows = bytearray()
+        for y in range(64):
+            rows.append(0)
+            for x in range(64):
+                rows.extend(((x * 4) & 255, (y * 4) & 255, ((x + y) * 2) & 255))
+        grad_png = make_png(64, 64, bytes(rows))
+        rec = gui.CaptureRecord(
+            url="https://example.com",
+            output="png",
+            path="grad.png",
+            size_bytes=len(grad_png),
+            duration_ms=100,
+            timestamp="12:00:00",
+        )
+        state = gui.GuiState(drawer="history", captures=(rec,))
+        sixel_frame = gui.render_frame(
+            launch.WindowSize(100, 30, 800, 480),
+            state,
+            protocol="sixel",
+            preview_png=grad_png,
+        )
+        self.assertIn(b"\x1bPq", sixel_frame)
+
+        # Oversized PNG header (10000x10000 = 100M pixels) must skip Sixel decompression
+        fake_huge_header = b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + struct.pack(">IIBBBBB", 10_000, 10_000, 8, 2, 0, 0, 0)
+        fallback_frame = gui.render_frame(
+            launch.WindowSize(100, 30, 800, 480),
+            state,
+            protocol="sixel",
+            preview_png=fake_huge_header,
+        )
+        self.assertNotIn(b"\x1bPq", fallback_frame)
+        self.assertIn(b"Capture History", fallback_frame)

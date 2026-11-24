@@ -126,6 +126,8 @@ HELP_ENTRIES: tuple[tuple[str, str], ...] = (
 
 DEFAULT_VIEWPORT = (1920, 1080)
 MAX_CAPTURE_BYTES = 200 * 1024 * 1024
+MAX_SIXEL_PREVIEW_PIXELS = 4_000_000
+MAX_PASTE_BYTES = 4096
 VIDEO_DURATION_MS = 4_000
 HISTORY_LIMIT = 50
 MAX_URL_CHARS = 2048
@@ -135,6 +137,7 @@ BRACKETED_PASTE_ON = b"\x1b[?2004h"
 BRACKETED_PASTE_OFF = b"\x1b[?2004l"
 _PASTE_START = b"\x1b[200~"
 _PASTE_END = b"\x1b[201~"
+_PASTE_TRUNCATED_MARK = b"\x00"
 
 ASCII_LOGO = (
     "                                         █                  ",
@@ -183,8 +186,21 @@ def styled_ascii_logo() -> list[str]:
 
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
+_TERMINAL_ESCAPE = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[PX^_][^\x1b]*\x1b\\|[@-Z\\-_])"
+)
 _HOST = re.compile(r"[^A-Za-z0-9.-]+")
 _WORD_SEPARATORS = frozenset(" \t/\\.:-?&=+#@,;()[]{}'\"")
+
+
+def sanitize_terminal_text(text: str) -> str:
+    """Strip ANSI/OSC escape sequences and C0/C1 control characters from untrusted text."""
+    cleaned = _TERMINAL_ESCAPE.sub("", text)
+    return "".join(
+        " " if ch in {"\r", "\n", "\t"} else ch
+        for ch in cleaned
+        if ch in {"\r", "\n", "\t"} or not (ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F)
+    )
 
 
 @dataclass(frozen=True)
@@ -201,7 +217,12 @@ class CaptureRecord:
     color_scheme: str = "system"
     engine: str = "chromium"
     cleanup: bool = False
-    scale: int = 1
+    consent_mode: str = "none"
+    block_ads: bool = False
+    block_trackers: bool = False
+    block_chats: bool = False
+    block_newsletters: bool = False
+    scale: float = 1
     quality: int = 90
     transparent: bool = False
     profile: str = "preview"
@@ -235,13 +256,18 @@ class GuiState:
     color_scheme: str = "system"
     engine: str = "chromium"
     cleanup: bool = False
+    consent_mode: str | None = None
+    block_ads: bool | None = None
+    block_trackers: bool | None = None
+    block_chats: bool | None = None
+    block_newsletters: bool | None = None
     video_duration_ms: int = VIDEO_DURATION_MS
     video_scroll: bool = False
     video_fps: int = 60
     wait_delay_ms: int = 0
     wait_selector: str = ""
     selector: str = ""
-    scale: int = 1
+    scale: float = 1
     quality: int = 90
     transparent: bool = False
     profile: str = "preview"
@@ -274,6 +300,7 @@ class GuiState:
     captures: tuple[CaptureRecord, ...] = ()
     presets: tuple[PresetEntry, ...] = ()
     presets_supported: bool = True
+    available_formats: tuple[str, ...] = FORMATS
 
     def __post_init__(self) -> None:
         length = len(self.url)
@@ -315,24 +342,116 @@ def server_base_url(server: str | None) -> str:
 
 
 def is_local_server(base_url: str) -> bool:
-    parsed = urllib.parse.urlsplit(base_url)
+    try:
+        parsed = urllib.parse.urlsplit(base_url)
+    except ValueError:
+        return False
     host = (parsed.hostname or "").lower()
     return host in {"127.0.0.1", "localhost", "::1"}
 
 
-def format_server_label(base_url: str) -> str:
-    if is_local_server(base_url):
+def is_default_local_server(base_url: str) -> bool:
+    try:
         parsed = urllib.parse.urlsplit(base_url)
         port = parsed.port
+    except ValueError:
+        return False
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    resolved_port = port or (443 if scheme == "https" else 80)
+    return (
+        scheme == "http"
+        and host in {"127.0.0.1", "localhost", "::1"}
+        and resolved_port == launch.PORT
+        and parsed.path in {"", "/"}
+    )
+
+
+def format_server_label(base_url: str) -> str:
+    try:
+        parsed = urllib.parse.urlsplit(base_url)
+        port = parsed.port
+    except ValueError:
+        return sanitize_terminal_text(base_url)
+    if is_local_server(base_url):
         if port in {None, launch.PORT}:
             return "local"
         return f"local:{port}"
-    parsed = urllib.parse.urlsplit(base_url)
-    return parsed.netloc or base_url
+    return sanitize_terminal_text(parsed.netloc or base_url)
+
+
+def effective_cleanup(state: GuiState) -> dict[str, object] | None:
+    """Resolve the active cleanup config, preserving granular preset settings."""
+    has_granular = any(
+        val is not None
+        for val in (
+            state.consent_mode,
+            state.block_ads,
+            state.block_trackers,
+            state.block_chats,
+            state.block_newsletters,
+        )
+    )
+    if not has_granular:
+        if not state.cleanup:
+            return None
+        return {
+            "consent_mode": "reject",
+            "block_ads": True,
+            "block_trackers": True,
+            "block_chats": True,
+            "block_newsletters": True,
+        }
+    consent = state.consent_mode if state.consent_mode is not None else ("reject" if state.cleanup else "none")
+    ads = state.block_ads if state.block_ads is not None else state.cleanup
+    trackers = state.block_trackers if state.block_trackers is not None else state.cleanup
+    chats = state.block_chats if state.block_chats is not None else state.cleanup
+    newsletters = state.block_newsletters if state.block_newsletters is not None else state.cleanup
+    if consent == "none" and not any((ads, trackers, chats, newsletters)):
+        return None
+    return {
+        "consent_mode": consent,
+        "block_ads": bool(ads),
+        "block_trackers": bool(trackers),
+        "block_chats": bool(chats),
+        "block_newsletters": bool(newsletters),
+    }
+
+
+def _cleanup_badge(state: GuiState) -> tuple[str, str]:
+    cfg = effective_cleanup(state)
+    if cfg is None:
+        return "clean:off", "2"
+    if (
+        cfg["consent_mode"] == "reject"
+        and cfg["block_ads"] is True
+        and cfg["block_trackers"] is True
+        and cfg["block_chats"] is True
+        and cfg["block_newsletters"] is True
+    ):
+        return "clean:on", "1;32"
+    return "clean:custom", "1;36"
+
+
+def _last_saved_path(state: GuiState) -> str:
+    if state.saved:
+        return state.saved
+    if state.captures:
+        return state.captures[0].path
+    return ""
+
+
+def _format_scale(scale: float) -> str:
+    if float(scale).is_integer():
+        return f"{int(scale)}x"
+    return f"{scale:g}x"
 
 
 def validate_capture_state(state: GuiState) -> str:
     """Return an error string if the current option combination is invalid."""
+    allowed = state.available_formats or FORMATS
+    if state.output not in allowed:
+        return f"{state.output.upper()} output is not supported by this server."
     if state.output == "pdf" and state.engine != "chromium":
         return "PDF output requires Chromium (press Ctrl+B to switch engine)."
     if state.selector.strip() and state.output not in IMAGE_FORMATS:
@@ -343,8 +462,8 @@ def validate_capture_state(state: GuiState) -> str:
 def capture_payload(state: GuiState, url: str) -> dict[str, object]:
     width, height = state.viewport
     viewport_doc: dict[str, object] = {"width": width, "height": height}
-    if state.scale != 1:
-        viewport_doc["device_scale_factor"] = state.scale
+    if state.scale != 1 or state.device != "desktop":
+        viewport_doc["device_scale_factor"] = int(state.scale) if float(state.scale).is_integer() else state.scale
 
     selector = state.selector.strip()
     use_selector = bool(selector) and state.output in IMAGE_FORMATS
@@ -367,14 +486,9 @@ def capture_payload(state: GuiState, url: str) -> dict[str, object]:
     if environment:
         payload["environment"] = environment
 
-    if state.cleanup:
-        payload["cleanup"] = {
-            "consent_mode": "reject",
-            "block_ads": True,
-            "block_trackers": True,
-            "block_chats": True,
-            "block_newsletters": True,
-        }
+    cleanup_doc = effective_cleanup(state)
+    if cleanup_doc is not None:
+        payload["cleanup"] = cleanup_doc
 
     if use_selector:
         payload["selector"] = selector
@@ -430,8 +544,9 @@ def _cycle_tuple(values: Sequence[object], current: object, step: int = 1) -> ob
     return values[(index + step) % len(values)]
 
 
-def cycle_output(output: str, step: int = 1) -> str:
-    return str(_cycle_tuple(FORMATS, output, step))
+def cycle_output(output: str, step: int = 1, formats: Sequence[str] = FORMATS) -> str:
+    choices = formats if formats else FORMATS
+    return str(_cycle_tuple(choices, output, step))
 
 
 def viewport_choices(custom_viewport: tuple[int, int] | None = None) -> list[tuple[str, int, int, str]]:
@@ -584,7 +699,7 @@ def _edit_text(
 
 def _option_value_text(state: GuiState, field_key: str) -> str:
     if field_key == "scale":
-        return f"{state.scale}x"
+        return _format_scale(state.scale)
     if field_key == "quality":
         suffix = "" if state.output in QUALITY_FORMATS else " (jpeg/webp/avif)"
         return f"{state.quality}{suffix}"
@@ -621,11 +736,25 @@ def _option_value_text(state: GuiState, field_key: str) -> str:
     return ""
 
 
+def _cycle_numeric(values: Sequence[int], current: float, step: int) -> int:
+    if current in values:
+        return int(_cycle_tuple(values, current, step))  # type: ignore[arg-type]
+    if step >= 0:
+        for val in values:
+            if val > current:
+                return val
+        return values[0]
+    for val in reversed(values):
+        if val < current:
+            return val
+    return values[-1]
+
+
 def _cycle_option(state: GuiState, field_key: str, step: int) -> GuiState:
     if field_key == "scale":
-        return _replace(state, scale=int(_cycle_tuple(SCALES, state.scale, step)), error="", notice="")  # type: ignore[arg-type]
+        return _replace(state, scale=_cycle_numeric(SCALES, state.scale, step), error="", notice="")
     if field_key == "quality":
-        return _replace(state, quality=int(_cycle_tuple(QUALITIES, state.quality, step)), error="", notice="")  # type: ignore[arg-type]
+        return _replace(state, quality=_cycle_numeric(QUALITIES, state.quality, step), error="", notice="")
     if field_key == "transparent":
         return _replace(state, transparent=not state.transparent, error="", notice="")
     if field_key == "profile":
@@ -633,7 +762,7 @@ def _cycle_option(state: GuiState, field_key: str, step: int) -> GuiState:
     if field_key == "video_scroll":
         return _replace(state, video_scroll=not state.video_scroll, error="", notice="")
     if field_key == "video_fps":
-        return _replace(state, video_fps=int(_cycle_tuple(VIDEO_FPS_CHOICES, state.video_fps, step)), error="", notice="")  # type: ignore[arg-type]
+        return _replace(state, video_fps=_cycle_numeric(VIDEO_FPS_CHOICES, state.video_fps, step), error="", notice="")
     if field_key == "pdf_paper_size":
         return _replace(state, pdf_paper_size=str(_cycle_tuple(PDF_PAPER_SIZES, state.pdf_paper_size, step)), error="", notice="")
     if field_key == "pdf_orientation":
@@ -750,13 +879,16 @@ def _apply_presets_drawer_key(state: GuiState, key: str) -> tuple[GuiState, str]
         return _replace(state, drawer_index=(idx + 1) % count, error=""), "edit"
     if key == "enter" and count:
         preset = state.presets[idx]
-        applied = apply_preset_settings(state, preset.settings)
+        applied, ignored = apply_preset_settings_with_warnings(state, preset.settings)
+        notice = f"Applied preset '{preset.name}'."
+        if ignored:
+            notice = f"Applied '{preset.name}' (ignored: {', '.join(ignored)})."
         return _replace(
             applied,
             drawer="",
             drawer_index=0,
             error="",
-            notice=f"Applied preset '{preset.name}'.",
+            notice=notice,
         ), "edit"
     if key in {"s", "S"}:
         if not state.presets_supported:
@@ -801,6 +933,11 @@ def _apply_history_drawer_key(state: GuiState, key: str) -> tuple[GuiState, str]
             color_scheme=rec.color_scheme,
             engine=rec.engine,
             cleanup=rec.cleanup,
+            consent_mode=rec.consent_mode,
+            block_ads=rec.block_ads,
+            block_trackers=rec.block_trackers,
+            block_chats=rec.block_chats,
+            block_newsletters=rec.block_newsletters,
             scale=rec.scale,
             quality=rec.quality,
             transparent=rec.transparent,
@@ -868,9 +1005,9 @@ def apply_key(state: GuiState, key: str) -> tuple[GuiState, str]:
     if key == "esc":
         return state, "quit"
     if key == "tab":
-        return _replace(state, output=cycle_output(state.output, 1), error="", notice=""), "edit"
+        return _replace(state, output=cycle_output(state.output, 1, state.available_formats), error="", notice=""), "edit"
     if key == "shift-tab":
-        return _replace(state, output=cycle_output(state.output, -1), error="", notice=""), "edit"
+        return _replace(state, output=cycle_output(state.output, -1, state.available_formats), error="", notice=""), "edit"
     if key == "ctrl-p":
         new_full = not state.full_page
         changes: dict[str, object] = {"full_page": new_full, "error": "", "notice": ""}
@@ -886,17 +1023,28 @@ def apply_key(state: GuiState, key: str) -> tuple[GuiState, str]:
     if key == "ctrl-b":
         return _replace(state, engine=cycle_engine(state.engine), error="", notice=""), "edit"
     if key == "ctrl-x":
-        return _replace(state, cleanup=not state.cleanup, error="", notice=""), "edit"
+        next_clean = effective_cleanup(state) is None
+        return _replace(
+            state,
+            cleanup=next_clean,
+            consent_mode="reject" if next_clean else "none",
+            block_ads=next_clean,
+            block_trackers=next_clean,
+            block_chats=next_clean,
+            block_newsletters=next_clean,
+            error="",
+            notice="",
+        ), "edit"
     if key == "ctrl-d":
         if state.output in VIDEO_FORMATS:
             return _replace(state, video_duration_ms=cycle_video_duration(state.video_duration_ms), error="", notice=""), "edit"
         return _replace(state, wait_delay_ms=cycle_wait_delay(state.wait_delay_ms), error="", notice=""), "edit"
     if key == "ctrl-o":
-        if not state.saved:
+        if not _last_saved_path(state):
             return _replace(state, error="No saved capture yet.", notice=""), "edit"
         return state, "open_last"
     if key == "ctrl-y":
-        if not state.saved:
+        if not _last_saved_path(state):
             return _replace(state, error="No saved capture yet.", notice=""), "edit"
         return state, "copy_last"
     if key == "ctrl-v":
@@ -1075,15 +1223,28 @@ def _consume_escape(pending: bytearray, keys: list[str]) -> bool:
 
     # Bracketed paste: \x1b[200~ ... \x1b[201~
     if pending.startswith(_PASTE_START):
-        end_idx = pending.find(_PASTE_END, len(_PASTE_START))
+        start_len = len(_PASTE_START)
+        end_idx = pending.find(_PASTE_END, start_len)
         if end_idx < 0:
-            if len(pending) < 16_384:
+            # Stay in paste mode until the closing marker arrives, while keeping
+            # the buffered paste bounded and preserving the last 5 bytes in case
+            # \x1b[201~ is split across reads.
+            tail_keep = len(_PASTE_END) - 1
+            trunc_idx = pending.find(_PASTE_TRUNCATED_MARK, start_len)
+            if trunc_idx >= 0:
+                tail = bytes(pending[trunc_idx + 1 :])
+                if len(tail) > tail_keep:
+                    del pending[trunc_idx + 1 : len(pending) - tail_keep]
                 return False
-            raw = bytes(pending[len(_PASTE_START) :])
-            del pending[:]
-        else:
-            raw = bytes(pending[len(_PASTE_START) : end_idx])
-            del pending[: end_idx + len(_PASTE_END)]
+            if len(pending) > start_len + MAX_PASTE_BYTES + tail_keep:
+                kept = bytes(pending[start_len : start_len + MAX_PASTE_BYTES]).replace(b"\x00", b"")
+                tail = bytes(pending[-tail_keep:])
+                pending[:] = _PASTE_START + kept + _PASTE_TRUNCATED_MARK + tail
+            return False
+        trunc_idx = pending.find(_PASTE_TRUNCATED_MARK, start_len, end_idx)
+        body_end = trunc_idx if trunc_idx >= 0 else end_idx
+        raw = bytes(pending[start_len:body_end]).replace(b"\x00", b"")
+        del pending[: end_idx + len(_PASTE_END)]
         text = raw.decode("utf-8", errors="replace")
         keys.append("paste:" + text)
         return True
@@ -1176,7 +1337,7 @@ def error_text(status: int, body: bytes) -> str:
         message = ""
     if not message:
         message = body.decode("utf-8", errors="replace")
-    message = " ".join(message.split())
+    message = " ".join(sanitize_terminal_text(message).split())
     if not message:
         return f"The capture failed ({status})."
     if len(message) > 280:
@@ -1190,11 +1351,42 @@ def output_extension(fmt: str, *, diagnostics: bool = False) -> str:
     return FORMAT_EXTENSIONS.get(fmt, fmt)
 
 
-def looks_like_output(fmt: str, body: bytes, *, diagnostics: bool = False) -> bool:
+def _content_type_matches_text_output(fmt: str, content_type: str | None) -> bool:
+    if not content_type:
+        return True
+    mime = content_type.split(";", 1)[0].strip().lower()
+    if not mime:
+        return True
+    if fmt == "html":
+        return mime in {"text/html", "application/xhtml+xml"}
+    if fmt == "markdown":
+        return mime in {"text/markdown", "text/x-markdown", "text/plain"}
+    if fmt == "metadata":
+        return mime == "application/json" or mime.endswith("+json")
+    return True
+
+
+def looks_like_output(
+    fmt: str,
+    body: bytes,
+    *,
+    diagnostics: bool = False,
+    content_type: str | None = None,
+) -> bool:
+    if diagnostics or fmt == "zip":
+        return bool(body) and body.startswith((b"PK\x03\x04", b"PK\x05\x06"))
+    if fmt == "markdown":
+        if not _content_type_matches_text_output(fmt, content_type):
+            return False
+        if b"\x00" in body:
+            return False
+        try:
+            body.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+        return True
     if not body:
         return False
-    if diagnostics or fmt == "zip":
-        return body.startswith((b"PK\x03\x04", b"PK\x05\x06"))
     if fmt == "png":
         return body.startswith(b"\x89PNG\r\n\x1a\n")
     if fmt == "jpeg":
@@ -1215,7 +1407,9 @@ def looks_like_output(fmt: str, body: bytes, *, diagnostics: bool = False) -> bo
         return len(body) >= 12 and body[4:8] == b"ftyp"
     if fmt == "webm":
         return body.startswith(b"\x1a\x45\xdf\xa3")
-    if fmt in {"html", "markdown"}:
+    if fmt == "html":
+        if not _content_type_matches_text_output(fmt, content_type):
+            return False
         if b"\x00" in body:
             return False
         try:
@@ -1224,6 +1418,8 @@ def looks_like_output(fmt: str, body: bytes, *, diagnostics: bool = False) -> bo
             return False
         return bool(text.strip())
     if fmt == "metadata":
+        if not _content_type_matches_text_output(fmt, content_type):
+            return False
         try:
             parsed = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -1356,7 +1552,14 @@ def read_clipboard() -> str | None:
     """Read plain text from the OS clipboard using native commands."""
     commands: list[list[str]] = []
     if os.name == "nt":
-        commands.append(["powershell", "-NoProfile", "-Command", "Get-Clipboard -Raw"])
+        commands.append(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-Clipboard -Raw",
+            ]
+        )
     elif sys.platform == "darwin":
         commands.append(["pbpaste"])
     else:
@@ -1445,11 +1648,17 @@ def open_in_viewer(path: str | Path) -> bool:
 
 def state_to_preset_settings(state: GuiState) -> dict[str, object]:
     """Serialize ``GuiState`` into Web UI-compatible preset settings."""
+    cleanup_cfg = effective_cleanup(state)
+    consent = str(cleanup_cfg["consent_mode"]) if cleanup_cfg else "none"
+    block_ads = bool(cleanup_cfg["block_ads"]) if cleanup_cfg else False
+    block_trackers = bool(cleanup_cfg["block_trackers"]) if cleanup_cfg else False
+    block_chats = bool(cleanup_cfg["block_chats"]) if cleanup_cfg else False
+    block_newsletters = bool(cleanup_cfg["block_newsletters"]) if cleanup_cfg else False
     return {
         "output": state.output,
         "width": state.viewport[0],
         "height": state.viewport[1],
-        "density": state.scale,
+        "density": int(state.scale) if float(state.scale).is_integer() else state.scale,
         "fullPage": state.full_page,
         "selector": state.selector,
         "quality": state.quality,
@@ -1460,11 +1669,11 @@ def state_to_preset_settings(state: GuiState) -> dict[str, object]:
         "videoScroll": state.video_scroll,
         "waitDelay": round(state.wait_delay_ms / 1000, 1),
         "waitSelector": state.wait_selector,
-        "consent": "reject" if state.cleanup else "none",
-        "blockAds": state.cleanup,
-        "blockTrackers": state.cleanup,
-        "blockChats": state.cleanup,
-        "blockNewsletters": state.cleanup,
+        "consent": consent,
+        "blockAds": block_ads,
+        "blockTrackers": block_trackers,
+        "blockChats": block_chats,
+        "blockNewsletters": block_newsletters,
         "device": state.device,
         "colorScheme": state.color_scheme,
         "paperSize": state.pdf_paper_size,
@@ -1475,35 +1684,41 @@ def state_to_preset_settings(state: GuiState) -> dict[str, object]:
     }
 
 
-def apply_preset_settings(state: GuiState, settings: Mapping[str, object]) -> GuiState:
-    """Apply preset settings (Web UI or GUI format) onto ``state``."""
+def apply_preset_settings_with_warnings(
+    state: GuiState,
+    settings: Mapping[str, object],
+) -> tuple[GuiState, tuple[str, ...]]:
+    """Apply preset settings onto ``state`` and return any unsupported behavior-changing keys."""
     changes: dict[str, object] = {}
+    ignored: list[str] = []
+
     out = settings.get("output")
     if isinstance(out, str) and out in FORMATS:
         changes["output"] = out
 
     w = settings.get("width")
     h = settings.get("height")
-    if isinstance(w, (int, float)) and isinstance(h, (int, float)):
+    if isinstance(w, (int, float)) and not isinstance(w, bool) and isinstance(h, (int, float)) and not isinstance(h, bool):
         wi, hi = int(w), int(h)
         if 1 <= wi <= 16_384 and 1 <= hi <= 16_384:
             changes["viewport"] = (wi, hi)
 
     density = settings.get("density")
-    if isinstance(density, (int, float)) and int(density) in SCALES:
-        changes["scale"] = int(density)
+    if isinstance(density, (int, float)) and not isinstance(density, bool) and 0.1 <= float(density) <= 8.0:
+        d_val = float(density)
+        changes["scale"] = int(d_val) if d_val.is_integer() else d_val
 
     if isinstance(settings.get("fullPage"), bool):
         changes["full_page"] = settings["fullPage"]
 
     if isinstance(settings.get("selector"), str):
-        sel = settings["selector"].strip()
+        sel = sanitize_terminal_text(settings["selector"]).strip()
         changes["selector"] = sel
         if sel:
             changes["full_page"] = False
 
     quality = settings.get("quality")
-    if isinstance(quality, (int, float)) and 1 <= int(quality) <= 100:
+    if isinstance(quality, (int, float)) and not isinstance(quality, bool) and 1 <= int(quality) <= 100:
         changes["quality"] = int(quality)
 
     if isinstance(settings.get("transparent"), bool):
@@ -1513,33 +1728,47 @@ def apply_preset_settings(state: GuiState, settings: Mapping[str, object]) -> Gu
         changes["diagnostics"] = settings["diagnostics"]
 
     vdur = settings.get("videoDuration")
-    if isinstance(vdur, (int, float)) and 1 <= vdur <= 30:
-        changes["video_duration_ms"] = int(round(vdur * 1000))
+    if isinstance(vdur, (int, float)) and not isinstance(vdur, bool) and 1 <= float(vdur) <= 30:
+        changes["video_duration_ms"] = int(round(float(vdur) * 1000))
 
     vfps = settings.get("videoFps")
-    if isinstance(vfps, (int, float)) and int(vfps) in VIDEO_FPS_CHOICES:
+    if isinstance(vfps, (int, float)) and not isinstance(vfps, bool) and 1 <= int(vfps) <= 60:
         changes["video_fps"] = int(vfps)
 
     if isinstance(settings.get("videoScroll"), bool):
         changes["video_scroll"] = settings["videoScroll"]
 
     wdelay = settings.get("waitDelay")
-    if isinstance(wdelay, (int, float)) and 0 <= wdelay <= 15:
-        changes["wait_delay_ms"] = int(round(wdelay * 1000))
+    if isinstance(wdelay, (int, float)) and not isinstance(wdelay, bool) and 0 <= float(wdelay) <= 15:
+        changes["wait_delay_ms"] = int(round(float(wdelay) * 1000))
 
     if isinstance(settings.get("waitSelector"), str):
-        changes["wait_selector"] = settings["waitSelector"].strip()
+        changes["wait_selector"] = sanitize_terminal_text(settings["waitSelector"]).strip()
 
-    consent = settings.get("consent")
-    block_flags = (
-        settings.get("blockAds"),
-        settings.get("blockTrackers"),
-        settings.get("blockChats"),
-        settings.get("blockNewsletters"),
+    consent_raw = settings.get("consent")
+    ads_raw = settings.get("blockAds")
+    trackers_raw = settings.get("blockTrackers")
+    chats_raw = settings.get("blockChats")
+    newsletters_raw = settings.get("blockNewsletters")
+    has_cleanup_keys = consent_raw is not None or any(
+        isinstance(flag, bool) for flag in (ads_raw, trackers_raw, chats_raw, newsletters_raw)
     )
-    if consent is not None or any(isinstance(flag, bool) for flag in block_flags):
-        cleanup_on = (consent not in {None, "none"}) or any(flag is True for flag in block_flags)
-        changes["cleanup"] = cleanup_on
+    if has_cleanup_keys:
+        consent_val = (
+            consent_raw
+            if isinstance(consent_raw, str) and consent_raw in {"none", "reject", "accept", "hide"}
+            else "none"
+        )
+        ads_val = bool(ads_raw) if isinstance(ads_raw, bool) else False
+        trackers_val = bool(trackers_raw) if isinstance(trackers_raw, bool) else False
+        chats_val = bool(chats_raw) if isinstance(chats_raw, bool) else False
+        newsletters_val = bool(newsletters_raw) if isinstance(newsletters_raw, bool) else False
+        changes["consent_mode"] = consent_val
+        changes["block_ads"] = ads_val
+        changes["block_trackers"] = trackers_val
+        changes["block_chats"] = chats_val
+        changes["block_newsletters"] = newsletters_val
+        changes["cleanup"] = consent_val != "none" or any((ads_val, trackers_val, chats_val, newsletters_val))
 
     device = settings.get("device")
     if isinstance(device, str) and device in {"desktop", "iphone_14", "pixel_7", "ipad"}:
@@ -1552,6 +1781,8 @@ def apply_preset_settings(state: GuiState, settings: Mapping[str, object]) -> Gu
     paper = settings.get("paperSize")
     if isinstance(paper, str) and paper in PDF_PAPER_SIZES:
         changes["pdf_paper_size"] = paper
+    elif isinstance(paper, str) and paper in {"A0", "A1", "A2", "A3", "A5", "A6"}:
+        ignored.append("paperSize")
 
     orient = settings.get("orientation")
     if isinstance(orient, str) and orient in PDF_ORIENTATIONS:
@@ -1568,7 +1799,43 @@ def apply_preset_settings(state: GuiState, settings: Mapping[str, object]) -> Gu
     if isinstance(settings.get("stealth"), bool):
         changes["stealth"] = settings["stealth"]
 
-    return _replace(state, **changes)
+    # Detect behavior-changing Web UI preset options that the TUI does not model.
+    if settings.get("preserveViewportWidth") is True:
+        ignored.append("preserveViewportWidth")
+    if isinstance(settings.get("headers"), str) and settings["headers"].strip():
+        ignored.append("headers")
+    if isinstance(settings.get("customCss"), str) and settings["customCss"].strip():
+        ignored.append("customCss")
+    if settings.get("clipEnabled") is True:
+        ignored.append("clip")
+    if isinstance(settings.get("locale"), str) and settings["locale"].strip():
+        ignored.append("locale")
+    if isinstance(settings.get("timezone"), str) and settings["timezone"].strip():
+        ignored.append("timezone")
+    if isinstance(settings.get("waitText"), str) and settings["waitText"].strip():
+        ignored.append("waitText")
+    if isinstance(settings.get("waitEvent"), str) and settings["waitEvent"] not in {"", "load"}:
+        ignored.append("waitEvent")
+    if isinstance(settings.get("reducedMotion"), str) and settings["reducedMotion"] not in {"", "system", "no-preference"}:
+        ignored.append("reducedMotion")
+    if isinstance(settings.get("failStatuses"), str) and settings["failStatuses"].strip():
+        ignored.append("failStatuses")
+    if isinstance(settings.get("lazyLoad"), str) and settings["lazyLoad"] not in {"", "adaptive"}:
+        ignored.append("lazyLoad")
+    if isinstance(settings.get("extractMode"), str) and settings["extractMode"] not in {"", "document"}:
+        ignored.append("extractMode")
+    if isinstance(settings.get("pdfMode"), str) and settings["pdfMode"] not in {"", "print"}:
+        ignored.append("pdfMode")
+    if isinstance(settings.get("videoBitrate"), (int, float)) and not isinstance(settings.get("videoBitrate"), bool) and settings["videoBitrate"] != 20:
+        ignored.append("videoBitrate")
+
+    return _replace(state, **changes), tuple(ignored)
+
+
+def apply_preset_settings(state: GuiState, settings: Mapping[str, object]) -> GuiState:
+    """Apply preset settings (Web UI or GUI format) onto ``state``."""
+    updated, _ignored = apply_preset_settings_with_warnings(state, settings)
+    return updated
 
 
 def _json_request(
@@ -1632,6 +1899,14 @@ def apply_app_config(state: GuiState, config: Mapping[str, object] | None) -> Gu
     changes: dict[str, object] = {}
     if isinstance(config.get("presets"), bool):
         changes["presets_supported"] = bool(config["presets"]) and state.local_server
+    raw_formats = config.get("output_formats")
+    if isinstance(raw_formats, list):
+        allowed_set = {item for item in raw_formats if isinstance(item, str)}
+        supported = tuple(fmt for fmt in FORMATS if fmt in allowed_set)
+        if supported:
+            changes["available_formats"] = supported
+            if state.output not in supported:
+                changes["output"] = supported[0]
     gpu = config.get("gpu")
     if isinstance(gpu, Mapping):
         mode = gpu.get("mode")
@@ -1677,8 +1952,10 @@ def _parse_presets_body(data: Mapping[str, object] | None) -> tuple[PresetEntry,
             continue
         name = item.get("name")
         settings = item.get("settings")
-        if isinstance(name, str) and name.strip() and isinstance(settings, dict):
-            entries.append(PresetEntry(name=name.strip(), settings=dict(settings)))
+        if isinstance(name, str) and isinstance(settings, dict):
+            clean_name = " ".join(sanitize_terminal_text(name).split())
+            if clean_name:
+                entries.append(PresetEntry(name=clean_name, settings=dict(settings)))
     return tuple(entries)
 
 
@@ -1907,18 +2184,19 @@ def _wrap(text: str, width: int) -> list[str]:
     return lines
 
 
-def _format_window_items(active: str) -> tuple[str, ...]:
-    """Return a compact slice of FORMATS centered around ``active``."""
+def _format_window_items(active: str, formats: Sequence[str] = FORMATS) -> tuple[str, ...]:
+    """Return a compact slice of ``formats`` centered around ``active``."""
+    choices = tuple(formats) if formats else FORMATS
     try:
-        idx = FORMATS.index(active)
+        idx = choices.index(active)
     except ValueError:
         idx = 0
     # Show up to 5 formats around the active one for a sleek bar.
-    total = len(FORMATS)
+    total = len(choices)
     if total <= 5:
-        return FORMATS
+        return choices
     start = max(0, min(total - 5, idx - 2))
-    return FORMATS[start : start + 5]
+    return choices[start : start + 5]
 
 
 def _viewport_summary(state: GuiState) -> str:
@@ -1935,7 +2213,7 @@ def _secondary_tokens(state: GuiState) -> list[tuple[str, str]]:
     tokens: list[tuple[str, str]] = []
     tokens.append((f"theme:{state.color_scheme}", "1;36" if state.color_scheme != "system" else "2"))
     tokens.append((state.engine, "1;33" if state.engine != "chromium" else "2"))
-    tokens.append(("clean:on" if state.cleanup else "clean:off", "1;32" if state.cleanup else "2"))
+    tokens.append(_cleanup_badge(state))
     if state.output in VIDEO_FORMATS:
         dur = format_seconds_short(state.video_duration_ms)
         tokens.append((f"dur:{dur}", "1;36" if state.video_duration_ms != VIDEO_DURATION_MS else "2"))
@@ -1943,7 +2221,7 @@ def _secondary_tokens(state: GuiState) -> list[tuple[str, str]]:
         delay = format_seconds_short(state.wait_delay_ms)
         tokens.append((f"delay:{delay}", "1;36" if state.wait_delay_ms > 0 else "2"))
     if state.scale != 1:
-        tokens.append((f"{state.scale}x", "1;35"))
+        tokens.append((_format_scale(state.scale), "1;35"))
     if state.transparent and state.output in TRANSPARENT_IMAGE_FORMATS:
         tokens.append(("alpha", "1;35"))
     if state.profile != "preview":
@@ -2019,7 +2297,7 @@ def panel_lines(state: GuiState, width: int, *, max_extra_lines: int | None = No
         link = _clip_right("example.com", inner)
     mode = page_label(state.full_page)
     dims = _viewport_summary(state)
-    choice = "  ".join(_format_window_items(state.output))
+    choice = "  ".join(_format_window_items(state.output, state.available_formats))
     summary = f"{choice}    {mode}    {dims}"
     secondary = _secondary_summary_plain(state, inner)
     lines = [link, _clip_right(summary, inner), secondary]
@@ -2035,19 +2313,19 @@ def panel_lines(state: GuiState, width: int, *, max_extra_lines: int | None = No
         lines.append(_clip(f"{label}  {progress_bar(state.progress, min(20, inner - 14))}", inner))
     elif state.error:
         limit = 3 if max_extra_lines is None else max(1, min(3, max_extra_lines))
-        lines.extend(_wrap(state.error, inner)[:limit])
+        lines.extend(_wrap(sanitize_terminal_text(state.error), inner)[:limit])
     elif hint:
         limit = 2 if max_extra_lines is None else max(1, min(2, max_extra_lines))
         lines.extend(_wrap(f"Note: {hint}", inner)[:limit])
     elif state.saved:
         limit = 2 if max_extra_lines is None else max(1, min(2, max_extra_lines))
-        text = _saved_status_text(state)
+        text = sanitize_terminal_text(_saved_status_text(state))
         if state.notice:
-            text = f"{text} · {state.notice}"
+            text = f"{text} · {sanitize_terminal_text(state.notice)}"
         lines.extend(_wrap(text, inner)[:limit])
     elif state.notice:
         limit = 2 if max_extra_lines is None else max(1, min(2, max_extra_lines))
-        lines.extend(_wrap(state.notice, inner)[:limit])
+        lines.extend(_wrap(sanitize_terminal_text(state.notice), inner)[:limit])
     return lines
 
 
@@ -2236,8 +2514,8 @@ def _drawer_panel_options(state: GuiState, inner: int, max_body_rows: int) -> li
     count = len(OPTIONS_FIELDS)
     selected = state.drawer_index % count
     start, end = _scroll_window(count, selected, list_rows)
-    label_w = min(18, max(10, inner // 2))
-    val_w = max(4, inner - label_w - 3)
+    label_w = max(4, min(18, (inner - 3) // 2))
+    val_w = max(1, inner - label_w - 3)
     for idx in range(start, end):
         field_key, label, _kind = OPTIONS_FIELDS[idx]
         is_sel = idx == selected
@@ -2247,15 +2525,15 @@ def _drawer_panel_options(state: GuiState, inner: int, max_body_rows: int) -> li
             val_part = _render_edit_field_ansi(state.edit_buffer, state.edit_cursor, val_w)
             body.append(f"\x1b[1;34m{prefix}{lbl}\x1b[0m {val_part}")
         else:
-            val_text = _ljust_cells(_option_value_text(state, field_key), val_w)
+            val_text = _ljust_cells(sanitize_terminal_text(_option_value_text(state, field_key)), val_w)
             if is_sel:
                 body.append(f"\x1b[1;34m{prefix}{lbl}\x1b[0m \x1b[1;37m{val_text}\x1b[0m")
             else:
                 body.append(f"{prefix}\x1b[2m{lbl}\x1b[0m {val_text}")
     if state.error:
-        body.append(f"\x1b[31m{_ljust_cells(state.error, inner)}\x1b[0m")
+        body.append(f"\x1b[31m{_ljust_cells(sanitize_terminal_text(state.error), inner)}\x1b[0m")
     elif state.notice:
-        body.append(f"\x1b[36m{_ljust_cells(state.notice, inner)}\x1b[0m")
+        body.append(f"\x1b[36m{_ljust_cells(sanitize_terminal_text(state.notice), inner)}\x1b[0m")
     return _box_lines("Advanced Options", body, inner)
 
 
@@ -2301,17 +2579,18 @@ def _drawer_panel_presets(state: GuiState, inner: int, max_body_rows: int) -> li
             preset = state.presets[idx]
             is_sel = idx == selected
             prefix = "▸ " if is_sel else "  "
+            clean_name = sanitize_terminal_text(preset.name)
             summary = _preset_summary(preset.settings)
-            line_text = f"{preset.name}  ({summary})" if summary else preset.name
+            line_text = f"{clean_name}  ({summary})" if summary else clean_name
             clipped = _ljust_cells(line_text, max(1, inner - 2))
             if is_sel:
                 body.append(f"\x1b[1;34m{prefix}\x1b[1;37m{clipped}\x1b[0m")
             else:
                 body.append(f"{prefix}{clipped}")
     if state.error:
-        body.append(f"\x1b[31m{_ljust_cells(state.error, inner)}\x1b[0m")
+        body.append(f"\x1b[31m{_ljust_cells(sanitize_terminal_text(state.error), inner)}\x1b[0m")
     elif state.notice:
-        body.append(f"\x1b[36m{_ljust_cells(state.notice, inner)}\x1b[0m")
+        body.append(f"\x1b[36m{_ljust_cells(sanitize_terminal_text(state.notice), inner)}\x1b[0m")
     return _box_lines("Saved Presets", body, inner)
 
 
@@ -2363,9 +2642,9 @@ def _drawer_panel_history(
         for _ in range(preview_rows):
             body.append(" " * inner)
     if state.error:
-        body.append(f"\x1b[31m{_ljust_cells(state.error, inner)}\x1b[0m")
+        body.append(f"\x1b[31m{_ljust_cells(sanitize_terminal_text(state.error), inner)}\x1b[0m")
     elif state.notice:
-        body.append(f"\x1b[36m{_ljust_cells(state.notice, inner)}\x1b[0m")
+        body.append(f"\x1b[36m{_ljust_cells(sanitize_terminal_text(state.notice), inner)}\x1b[0m")
     return _box_lines("Capture History", body, inner), preview_offset
 
 
@@ -2495,7 +2774,8 @@ def _render_tiny_frame(size: launch.WindowSize, state: GuiState, *, clear: bool)
                 lines.append(_clip_right(f"{state.output} {page_label(state.full_page)}", cols))
         if rows >= 4:
             lines.append(_clip_right(footer(state, max_width=cols), cols))
-    for row_index, text in enumerate(lines[:rows], start=1):
+    for row_index, raw_text in enumerate(lines[:rows], start=1):
+        text = _clip_right(sanitize_terminal_text(raw_text), cols)
         width = _display_width(text)
         col = max(1, (cols - width) // 2 + 1)
         parts.append(f"\x1b[{row_index};{col}H".encode("ascii"))
@@ -2529,6 +2809,10 @@ def render_frame(
     if state.drawer == "history" and protocol and state.captures and cols >= 40 and rows >= 18:
         rec = state.captures[state.drawer_index % len(state.captures)]
         img = preview_png if preview_png is not None else _read_preview_png(rec)
+        if img and protocol == "sixel":
+            dims = _png_dimensions(img)
+            if dims is None or dims[0] * dims[1] > MAX_SIXEL_PREVIEW_PIXELS:
+                img = None
         if img:
             panel_width = min(76, cols - 4)
             inner = max(12, panel_width - 4)
@@ -2656,7 +2940,7 @@ def _color_panel(state: GuiState, width: int, plain: list[str]) -> list[str]:
 def _colored_formats(state: GuiState, separator: str) -> tuple[str, int]:
     pieces: list[str] = []
     visible_len = 0
-    window = _format_window_items(state.output)
+    window = _format_window_items(state.output, state.available_formats)
     for index, name in enumerate(window):
         if index:
             pieces.append(separator)
@@ -2752,13 +3036,34 @@ def capture_credential(
     *,
     started_server: bool,
     environ: Mapping[str, str] | None = None,
+    endpoint: str | None = None,
 ) -> str:
-    """Bearer token for POST /v1/render."""
+    """Bearer token for POST /v1/render.
+
+    Admin token fallback is restricted to the default local server (or a server
+    started by this session). Explicit remote servers only receive
+    ``VIPERCAPTURE_API_KEY`` and only over HTTPS.
+    """
     env = os.environ if environ is None else environ
     project_key = _header_token(env.get("VIPERCAPTURE_API_KEY", ""))
     admin = _header_token(env.get("VIPERCAPTURE_ADMIN_TOKEN", ""))
     if started_server and admin:
         return admin
+    if endpoint is not None:
+        try:
+            parsed = urllib.parse.urlsplit(endpoint)
+        except ValueError:
+            return ""
+        scheme = parsed.scheme.lower()
+        local = is_local_server(endpoint)
+        default_local = local and (parsed.port or (443 if scheme == "https" else 80)) == launch.PORT and scheme == "http"
+        if not local:
+            if scheme != "https":
+                return ""
+            return project_key
+        if project_key:
+            return project_key
+        return admin if default_local else ""
     if project_key:
         return project_key
     return admin
@@ -2775,13 +3080,20 @@ def _cancelled_state(state: GuiState) -> GuiState:
     return _replace(state, busy=False, cancelling=False, saved="", error="Capture cancelled.")
 
 
-def _response_encode_ms(response: object) -> int:
+def _response_header(response: object, name: str) -> str | None:
     headers = getattr(response, "headers", None)
     raw: object = None
     if headers is not None and hasattr(headers, "get"):
-        raw = headers.get("X-ViperCapture-Encode-Ms")
+        raw = headers.get(name)
+        if raw is None:
+            raw = headers.get(name.lower())
     elif hasattr(response, "getheader"):
-        raw = response.getheader("X-ViperCapture-Encode-Ms")
+        raw = response.getheader(name)
+    return raw if isinstance(raw, str) else None
+
+
+def _response_encode_ms(response: object) -> int:
+    raw = _response_header(response, "X-ViperCapture-Encode-Ms")
     if isinstance(raw, str):
         try:
             value = int(float(raw.strip()))
@@ -2816,7 +3128,7 @@ def perform_capture(
     if timeout is None:
         timeout = 180 if state.output in VIDEO_FORMATS else 90
     if authorization is None:
-        authorization = capture_credential(started_server=started_server)
+        authorization = capture_credential(started_server=started_server, endpoint=endpoint)
     headers = {"Content-Type": "application/json", "Accept": "*/*"}
     if authorization:
         headers["Authorization"] = f"Bearer {authorization}"
@@ -2830,12 +3142,14 @@ def perform_capture(
 
     started_at = time.monotonic()
     encode_ms = 0
+    content_type: str | None = None
     try:
         with open_url(request, timeout) as response:
             status = getattr(response, "status", None)
             if status is None:
                 status = getattr(response, "code", 200)
             encode_ms = _response_encode_ms(response)
+            content_type = _response_header(response, "Content-Type")
             body = read_capture(response, cancel=cancel)
     except _Cancelled:
         return _cancelled_state(state)
@@ -2856,15 +3170,20 @@ def perform_capture(
     except (TimeoutError, OSError, http.client.HTTPException, ValueError) as exc:
         if cancel is not None and cancel.requested:
             return _cancelled_state(state)
-        return _replace(state, busy=False, cancelling=False, error=str(exc))
+        return _replace(state, busy=False, cancelling=False, error=sanitize_terminal_text(str(exc)))
     wall_ms = max(1, round((time.monotonic() - started_at) * 1000))
     duration_ms = encode_ms if encode_ms > 0 else wall_ms
     if (cancel is not None and cancel.requested) or state.cancelling:
         return _cancelled_state(state)
-    if status >= 400:
+    if not (200 <= status < 300):
         return _replace(state, busy=False, cancelling=False, error=error_text(status, body))
     expected_label = "zip" if state.diagnostics else state.output
-    if not body or not looks_like_output(state.output, body, diagnostics=state.diagnostics):
+    if not looks_like_output(
+        state.output,
+        body,
+        diagnostics=state.diagnostics,
+        content_type=content_type,
+    ):
         return _replace(
             state,
             busy=False,
@@ -2877,7 +3196,8 @@ def perform_capture(
         path = output_path(directory, url, state.output, when, diagnostics=state.diagnostics)
         _save_exclusive(directory, path, body)
     except OSError as exc:
-        return _replace(state, busy=False, cancelling=False, error=str(exc))
+        return _replace(state, busy=False, cancelling=False, error=sanitize_terminal_text(str(exc)))
+    cleanup_cfg = effective_cleanup(state)
     record = CaptureRecord(
         url=url,
         output=state.output,
@@ -2890,7 +3210,12 @@ def perform_capture(
         device=state.device,
         color_scheme=state.color_scheme,
         engine=state.engine,
-        cleanup=state.cleanup,
+        cleanup=cleanup_cfg is not None,
+        consent_mode=str(cleanup_cfg["consent_mode"]) if cleanup_cfg else "none",
+        block_ads=bool(cleanup_cfg["block_ads"]) if cleanup_cfg else False,
+        block_trackers=bool(cleanup_cfg["block_trackers"]) if cleanup_cfg else False,
+        block_chats=bool(cleanup_cfg["block_chats"]) if cleanup_cfg else False,
+        block_newsletters=bool(cleanup_cfg["block_newsletters"]) if cleanup_cfg else False,
         scale=state.scale,
         quality=state.quality,
         transparent=state.transparent,
@@ -3332,12 +3657,14 @@ def _handle_key(
         else:
             state = _replace(state, notice="Clipboard is empty or unavailable.")
     elif action == "open_last":
-        if open_in_viewer(state.saved):
-            state = _replace(state, notice=f"Opened {Path(state.saved).name}.", error="")
+        target = _last_saved_path(state)
+        if target and open_in_viewer(target):
+            state = _replace(state, notice=f"Opened {Path(target).name}.", error="")
         else:
             state = _replace(state, error="Could not open the saved file.")
     elif action == "copy_last":
-        if copy_to_clipboard(state.saved):
+        target = _last_saved_path(state)
+        if target and copy_to_clipboard(target):
             state = _replace(state, notice="Copied path to clipboard.", error="")
         else:
             state = _replace(state, error="Could not access the clipboard.")
@@ -3517,20 +3844,29 @@ def _windows_shift_pressed() -> bool:
         return False
 
 
-def _drain_windows_escape(msvcrt_mod: object) -> list[str]:
-    """Drain a VT escape sequence or bracketed paste on Windows Terminal."""
-    pending = bytearray(b"\x1b")
+def _drain_windows_escape(
+    msvcrt_mod: object,
+    pending: bytearray | None = None,
+) -> list[str]:
+    """Drain a VT escape sequence or bracketed paste on Windows Terminal.
+
+    When ``pending`` is supplied by the caller, an in-progress bracketed paste
+    stays in ``pending`` across timeouts instead of being dropped or flushed.
+    """
+    buf = pending if pending is not None else bytearray()
+    if not buf.startswith(_PASTE_START):
+        buf.extend(b"\x1b")
     deadline = time.monotonic() + 0.025
     while True:
         if msvcrt_mod.kbhit():  # type: ignore[attr-defined]
             ch = msvcrt_mod.getwch()  # type: ignore[attr-defined]
-            pending.extend(ch.encode("utf-8", errors="replace"))
-            keys = keys_from_bytes(pending, b"")
+            buf.extend(ch.encode("utf-8", errors="replace"))
+            keys = keys_from_bytes(buf, b"")
             if keys:
                 return keys
-            if not pending:
+            if not buf:
                 return []
-            if pending.startswith(_PASTE_START):
+            if buf.startswith(_PASTE_START):
                 deadline = time.monotonic() + 0.25
             else:
                 deadline = time.monotonic() + 0.02
@@ -3538,7 +3874,10 @@ def _drain_windows_escape(msvcrt_mod: object) -> list[str]:
         if time.monotonic() >= deadline:
             break
         time.sleep(0.002)
-    return flush_bare_escape(pending)
+    if buf.startswith(_PASTE_START):
+        # Keep paste mode active across delayed chunks until \x1b[201~ arrives.
+        return []
+    return flush_bare_escape(buf)
 
 
 def _run_windows_keys(
@@ -3554,6 +3893,7 @@ def _run_windows_keys(
     thread: threading.Thread | None = None
     cancel = CancelFlag()
     box: dict[str, GuiState] = {}
+    pending = bytearray()
     dirty = True
     last_size = _window_size()
     while True:
@@ -3567,21 +3907,24 @@ def _run_windows_keys(
             drawer.draw(state)
             dirty = False
         if msvcrt.kbhit():
-            char = msvcrt.getwch()
-            names: list[str] = []
-            if char in {"\x00", "\xe0"}:
-                ext = msvcrt.getwch()
-                mapped = _windows_extended_key(ext)
-                if mapped is not None:
-                    names.append(mapped)
-            elif char == "\x1b":
-                names.extend(_drain_windows_escape(msvcrt))
-            elif char == "\t" and _windows_shift_pressed():
-                names.append("shift-tab")
+            if pending.startswith(_PASTE_START):
+                names = _drain_windows_escape(msvcrt, pending)
             else:
-                mapped = _windows_key(char)
-                if mapped is not None:
-                    names.append(mapped)
+                char = msvcrt.getwch()
+                names = []
+                if char in {"\x00", "\xe0"}:
+                    ext = msvcrt.getwch()
+                    mapped = _windows_extended_key(ext)
+                    if mapped is not None:
+                        names.append(mapped)
+                elif char == "\x1b":
+                    names.extend(_drain_windows_escape(msvcrt, pending))
+                elif char == "\t" and _windows_shift_pressed():
+                    names.append("shift-tab")
+                else:
+                    mapped = _windows_key(char)
+                    if mapped is not None:
+                        names.append(mapped)
             for name in names:
                 state, thread, cancel, box, quit_menu = _handle_key(
                     state,
@@ -3654,8 +3997,11 @@ def _apply_startup_preset(state: GuiState, base_url: str, preset_name: str) -> G
         match = next((p for p in presets if p.name.lower() == lowered), None)
     if match is None:
         return _replace(state, presets=presets, error=f"Preset '{preset_name}' was not found.")
-    applied = apply_preset_settings(state, match.settings)
-    return _replace(applied, presets=presets, notice=f"Loaded preset '{match.name}'.")
+    applied, ignored = apply_preset_settings_with_warnings(state, match.settings)
+    notice = f"Loaded preset '{match.name}'."
+    if ignored:
+        notice = f"Loaded '{match.name}' (ignored: {', '.join(ignored)})."
+    return _replace(applied, presets=presets, notice=notice)
 
 
 def run_capture_gui(
