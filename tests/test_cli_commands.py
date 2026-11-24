@@ -106,7 +106,7 @@ class _ApiMockHandler(BaseHTTPRequestHandler):
                 200,
                 f"ARTIFACT-{safe_id}".encode("utf-8"),
                 "image/png",
-                headers={"Content-Disposition": f'attachment; filename="{safe_id}.png"'},
+                headers={"Content-Disposition": 'attachment; filename="artifact.png"'},
             )
             return
         if path.startswith("/v1/jobs/"):
@@ -454,6 +454,7 @@ class CliCommandsTests(unittest.TestCase):
         code, stdout, stderr = self._run([
             "preset", "save", "dark-desktop",
             "--viewport", "1440", "900",
+            "--no-full-page",
             "--color-scheme", "dark",
             "--header", "Authorization: Bearer super-secret-hdr",
             "--server", self.server,
@@ -501,7 +502,17 @@ class CliCommandsTests(unittest.TestCase):
         code, stdout, stderr = self._run(["preset", "show", "dark-desktop", "--server", self.server, "--json"])
         self.assertEqual(code, 0, stderr)
         self.assertNotIn("super-secret-hdr", stdout)
-        self.assertEqual(json.loads(stdout)["settings"]["viewport"]["width"], 1440)
+        shown_settings = json.loads(stdout)["settings"]
+        self.assertEqual(shown_settings["width"], 1440)
+        self.assertEqual(shown_settings["height"], 900)
+        self.assertFalse(shown_settings["fullPage"])
+        self.assertEqual(shown_settings["colorScheme"], "dark")
+        # Round-trip back to CLI RenderRequest shape
+        from vipercapture.capture_cli import preset_settings_to_payload
+        rt = preset_settings_to_payload(shown_settings)
+        self.assertEqual(rt["viewport"], {"width": 1440, "height": 900})
+        self.assertFalse(rt["full_page"])
+        self.assertEqual(rt["environment"]["color_scheme"], "dark")
 
         code, stdout, stderr = self._run(["preset", "delete", "dark-desktop", "--server", self.server, "--json"])
         self.assertEqual(code, 0, stderr)
@@ -1008,6 +1019,12 @@ class CliCouncilHardeningTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "diff_report_too_large")
 
     def test_verify_server_key_does_not_probe_filesystem_and_rejects_oversized_manifest(self) -> None:
+        try:
+            from cryptography.hazmat.primitives import serialization
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        except ImportError:
+            self.skipTest("cryptography not installed")
+
         with tempfile.TemporaryDirectory() as tmp:
             # Server-supplied key that looks like a file path must NOT call Path.is_file()
             with mock.patch.object(Path, "is_file", side_effect=AssertionError("should not probe path")):
@@ -1024,15 +1041,95 @@ class CliCouncilHardeningTests(unittest.TestCase):
                 zf.writestr("manifest.json", b"{" + b" " * (cli_commands._MAX_MANIFEST_BYTES + 2048) + b"}")
                 zf.writestr("manifest.sig", b"A" * 64)
                 zf.writestr("capture.png", b"png")
-            try:
-                from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-            except ImportError:
-                self.skipTest("cryptography not installed")
-            pub_raw = Ed25519PrivateKey.generate().public_key().public_bytes_raw()
+            pub_raw = Ed25519PrivateKey.generate().public_key().public_bytes(
+                serialization.Encoding.Raw,
+                serialization.PublicFormat.Raw,
+            )
             pub_b64 = base64.urlsafe_b64encode(pub_raw).decode("ascii").rstrip("=")
             with self.assertRaises(cli_commands.CaptureError) as ctx:
                 cli_commands.verify_certified_bundle(bad_zip, public_key_spec=pub_b64)
             self.assertEqual(ctx.exception.code, "bundle_invalid")
+
+    def test_round2_credential_scoping_long_bulk_ids_and_verify_auth(self) -> None:
+        # 1. admin and sign must NOT send local env secrets to non-local servers; sign honors --api-key first
+        with mock.patch.dict(
+            os.environ,
+            {
+                "VIPERCAPTURE_ADMIN_TOKEN": "local-admin-secret",
+                "VIPERCAPTURE_SIGNING_SECRET": "local-hmac-secret",
+                "VIPERCAPTURE_SIGNING_ADMIN_TOKEN": "local-sign-admin",
+                "VIPERCAPTURE_API_KEY": "",
+            },
+            clear=False,
+        ):
+            code, _out, stderr = self._run(["admin", "status", "--server", self.server, "--json"])
+            self.assertEqual(code, 0, stderr)
+            self.assertNotIn("Authorization", self.httpd.requests[-1]["headers"])  # type: ignore[attr-defined]
+
+            code, _out, stderr = self._run([
+                "sign", "https://example.com",
+                "--server", self.server,
+                "--api-key", "explicit-proj-key",
+                "--json",
+            ])
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(
+                self.httpd.requests[-1]["headers"].get("Authorization"),  # type: ignore[attr-defined]
+                "Bearer explicit-proj-key",
+            )
+
+            # gpu status probes /app-config anonymously (no Authorization)
+            code, _out, stderr = self._run(["gpu", "status", "--server", self.server, "--api-key", "proj-key", "--json"])
+            self.assertEqual(code, 0, stderr)
+            self.assertNotIn("Authorization", self.httpd.requests[-1]["headers"])  # type: ignore[attr-defined]
+
+        # 2. config.toml api_key scoped to configured server origin is NOT sent to a different --server
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "config.toml"
+            cfg.write_text('server = "https://other.example"\napi_key = "other-origin-key"\n', encoding="utf-8")
+            with mock.patch.dict(
+                os.environ,
+                {"VIPERCAPTURE_CONFIG": str(cfg), "VIPERCAPTURE_API_KEY": "", "VIPERCAPTURE_ADMIN_TOKEN": ""},
+                clear=False,
+            ):
+                code, _out, stderr = self._run(["baseline", "list", "--server", self.server, "--json"])
+            self.assertEqual(code, 0, stderr)
+            self.assertNotIn("Authorization", self.httpd.requests[-1]["headers"])  # type: ignore[attr-defined]
+
+        # 3. verify --api-key sends Authorization header when fetching /v1/certification/public-key
+        with tempfile.TemporaryDirectory() as tmp:
+            dummy = Path(tmp) / "dummy.zip"
+            dummy.write_bytes(b"not-a-zip")
+            self.httpd.state["cert_public_key"] = "A" * 43  # type: ignore[attr-defined]
+            self._run(["verify", str(dummy), "--server", self.server, "--api-key", "verify-proj-key"])
+            cert_req = next(r for r in reversed(self.httpd.requests) if r["path"] == "/v1/certification/public-key")  # type: ignore[attr-defined]
+            self.assertEqual(cert_req["headers"].get("Authorization"), "Bearer verify-proj-key")
+
+        # 4. bulk --wait with duplicate 128-character IDs terminates cleanly with unique filenames
+        with tempfile.TemporaryDirectory() as tmp:
+            long_id = "a" * 128
+            envelope = Path(tmp) / "long_bulk.json"
+            envelope.write_text(
+                json.dumps({
+                    "items": [
+                        {"id": long_id, "render": {"url": "https://a.example", "output": "png"}},
+                        {"id": long_id, "render": {"url": "https://b.example", "output": "png"}},
+                    ]
+                }),
+                encoding="utf-8",
+            )
+            out_dir = Path(tmp) / "out_long"
+            code, stdout, stderr = self._run([
+                "bulk", str(envelope),
+                "--wait", "--poll-ms", "1",
+                "--output-dir", str(out_dir),
+                "--server", self.server,
+                "--json",
+            ])
+            self.assertEqual(code, 0, stderr)
+            doc = json.loads(stdout)
+            self.assertEqual(doc["succeeded"], 2)
+            self.assertEqual(len({r["path"] for r in doc["results"]}), 2)
 
 
 if __name__ == "__main__":

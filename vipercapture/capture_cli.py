@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import copy
 import datetime
+import hashlib
 import json
 import math
 import mimetypes
@@ -891,6 +892,46 @@ def parse_capture_args(argv: list[str]) -> argparse.Namespace:
     return args
 
 
+def _server_origin(server: str | None) -> tuple[str, str, int] | None:
+    try:
+        root = api_root(server)
+    except ValueError:
+        return None
+    parsed = urlsplit(root)
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    port = parsed.port or (443 if scheme == "https" else 80)
+    return (scheme, host, port)
+
+
+def _config_credential_for_server(
+    cfg: dict[str, object],
+    key: str,
+    server: str | None,
+) -> str:
+    raw = cfg.get(key)
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    cfg_server = cfg.get("server")
+    if isinstance(cfg_server, str) and cfg_server.strip() and server is not None:
+        cfg_origin = _server_origin(cfg_server)
+        target_origin = _server_origin(server)
+        if cfg_origin is not None and target_origin is not None and cfg_origin != target_origin:
+            return ""
+    return _header_token(raw)
+
+
+def derive_batch_idempotency_key(base: str, suffix: str, *, max_len: int = 128) -> str:
+    """Derive a deterministic idempotency key guaranteed to fit within API length limits."""
+    combined = f"{base}-{suffix}"
+    if len(combined) <= max_len:
+        return combined
+    digest = hashlib.sha256(f"{base}:{suffix}".encode("utf-8")).hexdigest()[:16]
+    tail = f"-{digest}-{suffix}"
+    prefix_len = max(1, max_len - len(tail))
+    return f"{base[:prefix_len]}{tail}"[:max_len]
+
+
 def apply_config_defaults(
     args: argparse.Namespace,
     config: dict[str, object] | None = None,
@@ -913,8 +954,17 @@ def apply_config_defaults(
         "json": "--json",
         "stop_server": "--stop-server",
     }
+    if "server" in cfg and hasattr(args, "server") and "--server" not in explicit:
+        setattr(args, "server", cfg["server"])
+    effective_server = getattr(args, "server", None)
     for key, value in cfg.items():
-        if not hasattr(args, key):
+        if key == "server" or not hasattr(args, key):
+            continue
+        if key in {"api_key", "admin_token", "signing_token"}:
+            if getattr(args, key) is None:
+                scoped = _config_credential_for_server(cfg, key, effective_server)
+                if scoped:
+                    setattr(args, key, scoped)
             continue
         if key in flag_map:
             if flag_map[key] not in explicit:
@@ -1023,21 +1073,190 @@ def _decode_preset_headers(raw_headers: object) -> dict[str, str]:
     return headers
 
 
+_PRESET_CLI_EXTRAS = (
+    "engine",
+    "profile",
+    "stealth",
+    "actions",
+    "network",
+    "assertions",
+    "elements",
+    "side_outputs",
+    "deterministic",
+    "certification",
+    "slices",
+    "profile_id",
+    "save_profile",
+    "cache",
+    "cache_key",
+    "include_shadow_dom",
+    "captcha",
+    "proceed_on_captcha",
+    "viewports",
+    "base_url",
+    "delivery",
+)
+
+
 def payload_to_preset_settings(payload: dict[str, object]) -> dict[str, object]:
-    """Serialize a CLI render payload so it round-trips cleanly with the Web UI and CLI."""
-    settings = copy.deepcopy(payload)
-    for source_key in ("url", "html", "markdown"):
-        settings.pop(source_key, None)
-    raw_headers = settings.get("headers")
-    if isinstance(raw_headers, dict):
+    """Serialize a CLI render payload into Web UI PresetSettings keys while preserving CLI extras."""
+    settings: dict[str, object] = {}
+    fmt = str(payload.get("output") or "png").lower()
+    settings["output"] = _FORMAT_ALIASES.get(fmt, fmt)
+    if "full_page" in payload:
+        settings["fullPage"] = bool(payload["full_page"])
+    if payload.get("preserve_viewport_width"):
+        settings["preserveViewportWidth"] = True
+
+    vp = payload.get("viewport")
+    if isinstance(vp, dict):
+        if isinstance(vp.get("width"), (int, float)):
+            settings["width"] = int(vp["width"])
+        if isinstance(vp.get("height"), (int, float)):
+            settings["height"] = int(vp["height"])
+        if isinstance(vp.get("device_scale_factor"), (int, float)):
+            settings["density"] = vp["device_scale_factor"]
+
+    if isinstance(payload.get("selector"), str) and payload["selector"].strip():
+        settings["selector"] = payload["selector"]
+    clip = payload.get("clip")
+    if isinstance(clip, dict):
+        settings["clipEnabled"] = True
+        for src, dst in (("x", "clipX"), ("y", "clipY"), ("width", "clipWidth"), ("height", "clipHeight")):
+            if isinstance(clip.get(src), (int, float)):
+                settings[dst] = clip[src]
+
+    image = payload.get("image")
+    if isinstance(image, dict):
+        if isinstance(image.get("quality"), int):
+            settings["quality"] = image["quality"]
+        if image.get("transparent_background"):
+            settings["transparent"] = True
+        if "optimize_for_speed" in image:
+            settings["optimizePng"] = bool(image["optimize_for_speed"])
+        extra_img = {k: v for k, v in image.items() if k not in {"quality", "transparent_background", "optimize_for_speed"}}
+        if extra_img:
+            settings["image"] = copy.deepcopy(extra_img)
+
+    if isinstance(payload.get("lazy_load"), str):
+        settings["lazyLoad"] = payload["lazy_load"]
+    diag = payload.get("diagnostics")
+    if isinstance(diag, dict):
+        if diag.get("bundle"):
+            settings["diagnostics"] = True
+        extra_diag = {k: v for k, v in diag.items() if k != "bundle"}
+        if extra_diag:
+            settings["diagnostics_extra"] = copy.deepcopy(extra_diag)
+
+    video = payload.get("video")
+    if isinstance(video, dict):
+        if isinstance(video.get("duration_ms"), (int, float)):
+            settings["videoDuration"] = round(float(video["duration_ms"]) / 1000.0, 3)
+        if isinstance(video.get("fps"), int):
+            settings["videoFps"] = video["fps"]
+        if isinstance(video.get("bitrate_mbps"), int):
+            settings["videoBitrate"] = video["bitrate_mbps"]
+        if video.get("scroll"):
+            settings["videoScroll"] = True
+        if video.get("transparent_background"):
+            settings["transparent"] = True
+        extra_vid = {
+            k: v for k, v in video.items()
+            if k not in {"duration_ms", "fps", "bitrate_mbps", "scroll", "transparent_background"}
+        }
+        if extra_vid:
+            settings["video"] = copy.deepcopy(extra_vid)
+
+    pdf = payload.get("pdf")
+    if isinstance(pdf, dict):
+        if isinstance(pdf.get("mode"), str):
+            settings["pdfMode"] = pdf["mode"]
+        if isinstance(pdf.get("paper_size"), str):
+            settings["paperSize"] = pdf["paper_size"]
+        if isinstance(pdf.get("orientation"), str):
+            settings["orientation"] = pdf["orientation"]
+        margins = pdf.get("margins")
+        extra_pdf = {k: v for k, v in pdf.items() if k not in {"mode", "paper_size", "orientation", "margins"}}
+        if isinstance(margins, dict):
+            vals = [margins.get(side) for side in ("top", "right", "bottom", "left")]
+            if all(isinstance(v, (int, float)) for v in vals) and len(set(vals)) == 1:
+                settings["pdfMargin"] = vals[0]
+            else:
+                extra_pdf["margins"] = copy.deepcopy(margins)
+        if extra_pdf:
+            settings["pdf"] = copy.deepcopy(extra_pdf)
+
+    if isinstance(payload.get("extract_mode"), str):
+        settings["extractMode"] = payload["extract_mode"]
+
+    wait_for = payload.get("wait_for")
+    if isinstance(wait_for, dict):
+        if isinstance(wait_for.get("event"), str):
+            settings["waitEvent"] = wait_for["event"]
+        if isinstance(wait_for.get("delay_ms"), (int, float)):
+            settings["waitDelay"] = round(float(wait_for["delay_ms"]) / 1000.0, 3)
+        if isinstance(wait_for.get("selector"), str):
+            settings["waitSelector"] = wait_for["selector"]
+        if isinstance(wait_for.get("text"), str):
+            settings["waitText"] = wait_for["text"]
+        if isinstance(wait_for.get("timeout_ms"), (int, float)):
+            settings["waitTimeout"] = round(float(wait_for["timeout_ms"]) / 1000.0, 3)
+        extra_wait = {
+            k: v for k, v in wait_for.items()
+            if k not in {"event", "delay_ms", "selector", "text", "timeout_ms"}
+        }
+        if extra_wait:
+            settings["wait_for"] = copy.deepcopy(extra_wait)
+
+    env = payload.get("environment")
+    if isinstance(env, dict):
+        if isinstance(env.get("device"), str):
+            settings["device"] = env["device"]
+        if isinstance(env.get("color_scheme"), str):
+            settings["colorScheme"] = env["color_scheme"]
+        if isinstance(env.get("reduced_motion"), str):
+            settings["reducedMotion"] = env["reduced_motion"]
+        if isinstance(env.get("locale"), str):
+            settings["locale"] = env["locale"]
+        if isinstance(env.get("timezone"), str):
+            settings["timezone"] = env["timezone"]
+        if isinstance(env.get("media"), str):
+            settings["media"] = env["media"]
+
+    cleanup = payload.get("cleanup")
+    if isinstance(cleanup, dict):
+        if isinstance(cleanup.get("consent_mode"), str):
+            settings["consent"] = cleanup["consent_mode"]
+        if cleanup.get("block_ads"):
+            settings["blockAds"] = True
+        if cleanup.get("block_trackers"):
+            settings["blockTrackers"] = True
+        if cleanup.get("block_chats"):
+            settings["blockChats"] = True
+        if cleanup.get("block_newsletters"):
+            settings["blockNewsletters"] = True
+
+    if isinstance(payload.get("custom_css"), str):
+        settings["customCss"] = payload["custom_css"]
+    fail_on = payload.get("fail_on_status")
+    if isinstance(fail_on, list) and fail_on:
+        settings["failStatuses"] = ",".join(str(s) for s in fail_on)
+    raw_headers = payload.get("headers")
+    if isinstance(raw_headers, dict) and raw_headers:
         settings["headers"] = json.dumps(raw_headers, ensure_ascii=False)
+    elif isinstance(raw_headers, str) and raw_headers.strip():
+        settings["headers"] = raw_headers
+
+    for extra_key in _PRESET_CLI_EXTRAS:
+        if extra_key in payload:
+            settings[extra_key] = copy.deepcopy(payload[extra_key])
     return settings
 
 
 def preset_settings_to_payload(settings: dict[str, object]) -> dict[str, object]:
     """Convert either a Web UI PresetSettings dict or a RenderRequest dict into RenderRequest shape."""
     web_keys = {
-        "fullPage", "preserveViewportWidth", "lazyLoad", "optimizePng",
+        "width", "height", "fullPage", "preserveViewportWidth", "lazyLoad", "optimizePng",
         "videoDuration", "videoFps", "videoBitrate", "videoScroll",
         "waitEvent", "waitDelay", "waitSelector", "waitText", "waitTimeout",
         "blockAds", "blockTrackers", "blockChats", "blockNewsletters",
@@ -1195,6 +1414,25 @@ def preset_settings_to_payload(settings: dict[str, object]) -> dict[str, object]
     decoded_headers = _decode_preset_headers(settings.get("headers"))
     if decoded_headers:
         payload["headers"] = decoded_headers
+
+    if isinstance(settings.get("media"), str) and settings["media"] in _MEDIA:
+        env = dict(payload.get("environment") or {})  # type: ignore[arg-type]
+        env["media"] = settings["media"]
+        payload["environment"] = env
+    for section_key in ("image", "video", "pdf", "wait_for"):
+        extra_section = settings.get(section_key)
+        if isinstance(extra_section, dict) and extra_section:
+            merged_section = dict(payload.get(section_key) or {})  # type: ignore[arg-type]
+            merged_section.update(copy.deepcopy(extra_section))
+            payload[section_key] = merged_section
+    extra_diag = settings.get("diagnostics_extra")
+    if isinstance(extra_diag, dict) and extra_diag:
+        merged_diag = dict(payload.get("diagnostics") or {})  # type: ignore[arg-type]
+        merged_diag.update(copy.deepcopy(extra_diag))
+        payload["diagnostics"] = merged_diag
+    for extra_key in _PRESET_CLI_EXTRAS:
+        if extra_key in settings:
+            payload[extra_key] = copy.deepcopy(settings[extra_key])
     return payload
 
 
@@ -1943,6 +2181,83 @@ def _fast_validate_simple_payload(payload: dict[str, object]) -> bool:
     return True
 
 
+def _validate_payload_fallback(payload: dict[str, object]) -> None:
+    """Stdlib fallback validator used when Pydantic/RenderRequest is unavailable."""
+    if not isinstance(payload, dict):
+        raise ValueError("Render payload must be a JSON object.")
+    sources = sum(1 for k in ("url", "html", "markdown") if k in payload and payload[k] is not None)
+    if sources != 1:
+        raise ValueError("Render payload must specify exactly one of url, html, or markdown.")
+    for src_key in ("url", "html", "markdown"):
+        if src_key in payload and payload[src_key] is not None and not isinstance(payload[src_key], str):
+            raise ValueError(f"{src_key} must be a string.")
+    if "output" in payload:
+        out = payload["output"]
+        if not isinstance(out, str) or out not in _FORMATS:
+            raise ValueError(f"output must be one of: {', '.join(_FORMATS)}")
+    if "engine" in payload:
+        eng = payload["engine"]
+        if not isinstance(eng, str) or eng not in _ENGINES:
+            raise ValueError(f"engine must be one of: {', '.join(_ENGINES)}")
+    for bool_key in (
+        "full_page",
+        "stealth",
+        "cache",
+        "include_shadow_dom",
+        "preserve_viewport_width",
+        "save_profile",
+        "proceed_on_captcha",
+    ):
+        if bool_key in payload and type(payload[bool_key]) is not bool:
+            raise ValueError(f"{bool_key} must be a boolean.")
+    if "lazy_load" in payload and (not isinstance(payload["lazy_load"], str) or payload["lazy_load"] not in _LAZY):
+        raise ValueError(f"lazy_load must be one of: {', '.join(_LAZY)}")
+    if "profile" in payload and (not isinstance(payload["profile"], str) or payload["profile"] not in _PROFILES):
+        raise ValueError(f"profile must be one of: {', '.join(_PROFILES)}")
+    if "extract_mode" in payload and (not isinstance(payload["extract_mode"], str) or payload["extract_mode"] not in _EXTRACT):
+        raise ValueError(f"extract_mode must be one of: {', '.join(_EXTRACT)}")
+    if "viewport" in payload:
+        vp = payload["viewport"]
+        if not isinstance(vp, dict):
+            raise ValueError("viewport must be an object.")
+        for dim in ("width", "height"):
+            if dim in vp and (not _is_int(vp[dim]) or vp[dim] < 1):  # type: ignore[operator]
+                raise ValueError(f"viewport.{dim} must be a positive integer.")
+        if "device_scale_factor" in vp and (not _is_number(vp["device_scale_factor"]) or vp["device_scale_factor"] <= 0):  # type: ignore[operator]
+            raise ValueError("viewport.device_scale_factor must be a positive number.")
+    if "environment" in payload:
+        env = payload["environment"]
+        if not isinstance(env, dict):
+            raise ValueError("environment must be an object.")
+        if "device" in env and (not isinstance(env["device"], str) or env["device"] not in _DEVICES):
+            raise ValueError("environment.device is invalid.")
+        if "color_scheme" in env and (not isinstance(env["color_scheme"], str) or env["color_scheme"] not in _COLOR_SCHEMES):
+            raise ValueError("environment.color_scheme is invalid.")
+        if "reduced_motion" in env and (not isinstance(env["reduced_motion"], str) or env["reduced_motion"] not in _REDUCED_MOTION):
+            raise ValueError("environment.reduced_motion is invalid.")
+        if "media" in env and (not isinstance(env["media"], str) or env["media"] not in _MEDIA):
+            raise ValueError("environment.media is invalid.")
+    if "wait_for" in payload:
+        wf = payload["wait_for"]
+        if not isinstance(wf, dict):
+            raise ValueError("wait_for must be an object.")
+        if "event" in wf and (not isinstance(wf["event"], str) or wf["event"] not in _WAIT_EVENTS):
+            raise ValueError("wait_for.event is invalid.")
+        if "selector_state" in wf and (not isinstance(wf["selector_state"], str) or wf["selector_state"] not in _WAIT_STATES):
+            raise ValueError("wait_for.selector_state is invalid.")
+    if "actions" in payload:
+        acts = payload["actions"]
+        if not isinstance(acts, list):
+            raise ValueError("actions must be a list.")
+        for act in acts:
+            if not isinstance(act, dict) or not isinstance(act.get("type"), str) or act["type"] not in _FAST_ALL_ACTIONS:
+                raise ValueError("Each action must be an object with a valid type.")
+    if "headers" in payload:
+        hdrs = payload["headers"]
+        if not isinstance(hdrs, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in hdrs.items()):
+            raise ValueError("headers must be a mapping of string names to string values.")
+
+
 def validate_payload(payload: dict[str, object]) -> None:
     if _fast_validate_simple_payload(payload):
         return
@@ -1950,6 +2265,7 @@ def validate_payload(payload: dict[str, object]) -> None:
         from pydantic import ValidationError
         from vipercapture.render_contract import RenderRequest
     except ImportError:
+        _validate_payload_fallback(payload)
         return
     try:
         RenderRequest.model_validate(copy.deepcopy(payload))
@@ -2121,21 +2437,19 @@ def bearer_token(args: argparse.Namespace, *, started_server: bool) -> str:
     api_key = getattr(args, "api_key", None)
     if api_key is not None:
         return _header_token(api_key)
+    server = getattr(args, "server", None)
     project_key = _header_token(os.environ.get("VIPERCAPTURE_API_KEY", ""))
     if not project_key and not getattr(args, "no_config", False):
         try:
             cfg = load_cli_config()
         except ValueError:
             cfg = {}
-        cfg_key = cfg.get("api_key")
-        if isinstance(cfg_key, str) and cfg_key.strip():
-            project_key = _header_token(cfg_key)
+        project_key = _config_credential_for_server(cfg, "api_key", server)
     admin = _header_token(os.environ.get("VIPERCAPTURE_ADMIN_TOKEN", ""))
     if started_server and admin:
         return admin
     if project_key:
         return project_key
-    server = getattr(args, "server", None)
     if server is None or is_local_default(str(server)):
         return admin
     return ""
@@ -3306,7 +3620,7 @@ def run_capture(args: argparse.Namespace) -> int:
         base_idem = getattr(args, "idempotency_key", None)
         assert multi_targets is not None
         for index, (item_payload, target_path) in enumerate(zip(payloads, multi_targets), start=1):
-            item_idem = f"{base_idem}-{index}" if base_idem else None
+            item_idem = derive_batch_idempotency_key(base_idem, str(index)) if base_idem else None
             try:
                 headers, total, job_doc = _execute_one(
                     args,

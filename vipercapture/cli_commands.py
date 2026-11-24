@@ -13,6 +13,7 @@ import concurrent.futures
 import copy
 import hashlib
 import io
+import itertools
 import json
 import os
 import re
@@ -27,6 +28,8 @@ from vipercapture import capture_cli
 from vipercapture.capture_cli import (
     CaptureError,
     CaptureParser,
+    _config_credential_for_server,
+    _header_token,
     _json_line,
     _media_type,
     _read_json,
@@ -36,12 +39,14 @@ from vipercapture.capture_cli import (
     api_root,
     bearer_token,
     build_payload,
+    derive_batch_idempotency_key,
     display_path,
     display_server,
     encode_multipart_form,
     ensure_server,
     fail,
     filename_from_headers,
+    is_local_default,
     load_local_env,
     normalize_url,
     open_raw_response,
@@ -148,38 +153,55 @@ def _auth_headers(
     return headers
 
 
+def _is_local_target(args: argparse.Namespace) -> bool:
+    server = getattr(args, "server", None)
+    return server is None or is_local_default(str(server))
+
+
+def _load_local_env_for_target(args: argparse.Namespace) -> None:
+    if _is_local_target(args):
+        load_local_env()
+
+
 def _admin_token(args: argparse.Namespace) -> str:
     explicit = getattr(args, "admin_token", None) or getattr(args, "api_key", None)
     if explicit is not None:
-        return explicit.strip()
-    env_admin = os.environ.get("VIPERCAPTURE_ADMIN_TOKEN", "").strip()
-    if env_admin:
-        return env_admin
-    try:
-        cfg = load_cli_config()
-    except ValueError:
-        cfg = {}
-    cfg_admin = cfg.get("admin_token")
-    if isinstance(cfg_admin, str) and cfg_admin.strip():
-        return cfg_admin.strip()
+        return _header_token(explicit)
+    if not getattr(args, "no_config", False):
+        try:
+            cfg = load_cli_config()
+        except ValueError:
+            cfg = {}
+        cfg_admin = _config_credential_for_server(cfg, "admin_token", getattr(args, "server", None))
+        if cfg_admin:
+            return cfg_admin
+    if _is_local_target(args):
+        env_admin = _header_token(os.environ.get("VIPERCAPTURE_ADMIN_TOKEN", ""))
+        if env_admin:
+            return env_admin
     return ""
 
 
 def _signing_token(args: argparse.Namespace) -> str:
-    explicit = getattr(args, "signing_token", None)
-    if explicit is not None and explicit.strip():
-        return explicit.strip()
-    for env_name in ("VIPERCAPTURE_SIGNING_ADMIN_TOKEN", "VIPERCAPTURE_SIGNING_SECRET"):
-        val = os.environ.get(env_name, "").strip()
-        if val:
-            return val
-    try:
-        cfg = load_cli_config()
-    except ValueError:
-        cfg = {}
-    cfg_sign = cfg.get("signing_token")
-    if isinstance(cfg_sign, str) and cfg_sign.strip():
-        return cfg_sign.strip()
+    explicit_sign = getattr(args, "signing_token", None)
+    if explicit_sign is not None and explicit_sign.strip():
+        return _header_token(explicit_sign)
+    explicit_api = getattr(args, "api_key", None)
+    if explicit_api is not None and explicit_api.strip():
+        return _header_token(explicit_api)
+    if not getattr(args, "no_config", False):
+        try:
+            cfg = load_cli_config()
+        except ValueError:
+            cfg = {}
+        cfg_sign = _config_credential_for_server(cfg, "signing_token", getattr(args, "server", None))
+        if cfg_sign:
+            return cfg_sign
+    if _is_local_target(args):
+        for env_name in ("VIPERCAPTURE_SIGNING_ADMIN_TOKEN", "VIPERCAPTURE_SIGNING_SECRET"):
+            val = _header_token(os.environ.get(env_name, ""))
+            if val:
+                return val
     return bearer_token(args, started_server=False)
 
 
@@ -471,7 +493,8 @@ def cmd_gpu(argv: list[str]) -> int:
     )
     _add_common_client_flags(parser)
     args = parser.parse_args(argv)
-    load_local_env()
+    if args.mode != "status":
+        _load_local_env_for_target(args)
     try:
         root = api_root(args.server)
     except ValueError as exc:
@@ -483,7 +506,7 @@ def cmd_gpu(argv: list[str]) -> int:
                 root + "/app-config",
                 method="GET",
                 payload=None,
-                headers=_auth_headers(args, started_server=started),
+                headers={"Accept": "application/json"},
                 timeout=15.0,
             )
             try:
@@ -1215,7 +1238,9 @@ def cmd_bulk(argv: list[str]) -> int:
             extra: dict[str, str] = {}
             if args.idempotency_key:
                 extra["Idempotency-Key"] = (
-                    args.idempotency_key if len(chunks) == 1 else f"{args.idempotency_key}-batch-{batch_idx}"
+                    args.idempotency_key
+                    if len(chunks) == 1
+                    else derive_batch_idempotency_key(args.idempotency_key, f"batch-{batch_idx}")
                 )
             resp = open_response(
                 root + "/v1/jobs/bulk",
@@ -1290,12 +1315,14 @@ def cmd_bulk(argv: list[str]) -> int:
                 base_stem = safe_filename(f"{safe_filename(host or 'item')}-{idx + 1}")
             stem = base_stem
             if stem.lower() in used_stems:
-                candidate = safe_filename(f"{base_stem}-{idx + 1}")
-                suffix_num = 2
-                while candidate.lower() in used_stems:
-                    candidate = safe_filename(f"{base_stem}-{idx + 1}-{suffix_num}")
-                    suffix_num += 1
-                stem = candidate
+                for suffix_num in itertools.count(1):
+                    suffix = f"-{idx + 1}" if suffix_num == 1 else f"-{idx + 1}-{suffix_num}"
+                    prefix_limit = max(1, 80 - len(suffix))
+                    prefix = base_stem[:prefix_limit].rstrip(" ._-") or "item"
+                    candidate = safe_filename(f"{prefix}{suffix}")
+                    if candidate.lower() not in used_stems:
+                        stem = candidate
+                        break
             used_stems.add(stem.lower())
             tasks.append((idx, entry["job"], stem))
 
@@ -1863,7 +1890,7 @@ def cmd_sign(argv: list[str]) -> int:
     if args.ttl < 1:
         return fail("--ttl must be 1 or greater.", exit_code=2)
 
-    load_local_env()
+    _load_local_env_for_target(args)
     try:
         root = api_root(args.server)
         _ensure_render_namespace(args)
@@ -2088,7 +2115,7 @@ def cmd_verify(argv: list[str]) -> int:
     )
     _add_common_client_flags(parser, include_no_start=False)
     args = parser.parse_args(argv)
-    load_local_env()
+    _load_local_env_for_target(args)
 
     key_spec = args.public_key
     allow_key_file = True
@@ -2103,7 +2130,7 @@ def cmd_verify(argv: list[str]) -> int:
                 root + "/v1/certification/public-key",
                 method="GET",
                 payload=None,
-                headers={"Accept": "application/json"},
+                headers=_auth_headers(args, started_server=False, extra={"Accept": "application/json"}),
                 timeout=15.0,
             )
             try:
@@ -2194,7 +2221,7 @@ def cmd_admin(argv: list[str]) -> int:
     _add_admin_flags(p_status)
 
     args = parser.parse_args(argv)
-    load_local_env()
+    _load_local_env_for_target(args)
     try:
         root = api_root(args.server)
     except ValueError as exc:

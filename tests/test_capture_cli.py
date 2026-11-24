@@ -1200,12 +1200,22 @@ class NewCaptureFeaturesTests(unittest.TestCase):
                 self.assertEqual(main(["--no-config", "--dry-run", "https://example.com", "--cookie-file", str(part_file)]), 2)
             self.assertIn("partitionKey", stderr.getvalue())
 
-            # 3. Malformed --from-json with non-string enum (list) exits 2 cleanly instead of TypeError
+            # 3. Malformed --from-json with non-string enum (list) exits 2 cleanly even without pydantic
             bad_json = Path(tmp) / "bad.json"
             bad_json.write_text(json.dumps({"url": "https://example.com", "engine": ["chromium"]}), encoding="utf-8")
             stderr = io.StringIO()
-            with mock.patch("sys.stderr", stderr):
+            with mock.patch.dict(sys.modules, {"pydantic": None}), mock.patch("sys.stderr", stderr):
                 self.assertEqual(main(["--no-config", "--dry-run", "--from-json", str(bad_json)]), 2)
+
+            # 3b. Batch idempotency key derivation stays <= 128 chars for max-length keys
+            from vipercapture.capture_cli import derive_batch_idempotency_key
+            long_key = "k" * 128
+            derived_1 = derive_batch_idempotency_key(long_key, "1")
+            derived_2 = derive_batch_idempotency_key(long_key, "2")
+            self.assertLessEqual(len(derived_1), 128)
+            self.assertLessEqual(len(derived_2), 128)
+            self.assertNotEqual(derived_1, derived_2)
+            self.assertEqual(derived_1, derive_batch_idempotency_key(long_key, "1"))
 
             # 4. Mixed-host multi-URL rejects domainless Cookie header file so cookies cannot leak across hosts
             hdr_file = Path(tmp) / "hdr.txt"
