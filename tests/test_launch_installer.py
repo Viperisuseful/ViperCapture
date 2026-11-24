@@ -2655,6 +2655,22 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
         ensure_deps.assert_called_once()
         cli_main.assert_called_once()
 
+    def test_non_loopback_host_requires_admin_token(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch("launch.sys.argv", ["launch.py", "--host", "0.0.0.0", "--port", "9000"]),
+            mock.patch("launch.ensure_venv"),
+            mock.patch("launch.port_open", return_value=False),
+            mock.patch("launch.ensure_deps"),
+            mock.patch("launch.ensure_playwright"),
+            mock.patch("launch._new_server_environment", return_value=({}, "tok")),
+            mock.patch("sys.stderr", stderr),
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                launch.main()
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("VIPERCAPTURE_ADMIN_TOKEN", stderr.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

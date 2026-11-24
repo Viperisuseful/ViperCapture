@@ -3500,6 +3500,16 @@ def _can_import_cryptography() -> bool:
         return False
 
 
+def _is_loopback_bind_host(host: str) -> bool:
+    cleaned = host.strip().lower().strip("[]")
+    if cleaned in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    try:
+        return _mod("ipaddress").ip_address(cleaned).is_loopback
+    except ValueError:
+        return False
+
+
 def _format_bind_url(host: str, port: int) -> tuple[str, str]:
     """Return (connect_host, http_url) for a configured bind host and port."""
     if host == "0.0.0.0":
@@ -3590,6 +3600,14 @@ def main() -> None:
     log_handle = None
     log_tee_thread = None
     server_env, shutdown_token = _new_server_environment()
+    if not _is_loopback_bind_host(bind_host) and not server_env.get("VIPERCAPTURE_ADMIN_TOKEN", "").strip():
+        print(
+            "  Refusing to bind non-loopback --host without VIPERCAPTURE_ADMIN_TOKEN set "
+            "(the render API would be exposed without authentication).\n"
+            "  Set VIPERCAPTURE_ADMIN_TOKEN in the environment or .env.local, or bind to 127.0.0.1.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
     popen_kwargs: dict[str, object] = {"cwd": str(ROOT), "env": server_env}
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)

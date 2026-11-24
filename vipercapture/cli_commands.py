@@ -357,11 +357,13 @@ def cmd_status(argv: list[str]) -> int:
         _cfg_status, config_doc, _ = _probe_json_allow_error_body(root + "/app-config", headers, 5.0)
 
     is_ready = bool(ready_status == 200 and isinstance(ready_doc, dict) and ready_doc.get("ready"))
-    ver = read_version()
+    cli_ver = read_version()
+    server_ver = config_doc.get("version") if isinstance(config_doc, dict) and isinstance(config_doc.get("version"), str) else None
     summary: dict[str, object] = {
         "ok": running,
         "server": display_server(root),
-        "version": ver,
+        "cli_version": cli_ver,
+        "server_version": server_ver,
         "running": running,
         "healthy": running,
         "ready": is_ready,
@@ -378,8 +380,10 @@ def cmd_status(argv: list[str]) -> int:
         _emit_json(summary)
         return 0 if running else 1
 
-    write_line(sys.stdout, f"Server:   {display_server(root)}")
-    write_line(sys.stdout, f"Version:  {ver}")
+    write_line(sys.stdout, f"Server:      {display_server(root)}")
+    write_line(sys.stdout, f"CLI Version: {cli_ver}")
+    if server_ver:
+        write_line(sys.stdout, f"Server Ver:  {server_ver}")
     if not running:
         write_line(sys.stdout, "Status:   stopped (unreachable)")
         return 1

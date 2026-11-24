@@ -403,6 +403,8 @@ class CliCommandsTests(unittest.TestCase):
         doc = json.loads(stdout)
         self.assertTrue(doc["running"])
         self.assertTrue(doc["ready"])
+        self.assertEqual(doc["cli_version"], read_version())
+        self.assertIsNone(doc["server_version"])
         self.assertEqual(doc["config"]["gpu"]["mode"], "off")
 
         self.httpd.state["ready"] = False  # type: ignore[attr-defined]
