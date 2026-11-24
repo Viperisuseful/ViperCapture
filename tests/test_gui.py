@@ -2128,3 +2128,272 @@ class GuiCouncilHardeningTests(TestCase):
 
         rendered = gui._render_edit_field_ansi("\x1b[31mabc", 6, 10)
         self.assertIn("a\x1b[7mb\x1b[0mc", rendered)
+
+    def test_round5_tls_in_tls_proxy_cancel_handshake_idna_noproxy_and_path_scoping(self) -> None:
+        import socket as _socket
+        import ssl as _ssl
+        import threading as _threading
+        import time as _time
+
+        # 1. Admin-token fallback rejected for path-prefixed local service on port 8000
+        self.assertEqual(
+            gui.capture_credential(
+                started_server=False,
+                environ={"VIPERCAPTURE_ADMIN_TOKEN": "admin-secret"},
+                endpoint="http://127.0.0.1:8000/other-app/v1/render",
+            ),
+            "",
+        )
+
+        # 2. Implicit default port matches port-specific NO_PROXY=capture.example:443
+        proxies = {"https": "http://127.0.0.1:8888", "no": "capture.example:443"}
+        with (
+            mock.patch.object(gui.urllib.request, "getproxies", return_value=proxies),
+            mock.patch.object(gui.urllib.request, "proxy_bypass", return_value=False),
+        ):
+            self.assertIsNone(
+                gui._proxy_for_url("https://capture.example/v1/render", "https", "capture.example", 443)
+            )
+
+        # 3. IDNA hostname encodes to ASCII punycode in CONNECT without UnicodeEncodeError
+        seen_connect: list[bytes] = []
+        idna_srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        idna_srv.bind(("127.0.0.1", 0))
+        idna_srv.listen(1)
+        idna_port = idna_srv.getsockname()[1]
+
+        def _accept_idna() -> None:
+            conn, _ = idna_srv.accept()
+            try:
+                conn.settimeout(2.0)
+                seen_connect.append(conn.recv(512))
+                conn.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            finally:
+                conn.close()
+
+        t_idna = _threading.Thread(target=_accept_idna, daemon=True)
+        t_idna.start()
+        try:
+            with (
+                mock.patch.object(
+                    gui.urllib.request,
+                    "getproxies",
+                    return_value={"https": f"http://127.0.0.1:{idna_port}"},
+                ),
+                mock.patch.object(gui.urllib.request, "proxy_bypass_environment", return_value=False),
+                mock.patch.object(gui.urllib.request, "proxy_bypass", return_value=False),
+            ):
+                req = gui.urllib.request.Request("https://münchen.example/v1/render", data=b"{}", method="POST")
+                with self.assertRaises(gui.http.client.HTTPException):
+                    gui._open_capture(req, timeout=2.0, cancel=None)
+        finally:
+            t_idna.join(timeout=2.0)
+            idna_srv.close()
+        self.assertTrue(seen_connect)
+        self.assertIn(b"CONNECT xn--mnchen-3ya.example:443 HTTP/1.1", seen_connect[0])
+
+        # 4. Escape cancels a stalled TLS handshake immediately (not waiting for timeout)
+        hold_evt = _threading.Event()
+        hello_seen = _threading.Event()
+        stall_srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        stall_srv.bind(("127.0.0.1", 0))
+        stall_srv.listen(1)
+        stall_port = stall_srv.getsockname()[1]
+
+        def _stall_tls() -> None:
+            conn, _ = stall_srv.accept()
+            try:
+                conn.settimeout(5.0)
+                conn.recv(512)
+                hello_seen.set()
+                hold_evt.wait(timeout=5.0)
+            finally:
+                conn.close()
+
+        t_stall = _threading.Thread(target=_stall_tls, daemon=True)
+        t_stall.start()
+        cancel = gui.CancelFlag()
+        outcome: list[object] = []
+
+        def _worker() -> None:
+            with (
+                mock.patch.object(
+                    gui.urllib.request,
+                    "getproxies",
+                    return_value={"https": f"https://127.0.0.1:{stall_port}"},
+                ),
+                mock.patch.object(gui.urllib.request, "proxy_bypass_environment", return_value=False),
+                mock.patch.object(gui.urllib.request, "proxy_bypass", return_value=False),
+            ):
+                req = gui.urllib.request.Request("https://remote.example/v1/render", data=b"{}", method="POST")
+                try:
+                    gui._open_capture(req, timeout=30.0, cancel=cancel)
+                except Exception as exc:
+                    outcome.append(exc)
+
+        w = _threading.Thread(target=_worker, daemon=True)
+        w.start()
+        self.assertTrue(hello_seen.wait(timeout=3.0))
+        t0 = _time.monotonic()
+        cancel.abort()
+        w.join(timeout=3.0)
+        elapsed = _time.monotonic() - t0
+        hold_evt.set()
+        t_stall.join(timeout=2.0)
+        stall_srv.close()
+        self.assertFalse(w.is_alive())
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(len(outcome), 1)
+        self.assertIsInstance(outcome[0], gui._Cancelled)
+
+        # 5. End-to-end verified HTTPS-in-HTTPS proxy capture returns full PNG response body
+        try:
+            from cryptography import x509
+            from cryptography.hazmat.primitives import hashes, serialization
+            from cryptography.hazmat.primitives.asymmetric import rsa
+            from cryptography.x509.oid import NameOID
+            import datetime as _dt
+            import ipaddress as _ip
+        except ImportError:
+            return
+
+        with TemporaryDirectory() as tmp:
+            def _make_cert(cn: str, san_dns: list[str], san_ips: list[str], prefix: str) -> tuple[Path, Path]:
+                key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+                now = _dt.datetime.now(_dt.timezone.utc)
+                names = [x509.DNSName(d) for d in san_dns] + [x509.IPAddress(_ip.ip_address(ip)) for ip in san_ips]
+                cert = (
+                    x509.CertificateBuilder()
+                    .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)]))
+                    .issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)]))
+                    .public_key(key.public_key())
+                    .serial_number(x509.random_serial_number())
+                    .not_valid_before(now - _dt.timedelta(minutes=5))
+                    .not_valid_after(now + _dt.timedelta(hours=1))
+                    .add_extension(x509.SubjectAlternativeName(names), critical=False)
+                    .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+                    .sign(key, hashes.SHA256())
+                )
+                cert_p = Path(tmp) / f"{prefix}.crt"
+                key_p = Path(tmp) / f"{prefix}.key"
+                cert_p.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+                key_p.write_bytes(
+                    key.private_bytes(
+                        serialization.Encoding.PEM,
+                        serialization.PrivateFormat.TraditionalOpenSSL,
+                        serialization.NoEncryption(),
+                    )
+                )
+                return cert_p, key_p
+
+            proxy_cert, proxy_key = _make_cert("127.0.0.1", ["localhost"], ["127.0.0.1"], "proxy")
+            dest_cert, dest_key = _make_cert("capture.example", ["capture.example"], [], "dest")
+            ca_bundle = Path(tmp) / "ca.pem"
+            ca_bundle.write_bytes(proxy_cert.read_bytes() + b"\n" + dest_cert.read_bytes())
+
+            dest_srv_ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+            dest_srv_ctx.load_cert_chain(str(dest_cert), str(dest_key))
+            proxy_srv_ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+            proxy_srv_ctx.load_cert_chain(str(proxy_cert), str(proxy_key))
+
+            dest_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+            dest_sock.bind(("127.0.0.1", 0))
+            dest_sock.listen(1)
+            dest_port = dest_sock.getsockname()[1]
+
+            proxy_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+            proxy_sock.bind(("127.0.0.1", 0))
+            proxy_sock.listen(1)
+            proxy_port = proxy_sock.getsockname()[1]
+
+            png_body = b"\x89PNG\r\n\x1a\ntls-in-tls-ok"
+
+            def _run_dest() -> None:
+                raw, _ = dest_sock.accept()
+                tls = dest_srv_ctx.wrap_socket(raw, server_side=True)
+                try:
+                    tls.settimeout(5.0)
+                    buf = bytearray()
+                    while b"\r\n\r\n" not in buf:
+                        buf.extend(tls.recv(4096))
+                    # Read request body if Content-Length present
+                    head, _, rest = bytes(buf).partition(b"\r\n\r\n")
+                    cl = 0
+                    for line in head.decode("iso-8859-1").splitlines()[1:]:
+                        if line.lower().startswith("content-length:"):
+                            cl = int(line.split(":", 1)[1].strip())
+                    while len(rest) < cl:
+                        rest += tls.recv(4096)
+                    resp = (
+                        f"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {len(png_body)}\r\nConnection: close\r\n\r\n"
+                    ).encode("ascii") + png_body
+                    tls.sendall(resp)
+                finally:
+                    tls.close()
+
+            def _run_proxy() -> None:
+                raw, _ = proxy_sock.accept()
+                outer = proxy_srv_ctx.wrap_socket(raw, server_side=True)
+                upstream: _socket.socket | None = None
+                try:
+                    outer.settimeout(5.0)
+                    req_buf = bytearray()
+                    while not req_buf.endswith(b"\r\n\r\n"):
+                        ch = outer.recv(1)
+                        if not ch:
+                            return
+                        req_buf.extend(ch)
+                    upstream = _socket.create_connection(("127.0.0.1", dest_port), timeout=5.0)
+                    outer.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+
+                    def _pipe(src: _socket.socket, dst: _socket.socket) -> None:
+                        try:
+                            while True:
+                                data = src.recv(4096)
+                                if not data:
+                                    break
+                                dst.sendall(data)
+                        except OSError:
+                            pass
+
+                    t1 = _threading.Thread(target=_pipe, args=(outer, upstream), daemon=True)
+                    t2 = _threading.Thread(target=_pipe, args=(upstream, outer), daemon=True)
+                    t1.start()
+                    t2.start()
+                    t1.join(timeout=5.0)
+                    t2.join(timeout=5.0)
+                finally:
+                    if upstream is not None:
+                        upstream.close()
+                    outer.close()
+
+            td = _threading.Thread(target=_run_dest, daemon=True)
+            tp = _threading.Thread(target=_run_proxy, daemon=True)
+            td.start()
+            tp.start()
+            try:
+                client_ctx = _ssl.create_default_context(cafile=str(ca_bundle))
+                with (
+                    mock.patch.object(gui, "_default_ssl_context", return_value=client_ctx),
+                    mock.patch.object(
+                        gui.urllib.request,
+                        "getproxies",
+                        return_value={"https": f"https://127.0.0.1:{proxy_port}"},
+                    ),
+                    mock.patch.object(gui.urllib.request, "proxy_bypass_environment", return_value=False),
+                    mock.patch.object(gui.urllib.request, "proxy_bypass", return_value=False),
+                ):
+                    req = gui.urllib.request.Request(
+                        f"https://capture.example:{dest_port}/v1/render",
+                        data=b'{"url":"https://example.com","output":"png"}',
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with gui._open_capture(req, timeout=5.0, cancel=None) as resp:
+                        self.assertEqual(resp.status, 200)
+                        self.assertEqual(resp.read(128), png_body)
+            finally:
+                td.join(timeout=3.0)
+                tp.join(timeout=3.0)
+                dest_sock.close()
+                proxy_sock.close()

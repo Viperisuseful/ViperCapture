@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import http.client
+import io
 import ipaddress
 import json
 import math
@@ -3095,7 +3096,12 @@ def capture_credential(
             return ""
         scheme = parsed.scheme.lower()
         local = is_local_server(endpoint)
-        default_local = local and (parsed.port or (443 if scheme == "https" else 80)) == launch.PORT and scheme == "http"
+        default_local = (
+            local
+            and (parsed.port or (443 if scheme == "https" else 80)) == launch.PORT
+            and scheme == "http"
+            and parsed.path == "/v1/render"
+        )
         if not local:
             if scheme != "https":
                 return ""
@@ -3422,6 +3428,156 @@ def _read_tunnel_response(sock: socket.socket) -> tuple[int, str]:
     return code, reason
 
 
+def _ascii_host(hostname: str) -> str:
+    if ":" in hostname:
+        return hostname
+    try:
+        return hostname.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise ValueError(f"Invalid hostname: {hostname!r}") from exc
+
+
+def _host_for_header(hostname: str) -> str:
+    ascii_host = _ascii_host(hostname)
+    return f"[{ascii_host}]" if ":" in ascii_host else ascii_host
+
+
+def _default_ssl_context() -> ssl.SSLContext:
+    return ssl.create_default_context()
+
+
+class _TlsInTlsRawIO(io.RawIOBase):
+    def __init__(self, sock: "_TlsInTlsSocket") -> None:
+        self._sock = sock
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b: bytearray | memoryview) -> int:  # type: ignore[override]
+        return self._sock.recv_into(b)
+
+
+class _TlsInTlsSocket:
+    """True TLS-in-TLS socket over an outer SSLSocket via ssl.MemoryBIO."""
+
+    def __init__(
+        self,
+        outer: ssl.SSLSocket,
+        context: ssl.SSLContext,
+        server_hostname: str,
+    ) -> None:
+        self._outer = outer
+        self._in_bio = ssl.MemoryBIO()
+        self._out_bio = ssl.MemoryBIO()
+        self._ssl_obj = context.wrap_bio(
+            self._in_bio,
+            self._out_bio,
+            server_hostname=server_hostname,
+        )
+        self._closed = False
+
+    def _flush_out(self) -> None:
+        pending = self._out_bio.read()
+        if pending:
+            self._outer.sendall(pending)
+
+    def _pump_in(self) -> None:
+        data = self._outer.recv(16_384)
+        if not data:
+            self._in_bio.write_eof()
+        else:
+            self._in_bio.write(data)
+
+    def do_handshake(self) -> None:
+        while True:
+            try:
+                self._ssl_obj.do_handshake()
+                self._flush_out()
+                return
+            except ssl.SSLWantReadError:
+                self._flush_out()
+                self._pump_in()
+            except ssl.SSLWantWriteError:
+                self._flush_out()
+
+    def sendall(self, data: bytes | bytearray | memoryview) -> None:
+        view = memoryview(data)
+        sent = 0
+        total = len(view)
+        while sent < total:
+            try:
+                written = self._ssl_obj.write(view[sent:])
+                sent += written
+                self._flush_out()
+            except ssl.SSLWantWriteError:
+                self._flush_out()
+            except ssl.SSLWantReadError:
+                self._flush_out()
+                self._pump_in()
+
+    def recv(self, size: int = 16_384) -> bytes:
+        if size <= 0:
+            return b""
+        while True:
+            try:
+                return self._ssl_obj.read(size)
+            except ssl.SSLWantReadError:
+                self._flush_out()
+                self._pump_in()
+            except ssl.SSLWantWriteError:
+                self._flush_out()
+            except ssl.SSLEOFError:
+                return b""
+
+    def recv_into(self, buffer: bytearray | memoryview, nbytes: int = 0) -> int:
+        want = nbytes or len(buffer)
+        chunk = self.recv(want)
+        count = len(chunk)
+        buffer[:count] = chunk
+        return count
+
+    def makefile(self, mode: str = "rb", buffering: int = -1) -> object:
+        raw = _TlsInTlsRawIO(self)
+        if buffering == 0:
+            return raw
+        return io.BufferedReader(raw, buffer_size=buffering if buffering > 0 else io.DEFAULT_BUFFER_SIZE)
+
+    def settimeout(self, timeout: float | None) -> None:
+        self._outer.settimeout(timeout)
+
+    def gettimeout(self) -> float | None:
+        return self._outer.gettimeout()
+
+    def shutdown(self, how: int) -> None:
+        self._outer.shutdown(how)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        _close_socket(self._outer)
+
+
+def _wrap_tls_cancellable(
+    sock: socket.socket,
+    context: ssl.SSLContext,
+    *,
+    server_hostname: str,
+    live_sock: list[object | None],
+    cancel: CancelFlag | None,
+) -> ssl.SSLSocket:
+    tls_sock = context.wrap_socket(
+        sock,
+        server_hostname=server_hostname,
+        do_handshake_on_connect=False,
+    )
+    live_sock[0] = tls_sock
+    if cancel is not None and cancel.requested:
+        raise _Cancelled()
+    tls_sock.do_handshake()
+    return tls_sock
+
+
 def _open_capture(
     request: urllib.request.Request,
     timeout: float,
@@ -3431,19 +3587,23 @@ def _open_capture(
     if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
         raise ValueError("The API address is not http or https.")
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    ascii_dest_host = _ascii_host(parsed.hostname)
+    dest_host_hdr = _host_for_header(parsed.hostname)
     path = parsed.path or "/"
     if parsed.query:
         path = f"{path}?{parsed.query}"
     headers = _outgoing_headers(request)
     request_target = path
-    proxy_raw = _proxy_for_url(request.full_url, parsed.scheme, parsed.hostname, parsed.port)
-    live_sock: list[socket.socket | None] = [None]
+    proxy_raw = _proxy_for_url(request.full_url, parsed.scheme, parsed.hostname, port)
+    live_sock: list[object | None] = [None]
     connection: http.client.HTTPConnection | None = None
 
     def _abort_active() -> None:
         if connection is not None:
             _close_connection(connection)
-        _close_socket(live_sock[0])
+        active = live_sock[0]
+        if active is not None:
+            _close_socket(active)  # type: ignore[arg-type]
 
     try:
         if cancel is not None and cancel.requested:
@@ -3454,6 +3614,7 @@ def _open_capture(
             if proxy_parsed.scheme not in {"http", "https"} or proxy_parsed.hostname is None:
                 raise ValueError("The configured proxy URL is invalid.")
             proxy_port = proxy_parsed.port or (443 if proxy_parsed.scheme == "https" else 80)
+            ascii_proxy_host = _ascii_host(proxy_parsed.hostname)
             proxy_headers: dict[str, str] = {}
             if proxy_parsed.username is not None:
                 user = urllib.parse.unquote(proxy_parsed.username)
@@ -3462,7 +3623,7 @@ def _open_capture(
                 proxy_headers["Proxy-Authorization"] = f"Basic {creds}"
 
             sock: socket.socket = socket.create_connection(
-                (proxy_parsed.hostname, proxy_port),
+                (ascii_proxy_host, proxy_port),
                 timeout=timeout,
             )
             live_sock[0] = sock
@@ -3472,15 +3633,18 @@ def _open_capture(
                 raise _Cancelled()
 
             if proxy_parsed.scheme == "https":
-                proxy_ctx = ssl.create_default_context()
-                sock = proxy_ctx.wrap_socket(sock, server_hostname=proxy_parsed.hostname)
-                live_sock[0] = sock
+                sock = _wrap_tls_cancellable(
+                    sock,
+                    _default_ssl_context(),
+                    server_hostname=ascii_proxy_host,
+                    live_sock=live_sock,
+                    cancel=cancel,
+                )
 
             if parsed.scheme == "https":
-                target_host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
                 connect_lines = [
-                    f"CONNECT {target_host}:{port} HTTP/1.1",
-                    f"Host: {target_host}:{port}",
+                    f"CONNECT {dest_host_hdr}:{port} HTTP/1.1",
+                    f"Host: {dest_host_hdr}:{port}",
                 ]
                 for hdr_name, hdr_val in proxy_headers.items():
                     connect_lines.append(f"{hdr_name}: {hdr_val}")
@@ -3490,25 +3654,48 @@ def _open_capture(
                 status_code, reason = _read_tunnel_response(sock)
                 if status_code != 200:
                     raise http.client.HTTPException(f"Tunnel connection failed: {status_code} {reason}")
-                dest_ctx = ssl.create_default_context()
-                dest_sock = dest_ctx.wrap_socket(sock, server_hostname=parsed.hostname)
-                live_sock[0] = dest_sock
-                connection = http.client.HTTPSConnection(parsed.hostname, port, timeout=timeout)
-                connection.sock = dest_sock
+                if isinstance(sock, ssl.SSLSocket):
+                    tunnel_sock: object = _TlsInTlsSocket(sock, _default_ssl_context(), ascii_dest_host)
+                    live_sock[0] = tunnel_sock
+                    if cancel is not None and cancel.requested:
+                        raise _Cancelled()
+                    tunnel_sock.do_handshake()  # type: ignore[attr-defined]
+                else:
+                    tunnel_sock = _wrap_tls_cancellable(
+                        sock,
+                        _default_ssl_context(),
+                        server_hostname=ascii_dest_host,
+                        live_sock=live_sock,
+                        cancel=cancel,
+                    )
+                connection = http.client.HTTPSConnection(ascii_dest_host, port, timeout=timeout)
+                connection.sock = tunnel_sock  # type: ignore[assignment]
             else:
                 if proxy_parsed.scheme == "https":
-                    connection = http.client.HTTPSConnection(proxy_parsed.hostname, proxy_port, timeout=timeout)
+                    connection = http.client.HTTPSConnection(ascii_proxy_host, proxy_port, timeout=timeout)
                 else:
-                    connection = http.client.HTTPConnection(proxy_parsed.hostname, proxy_port, timeout=timeout)
+                    connection = http.client.HTTPConnection(ascii_proxy_host, proxy_port, timeout=timeout)
                 connection.sock = sock
                 request_target = request.full_url
                 headers.update(proxy_headers)
         elif parsed.scheme == "https":
-            connection = http.client.HTTPSConnection(parsed.hostname, port, timeout=timeout)
+            raw_sock = socket.create_connection((ascii_dest_host, port), timeout=timeout)
+            live_sock[0] = raw_sock
             if cancel is not None:
                 cancel.bind(_abort_active)
+            if cancel is not None and cancel.requested:
+                raise _Cancelled()
+            tls_sock = _wrap_tls_cancellable(
+                raw_sock,
+                _default_ssl_context(),
+                server_hostname=ascii_dest_host,
+                live_sock=live_sock,
+                cancel=cancel,
+            )
+            connection = http.client.HTTPSConnection(ascii_dest_host, port, timeout=timeout)
+            connection.sock = tls_sock
         else:
-            connection = http.client.HTTPConnection(parsed.hostname, port, timeout=timeout)
+            connection = http.client.HTTPConnection(ascii_dest_host, port, timeout=timeout)
             if cancel is not None:
                 cancel.bind(_abort_active)
 
