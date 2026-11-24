@@ -717,8 +717,11 @@ class CliCommandsTests(unittest.TestCase):
         self.assertIn("ttl_seconds=900", req["path"])
 
     def test_verify_real_certified_bundle_and_detects_tampering(self) -> None:
-        from cryptography.hazmat.primitives import serialization
-        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        try:
+            from cryptography.hazmat.primitives import serialization
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        except ImportError:
+            self.skipTest("cryptography not installed")
 
         artifact = RenderArtifact(b"\x89PNG\r\n\x1a\ncertified-image", "image/png", "capture.png")
         bundle_bytes = _certify_artifact(artifact, self.cert_secret)

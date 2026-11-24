@@ -2,9 +2,18 @@
 
 from __future__ import annotations
 
+import ast
 import os
-import tomllib
+import re
 from pathlib import Path
+
+try:
+    import tomllib  # type: ignore[import-not-found]
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback (e.g. Ubuntu CI)
+    try:
+        import tomli as tomllib  # type: ignore[import-not-found,no-redef]
+    except ModuleNotFoundError:
+        tomllib = None  # type: ignore[assignment]
 
 import launch
 
@@ -131,6 +140,102 @@ def _normalize_section(raw: dict[str, object]) -> dict[str, object]:
     return values
 
 
+def _strip_toml_comment(line: str) -> str:
+    in_quote: str | None = None
+    escaped = False
+    for index, ch in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if in_quote == '"' and ch == "\\":
+            escaped = True
+            continue
+        if ch in {'"', "'"}:
+            if in_quote is None:
+                in_quote = ch
+            elif in_quote == ch:
+                in_quote = None
+            continue
+        if ch == "#" and in_quote is None:
+            return line[:index]
+    return line
+
+
+def _parse_toml_scalar(raw: str) -> object:
+    value = raw.strip()
+    if not value:
+        raise ValueError("missing value")
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    if value.startswith('"') and value.endswith('"'):
+        return ast.literal_eval(value)
+    if value.startswith("'") and value.endswith("'"):
+        return value[1:-1]
+    if value.startswith("[") and value.endswith("]"):
+        inner = value[1:-1].strip()
+        if not inner:
+            return []
+        return [_parse_toml_scalar(part) for part in inner.split(",")]
+    if re.fullmatch(r"[+-]?\d+", value):
+        return int(value)
+    if re.fullmatch(r"[+-]?(?:\d+\.\d*|\.\d+|\d+[eE][+-]?\d+|\d+\.\d*[eE][+-]?\d+)", value):
+        return float(value)
+    raise ValueError(f"unsupported TOML value {value!r}")
+
+
+def _fallback_toml_loads(text: str) -> dict[str, object]:
+    """Minimal TOML subset parser used only on Python <3.11 without tomli."""
+    root: dict[str, object] = {}
+    current: dict[str, object] = root
+    for line_no, raw_line in enumerate(text.splitlines(), start=1):
+        line = _strip_toml_comment(raw_line).strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", section):
+                raise ValueError(f"line {line_no}: unsupported section [{section}]")
+            existing = root.get(section)
+            if existing is None:
+                existing = {}
+                root[section] = existing
+            elif not isinstance(existing, dict):
+                raise ValueError(f"line {line_no}: section {section} conflicts with key")
+            current = existing
+            continue
+        if "=" not in line:
+            raise ValueError(f"line {line_no}: expected key = value")
+        key_raw, val_raw = line.split("=", 1)
+        key = key_raw.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", key):
+            raise ValueError(f"line {line_no}: invalid key {key!r}")
+        try:
+            current[key] = _parse_toml_scalar(val_raw)
+        except (ValueError, SyntaxError) as exc:
+            raise ValueError(f"line {line_no}: {exc}") from exc
+    return root
+
+
+def _parse_toml(raw_bytes: bytes, target: Path) -> dict[str, object]:
+    try:
+        text = raw_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"Invalid TOML in {target}: {exc}") from exc
+    if tomllib is not None:
+        try:
+            parsed = tomllib.loads(text)
+        except tomllib.TOMLDecodeError as exc:
+            raise ValueError(f"Invalid TOML in {target}: {exc}") from exc
+    else:
+        try:
+            parsed = _fallback_toml_loads(text)
+        except ValueError as exc:
+            raise ValueError(f"Invalid TOML in {target}: {exc}") from exc
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def load_cli_config(path: Path | None = None) -> dict[str, object]:
     """Load optional ~/.vipercapture/config.toml defaults.
 
@@ -144,11 +249,8 @@ def load_cli_config(path: Path | None = None) -> dict[str, object]:
         raw_bytes = target.read_bytes()
     except OSError as exc:
         raise ValueError(f"Could not read config file {target}: {exc}") from exc
-    try:
-        parsed = tomllib.loads(raw_bytes.decode("utf-8-sig"))
-    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
-        raise ValueError(f"Invalid TOML in {target}: {exc}") from exc
-    if not isinstance(parsed, dict):
+    parsed = _parse_toml(raw_bytes, target)
+    if not parsed:
         return {}
     merged = _normalize_section(parsed)
     capture_table = parsed.get("capture")
