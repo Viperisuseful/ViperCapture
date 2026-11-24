@@ -1693,8 +1693,12 @@ def apply_preset_settings_with_warnings(
     ignored: list[str] = []
 
     out = settings.get("output")
+    allowed_formats = state.available_formats or FORMATS
     if isinstance(out, str) and out in FORMATS:
-        changes["output"] = out
+        if out in allowed_formats:
+            changes["output"] = out
+        else:
+            ignored.append(f"output({out})")
 
     w = settings.get("width")
     h = settings.get("height")
@@ -1777,6 +1781,8 @@ def apply_preset_settings_with_warnings(
     scheme = settings.get("colorScheme")
     if isinstance(scheme, str) and scheme in COLOR_SCHEMES:
         changes["color_scheme"] = scheme
+    elif isinstance(scheme, str) and scheme == "no-preference":
+        ignored.append("colorScheme")
 
     paper = settings.get("paperSize")
     if isinstance(paper, str) and paper in PDF_PAPER_SIZES:
@@ -1826,6 +1832,10 @@ def apply_preset_settings_with_warnings(
         ignored.append("extractMode")
     if isinstance(settings.get("pdfMode"), str) and settings["pdfMode"] not in {"", "print"}:
         ignored.append("pdfMode")
+    if isinstance(settings.get("waitTimeout"), (int, float)) and not isinstance(settings.get("waitTimeout"), bool) and float(settings["waitTimeout"]) != 15.0:
+        ignored.append("waitTimeout")
+    if isinstance(settings.get("pdfMargin"), (int, float)) and not isinstance(settings.get("pdfMargin"), bool) and abs(float(settings["pdfMargin"]) - 0.4) > 1e-6:
+        ignored.append("pdfMargin")
     if isinstance(settings.get("videoBitrate"), (int, float)) and not isinstance(settings.get("videoBitrate"), bool) and settings["videoBitrate"] != 20:
         ignored.append("videoBitrate")
 
@@ -1952,10 +1962,8 @@ def _parse_presets_body(data: Mapping[str, object] | None) -> tuple[PresetEntry,
             continue
         name = item.get("name")
         settings = item.get("settings")
-        if isinstance(name, str) and isinstance(settings, dict):
-            clean_name = " ".join(sanitize_terminal_text(name).split())
-            if clean_name:
-                entries.append(PresetEntry(name=clean_name, settings=dict(settings)))
+        if isinstance(name, str) and name.strip() and isinstance(settings, dict):
+            entries.append(PresetEntry(name=name, settings=dict(settings)))
     return tuple(entries)
 
 
@@ -2541,16 +2549,20 @@ def _preset_summary(settings: Mapping[str, object]) -> str:
     bits: list[str] = []
     out = settings.get("output")
     if isinstance(out, str):
-        bits.append(out)
+        clean_out = sanitize_terminal_text(out).strip()
+        if clean_out:
+            bits.append(clean_out)
     w, h = settings.get("width"), settings.get("height")
-    if isinstance(w, (int, float)) and isinstance(h, (int, float)):
+    if isinstance(w, (int, float)) and not isinstance(w, bool) and isinstance(h, (int, float)) and not isinstance(h, bool):
         bits.append(f"{int(w)}x{int(h)}")
     scheme = settings.get("colorScheme")
     if isinstance(scheme, str) and scheme != "system":
-        bits.append(scheme)
+        clean_scheme = sanitize_terminal_text(scheme).strip()
+        if clean_scheme:
+            bits.append(clean_scheme)
     if settings.get("fullPage") is True:
         bits.append("full")
-    return " · ".join(bits)
+    return sanitize_terminal_text(" · ".join(bits))
 
 
 def _drawer_panel_presets(state: GuiState, inner: int, max_body_rows: int) -> list[str]:
@@ -3576,11 +3588,13 @@ def _run_keys(
     *,
     started_server: bool,
     base_url: str = "",
+    config_loaded: bool = False,
 ) -> int:
     resolved_base = base_url or server_base_url(None)
-    config = fetch_app_config(resolved_base, timeout=0.6)
-    if config is not None:
-        state = apply_app_config(state, config)
+    if not config_loaded:
+        config = fetch_app_config(resolved_base, timeout=0.6)
+        if config is not None:
+            state = apply_app_config(state, config)
     if os.name == "nt":
         return _run_windows_keys(
             state, directory, drawer, started_server=started_server, base_url=resolved_base
@@ -3844,6 +3858,14 @@ def _windows_shift_pressed() -> bool:
         return False
 
 
+def _is_paste_prefix(buf: bytearray) -> bool:
+    if not buf:
+        return False
+    if buf.startswith(_PASTE_START):
+        return True
+    return len(buf) < len(_PASTE_START) and _PASTE_START.startswith(bytes(buf))
+
+
 def _drain_windows_escape(
     msvcrt_mod: object,
     pending: bytearray | None = None,
@@ -3851,10 +3873,11 @@ def _drain_windows_escape(
     """Drain a VT escape sequence or bracketed paste on Windows Terminal.
 
     When ``pending`` is supplied by the caller, an in-progress bracketed paste
-    stays in ``pending`` across timeouts instead of being dropped or flushed.
+    (including a split opening ``\\x1b[200~`` marker) stays in ``pending`` across
+    timeouts instead of being dropped or flushed.
     """
     buf = pending if pending is not None else bytearray()
-    if not buf.startswith(_PASTE_START):
+    if not buf:
         buf.extend(b"\x1b")
     deadline = time.monotonic() + 0.025
     while True:
@@ -3866,7 +3889,7 @@ def _drain_windows_escape(
                 return keys
             if not buf:
                 return []
-            if buf.startswith(_PASTE_START):
+            if _is_paste_prefix(buf):
                 deadline = time.monotonic() + 0.25
             else:
                 deadline = time.monotonic() + 0.02
@@ -3874,8 +3897,8 @@ def _drain_windows_escape(
         if time.monotonic() >= deadline:
             break
         time.sleep(0.002)
-    if buf.startswith(_PASTE_START):
-        # Keep paste mode active across delayed chunks until \x1b[201~ arrives.
+    if _is_paste_prefix(buf) and len(buf) > 1:
+        # Keep paste mode active across delayed chunks (even if \x1b[200~ was split).
         return []
     return flush_bare_escape(buf)
 
@@ -3907,7 +3930,7 @@ def _run_windows_keys(
             drawer.draw(state)
             dirty = False
         if msvcrt.kbhit():
-            if pending.startswith(_PASTE_START):
+            if pending:
                 names = _drain_windows_escape(msvcrt, pending)
             else:
                 char = msvcrt.getwch()
@@ -4072,6 +4095,9 @@ def run_capture_gui(
                     started.pid, shutdown_token, launch.PORT
                 )
             state = _replace(state, busy=False, progress=0)
+        config = fetch_app_config(base_url, timeout=0.6)
+        if config is not None:
+            state = apply_app_config(state, config)
         if preset:
             state = _apply_startup_preset(state, base_url, preset)
         return _run_keys(
@@ -4080,6 +4106,7 @@ def run_capture_gui(
             drawer,
             started_server=started is not None,
             base_url=base_url,
+            config_loaded=config is not None,
         )
     except KeyboardInterrupt:
         return 0

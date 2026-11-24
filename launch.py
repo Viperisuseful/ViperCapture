@@ -496,9 +496,14 @@ def png_rgba(png: bytes) -> tuple[int, int, bytes]:
     ):
         raise ValueError("unsupported png")
     channels = 4 if color_type == 6 else 3
-    raw = zlib.decompress(bytes(idat))
     stride = width * channels
     expected = height * (stride + 1)
+    if expected > 64 * 1024 * 1024:
+        raise ValueError("png too large")
+    decompressor = zlib.decompressobj()
+    raw = decompressor.decompress(bytes(idat), expected + 1)
+    if len(raw) > expected or decompressor.unconsumed_tail:
+        raise ValueError("png exceeds expected raster size")
     if len(raw) < expected:
         raise ValueError("truncated png")
     rows: list[bytearray] = []
@@ -3327,6 +3332,8 @@ def _validate_server_url(token: str) -> str:
         or not parsed.hostname
         or parsed.username is not None
         or parsed.password is not None
+        or "?" in value
+        or "#" in value
         or parsed.query
         or parsed.fragment
         or (port is not None and not (1 <= port <= 65535))

@@ -2645,6 +2645,19 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
         port_open.assert_called_once()
         mod_mock.assert_called_once_with("webbrowser")
 
+    def test_validate_server_url_rejects_query_and_fragment_delimiters(self) -> None:
+        self.assertEqual(launch._validate_server_url("https://example.com/api/"), "https://example.com/api")
+        for bad in (
+            "https://example.com?",
+            "https://example.com#",
+            "https://example.com/?a=1",
+            "https://example.com/#frag",
+        ):
+            with self.subTest(url=bad):
+                with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit) as ctx:
+                    launch._validate_server_url(bad)
+                self.assertEqual(ctx.exception.code, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

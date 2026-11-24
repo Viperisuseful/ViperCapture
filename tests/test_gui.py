@@ -1435,7 +1435,16 @@ class GuiCouncilHardeningTests(TestCase):
             {"presets": [{"name": "Dark\x1b[2J\x1b]0;pwn\x07Mode", "settings": {"output": "png"}}]}
         )
         self.assertEqual(len(presets), 1)
-        self.assertEqual(presets[0].name, "DarkMode")
+        # Exact server identifier is preserved for delete/lookup; rendered frame strips escapes.
+        self.assertEqual(presets[0].name, "Dark\x1b[2J\x1b]0;pwn\x07Mode")
+        preset_frame = gui.render_frame(
+            launch.WindowSize(80, 24),
+            gui.GuiState(drawer="presets", presets=presets),
+        ).decode("utf-8")
+        self.assertNotIn("\x1b]0;pwn", preset_frame)
+        self.assertNotIn("\x1b[2J", preset_frame[4:])
+        self.assertNotIn("\x07", preset_frame)
+        self.assertIn("DarkMode", preset_frame)
 
         state = gui.GuiState(error="err\x1b]52;c;ZGF0YQ==\x07msg")
         frame = gui.render_frame(launch.WindowSize(80, 24), state).decode("utf-8")
@@ -1648,3 +1657,117 @@ class GuiCouncilHardeningTests(TestCase):
         )
         self.assertNotIn(b"\x1bPq", fallback_frame)
         self.assertIn(b"Capture History", fallback_frame)
+
+        # PNG zlib decompression bomb (small 10x10 header, huge decompressed IDAT) must raise & skip Sixel
+        bomb_png = make_png(10, 10, b"\x00" * 200_000)
+        with self.assertRaises(ValueError):
+            launch.png_rgba(bomb_png)
+        bomb_frame = gui.render_frame(
+            launch.WindowSize(100, 30, 800, 480),
+            state,
+            protocol="sixel",
+            preview_png=bomb_png,
+        )
+        self.assertNotIn(b"\x1bPq", bomb_frame)
+
+    def test_preset_exact_name_preserved_on_delete_and_summary_sanitized(self) -> None:
+        presets = gui._parse_presets_body(
+            {
+                "presets": [
+                    {
+                        "name": "Web  PDF",
+                        "settings": {
+                            "output": "\x1b]52;c;ZGF0YQ==\x07png",
+                            "colorScheme": "\x1b[31mdark\x07",
+                        },
+                    },
+                    {"name": "Web PDF", "settings": {"output": "pdf"}},
+                ]
+            }
+        )
+        self.assertEqual([p.name for p in presets], ["Web  PDF", "Web PDF"])
+        summary = gui._preset_summary(presets[0].settings)
+        self.assertNotIn("\x1b", summary)
+        self.assertNotIn("\x07", summary)
+        state = gui.GuiState(drawer="presets", presets=presets, drawer_index=0)
+        frame = gui.render_frame(launch.WindowSize(80, 24), state).decode("utf-8")
+        self.assertNotIn("\x1b]52", frame)
+        self.assertNotIn("\x07", frame)
+
+        with mock.patch.object(gui, "delete_preset_remote", return_value=((presets[1],), "")) as del_mock:
+            gui._handle_key(state, "d", None, gui.CancelFlag(), {}, Path("."), started_server=False)
+        del_mock.assert_called_once()
+        self.assertEqual(del_mock.call_args.args[1], "Web  PDF")
+
+    def test_preset_checks_available_formats_and_reports_extra_ignored_fields(self) -> None:
+        base = gui.GuiState(output="png", available_formats=("png", "webp"))
+        updated, ignored = gui.apply_preset_settings_with_warnings(
+            base,
+            {
+                "output": "mp4",
+                "waitTimeout": 30,
+                "pdfMargin": 12,
+                "colorScheme": "no-preference",
+            },
+        )
+        self.assertEqual(updated.output, "png")
+        self.assertIn("output(mp4)", ignored)
+        self.assertIn("waitTimeout", ignored)
+        self.assertIn("pdfMargin", ignored)
+        self.assertIn("colorScheme", ignored)
+
+        # Startup --preset must run after /app-config restricts available_formats
+        mp4_preset = gui.PresetEntry(name="Video", settings={"output": "mp4", "width": 1280, "height": 720})
+        captured_initial: list[gui.GuiState] = []
+
+        def fake_run_keys(
+            initial: gui.GuiState,
+            *_args: object,
+            config_loaded: bool = False,
+            **_kwargs: object,
+        ) -> gui.GuiState:
+            self.assertTrue(config_loaded)
+            captured_initial.append(initial)
+            return initial
+
+        with (
+            mock.patch.object(gui, "fetch_app_config", return_value={"output_formats": ["png", "webp"]}),
+            mock.patch.object(gui, "fetch_presets", return_value=((mp4_preset,), "")),
+            mock.patch.object(gui, "load_url_history", return_value=()),
+            mock.patch.object(gui, "_run_keys", side_effect=fake_run_keys),
+            mock.patch.object(gui, "_enter"),
+            mock.patch.object(gui, "_leave"),
+            mock.patch.object(gui, "_enable_windows_vt", return_value=None),
+            mock.patch.object(gui, "_restore_windows_vt"),
+            mock.patch.object(launch, "choose_graphics_protocol", return_value="none"),
+            mock.patch.object(launch, "port_open", return_value=True),
+            mock.patch.object(launch, "ensure_deps"),
+            mock.patch.object(launch, "ensure_playwright"),
+            mock.patch.object(gui.sys, "stdin", mock.Mock(isatty=lambda: True)),
+            mock.patch.object(gui.sys, "stdout", mock.Mock(isatty=lambda: True)),
+        ):
+            gui.run_capture_gui((1920, 1080), preset="Video")
+        self.assertEqual(len(captured_initial), 1)
+        self.assertEqual(captured_initial[0].output, "png")
+        self.assertIn("output(mp4)", captured_initial[0].notice)
+
+    def test_windows_split_opening_paste_marker_stays_in_paste_mode(self) -> None:
+        class FakeMsvcrt:
+            def __init__(self, chunks: list[str]) -> None:
+                self._buf = list(chunks)
+
+            def kbhit(self) -> bool:
+                return bool(self._buf)
+
+            def getwch(self) -> str:
+                return self._buf.pop(0)
+
+        pending = bytearray()
+        # Opening \x1b[200~ split across Windows reads: first read gets \x1b then "[20"
+        self.assertEqual(gui._drain_windows_escape(FakeMsvcrt(list("[20")), pending), [])
+        self.assertEqual(bytes(pending), b"\x1b[20")
+        self.assertEqual(gui._drain_windows_escape(FakeMsvcrt(list("0~https://split.\n")), pending), [])
+        self.assertTrue(pending.startswith(gui._PASTE_START))
+        emitted = gui._drain_windows_escape(FakeMsvcrt(list("example\x1b[201~")), pending)
+        self.assertEqual(emitted, ["paste:https://split.\nexample"])
+        self.assertEqual(len(pending), 0)
