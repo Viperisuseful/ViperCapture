@@ -1144,12 +1144,12 @@ def payload_to_preset_settings(payload: dict[str, object]) -> dict[str, object]:
 
     image = payload.get("image")
     if isinstance(image, dict):
-        if isinstance(image.get("quality"), int):
+        if isinstance(image.get("quality"), int) and not isinstance(image.get("quality"), bool):
             settings["quality"] = image["quality"]
-        if image.get("transparent_background"):
-            settings["transparent"] = True
+        if "transparent_background" in image:
+            settings["transparent"] = _coerce_bool(image.get("transparent_background"), False)
         if "optimize_for_speed" in image:
-            settings["optimizePng"] = bool(image["optimize_for_speed"])
+            settings["optimizePng"] = _coerce_bool(image.get("optimize_for_speed"), False)
         extra_img = {k: v for k, v in image.items() if k not in {"quality", "transparent_background", "optimize_for_speed"}}
         if extra_img:
             settings["image"] = copy.deepcopy(extra_img)
@@ -1158,24 +1158,24 @@ def payload_to_preset_settings(payload: dict[str, object]) -> dict[str, object]:
         settings["lazyLoad"] = payload["lazy_load"]
     diag = payload.get("diagnostics")
     if isinstance(diag, dict):
-        if diag.get("bundle"):
-            settings["diagnostics"] = True
+        if "bundle" in diag:
+            settings["diagnostics"] = _coerce_bool(diag.get("bundle"), False)
         extra_diag = {k: v for k, v in diag.items() if k != "bundle"}
         if extra_diag:
             settings["diagnostics_extra"] = copy.deepcopy(extra_diag)
 
     video = payload.get("video")
     if isinstance(video, dict):
-        if isinstance(video.get("duration_ms"), (int, float)):
+        if isinstance(video.get("duration_ms"), (int, float)) and not isinstance(video.get("duration_ms"), bool):
             settings["videoDuration"] = round(float(video["duration_ms"]) / 1000.0, 3)
-        if isinstance(video.get("fps"), int):
+        if isinstance(video.get("fps"), int) and not isinstance(video.get("fps"), bool):
             settings["videoFps"] = video["fps"]
-        if isinstance(video.get("bitrate_mbps"), int):
+        if isinstance(video.get("bitrate_mbps"), int) and not isinstance(video.get("bitrate_mbps"), bool):
             settings["videoBitrate"] = video["bitrate_mbps"]
-        if video.get("scroll"):
-            settings["videoScroll"] = True
-        if video.get("transparent_background"):
-            settings["transparent"] = True
+        if "scroll" in video:
+            settings["videoScroll"] = _coerce_bool(video.get("scroll"), False)
+        if "transparent_background" in video and (fmt in {"webm", "mp4", "gif"} or "transparent" not in settings):
+            settings["transparent"] = _coerce_bool(video.get("transparent_background"), False)
         extra_vid = {
             k: v for k, v in video.items()
             if k not in {"duration_ms", "fps", "bitrate_mbps", "scroll", "transparent_background"}
@@ -1295,20 +1295,20 @@ def preset_settings_to_payload(settings: dict[str, object]) -> dict[str, object]
     fmt = _FORMAT_ALIASES.get(fmt, fmt)
     payload["output"] = fmt
     if "fullPage" in settings:
-        full_page = bool(settings["fullPage"])
+        full_page = _coerce_bool(settings["fullPage"], True)
         if not full_page:
             payload["full_page"] = False
     else:
         full_page = True
-    if full_page and settings.get("preserveViewportWidth"):
+    if full_page and _coerce_bool(settings.get("preserveViewportWidth"), False):
         payload["preserve_viewport_width"] = True
 
     viewport: dict[str, object] = {}
-    if isinstance(settings.get("width"), (int, float)) and int(settings["width"]) > 0:
+    if isinstance(settings.get("width"), (int, float)) and not isinstance(settings.get("width"), bool) and int(settings["width"]) > 0:
         viewport["width"] = int(settings["width"])
-    if isinstance(settings.get("height"), (int, float)) and int(settings["height"]) > 0:
+    if isinstance(settings.get("height"), (int, float)) and not isinstance(settings.get("height"), bool) and int(settings["height"]) > 0:
         viewport["height"] = int(settings["height"])
-    if isinstance(settings.get("density"), (int, float)) and float(settings["density"]) != 1.0:
+    if isinstance(settings.get("density"), (int, float)) and not isinstance(settings.get("density"), bool) and float(settings["density"]) != 1.0:
         viewport["device_scale_factor"] = float(settings["density"])
     if viewport:
         payload["viewport"] = viewport
@@ -1316,7 +1316,7 @@ def preset_settings_to_payload(settings: dict[str, object]) -> dict[str, object]
     selector = str(settings.get("selector") or "").strip()
     if selector and not full_page:
         payload["selector"] = selector
-    if settings.get("clipEnabled") and not full_page:
+    if _coerce_bool(settings.get("clipEnabled"), False) and not full_page:
         payload["clip"] = {
             "x": float(settings.get("clipX", 0)),
             "y": float(settings.get("clipY", 0)),
@@ -1327,31 +1327,31 @@ def preset_settings_to_payload(settings: dict[str, object]) -> dict[str, object]
     is_image = fmt in {"png", "jpeg", "webp", "avif"}
     is_video = fmt in {"webm", "mp4", "gif"}
     image: dict[str, object] = {}
-    if fmt in {"jpeg", "webp", "avif"} and isinstance(settings.get("quality"), int):
+    if fmt in {"jpeg", "webp", "avif"} and isinstance(settings.get("quality"), int) and not isinstance(settings.get("quality"), bool):
         image["quality"] = int(settings["quality"])
-    if fmt in {"png", "webp", "avif"} and settings.get("transparent"):
+    if fmt in {"png", "webp", "avif"} and _coerce_bool(settings.get("transparent"), False):
         image["transparent_background"] = True
     if fmt in {"png", "webp"} and "optimizePng" in settings:
-        image["optimize_for_speed"] = bool(settings["optimizePng"])
+        image["optimize_for_speed"] = _coerce_bool(settings["optimizePng"], False)
     if image:
         payload["image"] = image
 
     if settings.get("lazyLoad") in _LAZY:
         payload["lazy_load"] = settings["lazyLoad"]
-    if settings.get("diagnostics"):
+    if _coerce_bool(settings.get("diagnostics"), False):
         payload["diagnostics"] = {"bundle": True}
 
     if is_video:
         video: dict[str, object] = {}
-        if isinstance(settings.get("videoDuration"), (int, float)):
+        if isinstance(settings.get("videoDuration"), (int, float)) and not isinstance(settings.get("videoDuration"), bool):
             video["duration_ms"] = int(round(float(settings["videoDuration"]) * 1000))
-        if isinstance(settings.get("videoFps"), int):
+        if isinstance(settings.get("videoFps"), int) and not isinstance(settings.get("videoFps"), bool):
             video["fps"] = int(settings["videoFps"])
-        if isinstance(settings.get("videoBitrate"), int):
+        if isinstance(settings.get("videoBitrate"), int) and not isinstance(settings.get("videoBitrate"), bool):
             video["bitrate_mbps"] = int(settings["videoBitrate"])
-        if settings.get("videoScroll"):
+        if _coerce_bool(settings.get("videoScroll"), False):
             video["scroll"] = True
-        if full_page and fmt in {"webm", "gif"} and settings.get("transparent"):
+        if full_page and fmt in {"webm", "gif"} and _coerce_bool(settings.get("transparent"), False):
             video["transparent_background"] = True
         if video:
             payload["video"] = video
@@ -1404,13 +1404,13 @@ def preset_settings_to_payload(settings: dict[str, object]) -> dict[str, object]
     cleanup: dict[str, object] = {}
     if settings.get("consent") in _CONSENT and settings["consent"] != "none":
         cleanup["consent_mode"] = settings["consent"]
-    if settings.get("blockAds"):
+    if _coerce_bool(settings.get("blockAds"), False):
         cleanup["block_ads"] = True
-    if settings.get("blockTrackers"):
+    if _coerce_bool(settings.get("blockTrackers"), False):
         cleanup["block_trackers"] = True
-    if settings.get("blockChats"):
+    if _coerce_bool(settings.get("blockChats"), False):
         cleanup["block_chats"] = True
-    if settings.get("blockNewsletters"):
+    if _coerce_bool(settings.get("blockNewsletters"), False):
         cleanup["block_newsletters"] = True
     if cleanup:
         payload["cleanup"] = cleanup

@@ -358,7 +358,15 @@ def cmd_status(argv: list[str]) -> int:
 
     is_ready = bool(ready_status == 200 and isinstance(ready_doc, dict) and ready_doc.get("ready"))
     cli_ver = read_version()
-    server_ver = config_doc.get("version") if isinstance(config_doc, dict) and isinstance(config_doc.get("version"), str) else None
+    server_ver: str | None = None
+    if isinstance(config_doc, dict) and isinstance(config_doc.get("version"), str) and config_doc["version"].strip():
+        server_ver = config_doc["version"].strip()
+    elif running:
+        _oa_status, oa_doc, _ = _probe_json_allow_error_body(root + "/openapi.json", headers, 5.0)
+        if isinstance(oa_doc, dict) and isinstance(oa_doc.get("info"), dict):
+            oa_ver = oa_doc["info"].get("version")
+            if isinstance(oa_ver, str) and oa_ver.strip():
+                server_ver = oa_ver.strip()
     summary: dict[str, object] = {
         "ok": running,
         "server": display_server(root),

@@ -84,14 +84,23 @@ class _ApiMockHandler(BaseHTTPRequestHandler):
             self._send_json(200 if ready else 503, {"ready": ready, "role": "all", "async_jobs": True})
             return
         if path == "/app-config":
-            self._send_json(200, {
+            doc = {
                 "control_plane": True,
                 "presets": True,
                 "browser_engines": ["chromium", "firefox", "webkit"],
                 "output_formats": ["png", "jpeg", "pdf"],
                 "async_jobs": {"enabled": True, "workers": 4, "queue_limit": 200},
                 "gpu": {"mode": state["gpu_mode"], "hardware_active": state["gpu_mode"] == "auto", "mutable": True},
-            })
+            }
+            if state.get("app_config_version") is not None:
+                doc["version"] = state["app_config_version"]
+            self._send_json(200, doc)
+            return
+        if path == "/openapi.json":
+            if state.get("openapi_version") is not None:
+                self._send_json(200, {"openapi": "3.1.0", "info": {"title": "ViperCapture", "version": state["openapi_version"]}})
+                return
+            self._send_json(404, {"error": {"code": "not_found", "message": "Not found"}})
             return
         if path == "/local/presets":
             self._send_json(200, {"presets": state["presets"]})
@@ -1136,6 +1145,84 @@ class CliCouncilHardeningTests(unittest.TestCase):
             doc = json.loads(stdout)
             self.assertEqual(doc["succeeded"], 2)
             self.assertEqual(len({r["path"] for r in doc["results"]}), 2)
+
+    def test_round5_status_server_version_and_preset_bool_strings(self) -> None:
+        # 1. status reports server_version from /app-config when distinct from CLI version
+        self.httpd.state["app_config_version"] = "9.9.9-server"  # type: ignore[attr-defined]
+        code, stdout, stderr = self._run(["status", "--server", self.server, "--json"])
+        self.assertEqual(code, 0, stderr)
+        doc = json.loads(stdout)
+        self.assertEqual(doc["cli_version"], read_version())
+        self.assertEqual(doc["server_version"], "9.9.9-server")
+        self.assertNotEqual(doc["cli_version"], doc["server_version"])
+
+        code, text_out, stderr = self._run(["status", "--server", self.server])
+        self.assertEqual(code, 0, stderr)
+        self.assertIn(f"CLI Version: {read_version()}", text_out)
+        self.assertIn("Server Ver:  9.9.9-server", text_out)
+
+        # 2. status falls back to /openapi.json info.version when /app-config omits version
+        self.httpd.state["app_config_version"] = None  # type: ignore[attr-defined]
+        self.httpd.state["openapi_version"] = "8.8.8-openapi"  # type: ignore[attr-defined]
+        code, stdout, stderr = self._run(["status", "--server", self.server, "--json"])
+        self.assertEqual(code, 0, stderr)
+        doc = json.loads(stdout)
+        self.assertEqual(doc["cli_version"], read_version())
+        self.assertEqual(doc["server_version"], "8.8.8-openapi")
+
+        # 3. preset save --from-json coerces false/0 boolean strings across image, diagnostics, video, cleanup
+        with tempfile.TemporaryDirectory() as tmp:
+            img_json = Path(tmp) / "img_false.json"
+            img_json.write_text(
+                json.dumps({
+                    "output": "png",
+                    "image": {
+                        "transparent_background": "false",
+                        "optimize_for_speed": "0",
+                    },
+                    "diagnostics": {"bundle": "false"},
+                    "cleanup": {
+                        "block_ads": "false",
+                        "block_trackers": "0",
+                    },
+                }),
+                encoding="utf-8",
+            )
+            code, stdout, stderr = self._run([
+                "preset", "save", "false-strings-img",
+                "--from-json", str(img_json),
+                "--server", self.server,
+                "--json",
+            ])
+            self.assertEqual(code, 0, stderr)
+            saved = json.loads(stdout)["settings"]
+            self.assertIs(saved["transparent"], False)
+            self.assertIs(saved["optimizePng"], False)
+            self.assertIs(saved["diagnostics"], False)
+            self.assertIs(saved["blockAds"], False)
+            self.assertIs(saved["blockTrackers"], False)
+
+            vid_json = Path(tmp) / "vid_false.json"
+            vid_json.write_text(
+                json.dumps({
+                    "output": "webm",
+                    "video": {
+                        "scroll": "false",
+                        "transparent_background": "0",
+                    },
+                }),
+                encoding="utf-8",
+            )
+            code, stdout, stderr = self._run([
+                "preset", "save", "false-strings-vid",
+                "--from-json", str(vid_json),
+                "--server", self.server,
+                "--json",
+            ])
+            self.assertEqual(code, 0, stderr)
+            saved_vid = json.loads(stdout)["settings"]
+            self.assertIs(saved_vid["videoScroll"], False)
+            self.assertIs(saved_vid["transparent"], False)
 
 
 if __name__ == "__main__":

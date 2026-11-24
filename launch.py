@@ -2062,9 +2062,30 @@ def _server_record_path(pid: int) -> Path:
     return Path.home() / ".vipercapture" / "runtime" / f"server-{pid}.json"
 
 
+def _load_local_env_into(env: dict[str, str], root_dir: Path | None = None) -> None:
+    """Load machine-only KEY=VALUE entries from .env.local without overriding existing env."""
+    path = (root_dir if root_dir is not None else ROOT) / ".env.local"
+    try:
+        if not path.is_file():
+            return
+        raw_text = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    re_mod = _mod("re")
+    for raw_line in raw_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, separator, value = line.partition("=")
+        key = key.strip()
+        if separator and re_mod.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            env.setdefault(key, value.strip().strip("\"'"))
+
+
 def _new_server_environment() -> tuple[dict[str, str], str]:
     token = _mod("secrets").token_urlsafe(32)
     env = dict(os.environ)
+    _load_local_env_into(env)
     env["VIPERCAPTURE_SHUTDOWN_TOKEN"] = token
     return env, token
 

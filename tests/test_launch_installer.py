@@ -2671,6 +2671,63 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 2)
         self.assertIn("VIPERCAPTURE_ADMIN_TOKEN", stderr.getvalue())
 
+    def test_non_loopback_host_accepts_admin_token_from_env_local(self) -> None:
+        file_token = "f" * 40
+        env_token = "e" * 40
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".env.local").write_text(
+                f'VIPERCAPTURE_ADMIN_TOKEN="{file_token}"\n'
+                f'VIPERCAPTURE_SHUTDOWN_TOKEN="spoofed"\n',
+                encoding="utf-8",
+            )
+            clean_env = {
+                k: v for k, v in os.environ.items()
+                if k not in {"VIPERCAPTURE_ADMIN_TOKEN", "VIPERCAPTURE_SHUTDOWN_TOKEN"}
+            }
+            with (
+                mock.patch("launch.ROOT", root),
+                mock.patch.dict(os.environ, clean_env, clear=True),
+            ):
+                loaded_env, shutdown_token = launch._new_server_environment()
+                self.assertEqual(loaded_env.get("VIPERCAPTURE_ADMIN_TOKEN"), file_token)
+                self.assertEqual(loaded_env.get("VIPERCAPTURE_SHUTDOWN_TOKEN"), shutdown_token)
+                self.assertNotEqual(shutdown_token, "spoofed")
+
+                # Existing process env takes precedence over .env.local.
+                os.environ["VIPERCAPTURE_ADMIN_TOKEN"] = env_token
+                override_env, _ = launch._new_server_environment()
+                self.assertEqual(override_env.get("VIPERCAPTURE_ADMIN_TOKEN"), env_token)
+
+            # End-to-end launch.main() with --host 0.0.0.0 succeeds when token is only in .env.local.
+            captured_popen_env: dict[str, str] = {}
+
+            class _StopLaunch(RuntimeError):
+                pass
+
+            def _fake_popen(*_args, **kwargs):
+                captured_popen_env.update(kwargs.get("env") or {})
+                raise _StopLaunch()
+
+            fake_subproc = mock.MagicMock(Popen=_fake_popen, STDOUT=-2, PIPE=-1)
+            real_mod = launch._mod
+            with (
+                mock.patch("launch.ROOT", root),
+                mock.patch.dict(os.environ, clean_env, clear=True),
+                mock.patch("launch.sys.argv", ["launch.py", "--host", "0.0.0.0", "--port", "9000"]),
+                mock.patch("launch.ensure_venv"),
+                mock.patch("launch.port_open", return_value=False),
+                mock.patch("launch.ensure_deps"),
+                mock.patch("launch.ensure_playwright"),
+                mock.patch(
+                    "launch._mod",
+                    side_effect=lambda name: fake_subproc if name == "subprocess" else real_mod(name),
+                ),
+            ):
+                with self.assertRaises(_StopLaunch):
+                    launch.main()
+            self.assertEqual(captured_popen_env.get("VIPERCAPTURE_ADMIN_TOKEN"), file_token)
+
 
 if __name__ == "__main__":
     unittest.main()
