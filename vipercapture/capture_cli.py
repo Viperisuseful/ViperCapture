@@ -9,17 +9,25 @@ the shell quotes arguments before Python sees them.
 from __future__ import annotations
 
 import argparse
+import copy
+import datetime
 import json
 import math
+import mimetypes
 import os
 import re
+import secrets
+import shutil
+import subprocess
 import sys
 import time
+from http.cookies import CookieError, SimpleCookie
 from pathlib import Path
 from typing import TextIO
 from urllib.parse import urljoin, urlsplit
 
 import launch
+from vipercapture.cli_config import load_cli_config
 
 EXAMPLE = (
     "vipercapture capture https://dimaths.ma "
@@ -71,6 +79,20 @@ _EXTENSIONS = {
     "mp4": ".mp4",
     "gif": ".gif",
 }
+_MEDIA_EXTENSIONS = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/webp": ".webp",
+    "image/avif": ".avif",
+    "application/pdf": ".pdf",
+    "text/html": ".html",
+    "text/markdown": ".md",
+    "application/json": ".json",
+    "video/webm": ".webm",
+    "video/mp4": ".mp4",
+    "image/gif": ".gif",
+    "application/zip": ".zip",
+}
 _FORMATS = (
     "png", "jpeg", "jpg", "webp", "avif", "pdf", "html", "markdown", "md",
     "metadata", "webm", "mp4", "gif",
@@ -112,7 +134,16 @@ _COOKIE_KEYS = {
     "secure": "secure",
     "httponly": "http_only",
 }
+_SENSITIVE_HEADER_NAMES = frozenset({
+    "authorization",
+    "cookie",
+    "proxy-authorization",
+    "x-api-key",
+    "x-auth-token",
+})
+_RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
 _OPEN_JOBS = {"queued", "running"}
+_STARTED_SERVER_HANDLE: tuple[object, int | None] | None = None
 
 
 class CaptureError(Exception):
@@ -124,12 +155,14 @@ class CaptureError(Exception):
         code: str | None = None,
         body: object = None,
         exit_code: int = 1,
+        retry_after: float | None = None,
     ) -> None:
         super().__init__(message)
         self.status = status
         self.code = code
         self.body = body
         self.exit_code = exit_code
+        self.retry_after = retry_after
 
 
 class OptionalBool(argparse.Action):
@@ -264,6 +297,51 @@ def parse_thumbnail(value: str) -> dict[str, object]:
     return item
 
 
+def _normalize_same_site(value: object) -> str:
+    normalized = str(value or "Lax").strip().lower().replace("_", "-")
+    return {
+        "strict": "Strict",
+        "lax": "Lax",
+        "none": "None",
+        "no-restriction": "None",
+        "unspecified": "Lax",
+    }.get(normalized, "Lax")
+
+
+def _cookie_dict_to_render_cookie(
+    item: dict[str, object],
+    *,
+    default_domain: str | None = None,
+) -> dict[str, object]:
+    name = str(item.get("name") or "").strip()
+    domain = str(item.get("domain") or default_domain or "").strip()
+    if not name or not domain:
+        raise ValueError("Each cookie requires a name and domain.")
+    cookie: dict[str, object] = {
+        "name": name,
+        "value": str(item.get("value") if item.get("value") is not None else ""),
+        "domain": domain,
+        "path": str(item.get("path") or "/"),
+    }
+    raw_expires = item.get("expires", item.get("expirationDate"))
+    if raw_expires not in (None, ""):
+        try:
+            expires = float(raw_expires)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Cookie expires must be a number.") from exc
+        if expires > 0:
+            cookie["expires"] = expires
+    http_only = item.get("http_only", item.get("httpOnly", False))
+    if bool(http_only):
+        cookie["http_only"] = True
+    if bool(item.get("secure", False)):
+        cookie["secure"] = True
+    raw_same_site = item.get("same_site", item.get("sameSite"))
+    if raw_same_site is not None:
+        cookie["same_site"] = _normalize_same_site(raw_same_site)
+    return cookie
+
+
 def parse_cookie(text: str) -> dict[str, object]:
     parts = [part.strip() for part in text.split(";") if part.strip()]
     if not parts:
@@ -308,6 +386,109 @@ def parse_cookie(text: str) -> dict[str, object]:
     return cookie
 
 
+def parse_cookie_file_content(
+    content: str,
+    *,
+    default_domain: str | None = None,
+    default_secure: bool = False,
+) -> list[dict[str, object]]:
+    """Parse Playwright JSON, Cookie-Editor JSON, Netscape cookies.txt, or header lines."""
+    text = content.removeprefix("\ufeff").strip()
+    if not text:
+        raise ValueError("--cookie-file is empty.")
+    if text.startswith("{") or text.startswith("["):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"--cookie-file is not valid JSON: {exc}") from exc
+        if isinstance(parsed, dict):
+            if isinstance(parsed.get("cookies"), list):
+                items = parsed["cookies"]
+            elif "name" in parsed:
+                items = [parsed]
+            else:
+                raise ValueError("--cookie-file JSON object must contain a 'cookies' list or a cookie object.")
+        elif isinstance(parsed, list):
+            items = parsed
+        else:
+            raise ValueError("--cookie-file JSON must be a cookie object, array, or Playwright storage state.")
+        cookies: list[dict[str, object]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValueError("--cookie-file JSON entries must be objects.")
+            cookies.append(_cookie_dict_to_render_cookie(item, default_domain=default_domain))
+        return cookies
+
+    if "\t" in text or text.startswith("# Netscape"):
+        cookies = []
+        for number, raw_line in enumerate(text.splitlines(), 1):
+            line = raw_line.strip("\r\n")
+            http_only = line.startswith("#HttpOnly_")
+            if not line.strip() or (line.startswith("#") and not http_only):
+                continue
+            if http_only:
+                line = line.removeprefix("#HttpOnly_")
+            parts = line.split("\t")
+            if len(parts) != 7:
+                raise ValueError(f"Invalid Netscape cookie on line {number}.")
+            domain, include_subdomains, path, secure, expires, name, value = parts
+            if include_subdomains.upper() == "TRUE" and not domain.startswith("."):
+                domain = f".{domain}"
+            cookies.append(
+                _cookie_dict_to_render_cookie(
+                    {
+                        "name": name,
+                        "value": value,
+                        "domain": domain,
+                        "path": path or "/",
+                        "secure": secure.upper() == "TRUE",
+                        "http_only": http_only,
+                        "expires": expires,
+                    },
+                    default_domain=default_domain,
+                )
+            )
+        if not cookies:
+            raise ValueError("--cookie-file did not contain any cookies.")
+        return cookies
+
+    cookies = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if re.search(r"(?:^|;\s*)domain\s*=", line, flags=re.IGNORECASE):
+            cookies.append(parse_cookie(line))
+            continue
+        header = line
+        if header.lower().startswith("cookie:"):
+            header = header.partition(":")[2].strip()
+        if not default_domain:
+            raise ValueError(
+                "Cookie header entries in --cookie-file require a target URL or explicit domain= attribute."
+            )
+        jar = SimpleCookie()
+        try:
+            jar.load(header)
+        except CookieError as exc:
+            raise ValueError("--cookie-file contains a malformed Cookie header.") from exc
+        if not jar:
+            raise ValueError("--cookie-file did not contain any cookies.")
+        for name, morsel in jar.items():
+            cookie: dict[str, object] = {
+                "name": name,
+                "value": morsel.value,
+                "domain": default_domain,
+                "path": "/",
+            }
+            if default_secure:
+                cookie["secure"] = True
+            cookies.append(cookie)
+    if not cookies:
+        raise ValueError("--cookie-file did not contain any cookies.")
+    return cookies
+
+
 def parse_header(text: str) -> tuple[str, str]:
     colon = text.find(":")
     equals = text.find("=")
@@ -331,16 +512,24 @@ def _json_line(document: dict[str, object]) -> str:
 
 
 def public_payload(payload: dict[str, object]) -> dict[str, object]:
-    """A copy that can be printed. The proxy password is never copied out."""
+    """A copy that can be printed. Passwords, cookie values, and auth headers are redacted."""
 
-    def walk(value: object) -> object:
+    def walk(value: object, *, parent_key: str = "") -> object:
         if isinstance(value, dict):
             printed: dict[str, object] = {}
             for key, item in value.items():
-                printed[key] = "***" if key == "password" else walk(item)
+                lowered = str(key).lower()
+                if lowered == "password":
+                    printed[key] = "***"
+                elif parent_key == "headers" and lowered in _SENSITIVE_HEADER_NAMES:
+                    printed[key] = "***"
+                elif parent_key == "cookies" and lowered == "value":
+                    printed[key] = "***"
+                else:
+                    printed[key] = walk(item, parent_key=lowered)
             return printed
         if isinstance(value, list):
-            return [walk(item) for item in value]
+            return [walk(item, parent_key=parent_key) for item in value]
         return value
 
     printed = walk(payload)
@@ -397,27 +586,15 @@ def _record(group: argparse._ArgumentGroup, *option: str, kind: str, **kwargs) -
     group.add_argument(*option, action=Record, kind=kind, dest=kind, **kwargs)
 
 
-def build_parser() -> CaptureParser:
-    parser = CaptureParser(
-        prog="vipercapture capture",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        description=(
-            "Render a page through the local ViperCapture API and save the file. "
-            "Stdout is the saved path. Stderr errors are JSON."
-        ),
-        epilog=(
-            "Example (bash, PowerShell, and cmd accept the same flags):\n"
-            f"  {EXAMPLE}\n\n"
-            "--delay-ms waits after navigation and before actions. "
-            "Repeat --click, --fill, and the other action flags in the order "
-            "they should run. --full-page=false and --no-full-page match. "
-            "A background server stays up after a capture; stop it with "
-            "vipercapture kill."
-        ),
-    )
+def add_render_option_groups(
+    parser: argparse.ArgumentParser,
+    *,
+    include_timezone: bool = True,
+    include_webhook: bool = True,
+    include_wait_flag: bool = True,
+) -> None:
+    """Attach shared RenderRequest option groups so capture, bulk, schedule, sign, and preset stay in sync."""
     parser.set_defaults(steps=None)
-    parser.add_argument("target", nargs="?", help="Page URL. https:// is added when the scheme is omitted.")
-    parser.add_argument("--url", help="Page URL. Use this instead of the positional argument.")
 
     target = parser.add_argument_group("input")
     target.add_argument("--html", help="HTML document text.")
@@ -425,9 +602,10 @@ def build_parser() -> CaptureParser:
     target.add_argument("--markdown", help="Markdown text.")
     target.add_argument("--markdown-file", help="Markdown file, or - for stdin.")
     target.add_argument("--base-url", help="Base URL for HTML or Markdown input.")
+    target.add_argument("--from-json", help="Base RenderRequest JSON file, or - for stdin. CLI flags override fields.")
+    target.add_argument("--preset", help="Load a saved preset by name as base settings.")
 
     output = parser.add_argument_group("output")
-    output.add_argument("--output", help="File to write. Use - for stdout. The extension selects the format.")
     output.add_argument("--format", choices=_FORMATS, help="png, jpeg, webp, avif, pdf, html, markdown, metadata, webm, mp4, or gif.")
     output.add_argument("--engine", choices=_ENGINES, help="chromium, firefox, or webkit.")
     _add_bool(output, "--full-page", "full_page", "true or false. false captures the viewport. Also --no-full-page.")
@@ -446,7 +624,10 @@ def build_parser() -> CaptureParser:
     output.add_argument("--slice-overlap", type=int, help="Slice overlap. Requires --slice-height.")
 
     wait = parser.add_argument_group("wait")
-    wait.add_argument("--wait", dest="wait_selector", help="CSS selector to see before actions.")
+    if include_wait_flag:
+        wait.add_argument("--wait", dest="wait_selector", help="CSS selector to see before actions.")
+    else:
+        wait.add_argument("--wait-selector", dest="wait_selector", help="CSS selector to see before actions.")
     wait.add_argument("--wait-text", help="Text to see before actions.")
     wait.add_argument("--wait-event", choices=_WAIT_EVENTS, help="domcontentloaded, load, or networkidle.")
     wait.add_argument("--wait-state", choices=_WAIT_STATES, help="visible, attached, hidden, or detached.")
@@ -465,7 +646,9 @@ def build_parser() -> CaptureParser:
     _record(actions, "--scroll", kind="scroll", nargs=2, type=float, metavar=("X", "Y"), help="Scroll by x and y pixels.")
     _record(actions, "--scroll-to", kind="scroll_to", help="Scroll a selector into view.")
     _record(actions, "--js", kind="js", help="JavaScript action. The server must set VIPERCAPTURE_ALLOW_SCRIPTS=1.")
+    _record(actions, "--js-file", kind="js_file", metavar="PATH", help="JavaScript file action, or - for stdin.")
     _record(actions, "--action-wait", kind="action_wait", help="Wait for a selector after earlier actions.")
+    _record(actions, "--action-wait-text", kind="action_wait_text", metavar="TEXT", help="Wait for text after earlier actions.")
     _record(actions, "--pause-ms", kind="pause", type=int, help="Wait this many milliseconds after earlier actions.")
     _record(actions, "--action", kind="json", help="One action as a JSON object. Ordered with the other action flags.")
     _record(actions, "--action-delay-ms", kind="action_delay", type=int, help="delay_ms for every action that follows.")
@@ -476,7 +659,10 @@ def build_parser() -> CaptureParser:
     environment.add_argument("--reduced-motion", choices=_REDUCED_MOTION, help="reduce or no-preference.")
     environment.add_argument("--media", choices=_MEDIA, help="screen or print, applied before load.")
     environment.add_argument("--locale", help="BCP 47 language tag, for example fr-FR.")
-    environment.add_argument("--timezone", help="IANA time zone, for example Africa/Casablanca.")
+    if include_timezone:
+        environment.add_argument("--timezone", help="IANA time zone, for example Africa/Casablanca.")
+    else:
+        environment.add_argument("--capture-timezone", dest="timezone", help="Browser IANA time zone for the capture.")
     environment.add_argument("--css", help="CSS injected into the page.")
     environment.add_argument("--css-file", help="CSS file, or - for stdin.")
 
@@ -485,6 +671,7 @@ def build_parser() -> CaptureParser:
     network.add_argument("--user-agent", help="Browser user agent.")
     network.add_argument("--header", action="append", help="Request header as Name: value. Repeatable.")
     network.add_argument("--cookie", action="append", help="Cookie as name=value; domain=host; path=/; Secure; HttpOnly; SameSite=Lax.")
+    network.add_argument("--cookie-file", action="append", metavar="PATH", help="Cookie file (Playwright, Cookie-Editor JSON, Netscape, or Cookie header), or - for stdin.")
     network.add_argument("--block-url", action="append", help="URL glob to block. Repeatable.")
     network.add_argument("--block-resource", action="append", choices=_RESOURCES, help="Resource type to block. Repeatable.")
     network.add_argument("--geolocation", nargs=2, type=float, metavar=("LAT", "LON"), help="Latitude and longitude.")
@@ -562,7 +749,45 @@ def build_parser() -> CaptureParser:
     _add_bool(diagnostics, "--certify", "certify", "Return an Ed25519-certified bundle.")
     diagnostics.add_argument("--profile-id", help="Saved browser profile id.")
     _add_bool(diagnostics, "--save-profile", "save_profile", "Write the browser profile back. Requires --profile-id.")
-    diagnostics.add_argument("--webhook", help="Delivery webhook URL. Used with --async.")
+    if include_webhook:
+        diagnostics.add_argument("--webhook", help="Delivery webhook URL. Used with --async.")
+
+
+def build_parser() -> CaptureParser:
+    parser = CaptureParser(
+        prog="vipercapture capture",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Render a page through the local ViperCapture API and save the file. "
+            "Stdout is the saved path. Stderr errors are JSON."
+        ),
+        epilog=(
+            "Example (bash, PowerShell, and cmd accept the same flags):\n"
+            f"  {EXAMPLE}\n\n"
+            "--delay-ms waits after navigation and before actions. "
+            "Repeat --click, --fill, and the other action flags in the order "
+            "they should run. --full-page=false and --no-full-page match. "
+            "A background server stays up after a capture; stop it with "
+            "vipercapture kill (or pass --stop-server)."
+        ),
+    )
+    parser.add_argument(
+        "targets",
+        nargs="*",
+        metavar="URL",
+        help="Page URL(s). https:// is added when the scheme is omitted.",
+    )
+    parser.add_argument("--url", help="Page URL. Use this instead of the positional argument.")
+    parser.add_argument("--urls-file", help="File with one URL per line, or - for stdin.")
+
+    add_render_option_groups(parser)
+
+    files = parser.add_argument_group("output files")
+    files.add_argument("--output", help="File to write. Use - for stdout. The extension selects the format.")
+    files.add_argument("--output-dir", help="Directory for saved capture file(s) (required or default for multi-URL).")
+    files.add_argument("--output-template", help="Filename template for --output-dir / multi-URL, e.g. '{host}-{index}-{timestamp}{ext}'.")
+    files.add_argument("--open", dest="open_output", action="store_true", help="Open the saved file with the OS default viewer.")
+    files.add_argument("--copy", dest="copy_output", action="store_true", help="Copy saved content or path to the clipboard.")
 
     client = parser.add_argument_group("client")
     client.add_argument("--server", default=f"http://{launch.HOST}:{launch.PORT}", help="API base URL. The default local server is started when needed.")
@@ -571,8 +796,13 @@ def build_parser() -> CaptureParser:
     client.add_argument("--idempotency-key", help="Idempotency-Key for --async.")
     client.add_argument("--request-timeout", type=float, help="Seconds to wait for the render. Video defaults to 180 and images to 120.")
     client.add_argument("--async", dest="async_job", action="store_true", help="Submit /v1/jobs, poll, and save the result.")
+    client.add_argument("--no-wait", dest="no_wait", action="store_true", help="With --async, print the job ID (or JSON) and exit immediately.")
     client.add_argument("--poll-ms", type=int, default=500, help="Async poll interval in milliseconds.")
+    client.add_argument("--retries", type=int, default=0, help="Retry count for transient network errors and HTTP 429/502/503/504.")
+    client.add_argument("--retry-delay-ms", type=int, default=500, help="Initial retry backoff in milliseconds.")
     client.add_argument("--no-start", action="store_true", help="Do not start the local server.")
+    client.add_argument("--stop-server", action="store_true", help="Stop the local server after finishing if this command started it.")
+    client.add_argument("--no-config", action="store_true", help="Ignore ~/.vipercapture/config.toml defaults.")
     client.add_argument("--dry-run", action="store_true", help="Print the JSON request and exit.")
     client.add_argument("--json", action="store_true", help="Print a JSON result on stdout instead of the path.")
     client.add_argument("--quiet", action="store_true", help="Print nothing on success.")
@@ -580,8 +810,64 @@ def build_parser() -> CaptureParser:
     return parser
 
 
+def _flag_was_passed(argv: list[str], flag: str) -> bool:
+    prefix = flag + "="
+    return any(tok == flag or tok.startswith(prefix) for tok in argv)
+
+
 def parse_capture_args(argv: list[str]) -> argparse.Namespace:
-    return build_parser().parse_args(argv)
+    args = build_parser().parse_args(argv)
+    targets = list(getattr(args, "targets", []) or [])
+    args.target = targets[0] if len(targets) == 1 else None
+    args._explicit_flags = {
+        flag
+        for flag in (
+            "--server",
+            "--poll-ms",
+            "--retries",
+            "--retry-delay-ms",
+            "--no-start",
+            "--quiet",
+            "--verbose",
+            "--json",
+            "--stop-server",
+        )
+        if _flag_was_passed(argv, flag)
+    }
+    return args
+
+
+def apply_config_defaults(
+    args: argparse.Namespace,
+    config: dict[str, object] | None = None,
+) -> None:
+    """Apply ~/.vipercapture/config.toml defaults without overriding explicit CLI flags."""
+    if getattr(args, "no_config", False):
+        return
+    cfg = load_cli_config() if config is None else config
+    if not cfg:
+        return
+    explicit: set[str] = getattr(args, "_explicit_flags", set())
+    flag_map = {
+        "server": "--server",
+        "poll_ms": "--poll-ms",
+        "retries": "--retries",
+        "retry_delay_ms": "--retry-delay-ms",
+        "no_start": "--no-start",
+        "quiet": "--quiet",
+        "verbose": "--verbose",
+        "json": "--json",
+        "stop_server": "--stop-server",
+    }
+    for key, value in cfg.items():
+        if not hasattr(args, key):
+            continue
+        if key in flag_map:
+            if flag_map[key] not in explicit:
+                setattr(args, key, value)
+            continue
+        if getattr(args, key) is None:
+            setattr(args, key, value)
 
 
 def _read_text(path: str) -> str:
@@ -614,10 +900,253 @@ def infer_format(path: str | None, explicit: str | None) -> str:
     return "png"
 
 
-def _put(target: dict[str, object], key: str, value: object, default: object) -> None:
-    if value is None or value == default:
+def _put(
+    target: dict[str, object],
+    key: str,
+    value: object,
+    default: object,
+    *,
+    force_default: bool = False,
+) -> None:
+    if value is None:
+        return
+    if not force_default and value == default:
         return
     target[key] = value
+
+
+def _deep_merge(base: dict[str, object], override: dict[str, object]) -> dict[str, object]:
+    merged = copy.deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)  # type: ignore[arg-type]
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _local_presets_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    env_data = os.environ.get("VIPERCAPTURE_DATA_DIR", "").strip()
+    if env_data:
+        candidates.append(Path(env_data).expanduser() / "presets" / "presets.json")
+    candidates.append(Path.home() / ".vipercapture" / "data" / "presets" / "presets.json")
+    candidates.append(launch.ROOT / ".vipercapture" / "presets" / "presets.json")
+    return candidates
+
+
+def preset_settings_to_payload(settings: dict[str, object]) -> dict[str, object]:
+    """Convert either a Web UI PresetSettings dict or a RenderRequest dict into RenderRequest shape."""
+    web_keys = {
+        "fullPage", "preserveViewportWidth", "lazyLoad", "optimizePng",
+        "videoDuration", "videoFps", "videoBitrate", "videoScroll",
+        "waitEvent", "waitDelay", "waitSelector", "waitText", "waitTimeout",
+        "blockAds", "blockTrackers", "blockChats", "blockNewsletters",
+        "colorScheme", "reducedMotion", "customCss", "failStatuses",
+        "clipEnabled", "clipX", "clipY", "clipWidth", "clipHeight",
+        "extractMode", "pdfMode", "paperSize", "pdfMargin", "density",
+    }
+    if not (set(settings.keys()) & web_keys):
+        return copy.deepcopy(settings)
+
+    payload: dict[str, object] = {}
+    fmt = str(settings.get("output") or "png").lower()
+    fmt = _FORMAT_ALIASES.get(fmt, fmt)
+    payload["output"] = fmt
+    if "fullPage" in settings:
+        full_page = bool(settings["fullPage"])
+        if not full_page:
+            payload["full_page"] = False
+    else:
+        full_page = True
+    if full_page and settings.get("preserveViewportWidth"):
+        payload["preserve_viewport_width"] = True
+
+    viewport: dict[str, object] = {}
+    if isinstance(settings.get("width"), (int, float)) and int(settings["width"]) > 0:
+        viewport["width"] = int(settings["width"])
+    if isinstance(settings.get("height"), (int, float)) and int(settings["height"]) > 0:
+        viewport["height"] = int(settings["height"])
+    if isinstance(settings.get("density"), (int, float)) and float(settings["density"]) != 1.0:
+        viewport["device_scale_factor"] = float(settings["density"])
+    if viewport:
+        payload["viewport"] = viewport
+
+    selector = str(settings.get("selector") or "").strip()
+    if selector and not full_page:
+        payload["selector"] = selector
+    if settings.get("clipEnabled") and not full_page:
+        payload["clip"] = {
+            "x": float(settings.get("clipX", 0)),
+            "y": float(settings.get("clipY", 0)),
+            "width": float(settings.get("clipWidth", 640)),
+            "height": float(settings.get("clipHeight", 480)),
+        }
+
+    is_image = fmt in {"png", "jpeg", "webp", "avif"}
+    is_video = fmt in {"webm", "mp4", "gif"}
+    image: dict[str, object] = {}
+    if fmt in {"jpeg", "webp", "avif"} and isinstance(settings.get("quality"), int):
+        image["quality"] = int(settings["quality"])
+    if fmt in {"png", "webp", "avif"} and settings.get("transparent"):
+        image["transparent_background"] = True
+    if fmt in {"png", "webp"} and "optimizePng" in settings:
+        image["optimize_for_speed"] = bool(settings["optimizePng"])
+    if image:
+        payload["image"] = image
+
+    if settings.get("lazyLoad") in _LAZY:
+        payload["lazy_load"] = settings["lazyLoad"]
+    if settings.get("diagnostics"):
+        payload["diagnostics"] = {"bundle": True}
+
+    if is_video:
+        video: dict[str, object] = {}
+        if isinstance(settings.get("videoDuration"), (int, float)):
+            video["duration_ms"] = int(round(float(settings["videoDuration"]) * 1000))
+        if isinstance(settings.get("videoFps"), int):
+            video["fps"] = int(settings["videoFps"])
+        if fmt != "gif" and isinstance(settings.get("videoBitrate"), int):
+            video["bitrate_mbps"] = int(settings["videoBitrate"])
+        if not full_page and settings.get("videoScroll"):
+            video["scroll"] = True
+        if full_page and fmt in {"webm", "gif"} and settings.get("transparent"):
+            video["transparent_background"] = True
+        if video:
+            payload["video"] = video
+
+    if fmt == "pdf":
+        pdf: dict[str, object] = {}
+        if settings.get("pdfMode") in _PDF_MODES:
+            pdf["mode"] = settings["pdfMode"]
+        if settings.get("paperSize") in _PAPER:
+            pdf["paper_size"] = settings["paperSize"]
+        if settings.get("orientation") in _ORIENTATION:
+            pdf["orientation"] = settings["orientation"]
+        if isinstance(settings.get("pdfMargin"), (int, float)):
+            margin = float(settings["pdfMargin"])
+            pdf["margins"] = {"top": margin, "right": margin, "bottom": margin, "left": margin}
+        if pdf:
+            payload["pdf"] = pdf
+
+    if fmt in {"html", "markdown"} and settings.get("extractMode") in _EXTRACT:
+        payload["extract_mode"] = settings["extractMode"]
+
+    wait_for: dict[str, object] = {}
+    if settings.get("waitEvent") in _WAIT_EVENTS and settings["waitEvent"] != "load":
+        wait_for["event"] = settings["waitEvent"]
+    if isinstance(settings.get("waitDelay"), (int, float)) and float(settings["waitDelay"]) > 0:
+        wait_for["delay_ms"] = int(round(float(settings["waitDelay"]) * 1000))
+    if isinstance(settings.get("waitSelector"), str) and settings["waitSelector"].strip():
+        wait_for["selector"] = settings["waitSelector"].strip()
+    if isinstance(settings.get("waitText"), str) and settings["waitText"].strip():
+        wait_for["text"] = settings["waitText"].strip()
+    if isinstance(settings.get("waitTimeout"), (int, float)) and float(settings["waitTimeout"]) != 15:
+        wait_for["timeout_ms"] = int(round(float(settings["waitTimeout"]) * 1000))
+    if wait_for:
+        payload["wait_for"] = wait_for
+
+    env: dict[str, object] = {}
+    if settings.get("device") in _DEVICES and settings["device"] != "desktop":
+        env["device"] = settings["device"]
+    if settings.get("colorScheme") in _COLOR_SCHEMES:
+        env["color_scheme"] = settings["colorScheme"]
+    if settings.get("reducedMotion") in _REDUCED_MOTION:
+        env["reduced_motion"] = settings["reducedMotion"]
+    if isinstance(settings.get("locale"), str) and settings["locale"].strip():
+        env["locale"] = settings["locale"].strip()
+    if isinstance(settings.get("timezone"), str) and settings["timezone"].strip():
+        env["timezone"] = settings["timezone"].strip()
+    if env:
+        payload["environment"] = env
+
+    cleanup: dict[str, object] = {}
+    if settings.get("consent") in _CONSENT and settings["consent"] != "none":
+        cleanup["consent_mode"] = settings["consent"]
+    if settings.get("blockAds"):
+        cleanup["block_ads"] = True
+    if settings.get("blockTrackers"):
+        cleanup["block_trackers"] = True
+    if settings.get("blockChats"):
+        cleanup["block_chats"] = True
+    if settings.get("blockNewsletters"):
+        cleanup["block_newsletters"] = True
+    if cleanup:
+        payload["cleanup"] = cleanup
+
+    if isinstance(settings.get("customCss"), str) and settings["customCss"].strip():
+        payload["custom_css"] = settings["customCss"]
+
+    raw_fail = settings.get("failStatuses")
+    if isinstance(raw_fail, str) and raw_fail.strip():
+        statuses: list[int] = []
+        for token in re.split(r"[,\s]+", raw_fail.strip()):
+            if token:
+                statuses.append(int(token))
+        if statuses:
+            payload["fail_on_status"] = statuses
+
+    raw_headers = settings.get("headers")
+    if isinstance(raw_headers, str) and raw_headers.strip():
+        headers: dict[str, str] = {}
+        for line in raw_headers.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            name, val = parse_header(line)
+            headers[name] = val
+        if headers:
+            payload["headers"] = headers
+    elif isinstance(raw_headers, dict) and raw_headers:
+        payload["headers"] = {str(k): str(v) for k, v in raw_headers.items()}
+    return payload
+
+
+def load_preset_payload(name: str, *, server: str | None = None) -> dict[str, object]:
+    """Fetch a named preset from /local/presets or local presets.json fallback."""
+    target_name = name.strip()
+    if not target_name:
+        raise ValueError("Preset name cannot be empty.")
+
+    presets: list[dict[str, object]] | None = None
+    if server:
+        try:
+            root = api_root(server)
+            resp = open_response(
+                root + "/local/presets",
+                method="GET",
+                payload=None,
+                headers={"Accept": "application/json"},
+                timeout=3.0,
+            )
+            try:
+                doc = _read_json(resp)
+            finally:
+                resp.close()
+            raw = doc.get("presets")
+            if isinstance(raw, list):
+                presets = [item for item in raw if isinstance(item, dict)]
+        except (CaptureError, ValueError):
+            presets = None
+
+    if presets is None:
+        for candidate in _local_presets_candidates():
+            if not candidate.is_file():
+                continue
+            try:
+                raw = json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(raw, list):
+                presets = [item for item in raw if isinstance(item, dict)]
+                break
+
+    if presets is None:
+        raise ValueError(f"Preset {target_name!r} was not found (no reachable server or local presets file).")
+    for item in presets:
+        if item.get("name") == target_name and isinstance(item.get("settings"), dict):
+            return preset_settings_to_payload(item["settings"])
+    raise ValueError(f"Preset {target_name!r} was not found.")
 
 
 def _action_from(kind: str, values: object) -> dict[str, object]:
@@ -638,6 +1167,8 @@ def _action_from(kind: str, values: object) -> dict[str, object]:
             "action_wait": "wait",
         }[kind]
         return {"type": action_type, "selector": values}
+    if kind == "action_wait_text":
+        return {"type": "wait", "value": str(values)}
     if kind == "fill":
         selector, value = values  # type: ignore[misc]
         return {"type": "fill", "selector": selector, "value": value}
@@ -654,6 +1185,8 @@ def _action_from(kind: str, values: object) -> dict[str, object]:
         return {"type": "scroll", "x": x, "y": y}
     if kind == "js":
         return {"type": "javascript", "value": values}
+    if kind == "js_file":
+        return {"type": "javascript", "value": _read_text(str(values))}
     if kind == "pause":
         return {"type": "wait", "delay_ms": int(values)}  # type: ignore[arg-type]
     raise ValueError(f"Unknown action {kind}")
@@ -680,28 +1213,95 @@ def _apply_actions(payload: dict[str, object], steps: list[tuple[str, object]] |
         payload["actions"] = actions
 
 
-def build_payload(args: argparse.Namespace) -> dict[str, object]:
+def _load_base_document(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
+    base: dict[str, object] = {}
+    has_base = False
+    preset_name = getattr(args, "preset", None)
+    if preset_name:
+        base = load_preset_payload(preset_name, server=getattr(args, "server", None))
+        has_base = True
+    from_json = getattr(args, "from_json", None)
+    if from_json:
+        raw = _read_text(from_json)
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"--from-json is not valid JSON: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("--from-json must contain a JSON object.")
+        base = _deep_merge(base, parsed) if has_base else parsed
+        has_base = True
+    return base, has_base
+
+
+def build_payload(
+    args: argparse.Namespace,
+    *,
+    override_url: str | None = None,
+    require_source: bool = True,
+    base_document: dict[str, object] | None = None,
+) -> dict[str, object]:
+    if base_document is not None:
+        base, has_base = copy.deepcopy(base_document), True
+    else:
+        base, has_base = _load_base_document(args)
+
     payload: dict[str, object] = {}
-    url = args.url or args.target
-    if args.url and args.target:
-        raise ValueError("Pass the URL once, either as the argument or with --url.")
+    cli_target = getattr(args, "target", None)
+    cli_url = getattr(args, "url", None)
+    if override_url is not None:
+        url: str | None = override_url
+    else:
+        if cli_url and cli_target:
+            raise ValueError("Pass the URL once, either as the argument or with --url.")
+        url = cli_url or cli_target
+
     html = _one_of(args.html, args.html_file, "Use either --html or --html-file.")
     markdown = _one_of(args.markdown, args.markdown_file, "Use either --markdown or --markdown-file.")
-    sources = (url is not None, html is not None, markdown is not None)
-    if sum(sources) != 1:
+    cli_sources = (url is not None, html is not None, markdown is not None)
+    if sum(cli_sources) > 1:
         raise ValueError("Pass a URL, --html, or --markdown.")
-    if url is not None:
-        payload["url"] = normalize_url(url)
-    if html is not None:
-        payload["html"] = html
-    if markdown is not None:
-        payload["markdown"] = markdown
+
+    if sum(cli_sources) == 1:
+        for source_key in ("url", "html", "markdown"):
+            base.pop(source_key, None)
+        if url is not None:
+            payload["url"] = normalize_url(url)
+        if html is not None:
+            payload["html"] = html
+        if markdown is not None:
+            payload["markdown"] = markdown
+    elif require_source:
+        base_sources = (
+            base.get("url") is not None,
+            base.get("html") is not None,
+            base.get("markdown") is not None,
+        )
+        if sum(base_sources) != 1:
+            raise ValueError("Pass a URL, --html, or --markdown.")
+
+    effective_url = payload.get("url") or base.get("url")
+    default_domain: str | None = None
+    default_secure = False
+    if isinstance(effective_url, str) and effective_url:
+        parsed_target = urlsplit(effective_url)
+        default_domain = parsed_target.hostname
+        default_secure = parsed_target.scheme.lower() == "https"
+
     if args.base_url:
         payload["base_url"] = normalize_url(args.base_url)
-    payload["output"] = infer_format(args.output, args.format)
+
+    output_arg = getattr(args, "output", None)
+    if args.format:
+        payload["output"] = infer_format(output_arg, args.format)
+    elif output_arg and output_arg != "-" and Path(output_arg).suffix.lower() in _SUFFIX_FORMAT:
+        payload["output"] = infer_format(output_arg, None)
+    elif not has_base or "output" not in base:
+        payload["output"] = infer_format(output_arg, None)
+
     if args.engine:
         payload["engine"] = args.engine
-    _put(payload, "full_page", args.full_page, True)
+    _put(payload, "full_page", args.full_page, True, force_default=has_base)
     viewport: dict[str, object] = {}
     if args.viewport:
         viewport["width"], viewport["height"] = args.viewport
@@ -727,7 +1327,7 @@ def build_payload(args: argparse.Namespace) -> dict[str, object]:
     if environment:
         payload["environment"] = environment
     network: dict[str, object] = {}
-    _put(network, "java_script_enabled", args.javascript, True)
+    _put(network, "java_script_enabled", args.javascript, True, force_default=has_base)
     if args.user_agent:
         network["user_agent"] = args.user_agent
     if args.geolocation:
@@ -754,14 +1354,27 @@ def build_payload(args: argparse.Namespace) -> dict[str, object]:
         network["proxy"] = proxy
     elif any((args.proxy_username, args.proxy_password, args.proxy_bypass)):
         raise ValueError("--proxy-username, --proxy-password, and --proxy-bypass require --proxy.")
+
+    cookies: list[dict[str, object]] = []
+    if getattr(args, "cookie_file", None):
+        for cookie_path in args.cookie_file:
+            cookies.extend(
+                parse_cookie_file_content(
+                    _read_text(cookie_path),
+                    default_domain=default_domain,
+                    default_secure=default_secure,
+                )
+            )
     if args.cookie:
-        network["cookies"] = [parse_cookie(item) for item in args.cookie]
+        cookies.extend(parse_cookie(item) for item in args.cookie)
+    if cookies:
+        network["cookies"] = cookies
     if args.block_url:
         network["block_url_patterns"] = list(args.block_url)
     if args.block_resource:
         network["block_resource_types"] = list(args.block_resource)
-    _put(network, "bypass_csp", args.bypass_csp, False)
-    _put(network, "ignore_https_errors", args.ignore_https_errors, False)
+    _put(network, "bypass_csp", args.bypass_csp, False, force_default=has_base)
+    _put(network, "ignore_https_errors", args.ignore_https_errors, False, force_default=has_base)
     if network:
         payload["network"] = network
     _apply_actions(payload, args.steps)
@@ -778,16 +1391,18 @@ def build_payload(args: argparse.Namespace) -> dict[str, object]:
         payload["elements"] = [{"selector": selector} for selector in args.element]
     if args.side:
         payload["side_outputs"] = list(args.side)
-    if args.webhook:
+    if getattr(args, "webhook", None):
         payload["delivery"] = {"webhook_url": args.webhook}
     diagnostics: dict[str, object] = {}
     if args.diagnostics or args.har or args.trace or args.warc:
         diagnostics["bundle"] = True
-    _put(diagnostics, "include_har", args.har, False)
-    _put(diagnostics, "include_trace", args.trace, False)
-    _put(diagnostics, "include_warc", args.warc, False)
-    _put(diagnostics, "include_console", args.include_console, True)
-    _put(diagnostics, "include_network", args.include_network, True)
+    elif has_base and args.diagnostics is False:
+        diagnostics["bundle"] = False
+    _put(diagnostics, "include_har", args.har, False, force_default=has_base)
+    _put(diagnostics, "include_trace", args.trace, False, force_default=has_base)
+    _put(diagnostics, "include_warc", args.warc, False, force_default=has_base)
+    _put(diagnostics, "include_console", args.include_console, True, force_default=has_base)
+    _put(diagnostics, "include_network", args.include_network, True, force_default=has_base)
     if diagnostics:
         payload["diagnostics"] = diagnostics
     deterministic: dict[str, object] = {}
@@ -796,16 +1411,20 @@ def build_payload(args: argparse.Namespace) -> dict[str, object]:
         enabled or args.timestamp_ms is not None or args.seed is not None or args.wait_for_fonts is False
     ):
         deterministic["enabled"] = True
+    elif has_base and enabled is False:
+        deterministic["enabled"] = False
     if deterministic.get("enabled") is True:
         if args.timestamp_ms is not None:
             deterministic["timestamp_ms"] = args.timestamp_ms
         if args.seed is not None:
             deterministic["random_seed"] = args.seed
-        _put(deterministic, "wait_for_fonts", args.wait_for_fonts, True)
+        _put(deterministic, "wait_for_fonts", args.wait_for_fonts, True, force_default=has_base)
     if deterministic:
         payload["deterministic"] = deterministic
     if args.certify:
         payload["certification"] = {"enabled": True}
+    elif has_base and args.certify is False:
+        payload["certification"] = {"enabled": False}
     if args.slice_height is not None:
         slices: dict[str, object] = {"height": args.slice_height}
         if args.slice_overlap is not None:
@@ -815,7 +1434,7 @@ def build_payload(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("--slice-overlap requires --slice-height.")
     if args.profile_id:
         payload["profile_id"] = args.profile_id
-    _put(payload, "save_profile", args.save_profile, False)
+    _put(payload, "save_profile", args.save_profile, False, force_default=has_base)
     video: dict[str, object] = {}
     if args.video_duration_ms is not None:
         video["duration_ms"] = args.video_duration_ms
@@ -823,15 +1442,15 @@ def build_payload(args: argparse.Namespace) -> dict[str, object]:
         video["fps"] = args.fps
     if args.bitrate_mbps is not None:
         video["bitrate_mbps"] = args.bitrate_mbps
-    _put(video, "scroll", args.video_scroll, False)
+    _put(video, "scroll", args.video_scroll, False, force_default=has_base)
     if args.scroll_step is not None:
         video["scroll_step"] = args.scroll_step
     if args.scroll_delay_ms is not None:
         video["scroll_delay_ms"] = args.scroll_delay_ms
-    _put(video, "transparent_background", args.video_transparent, False)
+    _put(video, "transparent_background", args.video_transparent, False, force_default=has_base)
     if video:
         payload["video"] = video
-    _put(payload, "preserve_viewport_width", args.preserve_viewport_width, False)
+    _put(payload, "preserve_viewport_width", args.preserve_viewport_width, False, force_default=has_base)
     if args.lazy_load:
         payload["lazy_load"] = args.lazy_load
     if args.profile:
@@ -840,6 +1459,8 @@ def build_payload(args: argparse.Namespace) -> dict[str, object]:
         payload["cache_key"] = args.cache_key
     if args.cache is True or args.cache_key:
         payload["cache"] = True
+    elif has_base and args.cache is False:
+        payload["cache"] = False
     if args.selector:
         payload["selector"] = args.selector
     if args.clip:
@@ -857,7 +1478,7 @@ def build_payload(args: argparse.Namespace) -> dict[str, object]:
         image["width"] = args.image_width
     if args.image_height is not None:
         image["height"] = args.image_height
-    _put(image, "transparent_background", args.transparent, False)
+    _put(image, "transparent_background", args.transparent, False, force_default=has_base)
     if args.optimize_for_speed is not None:
         image["optimize_for_speed"] = args.optimize_for_speed
     if args.thumbnail:
@@ -871,7 +1492,7 @@ def build_payload(args: argparse.Namespace) -> dict[str, object]:
         pdf["paper_size"] = args.paper
     if args.orientation:
         pdf["orientation"] = args.orientation
-    _put(pdf, "print_background", args.pdf_background, True)
+    _put(pdf, "print_background", args.pdf_background, True, force_default=has_base)
     if args.pdf_tagged is not None:
         pdf["tagged"] = args.pdf_tagged
     if args.pdf_margin:
@@ -895,7 +1516,7 @@ def build_payload(args: argparse.Namespace) -> dict[str, object]:
         payload["pdf"] = pdf
     if args.extract:
         payload["extract_mode"] = args.extract
-    _put(payload, "include_shadow_dom", args.shadow_dom, False)
+    _put(payload, "include_shadow_dom", args.shadow_dom, False, force_default=has_base)
     if args.header:
         headers: dict[str, str] = {}
         seen: set[str] = set()
@@ -916,7 +1537,7 @@ def build_payload(args: argparse.Namespace) -> dict[str, object]:
         wait_for["event"] = args.wait_event
     if args.wait_state:
         wait_for["selector_state"] = args.wait_state
-    _put(wait_for, "images", args.wait_images, False)
+    _put(wait_for, "images", args.wait_images, False, force_default=has_base)
     if args.delay_ms is not None:
         wait_for["delay_ms"] = args.delay_ms
     if args.timeout_ms is not None:
@@ -926,13 +1547,13 @@ def build_payload(args: argparse.Namespace) -> dict[str, object]:
     cleanup: dict[str, object] = {}
     if args.consent:
         cleanup["consent_mode"] = args.consent
-    _put(cleanup, "block_ads", args.block_ads, False)
-    _put(cleanup, "block_trackers", args.block_trackers, False)
-    _put(cleanup, "block_chats", args.block_chats, False)
-    _put(cleanup, "block_newsletters", args.block_newsletters, False)
+    _put(cleanup, "block_ads", args.block_ads, False, force_default=has_base)
+    _put(cleanup, "block_trackers", args.block_trackers, False, force_default=has_base)
+    _put(cleanup, "block_chats", args.block_chats, False, force_default=has_base)
+    _put(cleanup, "block_newsletters", args.block_newsletters, False, force_default=has_base)
     if cleanup:
         payload["cleanup"] = cleanup
-    _put(payload, "stealth", args.stealth, True)
+    _put(payload, "stealth", args.stealth, True, force_default=has_base)
     captcha: dict[str, object] = {}
     if args.captcha:
         captcha["action"] = args.captcha
@@ -942,7 +1563,9 @@ def build_payload(args: argparse.Namespace) -> dict[str, object]:
         captcha["timeout_ms"] = args.captcha_timeout_ms
     if captcha:
         payload["captcha"] = captcha
-    _put(payload, "proceed_on_captcha", args.proceed_on_captcha, False)
+    _put(payload, "proceed_on_captcha", args.proceed_on_captcha, False, force_default=has_base)
+    if has_base:
+        return _deep_merge(base, payload)
     return payload
 
 
@@ -1188,7 +1811,6 @@ def validate_payload(payload: dict[str, object]) -> None:
     if _fast_validate_simple_payload(payload):
         return
     try:
-        import copy
         from pydantic import ValidationError
         from vipercapture.render_contract import RenderRequest
     except ImportError:
@@ -1214,9 +1836,61 @@ def artifact_is_archive(payload: dict[str, object]) -> bool:
     )
 
 
-def resolve_output(args: argparse.Namespace, payload: dict[str, object]) -> Path | None:
-    if args.output == "-":
+def render_output_template(
+    template: str,
+    *,
+    payload: dict[str, object],
+    index: int,
+    timestamp: str | None = None,
+) -> str:
+    fmt = str(payload.get("output", "png"))
+    ext = ".zip" if artifact_is_archive(payload) else _EXTENSIONS.get(fmt, ".png")
+    url_text = str(payload.get("url") or "")
+    parsed = urlsplit(url_text) if url_text else None
+    host = safe_filename(parsed.hostname if parsed and parsed.hostname else "capture")
+    path_slug = safe_filename(parsed.path.strip("/").replace("/", "-")) if parsed and parsed.path.strip("/") else host
+    stamp = timestamp or datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    try:
+        rendered = template.format(
+            host=host,
+            index=index,
+            slug=path_slug,
+            timestamp=stamp,
+            format=fmt,
+            ext=ext,
+        )
+    except (KeyError, ValueError, IndexError) as exc:
+        raise ValueError(
+            f"Invalid --output-template {template!r}: {exc}. "
+            "Supported placeholders: {host}, {index}, {slug}, {timestamp}, {format}, {ext}."
+        ) from exc
+    if "/" in rendered or "\\" in rendered or rendered in {"", ".", ".."}:
+        raise ValueError("--output-template must produce a filename without directory separators.")
+    candidate = Path(rendered)
+    stem = safe_filename(candidate.stem)
+    suffix = candidate.suffix
+    if suffix and not re.fullmatch(r"\.[A-Za-z0-9]{1,10}", suffix):
+        suffix = ext
+    return f"{stem}{suffix}"
+
+
+def resolve_output(
+    args: argparse.Namespace,
+    payload: dict[str, object],
+    *,
+    index: int = 1,
+    multi: bool = False,
+    timestamp: str | None = None,
+) -> Path | None:
+    if not multi and args.output == "-":
         return None
+    output_dir = getattr(args, "output_dir", None)
+    output_template = getattr(args, "output_template", None)
+    if multi or output_dir or output_template:
+        directory = Path(output_dir) if output_dir else Path.cwd()
+        template = output_template or ("{host}-{index}{ext}" if multi else "{host}{ext}")
+        filename = render_output_template(template, payload=payload, index=index, timestamp=timestamp)
+        return directory / filename
     if args.output:
         return Path(args.output)
     fmt = str(payload.get("output", "png"))
@@ -1308,8 +1982,9 @@ def _header_token(value: str) -> str:
 
 
 def bearer_token(args: argparse.Namespace, *, started_server: bool) -> str:
-    if args.api_key is not None:
-        return _header_token(args.api_key)
+    api_key = getattr(args, "api_key", None)
+    if api_key is not None:
+        return _header_token(api_key)
     project_key = _header_token(os.environ.get("VIPERCAPTURE_API_KEY", ""))
     admin = _header_token(os.environ.get("VIPERCAPTURE_ADMIN_TOKEN", ""))
     if started_server and admin:
@@ -1326,10 +2001,12 @@ def request_headers(args: argparse.Namespace, *, started_server: bool, json_body
     token = bearer_token(args, started_server=started_server)
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    if args.request_id:
-        headers["X-Request-Id"] = args.request_id
-    if args.idempotency_key:
-        headers["Idempotency-Key"] = args.idempotency_key
+    req_id = getattr(args, "request_id", None)
+    if req_id:
+        headers["X-Request-Id"] = req_id
+    idem = getattr(args, "idempotency_key", None)
+    if idem:
+        headers["Idempotency-Key"] = idem
     return headers
 
 
@@ -1346,8 +2023,22 @@ def max_capture_bytes() -> int:
     return value
 
 
-def _error_from_body(status: int, raw: bytes) -> CaptureError:
+def _parse_retry_after(headers) -> float | None:
+    if headers is None:
+        return None
+    raw = headers.get("Retry-After")
+    if not raw:
+        return None
+    try:
+        value = float(str(raw).strip())
+    except ValueError:
+        return None
+    return max(0.0, min(30.0, value))
+
+
+def _error_from_body(status: int, raw: bytes, headers=None) -> CaptureError:
     text = raw.decode("utf-8", errors="replace").strip()
+    retry_after = _parse_retry_after(headers)
     try:
         parsed = json.loads(text) if text else None
     except json.JSONDecodeError:
@@ -1361,8 +2052,16 @@ def _error_from_body(status: int, raw: bytes) -> CaptureError:
             status=status,
             code=code if isinstance(code, str) else None,
             body=parsed,
+            retry_after=retry_after,
         )
-    return CaptureError(text or f"HTTP {status}", status=status, body=text or None)
+    if isinstance(parsed, dict) and isinstance(parsed.get("detail"), str):
+        return CaptureError(
+            parsed["detail"],
+            status=status,
+            body=parsed,
+            retry_after=retry_after,
+        )
+    return CaptureError(text or f"HTTP {status}", status=status, body=text or None, retry_after=retry_after)
 
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -1488,9 +2187,45 @@ def _open_local_http(
                 raw = resp.read(64 * 1024)
             finally:
                 conn.close()
-            raise _error_from_body(resp.status, raw)
+            raise _error_from_body(resp.status, raw, resp.headers)
         return _LocalHttpResponse(conn, resp)
     raise CaptureError("The API redirected too many times.")
+
+
+def open_raw_response(
+    url: str,
+    *,
+    method: str,
+    body: bytes | None,
+    headers: dict[str, str],
+    timeout: float,
+):
+    parsed = urlsplit(url)
+    if parsed.scheme == "http" and (parsed.hostname or "").lower() in _LOOPBACK_HOSTS:
+        return _open_local_http(
+            url,
+            method=method,
+            data=body,
+            headers=headers,
+            timeout=timeout,
+        )
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        return _open(request, timeout)
+    except urllib.error.HTTPError as exc:
+        try:
+            raw = exc.read(64 * 1024)
+        finally:
+            exc.close()
+        raise _error_from_body(exc.code, raw, exc.headers) from exc
+    except urllib.error.URLError as exc:
+        reason = exc.reason
+        raise CaptureError(f"The API did not answer: {reason}") from exc
+    except TimeoutError as exc:
+        raise CaptureError("The API did not answer before the timeout.") from exc
 
 
 def open_response(
@@ -1504,32 +2239,92 @@ def open_response(
     data = None
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    parsed = urlsplit(url)
-    if parsed.scheme == "http" and (parsed.hostname or "").lower() in _LOOPBACK_HOSTS:
-        return _open_local_http(
-            url,
-            method=method,
-            data=data,
-            headers=headers,
-            timeout=timeout,
-        )
-    import urllib.error
-    import urllib.request
+    return open_raw_response(
+        url,
+        method=method,
+        body=data,
+        headers=headers,
+        timeout=timeout,
+    )
 
-    request = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        return _open(request, timeout)
-    except urllib.error.HTTPError as exc:
+
+def open_response_with_retries(
+    url: str,
+    *,
+    method: str,
+    payload: dict[str, object] | None = None,
+    body: bytes | None = None,
+    headers: dict[str, str],
+    timeout: float,
+    retries: int = 0,
+    retry_delay_ms: int = 500,
+    verbose: bool = False,
+):
+    attempts = max(0, int(retries)) + 1
+    base_delay = max(0, int(retry_delay_ms)) / 1000.0
+    last_exc: CaptureError | None = None
+    for attempt in range(attempts):
         try:
-            raw = exc.read(64 * 1024)
-        finally:
-            exc.close()
-        raise _error_from_body(exc.code, raw) from exc
-    except urllib.error.URLError as exc:
-        reason = exc.reason
-        raise CaptureError(f"The API did not answer: {reason}") from exc
-    except TimeoutError as exc:
-        raise CaptureError("The API did not answer before the timeout.") from exc
+            if body is not None:
+                return open_raw_response(
+                    url,
+                    method=method,
+                    body=body,
+                    headers=headers,
+                    timeout=timeout,
+                )
+            return open_response(
+                url,
+                method=method,
+                payload=payload,
+                headers=headers,
+                timeout=timeout,
+            )
+        except CaptureError as exc:
+            last_exc = exc
+            retryable = exc.status is None or exc.status in _RETRYABLE_STATUSES
+            if not retryable or attempt + 1 >= attempts:
+                raise
+            delay = exc.retry_after if exc.retry_after is not None else (base_delay * (2**attempt))
+            if verbose:
+                write_line(
+                    sys.stderr,
+                    f"Retry {attempt + 1}/{attempts - 1} in {delay:.2f}s after error: {exc}",
+                )
+            if delay > 0:
+                time.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
+
+
+def encode_multipart_form(
+    fields: dict[str, str] | None = None,
+    files: dict[str, tuple[str, bytes, str | None]] | None = None,
+) -> tuple[str, bytes]:
+    """Encode multipart/form-data fields and binary files using stdlib only."""
+    boundary = f"----ViperCaptureBoundary{secrets.token_hex(16)}"
+    parts: list[bytes] = []
+    for name, value in (fields or {}).items():
+        safe_name = name.replace('"', "")
+        parts.append(f"--{boundary}\r\n".encode("ascii"))
+        parts.append(
+            f'Content-Disposition: form-data; name="{safe_name}"\r\n\r\n'.encode("utf-8")
+        )
+        parts.append(str(value).encode("utf-8"))
+        parts.append(b"\r\n")
+    for name, (filename, data, content_type) in (files or {}).items():
+        safe_name = name.replace('"', "")
+        clean_file = safe_filename(Path(filename).name)
+        guessed = content_type or mimetypes.guess_type(clean_file)[0] or "application/octet-stream"
+        parts.append(f"--{boundary}\r\n".encode("ascii"))
+        parts.append(
+            f'Content-Disposition: form-data; name="{safe_name}"; filename="{clean_file}"\r\n'.encode("utf-8")
+        )
+        parts.append(f"Content-Type: {guessed}\r\n\r\n".encode("ascii"))
+        parts.append(data)
+        parts.append(b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode("ascii"))
+    return f"multipart/form-data; boundary={boundary}", b"".join(parts)
 
 
 def _read_bounded(response, handle) -> int:
@@ -1543,6 +2338,37 @@ def _read_bounded(response, handle) -> int:
         if total > limit:
             raise CaptureError(f"The capture is larger than {limit} bytes.")
         handle.write(block)
+
+
+def read_response_bytes(response) -> bytes:
+    import io
+
+    buf = io.BytesIO()
+    total = _read_bounded(response, buf)
+    if total <= 0:
+        raise CaptureError("The API returned an empty response.")
+    return buf.getvalue()
+
+
+def write_bytes_atomic(path: Path, data: bytes) -> int:
+    if not data:
+        raise CaptureError("The API returned an empty capture.")
+    directory = path.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.is_dir():
+        raise CaptureError(f"{path} is a directory.")
+    import tempfile
+
+    descriptor, name = tempfile.mkstemp(prefix=".vipercapture-", suffix=".part", dir=directory)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+        os.replace(temporary, path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    return len(data)
 
 
 def write_response(response, path: Path | None) -> int:
@@ -1584,6 +2410,113 @@ def _header_map(headers) -> dict[str, str]:
 def _media_type(headers) -> str:
     value = headers.get("Content-Type", "")
     return value.split(";", 1)[0].strip()
+
+
+def filename_from_headers(headers, fallback: str) -> str:
+    disposition = headers.get("Content-Disposition", "")
+    match = re.search(r'filename="?([^";\r\n]+)"?', disposition)
+    if match:
+        raw_name = Path(match.group(1)).name
+        candidate = Path(raw_name)
+        stem = safe_filename(candidate.stem)
+        suffix = candidate.suffix if re.fullmatch(r"\.[A-Za-z0-9]{1,10}", candidate.suffix) else ""
+        return f"{stem}{suffix}"
+    media = _media_type(headers).lower()
+    ext = _MEDIA_EXTENSIONS.get(media, "")
+    return f"{safe_filename(fallback)}{ext}"
+
+
+def open_saved_file(path: Path) -> None:
+    resolved = str(path.resolve())
+    try:
+        if sys.platform == "win32":
+            os.startfile(resolved)  # type: ignore[attr-defined]
+            return
+        opener = "open" if sys.platform == "darwin" else "xdg-open"
+        if shutil.which(opener) is None:
+            raise CaptureError(f"Could not open file: {opener} is not installed.")
+        subprocess.Popen(
+            [opener, resolved],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except CaptureError:
+        raise
+    except OSError as exc:
+        raise CaptureError(f"Could not open {path}: {exc}") from exc
+
+
+def copy_output_to_clipboard(path: Path, media_type: str = "") -> str:
+    """Copy text output content or file path to the OS clipboard (best effort)."""
+    resolved = path.resolve()
+    is_text = (
+        media_type.startswith("text/")
+        or media_type == "application/json"
+        or path.suffix.lower() in {".html", ".htm", ".md", ".markdown", ".json", ".txt"}
+    )
+    if is_text:
+        try:
+            text_payload = resolved.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise CaptureError(f"Could not read {path} for clipboard copy: {exc}") from exc
+        mode = "content"
+    else:
+        text_payload = str(resolved)
+        mode = "path"
+
+    if sys.platform == "win32":
+        if shutil.which("clip"):
+            proc = subprocess.run(
+                ["clip"],
+                input=text_payload.encode("utf-16-le"),
+                capture_output=True,
+                check=False,
+            )
+            if proc.returncode == 0:
+                return mode
+        pwsh = shutil.which("powershell.exe") or shutil.which("pwsh")
+        if pwsh:
+            proc = subprocess.run(
+                [pwsh, "-NoProfile", "-NonInteractive", "-Command", "Set-Clipboard -Value ([Console]::In.ReadToEnd())"],
+                input=text_payload,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                check=False,
+            )
+            if proc.returncode == 0:
+                return mode
+        raise CaptureError("Clipboard copy failed: neither clip nor PowerShell Set-Clipboard is available.")
+
+    if sys.platform == "darwin":
+        if shutil.which("pbcopy"):
+            proc = subprocess.run(
+                ["pbcopy"],
+                input=text_payload.encode("utf-8"),
+                capture_output=True,
+                check=False,
+            )
+            if proc.returncode == 0:
+                return mode
+        raise CaptureError("Clipboard copy failed: pbcopy is not available.")
+
+    for cmd in (
+        ["wl-copy"],
+        ["xclip", "-selection", "clipboard"],
+        ["xsel", "--clipboard", "--input"],
+    ):
+        if shutil.which(cmd[0]):
+            proc = subprocess.run(
+                cmd,
+                input=text_payload.encode("utf-8"),
+                capture_output=True,
+                check=False,
+            )
+            if proc.returncode == 0:
+                return mode
+    raise CaptureError("Clipboard copy failed: install wl-copy, xclip, or xsel.")
 
 
 def emit_success(args: argparse.Namespace, path: Path | None, total: int, headers) -> None:
@@ -1644,8 +2577,6 @@ def _is_descendant_process(child_pid: int, ancestor_pid: int) -> bool:
         except Exception:
             pass
     elif sys.platform == "darwin":
-        import subprocess
-
         try:
             cur = child_pid
             while cur > 1:
@@ -1672,6 +2603,7 @@ def _wait_for_local_server(
     token: str = "",
 ) -> bool:
     """Return True when the process this command started is the listening server."""
+    global _STARTED_SERVER_HANDLE
     started = time.monotonic()
     deadline = started + 60
     while time.monotonic() < deadline:
@@ -1686,6 +2618,7 @@ def _wait_for_local_server(
                     return False
                 if pid != proc.pid and token:
                     launch._record_server_process(pid, token, launch.PORT)
+                _STARTED_SERVER_HANDLE = (proc, pid if pid != proc.pid else None)
                 return True
         if proc.poll() is not None and not launch.port_open():
             break
@@ -1725,8 +2658,6 @@ def prepare_private_data_dir(env: dict[str, str], *, home: Path | None = None) -
 
 
 def start_local_server() -> bool:
-    import subprocess
-
     env, token = launch._new_server_environment()
     prepare_private_data_dir(env)
     log_path = Path.home() / ".vipercapture" / "requests.log"
@@ -1777,6 +2708,17 @@ def start_local_server() -> bool:
     return _wait_for_local_server(proc, log_path, token=token)
 
 
+def stop_started_server() -> None:
+    """Stop the local background server if this process started it."""
+    global _STARTED_SERVER_HANDLE
+    handle = _STARTED_SERVER_HANDLE
+    _STARTED_SERVER_HANDLE = None
+    if handle is None:
+        return
+    proc, worker_pid = handle
+    launch.stop_server(proc, announce=False, worker_pid=worker_pid)
+
+
 def ensure_server(args: argparse.Namespace) -> bool:
     if not is_local_default(args.server):
         return False
@@ -1787,7 +2729,7 @@ def ensure_server(args: argparse.Namespace) -> bool:
             f"Port {launch.PORT} is open, but it is not ViperCapture. "
             "Choose another API with --server."
         )
-    if args.no_start:
+    if getattr(args, "no_start", False):
         raise CaptureError(
             "ViperCapture is not running. Start it with vipercapture, or omit --no-start."
         )
@@ -1855,27 +2797,55 @@ def resolve_api_url(root: str, url: str) -> str:
 _MAX_JSON_BYTES = 1024 * 1024
 
 
-def _read_json(response) -> dict[str, object]:
+def _read_json_value(response) -> object:
     raw = response.read(_MAX_JSON_BYTES + 1)
     if len(raw) > _MAX_JSON_BYTES:
         raise CaptureError("The API returned a JSON document that is too large.")
     try:
-        parsed = json.loads(raw.decode("utf-8"))
+        return json.loads(raw.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise CaptureError("The API did not return JSON.") from exc
+
+
+def _read_json(response) -> dict[str, object]:
+    parsed = _read_json_value(response)
     if not isinstance(parsed, dict):
         raise CaptureError("The API did not return a JSON object.")
     return parsed
 
 
-def execute(args: argparse.Namespace, payload: dict[str, object], *, started_server: bool) -> int:
+def _execute_one(
+    args: argparse.Namespace,
+    payload: dict[str, object],
+    *,
+    root: str,
+    output: Path | None,
+    started_server: bool,
+) -> tuple[object, int, dict[str, object] | None]:
     timeout = request_timeout(args, payload)
-    root = api_root(args.server)
-    output = resolve_output(args, payload)
+    retries = max(0, int(getattr(args, "retries", 0) or 0))
+    retry_delay_ms = max(0, int(getattr(args, "retry_delay_ms", 500) or 0))
     if args.verbose and not args.quiet:
         route = "/v1/jobs" if args.async_job else "/v1/render"
         write_line(sys.stderr, f"POST {display_server(root)}{route}")
     if args.async_job:
+        if getattr(args, "no_wait", False):
+            submitted = open_response_with_retries(
+                root + "/v1/jobs",
+                method="POST",
+                payload=payload,
+                headers=request_headers(args, started_server=started_server, json_body=True),
+                timeout=min(30.0, timeout),
+                retries=retries,
+                retry_delay_ms=retry_delay_ms,
+                verbose=bool(args.verbose and not args.quiet),
+            )
+            try:
+                job = _read_json(submitted)
+                headers = submitted.headers
+            finally:
+                submitted.close()
+            return headers, 0, job
         response_headers, total = _execute_async(
             args,
             payload,
@@ -1883,20 +2853,50 @@ def execute(args: argparse.Namespace, payload: dict[str, object], *, started_ser
             output=output,
             timeout=timeout,
             started_server=started_server,
+            retries=retries,
+            retry_delay_ms=retry_delay_ms,
         )
-    else:
-        response = open_response(
-            root + "/v1/render",
-            method="POST",
-            payload=payload,
-            headers=request_headers(args, started_server=started_server, json_body=True),
-            timeout=timeout,
-        )
-        try:
-            total = write_response(response, output)
-            response_headers = response.headers
-        finally:
-            response.close()
+        return response_headers, total, None
+
+    response = open_response_with_retries(
+        root + "/v1/render",
+        method="POST",
+        payload=payload,
+        headers=request_headers(args, started_server=started_server, json_body=True),
+        timeout=timeout,
+        retries=retries,
+        retry_delay_ms=retry_delay_ms,
+        verbose=bool(args.verbose and not args.quiet),
+    )
+    try:
+        total = write_response(response, output)
+        response_headers = response.headers
+    finally:
+        response.close()
+    return response_headers, total, None
+
+
+def execute(args: argparse.Namespace, payload: dict[str, object], *, started_server: bool) -> int:
+    root = api_root(args.server)
+    output = resolve_output(args, payload)
+    response_headers, total, async_job_doc = _execute_one(
+        args,
+        payload,
+        root=root,
+        output=output,
+        started_server=started_server,
+    )
+    if async_job_doc is not None:
+        if args.json:
+            write_line(sys.stdout, _json_line({"ok": True, **async_job_doc}))
+        elif not args.quiet:
+            write_line(sys.stdout, str(async_job_doc.get("id") or ""))
+        return 0
+    if output is not None:
+        if getattr(args, "copy_output", False):
+            copy_output_to_clipboard(output, _media_type(response_headers))
+        if getattr(args, "open_output", False):
+            open_saved_file(output)
     emit_success(args, output, total, response_headers)
     return 0
 
@@ -1909,14 +2909,20 @@ def _execute_async(
     output: Path | None,
     timeout: float,
     started_server: bool,
+    retries: int = 0,
+    retry_delay_ms: int = 500,
 ) -> tuple[object, int]:
     deadline = time.monotonic() + timeout
-    submitted = open_response(
+    verbose = bool(args.verbose and not args.quiet)
+    submitted = open_response_with_retries(
         root + "/v1/jobs",
         method="POST",
         payload=payload,
         headers=request_headers(args, started_server=started_server, json_body=True),
         timeout=min(30, _remaining(deadline)),
+        retries=retries,
+        retry_delay_ms=retry_delay_ms,
+        verbose=verbose,
     )
     try:
         job = _read_json(submitted)
@@ -1928,12 +2934,15 @@ def _execute_async(
             result_url = job.get("result_url")
             if not isinstance(result_url, str) or not result_url:
                 raise CaptureError("The async job did not include a result URL.")
-            result = open_response(
+            result = open_response_with_retries(
                 resolve_api_url(root, result_url),
                 method="GET",
                 payload=None,
                 headers=request_headers(args, started_server=started_server, json_body=False),
                 timeout=_remaining(deadline),
+                retries=retries,
+                retry_delay_ms=retry_delay_ms,
+                verbose=verbose,
             )
             try:
                 return result.headers, write_response(result, output)
@@ -1952,12 +2961,15 @@ def _execute_async(
         if not isinstance(status_url, str) or not status_url:
             raise CaptureError("The async job did not include a status URL.")
         time.sleep(min(max(args.poll_ms, 1) / 1000, _remaining(deadline)))
-        polled = open_response(
+        polled = open_response_with_retries(
             resolve_api_url(root, status_url),
             method="GET",
             payload=None,
             headers=request_headers(args, started_server=started_server, json_body=False),
             timeout=min(30, _remaining(deadline)),
+            retries=retries,
+            retry_delay_ms=retry_delay_ms,
+            verbose=verbose,
         )
         try:
             job = _read_json(polled)
@@ -1972,15 +2984,86 @@ def _remaining(deadline: float) -> float:
     return left
 
 
+def _read_urls_file(path: str) -> list[str]:
+    text = _read_text(path)
+    urls: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        urls.append(line)
+    if not urls:
+        raise ValueError("--urls-file did not contain any URLs.")
+    return urls
+
+
+def _collect_multi_urls(args: argparse.Namespace) -> list[str] | None:
+    targets = list(getattr(args, "targets", []) or [])
+    urls_file = getattr(args, "urls_file", None)
+    if not urls_file and len(targets) <= 1:
+        return None
+    if args.url:
+        raise ValueError("Do not combine --url with multiple positional URLs or --urls-file.")
+    if args.html or args.html_file or args.markdown or args.markdown_file:
+        raise ValueError("Multi-URL capture cannot be combined with --html or --markdown.")
+    urls: list[str] = list(targets)
+    if urls_file:
+        urls.extend(_read_urls_file(urls_file))
+    if not urls:
+        raise ValueError("Pass at least one URL.")
+    return urls
+
+
+def _validate_client_options(args: argparse.Namespace) -> None:
+    if getattr(args, "no_wait", False) and not args.async_job:
+        raise ValueError("--no-wait requires --async.")
+    if getattr(args, "retries", 0) is not None and int(args.retries) < 0:
+        raise ValueError("--retries must be 0 or greater.")
+    if getattr(args, "retry_delay_ms", 500) is not None and int(args.retry_delay_ms) < 0:
+        raise ValueError("--retry-delay-ms must be 0 or greater.")
+    if args.output == "-" and getattr(args, "open_output", False):
+        raise ValueError("--open cannot be used with --output -.")
+    if args.output == "-" and getattr(args, "copy_output", False):
+        raise ValueError("--copy cannot be used with --output -.")
+
+
 def run_capture(args: argparse.Namespace) -> int:
     try:
-        payload = build_payload(args)
-        validate_payload(payload)
+        apply_config_defaults(args)
+        _validate_client_options(args)
+        multi_urls = _collect_multi_urls(args)
+        if multi_urls is not None:
+            if args.output:
+                raise ValueError("Use --output-dir (and optionally --output-template) instead of --output for multi-URL captures.")
+            base_doc, has_base = _load_base_document(args)
+            payloads = [
+                build_payload(
+                    args,
+                    override_url=u,
+                    base_document=base_doc if has_base else None,
+                )
+                for u in multi_urls
+            ]
+            for item in payloads:
+                validate_payload(item)
+        else:
+            payload = build_payload(args)
+            validate_payload(payload)
+            payloads = None
     except ValueError as exc:
         return fail(str(exc), exit_code=2)
+
     if args.dry_run:
-        write_line(sys.stdout, json.dumps(public_payload(payload), ensure_ascii=False, indent=2))
+        if payloads is not None:
+            write_line(
+                sys.stdout,
+                json.dumps([public_payload(item) for item in payloads], ensure_ascii=False, indent=2),
+            )
+        else:
+            write_line(sys.stdout, json.dumps(public_payload(payload), ensure_ascii=False, indent=2))
         return 0
+
+    started = False
     try:
         load_local_env()
         started = ensure_server(args)
@@ -1989,14 +3072,83 @@ def run_capture(args: argparse.Namespace) -> int:
                 sys.stderr,
                 f"ViperCapture is listening on http://{launch.HOST}:{launch.PORT}",
             )
-            write_line(sys.stderr, "Stop it with: vipercapture kill")
-        return execute(args, payload, started_server=started)
+            if not getattr(args, "stop_server", False):
+                write_line(sys.stderr, "Stop it with: vipercapture kill")
+
+        if payloads is None:
+            return execute(args, payload, started_server=started)
+
+        root = api_root(args.server)
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        results: list[dict[str, object]] = []
+        failures = 0
+        for index, item_payload in enumerate(payloads, start=1):
+            target_path = resolve_output(args, item_payload, index=index, multi=True, timestamp=stamp)
+            try:
+                headers, total, job_doc = _execute_one(
+                    args,
+                    item_payload,
+                    root=root,
+                    output=target_path,
+                    started_server=started,
+                )
+                if job_doc is not None:
+                    entry: dict[str, object] = {
+                        "ok": True,
+                        "url": item_payload.get("url"),
+                        "job": job_doc,
+                        "id": job_doc.get("id"),
+                    }
+                    results.append(entry)
+                    if not args.json and not args.quiet:
+                        write_line(sys.stdout, str(job_doc.get("id") or ""))
+                else:
+                    assert target_path is not None
+                    shown = display_path(target_path)
+                    results.append({
+                        "ok": True,
+                        "url": item_payload.get("url"),
+                        "path": shown,
+                        "absolute": str(target_path.resolve()),
+                        "bytes": total,
+                        "media_type": _media_type(headers),
+                    })
+                    if getattr(args, "open_output", False):
+                        open_saved_file(target_path)
+                    if not args.json and not args.quiet:
+                        write_line(sys.stdout, shown)
+            except CaptureError as exc:
+                failures += 1
+                results.append({
+                    "ok": False,
+                    "url": item_payload.get("url"),
+                    "error": str(exc),
+                    "status": exc.status,
+                    "code": exc.code,
+                })
+                if not args.json:
+                    fail(str(exc), status=exc.status, code=exc.code, body=exc.body)
+        if args.json:
+            write_line(
+                sys.stdout,
+                _json_line({
+                    "ok": failures == 0,
+                    "count": len(results),
+                    "succeeded": len(results) - failures,
+                    "failed": failures,
+                    "results": results,
+                }),
+            )
+        return 0 if failures == 0 else 1
     except CaptureError as exc:
         return fail(str(exc), status=exc.status, code=exc.code, body=exc.body, exit_code=exc.exit_code)
     except OSError as exc:
         return fail(str(exc))
     except BrokenPipeError:
         return 0
+    finally:
+        if started and getattr(args, "stop_server", False):
+            stop_started_server()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2017,3 +3169,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_capture(args)
     except KeyboardInterrupt:
         return fail("Capture cancelled.", exit_code=130)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -2556,6 +2556,8 @@ def wait_for_shutdown(
     on_resize: Callable[[], None] | None = None,
     announce: bool = True,
     worker_pid: int | None = None,
+    host: str = HOST,
+    port: int = PORT,
 ) -> bool:
     """Block until Esc twice, Ctrl+C, or the server exits.
 
@@ -2571,7 +2573,10 @@ def wait_for_shutdown(
     except KeyboardInterrupt:
         pass
     exited = server.poll() is not None
-    stop_server(server, announce=announce, worker_pid=worker_pid)
+    if host != HOST or port != PORT:
+        stop_server(server, announce=announce, worker_pid=worker_pid, host=host, port=port)
+    else:
+        stop_server(server, announce=announce, worker_pid=worker_pid)
     return exited
 
 
@@ -2580,31 +2585,41 @@ def present_running_server(
     log_path: Path,
     *,
     worker_pid: int | None = None,
+    url: str = URL,
+    host: str = HOST,
+    port: int = PORT,
 ) -> None:
     """Full-screen status here, request log in another window of this terminal."""
     screen: StatusScreen | None = None
+    custom_bind = host != HOST or port != PORT
     # Alternate-screen and image escapes belong on a terminal. Redirected
     # stdout (vipercapture > startup.log) keeps the normal banner.
     if sys.stdin.isatty() and sys.stdout.isatty() and sys.platform != "win32":
-        screen = StatusScreen(URL)
+        screen = StatusScreen(url)
     if screen is None:
-        print(ready_banner())
+        print(ready_banner(url) if url != URL else ready_banner())
         if not open_request_window(log_path, os.getpid()):
             print(f"  Requests: {log_path}")
+        wait_kwargs: dict[str, object] = {}
         if worker_pid is not None:
-            wait_for_shutdown(server, worker_pid=worker_pid)
-        else:
-            wait_for_shutdown(server)
+            wait_kwargs["worker_pid"] = worker_pid
+        if custom_bind:
+            wait_kwargs["host"] = host
+            wait_kwargs["port"] = port
+        wait_for_shutdown(server, **wait_kwargs)  # type: ignore[arg-type]
         return
     try:
         screen.enter()
         if not open_request_window(log_path, os.getpid()):
             screen.note = f"Requests: {log_path}"
             screen.draw()
+        wait_kwargs = {"on_resize": screen.draw, "announce": False}
         if worker_pid is not None:
-            exited = wait_for_shutdown(server, on_resize=screen.draw, announce=False, worker_pid=worker_pid)
-        else:
-            exited = wait_for_shutdown(server, on_resize=screen.draw, announce=False)
+            wait_kwargs["worker_pid"] = worker_pid
+        if custom_bind:
+            wait_kwargs["host"] = host
+            wait_kwargs["port"] = port
+        exited = wait_for_shutdown(server, **wait_kwargs)  # type: ignore[arg-type]
     finally:
         screen.leave()
     if exited:
@@ -3175,28 +3190,25 @@ def ensure_playwright() -> None:
 # ── Main ──────────────────────────────────────────────────────
 
 LAUNCH_HELP = """\
-usage: vipercapture [--one-window]
+usage: vipercapture [--one-window] [--host HOST] [--port PORT]
+       vipercapture --version | version [--json]
+       vipercapture capture URL [URL ...] --output FILE [options]
+       vipercapture status | logs | gpu | preset | diff | baseline
+       vipercapture bulk | job | schedule | profile | sign | verify | admin
+       vipercapture completion bash|zsh|fish|powershell
        vipercapture update [--check]
        vipercapture kill
-       vipercapture capture URL --output FILE [options]
        vipercapture --gui [--viewport WIDTH HEIGHT]
 
 Start ViperCapture in this terminal. Ghostty and Kitty open request
 logs in another window and show a full-screen status view.
 
+Launcher options:
   --one-window   Keep the status and request log in this terminal.
                  Use this over SSH, or anywhere a second window is wrong.
-  update         Download the latest ViperCapture and replace this install.
-                 The virtualenv and saved jobs stay in place. This uses
-                 Python only, on Linux, macOS, and Windows.
-  update --check Print whether an update is available, then exit.
-                 Exit 10 means an update is available.
-  kill           Stop all running instances of ViperCapture (server, GUI,
-                 and background workers) on Windows, macOS, and Linux.
-  capture        Render a page and save the file. The saved path is printed
-                 on stdout. vipercapture capture --help lists a flag for
-                 each major API field. The same flags work on Linux, macOS,
-                 and Windows.
+  --host HOST    Bind address for the server (default: 127.0.0.1).
+  --port PORT    TCP port for the server (default: 8000).
+  --version, -V  Print the ViperCapture version and exit.
   --gui          Open a full-screen capture menu in this terminal.
                  Type a website link, press Tab to switch png, gif, and
                  mp4, and press Ctrl+P to switch between the full page and
@@ -3205,8 +3217,54 @@ logs in another window and show a full-screen status view.
                  is 1920 1080.
   -h, --help     Show this help.
 
+Commands (run `vipercapture <command> --help` for details):
+  capture        Render page(s) and save file(s). The saved path is printed
+                 on stdout. vipercapture capture --help lists a flag for
+                 each major API field. The same flags work on Linux, macOS,
+                 and Windows.
+  version        Print the installed ViperCapture version.
+  status         Check server health, readiness, GPU, engines, and async jobs.
+  logs           Read or tail ~/.vipercapture/requests.log.
+  gpu            Show or switch local GPU mode (status, off, auto).
+  preset         Manage saved local presets (list, show, save, delete).
+  diff           Compare two images via /v1/diff and save a visual-diff ZIP.
+  baseline       Manage visual baselines (save, list, delete, compare).
+  bulk           Submit batch async render jobs to /v1/jobs/bulk.
+  job            Inspect, cancel, or download async jobs (/v1/jobs).
+  schedule       Manage cron schedules (create, list, get, update, delete).
+  profile        Manage encrypted browser profiles (create, import, delete).
+  sign           Generate an HMAC-signed render URL (/v1/signed-url).
+  verify         Verify an Ed25519-certified capture bundle (--certify).
+  admin          Manage control-plane projects, API keys, audit, and status.
+  completion     Output shell completion for bash, zsh, fish, or powershell.
+  update         Download the latest ViperCapture and replace this install.
+                 The virtualenv and saved jobs stay in place. This uses
+                 Python only, on Linux, macOS, and Windows.
+  update --check Print whether an update is available, then exit.
+                 Exit 10 means an update is available.
+  kill           Stop all running instances of ViperCapture (server, GUI,
+                 and background workers) on Windows, macOS, and Linux.
+
 Windows always uses one window. --gui stays in this window on every OS.
 """
+
+_CLI_SUBCOMMANDS = frozenset({
+    "version",
+    "status",
+    "logs",
+    "gpu",
+    "preset",
+    "diff",
+    "baseline",
+    "bulk",
+    "job",
+    "schedule",
+    "profile",
+    "sign",
+    "verify",
+    "admin",
+    "completion",
+})
 
 
 class CliArgs:
@@ -3219,6 +3277,11 @@ class CliArgs:
         "capture",
         "capture_argv",
         "viewport",
+        "host",
+        "port",
+        "version",
+        "subcommand",
+        "subcommand_argv",
     )
 
     def __init__(
@@ -3231,6 +3294,11 @@ class CliArgs:
         capture: bool = False,
         capture_argv: tuple[str, ...] = (),
         viewport: tuple[int, int] | None = None,
+        host: str | None = None,
+        port: int | None = None,
+        version: bool = False,
+        subcommand: str | None = None,
+        subcommand_argv: tuple[str, ...] = (),
     ) -> None:
         object.__setattr__(self, "one_window", one_window)
         object.__setattr__(self, "update", update)
@@ -3240,6 +3308,11 @@ class CliArgs:
         object.__setattr__(self, "capture", capture)
         object.__setattr__(self, "capture_argv", capture_argv)
         object.__setattr__(self, "viewport", viewport)
+        object.__setattr__(self, "host", host)
+        object.__setattr__(self, "port", port)
+        object.__setattr__(self, "version", version)
+        object.__setattr__(self, "subcommand", subcommand)
+        object.__setattr__(self, "subcommand_argv", subcommand_argv)
 
     def __setattr__(self, name: str, value: object) -> None:
         raise AttributeError("CliArgs is immutable")
@@ -3250,15 +3323,18 @@ class CliArgs:
         return (
             self.one_window, self.update, self.check, self.gui,
             self.kill, self.capture, self.capture_argv, self.viewport,
+            self.host, self.port, self.version, self.subcommand, self.subcommand_argv,
         ) == (
             other.one_window, other.update, other.check, other.gui,
             other.kill, other.capture, other.capture_argv, other.viewport,
+            other.host, other.port, other.version, other.subcommand, other.subcommand_argv,
         )
 
     def __hash__(self) -> int:
         return hash((
             self.one_window, self.update, self.check, self.gui,
             self.kill, self.capture, self.capture_argv, self.viewport,
+            self.host, self.port, self.version, self.subcommand, self.subcommand_argv,
         ))
 
     def __repr__(self) -> str:
@@ -3266,7 +3342,9 @@ class CliArgs:
             f"CliArgs(one_window={self.one_window!r}, update={self.update!r}, "
             f"check={self.check!r}, gui={self.gui!r}, kill={self.kill!r}, "
             f"capture={self.capture!r}, capture_argv={self.capture_argv!r}, "
-            f"viewport={self.viewport!r})"
+            f"viewport={self.viewport!r}, host={self.host!r}, port={self.port!r}, "
+            f"version={self.version!r}, subcommand={self.subcommand!r}, "
+            f"subcommand_argv={self.subcommand_argv!r})"
         )
 
 
@@ -3281,6 +3359,22 @@ def _viewport_edge(token: str) -> int:
     value = int(token)
     if value < 1 or value > 16_384:
         _reject_arg(f"Invalid viewport size: {token}")
+    return value
+
+
+def _parse_port(token: str) -> int:
+    if not token.isdigit() or len(token) > 5:
+        _reject_arg(f"Invalid port: {token}")
+    value = int(token)
+    if value < 1 or value > 65_535:
+        _reject_arg(f"Invalid port: {token}")
+    return value
+
+
+def _parse_host(token: str) -> str:
+    value = token.strip()
+    if not value or any(ch.isspace() or ord(ch) < 32 for ch in value):
+        _reject_arg(f"Invalid host: {token}")
     return value
 
 
@@ -3309,9 +3403,23 @@ def parse_cli(argv: list[str] | None = None) -> CliArgs:
         return CliArgs(kill=True)
     if args and args[0] == "capture":
         return CliArgs(capture=True, capture_argv=tuple(args[1:]))
+    if args and args[0] in _CLI_SUBCOMMANDS:
+        return CliArgs(
+            version=(args[0] == "version"),
+            subcommand=args[0],
+            subcommand_argv=tuple(args[1:]),
+        )
+    if args and args[0] in {"--version", "-V"}:
+        return CliArgs(
+            version=True,
+            subcommand="version",
+            subcommand_argv=tuple(args[1:]),
+        )
     gui = False
     one_window = False
     viewport: tuple[int, int] | None = None
+    host: str | None = None
+    port: int | None = None
     index = 0
     while index < len(args):
         arg = args[index]
@@ -3332,12 +3440,34 @@ def parse_cli(argv: list[str] | None = None) -> CliArgs:
             viewport = (_viewport_edge(args[index + 1]), _viewport_edge(args[index + 2]))
             index += 3
             continue
+        if arg == "--host":
+            if index + 1 >= len(args):
+                _reject_arg("--host needs a bind address.")
+            host = _parse_host(args[index + 1])
+            index += 2
+            continue
+        if arg.startswith("--host="):
+            host = _parse_host(arg.split("=", 1)[1])
+            index += 1
+            continue
+        if arg == "--port":
+            if index + 1 >= len(args):
+                _reject_arg("--port needs a port number.")
+            port = _parse_port(args[index + 1])
+            index += 2
+            continue
+        if arg.startswith("--port="):
+            port = _parse_port(arg.split("=", 1)[1])
+            index += 1
+            continue
         _reject_arg(f"Unknown argument: {arg}")
     if viewport is not None and not gui:
         _reject_arg("--viewport is only used with --gui.")
     if gui and one_window:
         _reject_arg("--gui already keeps everything in this terminal.")
-    return CliArgs(one_window=one_window, gui=gui, viewport=viewport)
+    if gui and (host is not None or port is not None):
+        _reject_arg("--host and --port cannot be used with --gui.")
+    return CliArgs(one_window=one_window, gui=gui, viewport=viewport, host=host, port=port)
 
 
 def parse_launch_args(argv: list[str] | None = None) -> bool:
@@ -3362,19 +3492,56 @@ def _configure_console_streams() -> None:
                 pass
 
 
+def _can_import_cryptography() -> bool:
+    try:
+        import cryptography.hazmat.primitives.asymmetric.ed25519  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _format_bind_url(host: str, port: int) -> tuple[str, str]:
+    """Return (connect_host, http_url) for a configured bind host and port."""
+    if host == "0.0.0.0":
+        connect_host = "127.0.0.1"
+    elif host in {"::", "[::]"}:
+        connect_host = "::1"
+    else:
+        connect_host = host.strip("[]")
+    url_host = f"[{connect_host}]" if ":" in connect_host else connect_host
+    return connect_host, f"http://{url_host}:{port}/"
+
+
 def main() -> None:
     _configure_console_streams()
-    # Parsed before the venv re-exec so --help and update do not install
-    # dependencies or start the server. ensure_venv re-runs this file with
-    # the same arguments when the command is a normal launch.
+    # Parsed before the venv re-exec so --help, --version, fast subcommands,
+    # and update do not install dependencies or start the server. ensure_venv
+    # re-runs this file with the same arguments when the command needs the venv.
     cli = parse_cli()
     if cli.capture:
         global INTERACTIVE_FAILURES
         INTERACTIVE_FAILURES = False
         import vipercapture.capture_cli as capture_cli
-        if not capture_cli.wants_help(list(cli.capture_argv)):
+        cap_argv = list(cli.capture_argv)
+        skip_venv = capture_cli.wants_help(cap_argv) or (
+            "--dry-run" in cap_argv and not VENV_PYTHON.exists()
+        )
+        if not skip_venv:
             ensure_venv()
-        raise SystemExit(capture_cli.main(list(cli.capture_argv)))
+        raise SystemExit(capture_cli.main(cap_argv))
+    if cli.subcommand is not None or cli.version:
+        INTERACTIVE_FAILURES = False
+        sub_name = cli.subcommand or "version"
+        sub_argv = list(cli.subcommand_argv)
+        import vipercapture.capture_cli as capture_cli
+        import vipercapture.cli_commands as cli_commands
+        if not capture_cli.wants_help(sub_argv):
+            if sub_name == "verify":
+                if not _can_import_cryptography():
+                    ensure_venv()
+            elif sub_name not in cli_commands.FAST_NO_VENV_SUBCOMMANDS and sub_name != "status":
+                ensure_venv()
+        raise SystemExit(cli_commands.main([sub_name, *sub_argv]))
     if cli.kill:
         raise SystemExit(kill_all_instances())
     if cli.update:
@@ -3389,6 +3556,13 @@ def main() -> None:
     one_window = use_one_window(cli.one_window)
     ensure_venv()    # may re-exec this script under the venv Python
 
+    bind_host = cli.host if cli.host is not None else HOST
+    bind_port = cli.port if cli.port is not None else PORT
+    custom_bind = cli.host is not None or cli.port is not None
+    connect_host, bind_url = (
+        _format_bind_url(bind_host, bind_port) if custom_bind else (HOST, URL)
+    )
+
     print()
     print("  ViperCapture")
     print("  ------------")
@@ -3396,18 +3570,18 @@ def main() -> None:
 
     # Server already running from a previous session? Open it immediately
     # without hashing requirements or importing Playwright first.
-    if port_open():
+    if port_open(connect_host, bind_port) if custom_bind else port_open():
         show_terminal_logo()
-        print(f"\n{listening_line()}")
+        print(f"\n{listening_line(bind_url)}")
         print("  That server is already running. Opening it in your browser.")
-        _mod("webbrowser").open(URL)
+        _mod("webbrowser").open(bind_url)
         return
 
     ensure_deps()
     ensure_playwright()
 
     # ── Start the server ────────────────────────────────────────
-    print(f"\n  Starting server at {URL}\n")
+    print(f"\n  Starting server at {bind_url}\n")
 
     subprocess = _mod("subprocess")
     log_path = Path.home() / ".vipercapture" / "requests.log"
@@ -3422,10 +3596,10 @@ def main() -> None:
         popen_kwargs["stderr"] = subprocess.STDOUT
     server = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "vipercapture.main:app",
-         "--host", HOST, "--port", str(PORT), "--ws", "none"],
+         "--host", bind_host, "--port", str(bind_port), "--ws", "none"],
         **popen_kwargs,
     )
-    _record_server_process(server.pid, shutdown_token, PORT)
+    _record_server_process(server.pid, shutdown_token, bind_port)
 
     # ── Wait for port (50ms poll, 30s max) ──────────────────────
     # One-window mode inherits uvicorn's output, so progress dots would
@@ -3440,8 +3614,10 @@ def main() -> None:
     deadline = wait_start + 30.0
     next_dot = wait_start + 1.0
     while time.monotonic() < deadline:
-        if port_open():
-            worker_pid = _record_endpoint_server_process(server.pid, shutdown_token, PORT)
+        if port_open(connect_host, bind_port) if custom_bind else port_open():
+            worker_pid = _record_endpoint_server_process(
+                server.pid, shutdown_token, bind_port, host=connect_host
+            )
             ready = True
             break
         if server.poll() is not None:
@@ -3468,21 +3644,28 @@ def main() -> None:
         else:
             print("  Check the output above for details.")
         if server.poll() is None:
-            stop_server(server, announce=False, worker_pid=worker_pid)
+            stop_server(server, announce=False, host=connect_host, port=bind_port, worker_pid=worker_pid)
         if log_handle is not None:
             log_handle.close()
         wait_and_exit(1)
 
     # ── Open browser, then present this terminal ───────────────
-    _mod("webbrowser").open(URL)
+    _mod("webbrowser").open(bind_url)
     try:
         if one_window:
             show_terminal_logo()
-            print(ready_banner())
-            if wait_for_shutdown(server, worker_pid=worker_pid):
+            print(ready_banner(bind_url))
+            if wait_for_shutdown(server, worker_pid=worker_pid, host=connect_host, port=bind_port):
                 print("\n  Server exited.")
         else:
-            present_running_server(server, log_path, worker_pid=worker_pid)
+            present_running_server(
+                server,
+                log_path,
+                worker_pid=worker_pid,
+                url=bind_url,
+                host=connect_host,
+                port=bind_port,
+            )
     finally:
         if log_handle is not None:
             log_handle.close()

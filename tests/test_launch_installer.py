@@ -540,6 +540,56 @@ class LaunchArgsTests(unittest.TestCase):
         self.assertFalse(launch.use_one_window(False, "darwin"))
         self.assertTrue(launch.use_one_window(True, "linux"))
 
+    def test_host_and_port_flags(self) -> None:
+        parsed = launch.parse_cli(["--host", "0.0.0.0", "--port", "9090", "--one-window"])
+        self.assertEqual(parsed.host, "0.0.0.0")
+        self.assertEqual(parsed.port, 9090)
+        self.assertTrue(parsed.one_window)
+
+        equals_form = launch.parse_cli(["--host=127.0.0.1", "--port=8088"])
+        self.assertEqual(equals_form.host, "127.0.0.1")
+        self.assertEqual(equals_form.port, 8088)
+
+        for bad in (["--port", "0"], ["--port", "70000"], ["--port", "abc"], ["--host", "bad host"], ["--gui", "--port", "9000"]):
+            with self.subTest(bad=bad):
+                with mock.patch("sys.stderr", io.StringIO()):
+                    with self.assertRaises(SystemExit) as caught:
+                        launch.parse_cli(bad)
+                self.assertEqual(caught.exception.code, 2)
+
+    def test_version_and_subcommands_route_and_fast_path_skips_venv(self) -> None:
+        ver_flag = launch.parse_cli(["--version"])
+        self.assertTrue(ver_flag.version)
+        self.assertEqual(ver_flag.subcommand, "version")
+
+        for sub in ("version", "status", "logs", "gpu", "preset", "diff", "baseline", "bulk", "job", "schedule", "profile", "sign", "verify", "admin", "completion"):
+            parsed = launch.parse_cli([sub, "--help"])
+            self.assertEqual(parsed.subcommand, sub)
+            self.assertEqual(parsed.subcommand_argv, ("--help",))
+
+        previous = launch.INTERACTIVE_FAILURES
+        try:
+            for fast_argv in (
+                ["launch.py", "--version"],
+                ["launch.py", "version", "--json"],
+                ["launch.py", "completion", "bash"],
+                ["launch.py", "gpu", "--help"],
+                ["launch.py", "diff", "--help"],
+            ):
+                with self.subTest(argv=fast_argv):
+                    stdout = io.StringIO()
+                    with (
+                        mock.patch("sys.stdout", stdout),
+                        mock.patch.object(launch, "ensure_venv", side_effect=AssertionError("venv")),
+                        mock.patch.object(sys, "argv", fast_argv),
+                    ):
+                        with self.assertRaises(SystemExit) as caught:
+                            launch.main()
+                    self.assertEqual(caught.exception.code, 0)
+                    self.assertTrue(stdout.getvalue().strip())
+        finally:
+            launch.INTERACTIVE_FAILURES = previous
+
 
 class StopKeyBufferTests(unittest.TestCase):
     def test_two_separate_escapes_stop(self) -> None:
