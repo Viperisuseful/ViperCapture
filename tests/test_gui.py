@@ -1982,3 +1982,149 @@ class GuiCouncilHardeningTests(TestCase):
                 deleted = client.delete(f"/local/presets/{encoded}")
                 self.assertEqual(deleted.status_code, 200)
                 self.assertEqual(deleted.json()["presets"], [])
+
+    def test_round4_proxy_tls_noproxy_cancel_huge_preset_and_cursor_alignment(self) -> None:
+        import socket as _socket
+        import threading as _threading
+        import time as _time
+
+        # 1. Port-specific NO_PROXY and 127.0.0.2 loopback bypass
+        proxies = {
+            "https": "http://127.0.0.1:8888",
+            "no": "capture.example:8443,[::ffff:192.0.2.1]:9443",
+        }
+        with (
+            mock.patch.object(gui.urllib.request, "getproxies", return_value=proxies),
+            mock.patch.object(gui.urllib.request, "proxy_bypass", return_value=False),
+        ):
+            self.assertIsNone(
+                gui._proxy_for_url("https://capture.example:8443/v1/render", "https", "capture.example", 8443)
+            )
+            self.assertEqual(
+                gui._proxy_for_url("https://capture.example:443/v1/render", "https", "capture.example", 443),
+                "http://127.0.0.1:8888",
+            )
+            self.assertIsNone(
+                gui._proxy_for_url("http://127.0.0.2:8000/v1/render", "http", "127.0.0.2", 8000)
+            )
+
+        # 2. HTTPS proxy for HTTPS target starts TLS handshake BEFORE sending CONNECT/credentials
+        first_bytes: list[bytes] = []
+        srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        tls_proxy_port = srv.getsockname()[1]
+
+        def _accept_once() -> None:
+            conn, _addr = srv.accept()
+            try:
+                conn.settimeout(2.0)
+                first_bytes.append(conn.recv(64))
+            finally:
+                conn.close()
+
+        t_tls = _threading.Thread(target=_accept_once, daemon=True)
+        t_tls.start()
+        try:
+            with (
+                mock.patch.object(
+                    gui.urllib.request,
+                    "getproxies",
+                    return_value={"https": f"https://alice:secret@127.0.0.1:{tls_proxy_port}"},
+                ),
+                mock.patch.object(gui.urllib.request, "proxy_bypass_environment", return_value=False),
+                mock.patch.object(gui.urllib.request, "proxy_bypass", return_value=False),
+            ):
+                req = gui.urllib.request.Request("https://remote.example/v1/render", data=b"{}", method="POST")
+                with self.assertRaises(Exception):
+                    gui._open_capture(req, timeout=2.0, cancel=None)
+        finally:
+            t_tls.join(timeout=2.0)
+            srv.close()
+        self.assertTrue(first_bytes and first_bytes[0].startswith(b"\x16\x03"))
+        self.assertNotIn(b"CONNECT", first_bytes[0])
+        self.assertNotIn(b"secret", first_bytes[0])
+
+        # 3. CancelFlag aborts a stalled proxy CONNECT immediately
+        hold_evt = _threading.Event()
+        connected_evt = _threading.Event()
+        stall_srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        stall_srv.bind(("127.0.0.1", 0))
+        stall_srv.listen(1)
+        stall_port = stall_srv.getsockname()[1]
+
+        def _stall_proxy() -> None:
+            conn, _addr = stall_srv.accept()
+            try:
+                conn.settimeout(5.0)
+                conn.recv(512)
+                connected_evt.set()
+                hold_evt.wait(timeout=5.0)
+            finally:
+                conn.close()
+
+        t_stall = _threading.Thread(target=_stall_proxy, daemon=True)
+        t_stall.start()
+        cancel = gui.CancelFlag()
+        outcome: list[object] = []
+
+        def _worker() -> None:
+            with (
+                mock.patch.object(
+                    gui.urllib.request,
+                    "getproxies",
+                    return_value={"https": f"http://127.0.0.1:{stall_port}"},
+                ),
+                mock.patch.object(gui.urllib.request, "proxy_bypass_environment", return_value=False),
+                mock.patch.object(gui.urllib.request, "proxy_bypass", return_value=False),
+            ):
+                req = gui.urllib.request.Request("https://remote.example/v1/render", data=b"{}", method="POST")
+                try:
+                    gui._open_capture(req, timeout=30.0, cancel=cancel)
+                except Exception as exc:
+                    outcome.append(exc)
+
+        w = _threading.Thread(target=_worker, daemon=True)
+        w.start()
+        self.assertTrue(connected_evt.wait(timeout=3.0))
+        started = _time.monotonic()
+        cancel.abort()
+        w.join(timeout=3.0)
+        elapsed = _time.monotonic() - started
+        hold_evt.set()
+        t_stall.join(timeout=2.0)
+        stall_srv.close()
+        self.assertFalse(w.is_alive())
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(len(outcome), 1)
+        self.assertIsInstance(outcome[0], gui._Cancelled)
+
+        # 4. Huge JSON numbers in density/videoDuration/waitDelay do not raise OverflowError
+        huge = 10**400
+        st_huge, _ignored = gui.apply_preset_settings_with_warnings(
+            gui.GuiState(),
+            {
+                "width": huge,
+                "height": huge,
+                "density": huge,
+                "quality": huge,
+                "videoDuration": huge,
+                "videoFps": huge,
+                "waitDelay": huge,
+            },
+        )
+        self.assertEqual(st_huge.scale, 1)
+        self.assertEqual(st_huge.video_duration_ms, 4000)
+
+        # 5. Down-arrow recall sanitizes URL and _render_edit_field_ansi aligns cursor past stripped escapes
+        st_hist = gui.GuiState(
+            url_history=("https://first.example/\x1b[31mone\x07", "https://second.example/\x1b[32mtwo\x07"),
+            history_index=1,
+            url="https://second.example/two",
+        )
+        down_st, _ = gui.apply_key(st_hist, "down")
+        self.assertEqual(down_st.url, "https://first.example/one")
+        self.assertEqual(down_st.cursor, len("https://first.example/one"))
+
+        rendered = gui._render_edit_field_ansi("\x1b[31mabc", 6, 10)
+        self.assertIn("a\x1b[7mb\x1b[0mc", rendered)

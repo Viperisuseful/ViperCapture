@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import base64
 import http.client
+import ipaddress
 import json
 import math
 import os
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -1087,7 +1089,7 @@ def apply_key(state: GuiState, key: str) -> tuple[GuiState, str]:
                 notice="",
             ), "edit"
         next_idx = state.history_index - 1
-        recalled = state.url_history[next_idx]
+        recalled = sanitize_terminal_text(state.url_history[next_idx])
         return _replace(
             state,
             url=recalled,
@@ -1704,16 +1706,22 @@ def apply_preset_settings_with_warnings(
         else:
             ignored.append(f"output({out})")
 
-    w = settings.get("width")
-    h = settings.get("height")
-    if isinstance(w, (int, float)) and not isinstance(w, bool) and isinstance(h, (int, float)) and not isinstance(h, bool):
-        wi, hi = int(w), int(h)
-        if 1 <= wi <= 16_384 and 1 <= hi <= 16_384:
-            changes["viewport"] = (wi, hi)
+    def _in_range_number(value: object, lo: int | float, hi: int | float) -> float | None:
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return None
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        if lo <= value <= hi:
+            return float(value)
+        return None
 
-    density = settings.get("density")
-    if isinstance(density, (int, float)) and not isinstance(density, bool) and 0.1 <= float(density) <= 8.0:
-        d_val = float(density)
+    w_num = _in_range_number(settings.get("width"), 1, 16_384)
+    h_num = _in_range_number(settings.get("height"), 1, 16_384)
+    if w_num is not None and h_num is not None:
+        changes["viewport"] = (int(w_num), int(h_num))
+
+    d_val = _in_range_number(settings.get("density"), 0.1, 8.0)
+    if d_val is not None:
         changes["scale"] = int(d_val) if d_val.is_integer() else d_val
 
     if isinstance(settings.get("fullPage"), bool):
@@ -1725,9 +1733,9 @@ def apply_preset_settings_with_warnings(
         if sel:
             changes["full_page"] = False
 
-    quality = settings.get("quality")
-    if isinstance(quality, (int, float)) and not isinstance(quality, bool) and 1 <= int(quality) <= 100:
-        changes["quality"] = int(quality)
+    q_val = _in_range_number(settings.get("quality"), 1, 100)
+    if q_val is not None:
+        changes["quality"] = int(q_val)
 
     if isinstance(settings.get("transparent"), bool):
         changes["transparent"] = settings["transparent"]
@@ -1735,20 +1743,20 @@ def apply_preset_settings_with_warnings(
     if isinstance(settings.get("diagnostics"), bool):
         changes["diagnostics"] = settings["diagnostics"]
 
-    vdur = settings.get("videoDuration")
-    if isinstance(vdur, (int, float)) and not isinstance(vdur, bool) and 1 <= float(vdur) <= 30:
-        changes["video_duration_ms"] = int(round(float(vdur) * 1000))
+    vdur_val = _in_range_number(settings.get("videoDuration"), 1, 30)
+    if vdur_val is not None:
+        changes["video_duration_ms"] = int(round(vdur_val * 1000))
 
-    vfps = settings.get("videoFps")
-    if isinstance(vfps, (int, float)) and not isinstance(vfps, bool) and 1 <= int(vfps) <= 60:
-        changes["video_fps"] = int(vfps)
+    vfps_val = _in_range_number(settings.get("videoFps"), 1, 60)
+    if vfps_val is not None:
+        changes["video_fps"] = int(vfps_val)
 
     if isinstance(settings.get("videoScroll"), bool):
         changes["video_scroll"] = settings["videoScroll"]
 
-    wdelay = settings.get("waitDelay")
-    if isinstance(wdelay, (int, float)) and not isinstance(wdelay, bool) and 0 <= float(wdelay) <= 15:
-        changes["wait_delay_ms"] = int(round(float(wdelay) * 1000))
+    wdelay_val = _in_range_number(settings.get("waitDelay"), 0, 15)
+    if wdelay_val is not None:
+        changes["wait_delay_ms"] = int(round(wdelay_val * 1000))
 
     if isinstance(settings.get("waitSelector"), str):
         changes["wait_selector"] = sanitize_terminal_text(settings["waitSelector"]).strip()
@@ -2499,8 +2507,9 @@ def _render_edit_field_ansi(text: str, cursor: int, width: int, placeholder: str
         caret = "\x1b[7m \x1b[0m"
         pad = " " * max(0, width - 1 - _display_width(shown))
         return caret + (f"\x1b[2m{shown}\x1b[0m" if shown else "") + pad
-    clamped_cursor = max(0, min(len(clean_text), cursor))
-    before, caret_char, after = _window_around_cursor(clean_text, clamped_cursor, width)
+    raw_cursor = max(0, min(len(text), cursor))
+    clean_cursor = min(len(clean_text), len(sanitize_terminal_text(text[:raw_cursor])))
+    before, caret_char, after = _window_around_cursor(clean_text, clean_cursor, width)
     used = _display_width(before) + _char_width(caret_char) + _display_width(after)
     pad = " " * max(0, width - used)
     return f"{before}\x1b[7m{caret_char}\x1b[0m{after}{pad}"
@@ -3352,18 +3361,65 @@ class _CaptureResponse:
         return False
 
 
-def _proxy_for_url(url: str, scheme: str, hostname: str) -> str | None:
-    if is_local_server(url):
+def _is_loopback_host(hostname: str) -> bool:
+    lowered = hostname.strip().lower().strip("[]")
+    if lowered in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    try:
+        return ipaddress.ip_address(lowered).is_loopback
+    except ValueError:
+        return False
+
+
+def _proxy_for_url(url: str, scheme: str, hostname: str, port: int | None = None) -> str | None:
+    if is_local_server(url) or _is_loopback_host(hostname):
         return None
     proxies = urllib.request.getproxies()
     if not proxies:
         return None
-    if urllib.request.proxy_bypass_environment(hostname, proxies) or urllib.request.proxy_bypass(hostname):
+    bare_host = f"[{hostname}]" if ":" in hostname else hostname
+    authority = f"{bare_host}:{port}" if port is not None else bare_host
+    if urllib.request.proxy_bypass_environment(authority, proxies) or urllib.request.proxy_bypass(authority):
         return None
     proxy_url = proxies.get(scheme) or proxies.get("all")
     if not proxy_url:
         return None
     return proxy_url
+
+
+def _close_socket(sock: socket.socket | None) -> None:
+    if sock is None:
+        return
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def _read_tunnel_response(sock: socket.socket) -> tuple[int, str]:
+    buf = bytearray()
+    while not buf.endswith(b"\r\n\r\n"):
+        chunk = sock.recv(1)
+        if not chunk:
+            break
+        buf.extend(chunk)
+        if len(buf) > 65_536:
+            raise http.client.HTTPException("Proxy CONNECT response headers too large.")
+    head = bytes(buf).split(b"\r\n\r\n", 1)[0].decode("iso-8859-1", errors="replace")
+    status_line = head.split("\r\n", 1)[0]
+    parts = status_line.split(" ", 2)
+    if len(parts) < 2 or not parts[0].upper().startswith("HTTP/"):
+        raise http.client.HTTPException(f"Invalid proxy CONNECT response: {status_line!r}")
+    try:
+        code = int(parts[1])
+    except ValueError as exc:
+        raise http.client.HTTPException(f"Invalid proxy CONNECT status: {status_line!r}") from exc
+    reason = parts[2] if len(parts) > 2 else ""
+    return code, reason
 
 
 def _open_capture(
@@ -3380,66 +3436,96 @@ def _open_capture(
         path = f"{path}?{parsed.query}"
     headers = _outgoing_headers(request)
     request_target = path
-    proxy_raw = _proxy_for_url(request.full_url, parsed.scheme, parsed.hostname)
-    if proxy_raw:
-        proxy_url = proxy_raw if "://" in proxy_raw else f"http://{proxy_raw}"
-        proxy_parsed = urllib.parse.urlsplit(proxy_url)
-        if proxy_parsed.scheme not in {"http", "https"} or proxy_parsed.hostname is None:
-            raise ValueError("The configured proxy URL is invalid.")
-        proxy_port = proxy_parsed.port or (443 if proxy_parsed.scheme == "https" else 80)
-        proxy_headers: dict[str, str] = {}
-        if proxy_parsed.username is not None:
-            user = urllib.parse.unquote(proxy_parsed.username)
-            password = urllib.parse.unquote(proxy_parsed.password or "")
-            creds = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
-            proxy_headers["Proxy-Authorization"] = f"Basic {creds}"
-        if parsed.scheme == "https":
-            connection: http.client.HTTPConnection = http.client.HTTPSConnection(
-                proxy_parsed.hostname,
-                proxy_port,
+    proxy_raw = _proxy_for_url(request.full_url, parsed.scheme, parsed.hostname, parsed.port)
+    live_sock: list[socket.socket | None] = [None]
+    connection: http.client.HTTPConnection | None = None
+
+    def _abort_active() -> None:
+        if connection is not None:
+            _close_connection(connection)
+        _close_socket(live_sock[0])
+
+    try:
+        if cancel is not None and cancel.requested:
+            raise _Cancelled()
+        if proxy_raw:
+            proxy_url = proxy_raw if "://" in proxy_raw else f"http://{proxy_raw}"
+            proxy_parsed = urllib.parse.urlsplit(proxy_url)
+            if proxy_parsed.scheme not in {"http", "https"} or proxy_parsed.hostname is None:
+                raise ValueError("The configured proxy URL is invalid.")
+            proxy_port = proxy_parsed.port or (443 if proxy_parsed.scheme == "https" else 80)
+            proxy_headers: dict[str, str] = {}
+            if proxy_parsed.username is not None:
+                user = urllib.parse.unquote(proxy_parsed.username)
+                password = urllib.parse.unquote(proxy_parsed.password or "")
+                creds = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
+                proxy_headers["Proxy-Authorization"] = f"Basic {creds}"
+
+            sock: socket.socket = socket.create_connection(
+                (proxy_parsed.hostname, proxy_port),
                 timeout=timeout,
             )
-            connection.set_tunnel(parsed.hostname, port, headers=proxy_headers or None)
-        else:
+            live_sock[0] = sock
+            if cancel is not None:
+                cancel.bind(_abort_active)
+            if cancel is not None and cancel.requested:
+                raise _Cancelled()
+
             if proxy_parsed.scheme == "https":
-                connection = http.client.HTTPSConnection(
-                    proxy_parsed.hostname,
-                    proxy_port,
-                    timeout=timeout,
-                )
+                proxy_ctx = ssl.create_default_context()
+                sock = proxy_ctx.wrap_socket(sock, server_hostname=proxy_parsed.hostname)
+                live_sock[0] = sock
+
+            if parsed.scheme == "https":
+                target_host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+                connect_lines = [
+                    f"CONNECT {target_host}:{port} HTTP/1.1",
+                    f"Host: {target_host}:{port}",
+                ]
+                for hdr_name, hdr_val in proxy_headers.items():
+                    connect_lines.append(f"{hdr_name}: {hdr_val}")
+                connect_lines.append("")
+                connect_lines.append("")
+                sock.sendall("\r\n".join(connect_lines).encode("ascii"))
+                status_code, reason = _read_tunnel_response(sock)
+                if status_code != 200:
+                    raise http.client.HTTPException(f"Tunnel connection failed: {status_code} {reason}")
+                dest_ctx = ssl.create_default_context()
+                dest_sock = dest_ctx.wrap_socket(sock, server_hostname=parsed.hostname)
+                live_sock[0] = dest_sock
+                connection = http.client.HTTPSConnection(parsed.hostname, port, timeout=timeout)
+                connection.sock = dest_sock
             else:
-                connection = http.client.HTTPConnection(
-                    proxy_parsed.hostname,
-                    proxy_port,
-                    timeout=timeout,
-                )
-            request_target = request.full_url
-            headers.update(proxy_headers)
-    elif parsed.scheme == "https":
-        connection = http.client.HTTPSConnection(
-            parsed.hostname,
-            port,
-            timeout=timeout,
-        )
-    else:
-        connection = http.client.HTTPConnection(parsed.hostname, port, timeout=timeout)
-    try:
+                if proxy_parsed.scheme == "https":
+                    connection = http.client.HTTPSConnection(proxy_parsed.hostname, proxy_port, timeout=timeout)
+                else:
+                    connection = http.client.HTTPConnection(proxy_parsed.hostname, proxy_port, timeout=timeout)
+                connection.sock = sock
+                request_target = request.full_url
+                headers.update(proxy_headers)
+        elif parsed.scheme == "https":
+            connection = http.client.HTTPSConnection(parsed.hostname, port, timeout=timeout)
+            if cancel is not None:
+                cancel.bind(_abort_active)
+        else:
+            connection = http.client.HTTPConnection(parsed.hostname, port, timeout=timeout)
+            if cancel is not None:
+                cancel.bind(_abort_active)
+
         connection.request(
             request.get_method(),
             request_target,
             body=request.data,
             headers=headers,
         )
-        if cancel is not None:
-            cancel.bind(lambda: _close_connection(connection))
         if cancel is not None and cancel.requested:
             raise _Cancelled()
         response = connection.getresponse()
     except _Cancelled:
-        _close_connection(connection)
+        _abort_active()
         raise
     except Exception:
-        _close_connection(connection)
+        _abort_active()
         if cancel is not None and cancel.requested:
             raise _Cancelled() from None
         raise
