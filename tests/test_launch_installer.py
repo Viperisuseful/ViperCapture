@@ -534,6 +534,56 @@ class LaunchArgsTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 2)
         self.assertIn("already keeps everything in this terminal", stderr.getvalue())
 
+    def test_gui_extended_flags_and_positional_url(self) -> None:
+        parsed = launch.parse_cli(
+            [
+                "--gui",
+                "https://example.com/demo",
+                "--viewport",
+                "1280",
+                "720",
+                "--output-dir",
+                "captures",
+                "--server",
+                "http://127.0.0.1:9000/",
+                "--preset",
+                "Blog dark",
+            ]
+        )
+        self.assertTrue(parsed.gui)
+        self.assertEqual(parsed.url, "https://example.com/demo")
+        self.assertEqual(parsed.viewport, (1280, 720))
+        self.assertEqual(parsed.output_dir, "captures")
+        self.assertEqual(parsed.server, "http://127.0.0.1:9000")
+        self.assertEqual(parsed.preset, "Blog dark")
+
+        with_flag_url = launch.parse_cli(["--gui", "--url", "example.org"])
+        self.assertEqual(with_flag_url.url, "example.org")
+
+        url_first = launch.parse_cli(["example.net", "--gui"])
+        self.assertTrue(url_first.gui)
+        self.assertEqual(url_first.url, "example.net")
+
+    def test_gui_extended_flags_require_gui_and_valid_values(self) -> None:
+        for argv, expected in (
+            (["--output-dir", "out"], "only used with --gui"),
+            (["--server", "http://127.0.0.1:8000"], "only used with --gui"),
+            (["--preset", "demo"], "only used with --gui"),
+            (["--url", "https://example.com"], "only used with --gui"),
+            (["https://example.com"], "Unknown argument"),
+            (["--gui", "--server", "ftp://bad.example"], "Invalid server URL"),
+            (["--gui", "--url", "a.com", "b.com"], "Unknown argument"),
+            (["--gui", "--output-dir"], "--output-dir needs"),
+            (["--gui", "--preset"], "--preset needs"),
+        ):
+            with self.subTest(argv=argv):
+                stderr = io.StringIO()
+                with mock.patch("sys.stderr", stderr):
+                    with self.assertRaises(SystemExit) as caught:
+                        launch.parse_cli(argv)
+                self.assertEqual(caught.exception.code, 2)
+                self.assertIn(expected, stderr.getvalue())
+
     def test_windows_stays_in_one_window_without_the_flag(self) -> None:
         self.assertTrue(launch.use_one_window(False, "win32"))
         self.assertFalse(launch.use_one_window(False, "linux"))

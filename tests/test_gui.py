@@ -17,13 +17,14 @@ import gui
 class GuiKeyTests(TestCase):
     def test_tab_cycles_format_and_ctrl_p_switches_the_page(self) -> None:
         state = gui.GuiState()
-        state, action = gui.apply_key(state, "tab")
-        self.assertEqual(action, "edit")
-        self.assertEqual(state.output, "gif")
+        for expected in gui.FORMATS[1:]:
+            state, action = gui.apply_key(state, "tab")
+            self.assertEqual(action, "edit")
+            self.assertEqual(state.output, expected)
         state, _action = gui.apply_key(state, "tab")
-        self.assertEqual(state.output, "mp4")
-        state, _action = gui.apply_key(state, "tab")
-        self.assertEqual(state.output, "png")
+        self.assertEqual(state.output, gui.FORMATS[0])
+        state, _action = gui.apply_key(state, "shift-tab")
+        self.assertEqual(state.output, gui.FORMATS[-1])
         state, _action = gui.apply_key(state, "ctrl-p")
         self.assertTrue(state.full_page)
         state, _action = gui.apply_key(state, "ctrl-p")
@@ -46,11 +47,15 @@ class GuiKeyTests(TestCase):
         self.assertEqual(action, "quit")
 
     def test_arrow_keys_are_not_typed_into_the_link(self) -> None:
-        self.assertEqual(gui.keys_from_bytes(bytearray(), b"ab\x1b[A\t"), ["a", "b", "tab"])
+        self.assertEqual(gui.keys_from_bytes(bytearray(), b"ab\x1b[A\t"), ["a", "b", "up", "tab"])
         pending = bytearray(b"\x1b")
         self.assertEqual(gui.keys_from_bytes(pending, b""), [])
-        self.assertEqual(gui.keys_from_bytes(pending, b"[B"), [])
+        self.assertEqual(gui.keys_from_bytes(pending, b"[B"), ["down"])
         self.assertEqual(pending, bytearray())
+        state = gui.GuiState(url="ab")
+        for key in ("up", "down", "left", "right"):
+            state, _ = gui.apply_key(state, key)
+        self.assertEqual(state.url, "ab")
 
     def test_a_lone_escape_flushes_after_the_input_wait(self) -> None:
         pending = bytearray(b"\x1b")
@@ -511,7 +516,8 @@ class GuiFrameTests(TestCase):
 
         cols, rows = launch.logo_cells(size)
         col = (size.cols - cols) // 2 + 1
-        row = (size.rows - 7 - rows) // 2
+        block_len = len(gui._frame_block(gui.GuiState(), size.cols, image=True, rows=size.rows - rows - 1))
+        row = (size.rows - block_len - rows) // 2
         image = launch.iterm2_image_sequence(png, width=cols, height=rows)
         choose.assert_called_with(alternate_screen=True)
         self.assertIn(b"enter capture", initial)
@@ -723,3 +729,646 @@ class GuiHelpTests(TestCase):
         self.assertIn("--gui", text)
         self.assertIn("1920 1080", text)
         self.assertIn("Ctrl+P", text)
+        self.assertIn("--output-dir", text)
+        self.assertIn("--server", text)
+        self.assertIn("--preset", text)
+        self.assertIn("--url", text)
+        self.assertIn("F1", text)
+
+
+class GuiCrossPlatformKeybindTests(TestCase):
+    def test_posix_control_and_escape_sequences(self) -> None:
+        control_cases = {
+            b"\x01": "ctrl-a",
+            b"\x02": "ctrl-b",
+            b"\x03": "quit",
+            b"\x04": "ctrl-d",
+            b"\x05": "ctrl-e",
+            b"\x06": "ctrl-f",
+            b"\x07": "ctrl-g",
+            b"\x08": "backspace",
+            b"\x09": "tab",
+            b"\x0a": "enter",
+            b"\x0c": "ctrl-l",
+            b"\x0d": "enter",
+            b"\x0f": "ctrl-o",
+            b"\x10": "ctrl-p",
+            b"\x12": "ctrl-r",
+            b"\x14": "ctrl-t",
+            b"\x15": "ctrl-u",
+            b"\x16": "ctrl-v",
+            b"\x17": "ctrl-w",
+            b"\x18": "ctrl-x",
+            b"\x19": "ctrl-y",
+            b"\x1f": "ctrl-slash",
+            b"\x7f": "backspace",
+        }
+        for raw, expected in control_cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(gui.keys_from_bytes(bytearray(), raw), [expected])
+
+        escape_cases = {
+            b"\x1b[A": "up",
+            b"\x1b[B": "down",
+            b"\x1b[C": "right",
+            b"\x1b[D": "left",
+            b"\x1b[H": "home",
+            b"\x1b[F": "end",
+            b"\x1b[1~": "home",
+            b"\x1b[4~": "end",
+            b"\x1b[3~": "delete",
+            b"\x1b[Z": "shift-tab",
+            b"\x1b[1;5C": "ctrl-right",
+            b"\x1b[1;5D": "ctrl-left",
+            b"\x1bOP": "f1",
+            b"\x1b[11~": "f1",
+            b"\x1b[47;5u": "ctrl-slash",
+            b"\x1bOA": "up",
+            b"\x1bOB": "down",
+            b"\x1bOC": "right",
+            b"\x1bOD": "left",
+            b"\x1bOH": "home",
+            b"\x1bOF": "end",
+        }
+        for raw, expected in escape_cases.items():
+            with self.subTest(raw=raw):
+                pending = bytearray()
+                self.assertEqual(gui.keys_from_bytes(pending, raw), [expected])
+                self.assertEqual(pending, bytearray())
+
+    def test_windows_control_and_extended_scan_codes(self) -> None:
+        for ch, expected in (
+            ("\x01", "ctrl-a"),
+            ("\x02", "ctrl-b"),
+            ("\x03", "quit"),
+            ("\x04", "ctrl-d"),
+            ("\x05", "ctrl-e"),
+            ("\x06", "ctrl-f"),
+            ("\x07", "ctrl-g"),
+            ("\x08", "backspace"),
+            ("\t", "tab"),
+            ("\r", "enter"),
+            ("\x0c", "ctrl-l"),
+            ("\x0f", "ctrl-o"),
+            ("\x10", "ctrl-p"),
+            ("\x12", "ctrl-r"),
+            ("\x14", "ctrl-t"),
+            ("\x15", "ctrl-u"),
+            ("\x16", "ctrl-v"),
+            ("\x17", "ctrl-w"),
+            ("\x18", "ctrl-x"),
+            ("\x19", "ctrl-y"),
+            ("\x1b", "esc"),
+            ("\x1f", "ctrl-slash"),
+            ("\x7f", "backspace"),
+            ("x", "x"),
+        ):
+            with self.subTest(ch=ch):
+                self.assertEqual(gui._windows_key(ch), expected)
+
+        for ext, expected in (
+            ("H", "up"),
+            ("P", "down"),
+            ("K", "left"),
+            ("M", "right"),
+            ("G", "home"),
+            ("O", "end"),
+            ("S", "delete"),
+            ("s", "ctrl-left"),
+            ("t", "ctrl-right"),
+            (";", "f1"),
+            ("\x0f", "shift-tab"),
+        ):
+            with self.subTest(ext=ext):
+                self.assertEqual(gui._windows_extended_key(ext), expected)
+
+    def test_bracketed_paste_handles_split_chunks_and_does_not_fire_shortcuts(self) -> None:
+        pending = bytearray()
+        self.assertEqual(gui.keys_from_bytes(pending, b"\x1b[200~https://example.com/"), [])
+        self.assertEqual(gui.flush_bare_escape(pending), [])
+        keys = gui.keys_from_bytes(pending, b"docs?q=1\x1b[201~")
+        self.assertEqual(keys, ["paste:https://example.com/docs?q=1"])
+        self.assertEqual(pending, bytearray())
+
+        state = gui.GuiState()
+        state, action = gui.apply_key(state, keys[0])
+        self.assertEqual(action, "edit")
+        self.assertEqual(state.url, "https://example.com/docs?q=1")
+        self.assertEqual(state.cursor, len(state.url))
+        self.assertEqual(state.drawer, "")
+
+    def test_enter_and_leave_toggle_bracketed_paste_mode(self) -> None:
+        out = io.BytesIO()
+        stdout = mock.Mock(buffer=out)
+        with mock.patch.object(gui.sys, "stdout", stdout):
+            gui._enter()
+            gui._leave("kitty")
+        raw = out.getvalue()
+        self.assertIn(gui.BRACKETED_PASTE_ON, raw)
+        self.assertIn(gui.BRACKETED_PASTE_OFF, raw)
+
+
+class GuiUrlEditingAndHistoryTests(TestCase):
+    def test_cursor_movement_mid_edit_word_jump_and_delete(self) -> None:
+        state = gui.GuiState(url="https://example.com/docs/guide")
+        self.assertEqual(state.cursor, len(state.url))
+
+        state, _ = gui.apply_key(state, "home")
+        self.assertEqual(state.cursor, 0)
+        state, _ = gui.apply_key(state, "end")
+        self.assertEqual(state.cursor, len(state.url))
+
+        # Word jump left over 'guide'
+        state, _ = gui.apply_key(state, "ctrl-left")
+        self.assertEqual(state.url[state.cursor :], "guide")
+
+        # Delete forward ('g')
+        state, _ = gui.apply_key(state, "delete")
+        self.assertEqual(state.url, "https://example.com/docs/uide")
+
+        # Insert 'G' at cursor
+        state, _ = gui.apply_key(state, "G")
+        self.assertEqual(state.url, "https://example.com/docs/Guide")
+
+        # Move left 1, backspace removes 'G'
+        state, _ = gui.apply_key(state, "left")
+        state, _ = gui.apply_key(state, "right")
+        state, _ = gui.apply_key(state, "backspace")
+        self.assertEqual(state.url, "https://example.com/docs/uide")
+
+        # Ctrl+W deletes previous segment ('docs/')
+        state, _ = gui.apply_key(state, "ctrl-w")
+        self.assertEqual(state.url, "https://example.com/uide")
+
+        # Ctrl+A / Ctrl+Right / Ctrl+E / Ctrl+U
+        state, _ = gui.apply_key(state, "ctrl-a")
+        self.assertEqual(state.cursor, 0)
+        state, _ = gui.apply_key(state, "ctrl-right")
+        self.assertEqual(state.url[state.cursor :], "example.com/uide")
+        state, _ = gui.apply_key(state, "ctrl-e")
+        self.assertEqual(state.cursor, len(state.url))
+        state, _ = gui.apply_key(state, "ctrl-u")
+        self.assertEqual(state.url, "")
+        self.assertEqual(state.cursor, 0)
+
+    def test_window_around_cursor_scrolls_without_overflow(self) -> None:
+        long_url = "https://example.com/one/two/three/four/five/six/seven/eight"
+        for pos in (0, 5, 25, len(long_url) - 3, len(long_url)):
+            before, caret, after = gui._window_around_cursor(long_url, pos, 24)
+            width = gui._display_width(before) + gui._char_width(caret) + gui._display_width(after)
+            self.assertLessEqual(width, 24)
+            if pos < len(long_url):
+                self.assertEqual(caret, long_url[pos])
+            else:
+                self.assertEqual(caret, " ")
+
+    def test_url_history_cycle_and_persistence(self) -> None:
+        state = gui.GuiState(
+            url="draft.example",
+            url_history=("https://latest.example", "https://older.example"),
+        )
+        state, _ = gui.apply_key(state, "up")
+        self.assertEqual(state.url, "https://latest.example")
+        state, _ = gui.apply_key(state, "up")
+        self.assertEqual(state.url, "https://older.example")
+        state, _ = gui.apply_key(state, "down")
+        self.assertEqual(state.url, "https://latest.example")
+        state, _ = gui.apply_key(state, "down")
+        self.assertEqual(state.url, "draft.example")
+        self.assertEqual(state.history_index, -1)
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "gui_history.json"
+            urls = [f"https://site-{i}.example" for i in range(60)]
+            gui.save_url_history(urls, path=path)
+            loaded = gui.load_url_history(path=path)
+            self.assertEqual(len(loaded), gui.HISTORY_LIMIT)
+            self.assertEqual(loaded[0], "https://site-0.example")
+            updated = gui.record_url_history(loaded, "https://site-5.example")
+            self.assertEqual(updated[0], "https://site-5.example")
+            self.assertEqual(updated.count("https://site-5.example"), 1)
+
+
+class GuiControlsAndPayloadTests(TestCase):
+    def test_viewport_theme_engine_cleanup_and_contextual_duration_controls(self) -> None:
+        state = gui.GuiState(viewport=(1440, 900), custom_viewport=(1440, 900))
+        # Ctrl+R cycles custom -> Full HD -> HD -> Phone -> Tablet -> 2K -> 4K -> custom
+        seen_viewports = [(state.viewport, state.device)]
+        for _ in range(len(gui.VIEWPORT_PRESETS) + 1):
+            state, _ = gui.apply_key(state, "ctrl-r")
+            seen_viewports.append((state.viewport, state.device))
+        self.assertIn(((1440, 900), "desktop"), seen_viewports)
+        self.assertIn(((390, 844), "iphone_14"), seen_viewports)
+        self.assertIn(((768, 1024), "ipad"), seen_viewports)
+        self.assertEqual(seen_viewports[0], seen_viewports[-1])
+
+        # Ctrl+T cycles theme
+        state, _ = gui.apply_key(state, "ctrl-t")
+        self.assertEqual(state.color_scheme, "dark")
+        state, _ = gui.apply_key(state, "ctrl-t")
+        self.assertEqual(state.color_scheme, "light")
+        state, _ = gui.apply_key(state, "ctrl-t")
+        self.assertEqual(state.color_scheme, "system")
+
+        # Ctrl+B cycles engine
+        state, _ = gui.apply_key(state, "ctrl-b")
+        self.assertEqual(state.engine, "firefox")
+        state, _ = gui.apply_key(state, "ctrl-b")
+        self.assertEqual(state.engine, "webkit")
+        state, _ = gui.apply_key(state, "ctrl-b")
+        self.assertEqual(state.engine, "chromium")
+
+        # Ctrl+X toggles cleanup
+        state, _ = gui.apply_key(state, "ctrl-x")
+        self.assertTrue(state.cleanup)
+        state, _ = gui.apply_key(state, "ctrl-x")
+        self.assertFalse(state.cleanup)
+
+        # Ctrl+D cycles wait delay for non-video and duration for video
+        self.assertEqual(state.output, "png")
+        state, _ = gui.apply_key(state, "ctrl-d")
+        self.assertEqual(state.wait_delay_ms, 1000)
+        state, _ = gui.apply_key(state, "ctrl-d")
+        self.assertEqual(state.wait_delay_ms, 2500)
+        state = gui._replace(state, output="mp4")
+        state, _ = gui.apply_key(state, "ctrl-d")
+        self.assertEqual(state.video_duration_ms, 8000)
+        state, _ = gui.apply_key(state, "ctrl-d")
+        self.assertEqual(state.video_duration_ms, 15000)
+
+    def test_capture_payload_all_options_and_contract_validation(self) -> None:
+        from vipercapture.render_contract import RenderRequest
+
+        # Rich image payload
+        img_state = gui.GuiState(
+            url="https://example.com",
+            output="webp",
+            full_page=True,
+            viewport=(390, 844),
+            device="iphone_14",
+            color_scheme="dark",
+            engine="firefox",
+            cleanup=True,
+            scale=2,
+            quality=80,
+            transparent=True,
+            profile="accurate",
+            wait_delay_ms=2500,
+            wait_selector="#ready",
+            selector=".hero",
+            stealth=False,
+            diagnostics=True,
+        )
+        payload = gui.capture_payload(img_state, img_state.url)
+        self.assertFalse(payload["full_page"])  # selector forces full_page=False
+        self.assertEqual(payload["selector"], ".hero")
+        self.assertEqual(payload["viewport"], {"width": 390, "height": 844, "device_scale_factor": 2})
+        self.assertEqual(payload["environment"], {"device": "iphone_14", "color_scheme": "dark"})
+        self.assertEqual(payload["engine"], "firefox")
+        self.assertEqual(
+            payload["cleanup"],
+            {
+                "consent_mode": "reject",
+                "block_ads": True,
+                "block_trackers": True,
+                "block_chats": True,
+                "block_newsletters": True,
+            },
+        )
+        self.assertEqual(payload["image"], {"quality": 80, "transparent_background": True})
+        self.assertEqual(payload["wait_for"], {"delay_ms": 2500, "selector": "#ready"})
+        self.assertEqual(payload["profile"], "accurate")
+        self.assertFalse(payload["stealth"])
+        self.assertEqual(payload["diagnostics"], {"bundle": True})
+        RenderRequest.model_validate(payload)
+
+        # PDF payload
+        pdf_state = gui.GuiState(
+            url="https://example.com",
+            output="pdf",
+            pdf_paper_size="Letter",
+            pdf_orientation="landscape",
+        )
+        pdf_payload = gui.capture_payload(pdf_state, pdf_state.url)
+        self.assertEqual(pdf_payload["pdf"], {"paper_size": "Letter", "orientation": "landscape"})
+        RenderRequest.model_validate(pdf_payload)
+
+        # Video payload with custom fps and scroll
+        vid_state = gui.GuiState(
+            url="https://example.com",
+            output="webm",
+            video_duration_ms=15000,
+            video_scroll=True,
+            video_fps=30,
+        )
+        vid_payload = gui.capture_payload(vid_state, vid_state.url)
+        self.assertEqual(vid_payload["video"], {"duration_ms": 15000, "scroll": True, "fps": 30})
+        RenderRequest.model_validate(vid_payload)
+
+        # Incompatible PDF + Firefox blocked on Enter
+        bad_pdf = gui.GuiState(url="https://example.com", output="pdf", engine="firefox")
+        next_state, action = gui.apply_key(bad_pdf, "enter")
+        self.assertEqual(action, "edit")
+        self.assertIn("Chromium", next_state.error)
+
+    def test_looks_like_output_and_extensions_for_all_formats_and_diagnostics(self) -> None:
+        samples = [
+            ("png", "png", b"\x89PNG\r\n\x1a\n" + b"x"),
+            ("jpeg", "jpg", b"\xff\xd8\xff\xe0" + b"x"),
+            ("webp", "webp", b"RIFF\x10\x00\x00\x00WEBP" + b"x"),
+            ("avif", "avif", b"\x00\x00\x00\x1cftypavif" + b"x"),
+            ("pdf", "pdf", b"%PDF-1.7\n"),
+            ("gif", "gif", b"GIF89a"),
+            ("mp4", "mp4", b"\x00\x00\x00\x18ftypmp42"),
+            ("webm", "webm", b"\x1a\x45\xdf\xa3" + b"x"),
+            ("html", "html", b"<!doctype html><html><body>hi</body></html>"),
+            ("markdown", "md", b"# Hello\n\nWorld\n"),
+            ("metadata", "json", b'{"title":"Example"}'),
+        ]
+        moment = datetime(2026, 11, 24, 12, 0, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmp:
+            for fmt, ext, body in samples:
+                with self.subTest(fmt=fmt):
+                    self.assertTrue(gui.looks_like_output(fmt, body))
+                    self.assertFalse(gui.looks_like_output(fmt, b"\x00\x01\x02\x03"))
+                    self.assertEqual(gui.output_extension(fmt), ext)
+                    out_path = gui.output_path(Path(tmp), "https://example.com", fmt, moment)
+                    self.assertTrue(out_path.name.endswith(f".{ext}"))
+
+            # Diagnostics ZIP bundle
+            zip_body = b"PK\x03\x04dummy-zip"
+            self.assertTrue(gui.looks_like_output("png", zip_body, diagnostics=True))
+            self.assertFalse(gui.looks_like_output("png", b"\x89PNG\r\n\x1a\n", diagnostics=True))
+            zip_path = gui.output_path(Path(tmp), "https://example.com", "png", moment, diagnostics=True)
+            self.assertTrue(zip_path.name.endswith(".zip"))
+
+    def test_perform_capture_records_telemetry_and_history(self) -> None:
+        png = b"\x89PNG\r\n\x1a\n" + b"payload-bytes"
+
+        class HeaderResponse:
+            headers = {"X-ViperCapture-Encode-Ms": "275"}
+            status = 200
+
+            def __init__(self) -> None:
+                self.done = False
+
+            def read(self, _n: int) -> bytes:
+                if self.done:
+                    return b""
+                self.done = True
+                return png
+
+            def __enter__(self) -> "HeaderResponse":
+                return self
+
+            def __exit__(self, *_a: object) -> bool:
+                return False
+
+        with TemporaryDirectory() as tmp:
+            state = gui.perform_capture(
+                gui.GuiState(url="example.com", busy=True),
+                directory=Path(tmp),
+                opener=lambda _req, timeout: HeaderResponse(),
+            )
+            self.assertEqual(state.last_size_bytes, len(png))
+            self.assertEqual(state.last_duration_ms, 275)
+            self.assertEqual(len(state.captures), 1)
+            self.assertEqual(state.captures[0].url, "https://example.com")
+            self.assertEqual(state.url_history[0], "https://example.com")
+
+
+class GuiDrawerAndActionTests(TestCase):
+    def test_post_capture_actions_open_copy_and_paste(self) -> None:
+        empty = gui.GuiState()
+        s_open, a_open = gui.apply_key(empty, "ctrl-o")
+        self.assertEqual(a_open, "edit")
+        self.assertIn("No saved capture", s_open.error)
+
+        with TemporaryDirectory() as tmp:
+            saved_file = Path(tmp) / "shot.png"
+            saved_file.write_bytes(b"\x89PNG\r\n\x1a\n")
+            state = gui.GuiState(url="https://example.com", saved=str(saved_file))
+            cancel = gui.CancelFlag()
+            with mock.patch.object(gui, "open_in_viewer", return_value=True) as opener:
+                state, _, _, _, quit_flag = gui._handle_key(
+                    state, "ctrl-o", None, cancel, {}, Path(tmp), started_server=False
+                )
+                self.assertFalse(quit_flag)
+                opener.assert_called_once_with(str(saved_file))
+                self.assertIn("Opened shot.png", state.notice)
+            with mock.patch.object(gui, "copy_to_clipboard", return_value=True) as copier:
+                state, _, _, _, _ = gui._handle_key(
+                    state, "ctrl-y", None, cancel, {}, Path(tmp), started_server=False
+                )
+                copier.assert_called_once_with(str(saved_file))
+                self.assertIn("Copied path", state.notice)
+            with mock.patch.object(gui, "read_clipboard", return_value="https://pasted.example\n"):
+                fresh = gui.GuiState()
+                fresh, _, _, _, _ = gui._handle_key(
+                    fresh, "ctrl-v", None, cancel, {}, Path(tmp), started_server=False
+                )
+                self.assertEqual(fresh.url, "https://pasted.example")
+
+    def test_advanced_options_drawer_navigation_editing_and_gpu_toggle(self) -> None:
+        state = gui.GuiState(full_page=True)
+        state, action = gui.apply_key(state, "ctrl-g")
+        self.assertEqual(state.drawer, "options")
+        self.assertEqual(action, "edit")
+
+        # Field 0 is scale -> cycle right -> 2x
+        state, _ = gui.apply_key(state, "right")
+        self.assertEqual(state.scale, 2)
+
+        # Navigate to selector (index 5) and edit it
+        for _ in range(5):
+            state, _ = gui.apply_key(state, "down")
+        self.assertEqual(gui.OPTIONS_FIELDS[state.drawer_index][0], "selector")
+        state, _ = gui.apply_key(state, "enter")
+        self.assertEqual(state.editing_field, "selector")
+        for ch in "#main":
+            state, _ = gui.apply_key(state, ch)
+        state, _ = gui.apply_key(state, "enter")
+        self.assertEqual(state.editing_field, "")
+        self.assertEqual(state.selector, "#main")
+        self.assertFalse(state.full_page)
+
+        # Navigate to gpu_mode (last field)
+        state = gui._replace(state, drawer_index=len(gui.OPTIONS_FIELDS) - 1)
+        state, action = gui.apply_key(state, " ")
+        self.assertEqual(action, "toggle_gpu")
+
+        with mock.patch.object(
+            gui,
+            "set_gpu_mode",
+            return_value=({"mode": "auto", "hardware_active": True}, ""),
+        ) as set_gpu:
+            updated, _, _, _, _ = gui._handle_key(
+                state, " ", None, gui.CancelFlag(), {}, Path("."), started_server=False
+            )
+            set_gpu.assert_called_once()
+            self.assertEqual(updated.gpu_mode, "auto")
+            self.assertTrue(updated.gpu_hardware)
+
+        # Close drawer with Esc
+        closed, action = gui.apply_key(updated, "esc")
+        self.assertEqual(action, "edit")
+        self.assertEqual(closed.drawer, "")
+
+    def test_presets_drawer_load_apply_save_delete_and_webui_compat(self) -> None:
+        web_preset = gui.PresetEntry(
+            name="Dark Mobile",
+            settings={
+                "output": "webp",
+                "width": 390,
+                "height": 844,
+                "density": 2,
+                "fullPage": True,
+                "quality": 85,
+                "colorScheme": "dark",
+                "device": "iphone_14",
+                "consent": "reject",
+                "blockAds": True,
+                "videoDuration": 15,
+                "waitDelay": 2.5,
+                "paperSize": "Letter",
+                "orientation": "landscape",
+            },
+        )
+        state = gui.GuiState()
+        with mock.patch.object(gui, "fetch_presets", return_value=((web_preset,), "")):
+            state, _, _, _, _ = gui._handle_key(
+                state, "ctrl-f", None, gui.CancelFlag(), {}, Path("."), started_server=False
+            )
+        self.assertEqual(state.drawer, "presets")
+        self.assertEqual(len(state.presets), 1)
+
+        # Apply with Enter
+        applied, _ = gui.apply_key(state, "enter")
+        self.assertEqual(applied.drawer, "")
+        self.assertEqual(applied.output, "webp")
+        self.assertEqual(applied.viewport, (390, 844))
+        self.assertEqual(applied.device, "iphone_14")
+        self.assertEqual(applied.color_scheme, "dark")
+        self.assertEqual(applied.scale, 2)
+        self.assertEqual(applied.quality, 85)
+        self.assertTrue(applied.cleanup)
+        self.assertEqual(applied.video_duration_ms, 15000)
+        self.assertEqual(applied.wait_delay_ms, 2500)
+
+        # Round-trip preset settings
+        exported = gui.state_to_preset_settings(applied)
+        reapplied = gui.apply_preset_settings(gui.GuiState(), exported)
+        self.assertEqual(reapplied.output, "webp")
+        self.assertEqual(reapplied.viewport, (390, 844))
+        self.assertEqual(reapplied.color_scheme, "dark")
+
+        # Save preset ('s') and delete preset ('d')
+        state, _ = gui.apply_key(state, "s")
+        self.assertEqual(state.editing_field, "preset_name")
+        for ch in "My Preset":
+            state, _ = gui.apply_key(state, ch)
+        new_entry = gui.PresetEntry(name="My Preset", settings=exported)
+        with mock.patch.object(gui, "save_preset_remote", return_value=((new_entry, web_preset), "")):
+            state, _, _, _, _ = gui._handle_key(
+                state, "enter", None, gui.CancelFlag(), {}, Path("."), started_server=False
+            )
+        self.assertEqual(state.editing_field, "")
+        self.assertEqual(len(state.presets), 2)
+        with mock.patch.object(gui, "delete_preset_remote", return_value=((web_preset,), "")):
+            state, _, _, _, _ = gui._handle_key(
+                state, "d", None, gui.CancelFlag(), {}, Path("."), started_server=False
+            )
+        self.assertEqual(len(state.presets), 1)
+
+    def test_history_drawer_reload_preview_and_help_overlay(self) -> None:
+        with TemporaryDirectory() as tmp:
+            png_path = Path(tmp) / "shot.png"
+            png_bytes = launch.LOGO_PNG.read_bytes()
+            png_path.write_bytes(png_bytes)
+            rec = gui.CaptureRecord(
+                url="https://captured.example",
+                output="png",
+                path=str(png_path),
+                size_bytes=len(png_bytes),
+                duration_ms=310,
+                timestamp="12:00:00",
+                full_page=True,
+                color_scheme="dark",
+                cleanup=True,
+            )
+            state = gui.GuiState(captures=(rec,))
+            state, _ = gui.apply_key(state, "ctrl-l")
+            self.assertEqual(state.drawer, "history")
+
+            # Image-capable terminal renders inline PNG preview
+            kitty_frame = gui.render_frame(
+                launch.WindowSize(100, 30, 1000, 600),
+                state,
+                protocol="kitty",
+            )
+            self.assertIn(b"\x1b_G", kitty_frame)
+            self.assertIn(b"Capture History", kitty_frame)
+
+            # Plain terminal renders metadata without image escapes
+            plain_frame = gui.render_frame(launch.WindowSize(100, 30), state)
+            self.assertNotIn(b"\x1b_G", plain_frame)
+            self.assertIn(b"310ms", plain_frame)
+
+            # Reload capture settings with 'r'
+            reloaded, _ = gui.apply_key(state, "r")
+            self.assertEqual(reloaded.drawer, "")
+            self.assertEqual(reloaded.url, "https://captured.example")
+            self.assertTrue(reloaded.full_page)
+            self.assertEqual(reloaded.color_scheme, "dark")
+            self.assertTrue(reloaded.cleanup)
+
+            # Help overlay opens with F1 and Ctrl+/ and closes with Esc
+            helped, _ = gui.apply_key(reloaded, "f1")
+            self.assertEqual(helped.drawer, "help")
+            closed, _ = gui.apply_key(helped, "esc")
+            self.assertEqual(closed.drawer, "")
+            helped2, _ = gui.apply_key(closed, "ctrl-slash")
+            self.assertEqual(helped2.drawer, "help")
+            closed2, _ = gui.apply_key(helped2, "f1")
+            self.assertEqual(closed2.drawer, "")
+
+    def test_all_drawers_render_within_bounds_across_terminal_sizes(self) -> None:
+        import re
+
+        csi_move = re.compile(r"\x1b\[(\d+);(\d+)H")
+        rec = gui.CaptureRecord(
+            url="https://example.com/very/long/path/for/history",
+            output="pdf",
+            path="/tmp/vipercapture-example.com-20261124-120000.pdf",
+            size_bytes=524_288,
+            duration_ms=1450,
+            timestamp="12:00:00",
+        )
+        preset = gui.PresetEntry(name="Mobile Dark PDF", settings={"output": "pdf", "width": 390, "height": 844})
+        drawer_states = [
+            gui.GuiState(url="https://example.com", color_scheme="dark", engine="firefox", cleanup=True, gpu_known=True, gpu_hardware=True),
+            gui.GuiState(drawer="options", drawer_index=5, editing_field="selector", edit_buffer="#content > article"),
+            gui.GuiState(drawer="presets", presets=(preset,), editing_field="preset_name", edit_buffer="My Preset"),
+            gui.GuiState(drawer="history", captures=(rec,)),
+            gui.GuiState(drawer="help", drawer_index=2),
+        ]
+        sizes = (
+            launch.WindowSize(14, 6),
+            launch.WindowSize(40, 14),
+            launch.WindowSize(80, 24),
+            launch.WindowSize(120, 40),
+        )
+        for size in sizes:
+            for state in drawer_states:
+                with self.subTest(size=(size.cols, size.rows), drawer=state.drawer or "main"):
+                    frame = gui.render_frame(size, state).decode("utf-8", errors="replace")
+                    parts = csi_move.split(frame)
+                    for idx in range(1, len(parts), 3):
+                        row, col = int(parts[idx]), int(parts[idx + 1])
+                        vis = gui.visible(parts[idx + 2])
+                        self.assertLessEqual(row, size.rows)
+                        self.assertLessEqual(
+                            col + gui._display_width(vis) - 1,
+                            size.cols,
+                            f"Overflow at {size.cols}x{size.rows} ({state.drawer}): {vis!r}",
+                        )

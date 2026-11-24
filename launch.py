@@ -3179,7 +3179,8 @@ usage: vipercapture [--one-window]
        vipercapture update [--check]
        vipercapture kill
        vipercapture capture URL --output FILE [options]
-       vipercapture --gui [--viewport WIDTH HEIGHT]
+       vipercapture --gui [URL] [--viewport WIDTH HEIGHT] [--output-dir DIR]
+                          [--server URL] [--preset NAME] [--url URL]
 
 Start ViperCapture in this terminal. Ghostty and Kitty open request
 logs in another window and show a full-screen status view.
@@ -3198,11 +3199,19 @@ logs in another window and show a full-screen status view.
                  each major API field. The same flags work on Linux, macOS,
                  and Windows.
   --gui          Open a full-screen capture menu in this terminal.
-                 Type a website link, press Tab to switch png, gif, and
-                 mp4, and press Ctrl+P to switch between the full page and
-                 the viewport. Nothing else is opened. --GUI is accepted too.
+                 Type a website link, press Tab / Shift+Tab to switch output
+                 formats, Ctrl+P for full page, Ctrl+R for viewport presets,
+                 Ctrl+G for advanced options, Ctrl+F for saved presets,
+                 Ctrl+L for history, and F1 for all keybinds. Nothing else
+                 is opened. --GUI is accepted too.
   --viewport     With --gui, set the page size in pixels. The default
                  is 1920 1080.
+  --output-dir   With --gui, save captures to DIR instead of the current
+                 directory.
+  --server       With --gui, connect to an existing or remote ViperCapture
+                 server URL instead of starting a local one.
+  --preset       With --gui, load a saved preset by name on startup.
+  --url          With --gui, pre-fill the URL bar (or pass URL positionally).
   -h, --help     Show this help.
 
 Windows always uses one window. --gui stays in this window on every OS.
@@ -3219,6 +3228,10 @@ class CliArgs:
         "capture",
         "capture_argv",
         "viewport",
+        "output_dir",
+        "server",
+        "preset",
+        "url",
     )
 
     def __init__(
@@ -3231,6 +3244,10 @@ class CliArgs:
         capture: bool = False,
         capture_argv: tuple[str, ...] = (),
         viewport: tuple[int, int] | None = None,
+        output_dir: str | None = None,
+        server: str | None = None,
+        preset: str | None = None,
+        url: str | None = None,
     ) -> None:
         object.__setattr__(self, "one_window", one_window)
         object.__setattr__(self, "update", update)
@@ -3240,6 +3257,10 @@ class CliArgs:
         object.__setattr__(self, "capture", capture)
         object.__setattr__(self, "capture_argv", capture_argv)
         object.__setattr__(self, "viewport", viewport)
+        object.__setattr__(self, "output_dir", output_dir)
+        object.__setattr__(self, "server", server)
+        object.__setattr__(self, "preset", preset)
+        object.__setattr__(self, "url", url)
 
     def __setattr__(self, name: str, value: object) -> None:
         raise AttributeError("CliArgs is immutable")
@@ -3250,15 +3271,18 @@ class CliArgs:
         return (
             self.one_window, self.update, self.check, self.gui,
             self.kill, self.capture, self.capture_argv, self.viewport,
+            self.output_dir, self.server, self.preset, self.url,
         ) == (
             other.one_window, other.update, other.check, other.gui,
             other.kill, other.capture, other.capture_argv, other.viewport,
+            other.output_dir, other.server, other.preset, other.url,
         )
 
     def __hash__(self) -> int:
         return hash((
             self.one_window, self.update, self.check, self.gui,
             self.kill, self.capture, self.capture_argv, self.viewport,
+            self.output_dir, self.server, self.preset, self.url,
         ))
 
     def __repr__(self) -> str:
@@ -3266,7 +3290,8 @@ class CliArgs:
             f"CliArgs(one_window={self.one_window!r}, update={self.update!r}, "
             f"check={self.check!r}, gui={self.gui!r}, kill={self.kill!r}, "
             f"capture={self.capture!r}, capture_argv={self.capture_argv!r}, "
-            f"viewport={self.viewport!r})"
+            f"viewport={self.viewport!r}, output_dir={self.output_dir!r}, "
+            f"server={self.server!r}, preset={self.preset!r}, url={self.url!r})"
         )
 
 
@@ -3282,6 +3307,16 @@ def _viewport_edge(token: str) -> int:
     if value < 1 or value > 16_384:
         _reject_arg(f"Invalid viewport size: {token}")
     return value
+
+
+def _validate_server_url(token: str) -> str:
+    import urllib.parse
+
+    value = token.strip()
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        _reject_arg(f"Invalid server URL: {token}")
+    return value.rstrip("/")
 
 
 def parse_cli(argv: list[str] | None = None) -> CliArgs:
@@ -3312,6 +3347,11 @@ def parse_cli(argv: list[str] | None = None) -> CliArgs:
     gui = False
     one_window = False
     viewport: tuple[int, int] | None = None
+    output_dir: str | None = None
+    server: str | None = None
+    preset: str | None = None
+    url: str | None = None
+    positionals: list[str] = []
     index = 0
     while index < len(args):
         arg = args[index]
@@ -3332,12 +3372,64 @@ def parse_cli(argv: list[str] | None = None) -> CliArgs:
             viewport = (_viewport_edge(args[index + 1]), _viewport_edge(args[index + 2]))
             index += 3
             continue
+        if arg == "--output-dir":
+            if index + 1 >= len(args) or not args[index + 1].strip():
+                _reject_arg("--output-dir needs a directory path.")
+            output_dir = args[index + 1]
+            index += 2
+            continue
+        if arg == "--server":
+            if index + 1 >= len(args) or not args[index + 1].strip():
+                _reject_arg("--server needs an http:// or https:// URL.")
+            server = _validate_server_url(args[index + 1])
+            index += 2
+            continue
+        if arg == "--preset":
+            if index + 1 >= len(args) or not args[index + 1].strip():
+                _reject_arg("--preset needs a preset name.")
+            preset = args[index + 1].strip()
+            index += 2
+            continue
+        if arg == "--url":
+            if index + 1 >= len(args) or not args[index + 1].strip():
+                _reject_arg("--url needs a website link.")
+            url = args[index + 1].strip()
+            index += 2
+            continue
+        if not arg.startswith("-"):
+            positionals.append(arg)
+            index += 1
+            continue
         _reject_arg(f"Unknown argument: {arg}")
-    if viewport is not None and not gui:
-        _reject_arg("--viewport is only used with --gui.")
+    if positionals:
+        if not gui:
+            _reject_arg(f"Unknown argument: {positionals[0]}")
+        if url is not None or len(positionals) > 1:
+            extra = positionals[0] if url is not None else positionals[1]
+            _reject_arg(f"Unknown argument: {extra}")
+        url = positionals[0].strip()
+    if not gui:
+        if viewport is not None:
+            _reject_arg("--viewport is only used with --gui.")
+        if output_dir is not None:
+            _reject_arg("--output-dir is only used with --gui.")
+        if server is not None:
+            _reject_arg("--server is only used with --gui.")
+        if preset is not None:
+            _reject_arg("--preset is only used with --gui.")
+        if url is not None:
+            _reject_arg("--url is only used with --gui.")
     if gui and one_window:
         _reject_arg("--gui already keeps everything in this terminal.")
-    return CliArgs(one_window=one_window, gui=gui, viewport=viewport)
+    return CliArgs(
+        one_window=one_window,
+        gui=gui,
+        viewport=viewport,
+        output_dir=output_dir,
+        server=server,
+        preset=preset,
+        url=url,
+    )
 
 
 def parse_launch_args(argv: list[str] | None = None) -> bool:
@@ -3382,10 +3474,20 @@ def main() -> None:
         raise SystemExit(updater.run_update(ROOT, check_only=cli.check))
     _clear_application_shutdown_request()
     if cli.gui:
-        ensure_venv()
+        if not cli.server:
+            ensure_venv()
         import gui
         viewport = cli.viewport if cli.viewport is not None else (1920, 1080)
-        raise SystemExit(gui.run_capture_gui(viewport))
+        raise SystemExit(
+            gui.run_capture_gui(
+                viewport,
+                directory=Path(cli.output_dir) if cli.output_dir else None,
+                server=cli.server,
+                preset=cli.preset,
+                initial_url=cli.url or "",
+                custom_viewport=cli.viewport is not None,
+            )
+        )
     one_window = use_one_window(cli.one_window)
     ensure_venv()    # may re-exec this script under the venv Python
 
