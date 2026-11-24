@@ -1670,6 +1670,20 @@ class GuiCouncilHardeningTests(TestCase):
         )
         self.assertNotIn(b"\x1bPq", bomb_frame)
 
+        # Truncated zlib stream (full raster present, 4-byte Adler-32 checksum stripped) must be rejected
+        small_rows = b"\x00" + b"\x11\x22\x33" * 4
+        compressed_trunc = zlib.compress(small_rows)[:-4]
+        def _chunk(kind: bytes, data: bytes) -> bytes:
+            return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+        trunc_png = (
+            b"\x89PNG\r\n\x1a\n"
+            + _chunk(b"IHDR", struct.pack(">IIBBBBB", 4, 1, 8, 2, 0, 0, 0))
+            + _chunk(b"IDAT", compressed_trunc)
+            + _chunk(b"IEND", b"")
+        )
+        with self.assertRaises(ValueError):
+            launch.png_rgba(trunc_png)
+
     def test_preset_exact_name_preserved_on_delete_and_summary_sanitized(self) -> None:
         presets = gui._parse_presets_body(
             {
@@ -1771,3 +1785,200 @@ class GuiCouncilHardeningTests(TestCase):
         emitted = gui._drain_windows_escape(FakeMsvcrt(list("example\x1b[201~")), pending)
         self.assertEqual(emitted, ["paste:https://split.\nexample"])
         self.assertEqual(len(pending), 0)
+
+    def test_windows_delayed_paste_immediately_after_escape_and_standalone_escape(self) -> None:
+        import time as _time
+
+        class DelayedAfterEsc:
+            def __init__(self, delay_s: float, tail: str) -> None:
+                self._ready_at = _time.monotonic() + delay_s
+                self._buf = list(tail)
+
+            def kbhit(self) -> bool:
+                return bool(self._buf) and _time.monotonic() >= self._ready_at
+
+            def getwch(self) -> str:
+                return self._buf.pop(0)
+
+        class EmptyMsvcrt:
+            def kbhit(self) -> bool:
+                return False
+
+            def getwch(self) -> str:
+                raise AssertionError("should not read")
+
+        # Chunk arriving 45ms after initial Escape (>25ms) must enter paste mode, not emit esc
+        pending = bytearray()
+        emitted = gui._drain_windows_escape(
+            DelayedAfterEsc(0.045, "[200~https://after-esc.example\x1b[201~"),
+            pending,
+            paste_grace=0.15,
+        )
+        self.assertEqual(emitted, ["paste:https://after-esc.example"])
+        self.assertEqual(len(pending), 0)
+
+        # Standalone Escape with no following bytes still flushes as esc after grace timeout
+        bare_pending = bytearray()
+        self.assertEqual(
+            gui._drain_windows_escape(EmptyMsvcrt(), bare_pending, paste_grace=0.02),
+            ["esc"],
+        )
+        self.assertEqual(len(bare_pending), 0)
+
+    def test_preset_huge_numeric_fields_and_startup_config_retry_and_url_sanitization(self) -> None:
+        # Huge JSON ints must not raise OverflowError in preset warning detection
+        huge = 10**400
+        _st, ignored = gui.apply_preset_settings_with_warnings(
+            gui.GuiState(),
+            {"waitTimeout": huge, "pdfMargin": huge, "videoBitrate": huge},
+        )
+        self.assertIn("waitTimeout", ignored)
+        self.assertIn("pdfMargin", ignored)
+        self.assertIn("videoBitrate", ignored)
+
+        # Transparent full-page GIF & WebM presets emit video.transparent_background
+        for fmt in ("gif", "webm"):
+            st = gui.apply_preset_settings(gui.GuiState(), {"output": fmt, "fullPage": True, "transparent": True})
+            doc = gui.capture_payload(st, "https://example.com")
+            self.assertTrue(doc["video"]["transparent_background"])  # type: ignore[index]
+        st_vp = gui.apply_preset_settings(gui.GuiState(), {"output": "webm", "fullPage": False, "transparent": True})
+        self.assertNotIn("transparent_background", gui.capture_payload(st_vp, "https://example.com")["video"])  # type: ignore[operator]
+
+        # Startup config retry finishes before --preset is applied; startup --url is sanitized
+        mp4_preset = gui.PresetEntry(name="Video", settings={"output": "mp4", "width": 1280, "height": 720})
+        captured: list[gui.GuiState] = []
+
+        def fake_run_keys(
+            initial: gui.GuiState,
+            *_args: object,
+            config_loaded: bool = False,
+            **_kwargs: object,
+        ) -> gui.GuiState:
+            self.assertTrue(config_loaded)
+            captured.append(initial)
+            return initial
+
+        with (
+            mock.patch.object(
+                gui,
+                "fetch_app_config",
+                side_effect=[None, {"output_formats": ["png", "webp"]}],
+            ) as cfg_mock,
+            mock.patch.object(gui, "fetch_presets", return_value=((mp4_preset,), "")),
+            mock.patch.object(gui, "load_url_history", return_value=()),
+            mock.patch.object(gui, "_run_keys", side_effect=fake_run_keys),
+            mock.patch.object(gui, "_enter"),
+            mock.patch.object(gui, "_leave"),
+            mock.patch.object(gui, "_enable_windows_vt", return_value=None),
+            mock.patch.object(gui, "_restore_windows_vt"),
+            mock.patch.object(launch, "choose_graphics_protocol", return_value="none"),
+            mock.patch.object(launch, "port_open", return_value=True),
+            mock.patch.object(launch, "ensure_deps"),
+            mock.patch.object(launch, "ensure_playwright"),
+            mock.patch.object(gui.sys, "stdin", mock.Mock(isatty=lambda: True)),
+            mock.patch.object(gui.sys, "stdout", mock.Mock(isatty=lambda: True)),
+        ):
+            gui.run_capture_gui(
+                (1920, 1080),
+                preset="Video",
+                initial_url="https://example.com/\x1b]52;c;ZGF0YQ==\x07ok",
+            )
+        self.assertEqual(cfg_mock.call_count, 2)
+        self.assertEqual(captured[0].output, "png")
+        self.assertIn("output(mp4)", captured[0].notice)
+        self.assertEqual(captured[0].url, "https://example.com/ok")
+        self.assertEqual(captured[0].cursor, len("https://example.com/ok"))
+
+        # History recall sanitizes stored URLs and computes cursor from cleaned length
+        dirty_state = gui.GuiState(url_history=("https://hist.example/\x1b[31mred\x07",))
+        recalled, _ = gui.apply_key(dirty_state, "up")
+        self.assertEqual(recalled.url, "https://hist.example/red")
+        self.assertEqual(recalled.cursor, len("https://hist.example/red"))
+        frame = gui.render_frame(launch.WindowSize(80, 24), recalled).decode("utf-8")
+        self.assertNotIn("\x1b[31m", frame)
+        self.assertNotIn("\x07", frame)
+
+    def test_remote_capture_uses_configured_proxy_and_local_bypasses_proxy(self) -> None:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading as _threading
+
+        seen_requests: list[tuple[str, str]] = []
+
+        class ProxyHandler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(length)
+                seen_requests.append((self.path, self.headers.get("Proxy-Authorization", "")))
+                body = b"\x89PNG\r\n\x1a\nproxied"
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        proxy_srv = ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
+        t = _threading.Thread(target=proxy_srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            proxy_port = proxy_srv.server_address[1]
+            with (
+                mock.patch.object(
+                    gui.urllib.request,
+                    "getproxies",
+                    return_value={"http": f"http://alice:pw@127.0.0.1:{proxy_port}"},
+                ),
+                mock.patch.object(gui.urllib.request, "proxy_bypass_environment", return_value=False),
+                mock.patch.object(gui.urllib.request, "proxy_bypass", return_value=False),
+            ):
+                # Local loopback must bypass the proxy
+                self.assertIsNone(gui._proxy_for_url("http://127.0.0.1:8000/v1/render", "http", "127.0.0.1"))
+                # Remote HTTP capture routes through the proxy with Proxy-Authorization
+                req = gui.urllib.request.Request(
+                    "http://remote.example/v1/render",
+                    data=b'{"url":"https://example.com","output":"png"}',
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with gui._open_capture(req, timeout=5.0, cancel=None) as resp:
+                    self.assertEqual(resp.status, 200)
+                    self.assertEqual(resp.read(64), b"\x89PNG\r\n\x1a\nproxied")
+            self.assertEqual(len(seen_requests), 1)
+            self.assertEqual(seen_requests[0][0], "http://remote.example/v1/render")
+            self.assertTrue(seen_requests[0][1].startswith("Basic "))
+        finally:
+            proxy_srv.shutdown()
+            proxy_srv.server_close()
+
+    def test_delete_preset_with_slash_in_name_via_http_endpoint(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+            from vipercapture import main as vc_main
+        except ImportError:
+            self.skipTest("fastapi/vipercapture server dependencies not installed")
+
+        with TemporaryDirectory() as tmp:
+            presets_dir = Path(tmp)
+            presets_file = presets_dir / "presets.json"
+            with (
+                mock.patch.object(vc_main, "PRESETS_DIRECTORY", presets_dir),
+                mock.patch.object(vc_main, "PRESETS_FILE", presets_file),
+            ):
+                client = TestClient(
+                    vc_main.app,
+                    base_url="http://127.0.0.1:8000",
+                    client=("127.0.0.1", 50000),
+                )
+                created = client.post(
+                    "/local/presets",
+                    json={"name": "Desktop / PDF", "settings": {"output": "pdf"}},
+                )
+                self.assertEqual(created.status_code, 201)
+                self.assertEqual([p["name"] for p in created.json()["presets"]], ["Desktop / PDF"])
+
+                encoded = gui.urllib.parse.quote("Desktop / PDF", safe="")
+                deleted = client.delete(f"/local/presets/{encoded}")
+                self.assertEqual(deleted.status_code, 200)
+                self.assertEqual(deleted.json()["presets"], [])

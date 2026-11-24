@@ -504,7 +504,7 @@ def png_rgba(png: bytes) -> tuple[int, int, bytes]:
     raw = decompressor.decompress(bytes(idat), expected + 1)
     if len(raw) > expected or decompressor.unconsumed_tail:
         raise ValueError("png exceeds expected raster size")
-    if len(raw) < expected:
+    if len(raw) < expected or not decompressor.eof:
         raise ValueError("truncated png")
     rows: list[bytearray] = []
     pos = 0

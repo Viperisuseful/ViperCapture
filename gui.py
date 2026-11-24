@@ -7,8 +7,10 @@ previews; every other terminal gets an ASCII wordmark and text metadata.
 
 from __future__ import annotations
 
+import base64
 import http.client
 import json
+import math
 import os
 import re
 import shutil
@@ -510,6 +512,8 @@ def capture_payload(state: GuiState, url: str) -> dict[str, object]:
         }
         if state.video_fps != 60:
             video_doc["fps"] = state.video_fps
+        if state.transparent and full_page and state.output in {"gif", "webm"}:
+            video_doc["transparent_background"] = True
         payload["video"] = video_doc
 
     if state.output == "pdf":
@@ -1058,7 +1062,7 @@ def apply_key(state: GuiState, key: str) -> tuple[GuiState, str]:
         else:
             draft = state.history_draft
             next_idx = min(len(state.url_history) - 1, state.history_index + 1)
-        recalled = state.url_history[next_idx]
+        recalled = sanitize_terminal_text(state.url_history[next_idx])
         return _replace(
             state,
             url=recalled,
@@ -1072,7 +1076,7 @@ def apply_key(state: GuiState, key: str) -> tuple[GuiState, str]:
         if state.history_index < 0:
             return state, "edit"
         if state.history_index == 0:
-            draft = state.history_draft
+            draft = sanitize_terminal_text(state.history_draft)
             return _replace(
                 state,
                 url=draft,
@@ -1481,7 +1485,7 @@ def load_url_history(path: Path | None = None, *, limit: int = HISTORY_LIMIT) ->
     for entry in raw:
         if not isinstance(entry, str):
             continue
-        cleaned = entry.strip()
+        cleaned = sanitize_terminal_text(entry).strip()
         if not cleaned or cleaned in seen:
             continue
         seen.add(cleaned)
@@ -1497,7 +1501,7 @@ def record_url_history(
     *,
     limit: int = HISTORY_LIMIT,
 ) -> tuple[str, ...]:
-    cleaned = url.strip()
+    cleaned = sanitize_terminal_text(url).strip()
     if not cleaned:
         return tuple(history)[:limit]
     result = [cleaned]
@@ -1832,11 +1836,23 @@ def apply_preset_settings_with_warnings(
         ignored.append("extractMode")
     if isinstance(settings.get("pdfMode"), str) and settings["pdfMode"] not in {"", "print"}:
         ignored.append("pdfMode")
-    if isinstance(settings.get("waitTimeout"), (int, float)) and not isinstance(settings.get("waitTimeout"), bool) and float(settings["waitTimeout"]) != 15.0:
+    def _number_differs(value: object, default: int | float, *, tol: float = 0.0) -> bool:
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return False
+        if isinstance(value, float) and not math.isfinite(value):
+            return True
+        if tol > 0:
+            try:
+                return abs(float(value) - float(default)) > tol
+            except OverflowError:
+                return True
+        return value != default
+
+    if _number_differs(settings.get("waitTimeout"), 15):
         ignored.append("waitTimeout")
-    if isinstance(settings.get("pdfMargin"), (int, float)) and not isinstance(settings.get("pdfMargin"), bool) and abs(float(settings["pdfMargin"]) - 0.4) > 1e-6:
+    if _number_differs(settings.get("pdfMargin"), 0.4, tol=1e-6):
         ignored.append("pdfMargin")
-    if isinstance(settings.get("videoBitrate"), (int, float)) and not isinstance(settings.get("videoBitrate"), bool) and settings["videoBitrate"] != 20:
+    if _number_differs(settings.get("videoBitrate"), 20):
         ignored.append("videoBitrate")
 
     return _replace(state, **changes), tuple(ignored)
@@ -2477,12 +2493,14 @@ def _wordmark(cols: int, *, image: bool, rows: int | None = None) -> tuple[str, 
 
 
 def _render_edit_field_ansi(text: str, cursor: int, width: int, placeholder: str = "") -> str:
-    if not text:
+    clean_text = sanitize_terminal_text(text)
+    if not clean_text:
         shown = _clip_right(placeholder, max(1, width - 1)) if placeholder else ""
         caret = "\x1b[7m \x1b[0m"
         pad = " " * max(0, width - 1 - _display_width(shown))
         return caret + (f"\x1b[2m{shown}\x1b[0m" if shown else "") + pad
-    before, caret_char, after = _window_around_cursor(text, cursor, width)
+    clamped_cursor = max(0, min(len(clean_text), cursor))
+    before, caret_char, after = _window_around_cursor(clean_text, clamped_cursor, width)
     used = _display_width(before) + _char_width(caret_char) + _display_width(after)
     pad = " " * max(0, width - used)
     return f"{before}\x1b[7m{caret_char}\x1b[0m{after}{pad}"
@@ -3334,6 +3352,20 @@ class _CaptureResponse:
         return False
 
 
+def _proxy_for_url(url: str, scheme: str, hostname: str) -> str | None:
+    if is_local_server(url):
+        return None
+    proxies = urllib.request.getproxies()
+    if not proxies:
+        return None
+    if urllib.request.proxy_bypass_environment(hostname, proxies) or urllib.request.proxy_bypass(hostname):
+        return None
+    proxy_url = proxies.get(scheme) or proxies.get("all")
+    if not proxy_url:
+        return None
+    return proxy_url
+
+
 def _open_capture(
     request: urllib.request.Request,
     timeout: float,
@@ -3346,8 +3378,45 @@ def _open_capture(
     path = parsed.path or "/"
     if parsed.query:
         path = f"{path}?{parsed.query}"
-    if parsed.scheme == "https":
-        connection: http.client.HTTPConnection = http.client.HTTPSConnection(
+    headers = _outgoing_headers(request)
+    request_target = path
+    proxy_raw = _proxy_for_url(request.full_url, parsed.scheme, parsed.hostname)
+    if proxy_raw:
+        proxy_url = proxy_raw if "://" in proxy_raw else f"http://{proxy_raw}"
+        proxy_parsed = urllib.parse.urlsplit(proxy_url)
+        if proxy_parsed.scheme not in {"http", "https"} or proxy_parsed.hostname is None:
+            raise ValueError("The configured proxy URL is invalid.")
+        proxy_port = proxy_parsed.port or (443 if proxy_parsed.scheme == "https" else 80)
+        proxy_headers: dict[str, str] = {}
+        if proxy_parsed.username is not None:
+            user = urllib.parse.unquote(proxy_parsed.username)
+            password = urllib.parse.unquote(proxy_parsed.password or "")
+            creds = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
+            proxy_headers["Proxy-Authorization"] = f"Basic {creds}"
+        if parsed.scheme == "https":
+            connection: http.client.HTTPConnection = http.client.HTTPSConnection(
+                proxy_parsed.hostname,
+                proxy_port,
+                timeout=timeout,
+            )
+            connection.set_tunnel(parsed.hostname, port, headers=proxy_headers or None)
+        else:
+            if proxy_parsed.scheme == "https":
+                connection = http.client.HTTPSConnection(
+                    proxy_parsed.hostname,
+                    proxy_port,
+                    timeout=timeout,
+                )
+            else:
+                connection = http.client.HTTPConnection(
+                    proxy_parsed.hostname,
+                    proxy_port,
+                    timeout=timeout,
+                )
+            request_target = request.full_url
+            headers.update(proxy_headers)
+    elif parsed.scheme == "https":
+        connection = http.client.HTTPSConnection(
             parsed.hostname,
             port,
             timeout=timeout,
@@ -3357,9 +3426,9 @@ def _open_capture(
     try:
         connection.request(
             request.get_method(),
-            path,
+            request_target,
             body=request.data,
-            headers=_outgoing_headers(request),
+            headers=headers,
         )
         if cancel is not None:
             cancel.bind(lambda: _close_connection(connection))
@@ -3869,17 +3938,21 @@ def _is_paste_prefix(buf: bytearray) -> bool:
 def _drain_windows_escape(
     msvcrt_mod: object,
     pending: bytearray | None = None,
+    *,
+    paste_grace: float = 0.25,
 ) -> list[str]:
     """Drain a VT escape sequence or bracketed paste on Windows Terminal.
 
     When ``pending`` is supplied by the caller, an in-progress bracketed paste
     (including a split opening ``\\x1b[200~`` marker) stays in ``pending`` across
-    timeouts instead of being dropped or flushed.
+    timeouts instead of being dropped or flushed. A bare Escape receives the
+    same bounded grace period before flushing as ``esc`` so a delayed paste
+    prefix never exits the GUI.
     """
     buf = pending if pending is not None else bytearray()
     if not buf:
         buf.extend(b"\x1b")
-    deadline = time.monotonic() + 0.025
+    deadline = time.monotonic() + (paste_grace if _is_paste_prefix(buf) else 0.025)
     while True:
         if msvcrt_mod.kbhit():  # type: ignore[attr-defined]
             ch = msvcrt_mod.getwch()  # type: ignore[attr-defined]
@@ -3890,7 +3963,7 @@ def _drain_windows_escape(
             if not buf:
                 return []
             if _is_paste_prefix(buf):
-                deadline = time.monotonic() + 0.25
+                deadline = time.monotonic() + paste_grace
             else:
                 deadline = time.monotonic() + 0.02
             continue
@@ -4051,9 +4124,10 @@ def run_capture_gui(
         launch.ensure_deps()
         launch.ensure_playwright()
     url_history = load_url_history()
+    clean_initial_url = sanitize_terminal_text(initial_url)
     state = GuiState(
-        url=initial_url,
-        cursor=len(initial_url),
+        url=clean_initial_url,
+        cursor=len(clean_initial_url),
         viewport=viewport,
         custom_viewport=viewport if custom_viewport else None,
         output_dir=str(directory),
@@ -4096,6 +4170,8 @@ def run_capture_gui(
                 )
             state = _replace(state, busy=False, progress=0)
         config = fetch_app_config(base_url, timeout=0.6)
+        if config is None:
+            config = fetch_app_config(base_url, timeout=0.6)
         if config is not None:
             state = apply_app_config(state, config)
         if preset:
@@ -4106,7 +4182,7 @@ def run_capture_gui(
             drawer,
             started_server=started is not None,
             base_url=base_url,
-            config_loaded=config is not None,
+            config_loaded=True,
         )
     except KeyboardInterrupt:
         return 0
