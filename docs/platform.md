@@ -1,18 +1,15 @@
 # Platform configuration
 
-This page covers project controls, artifact options, distributed roles, and
-observability. Existing single-operator installations can continue without
-enabling the project control plane or distributed roles.
+This guide covers the optional project control plane, deterministic and certified artifacts, split API and worker roles, observability, and operator CAPTCHA handlers. Single-operator installs can leave the control plane and distributed roles disabled.
 
 ## Configure projects, keys, quotas, and profiles
 
-Set separate random `VIPERCAPTURE_ADMIN_TOKEN` and
-`VIPERCAPTURE_CONTROL_SECRET` values of at least 32 bytes. The first
-authenticates administrators; the stable second value encrypts profiles and
-keys API-token fingerprints so administrator-token rotation does not corrupt
-stored state. Every `/v1`,
-`/take`, and `/compat` request then requires either that administrator token or
-a project key. Create a project and its first key:
+Set two separate random secrets of at least 32 bytes each:
+
+- **`VIPERCAPTURE_ADMIN_TOKEN`.** Authenticates administrator calls.
+- **`VIPERCAPTURE_CONTROL_SECRET`.** Encrypts stored browser profiles and keys API-token digests so rotating the admin token does not invalidate stored state.
+
+Once both are set, every `/v1`, `/take`, and `/compat` request requires either the admin token or a project API key. Create a project and its first key:
 
 ```bash
 curl -H "Authorization: Bearer $VIPERCAPTURE_ADMIN_TOKEN" \
@@ -24,102 +21,46 @@ curl -H "Authorization: Bearer $VIPERCAPTURE_ADMIN_TOKEN" \
   http://127.0.0.1:8000/v1/admin/projects/PROJECT_ID/keys
 ```
 
-Raw keys are returned once and only server-keyed digests are stored. Keys can be
-restricted to any combination of the `render`, `jobs`, `schedules`, `profiles`,
-and `baselines` scopes. Jobs, schedules,
-profiles, and visual baselines are project-owned. Profile storage state is
-AES-GCM encrypted at rest; profile IDs are unguessable and can be supplied as
-`profile_id` on a render request.
+ViperCapture returns raw API keys once and stores only server-keyed digests. You can scope each key to any subset of `render`, `jobs`, `schedules`, `profiles`, and `baselines`. Jobs, schedules, profiles, and baselines belong to the project that created them. ViperCapture encrypts profile storage state with AES-GCM at rest and issues unguessable IDs that callers pass as `profile_id` on render requests.
 
-Portable browser exports can be normalized through `POST /v1/profiles/import`.
-This accepts Playwright storage state, common Chrome/Edge/Brave/Firefox cookie
-JSON exports, Netscape `cookies.txt`, and a pasted Cookie header. Directly
-reading local browser databases is deliberately out of scope: it is
-platform-specific, often requires OS credential decryption, and would give the
-service broader access than an explicit export.
+Use `POST /v1/profiles/import` to normalize Playwright storage state, Chrome, Edge, Brave, or Firefox cookie JSON exports, Netscape `cookies.txt` files, or a pasted `Cookie` header. ViperCapture does not read live browser profile databases on disk because that depends on OS credential decryption and would grant the server broader access than an explicit export.
 
-Native routes use `Authorization: Bearer vcp_...`; Bearer authentication
-failures include `WWW-Authenticate`. Query-string credentials are accepted
-only by the ScreenshotOne-compatible `/take` route and can be disabled with
-`VIPERCAPTURE_ALLOW_QUERY_AUTH=0`.
+Native routes authenticate with `Authorization: Bearer vcp_...` and return `WWW-Authenticate` on auth failure. Only the ScreenshotOne-compatible `/take` route accepts query-string keys, and you can turn that off with `VIPERCAPTURE_ALLOW_QUERY_AUTH=0`.
 
-RPM events and active-render leases are transactionally recorded in the
-control database. Processes using that same database therefore share project
-limits; abandoned concurrency leases expire after 15 minutes.
-Each project may retain at most 100 schedules and 512 MiB of encrypted schedule
-payloads. Creation reserves quota before the durable schedule row is written;
-updates resize that reservation and deletion releases it.
+The control database records RPM events and active-render leases transactionally, so processes sharing that database share project quotas. Abandoned concurrency leases expire after 15 minutes. Each project can store up to 100 schedules and 512 MiB of encrypted schedule payloads. ViperCapture reserves quota before writing a schedule row, resizes the reservation on updates, and releases it on deletion.
 
 ## Configure artifact options
 
-`deterministic.enabled` fixes `Date`, `Math.random`, Web Crypto random values
-and UUIDs, and the browser performance clock; it also waits for fonts and
-combines with the existing animation stabilization. `slices` emits a ZIP
-of bounded-height full-page sections. A diagnostic bundle can add a redacted
-HAR 1.2 log (HTTP versions from Chromium CDP or Resource Timing, allowlisted
-headers, mime types, and timings; query strings, matrix/path parameters,
-cookies, credentials, and bodies omitted; Firefox/WebKit HTTPS versions stay
-`unknown` without Resource Timing), Playwright trace, and WARC
-files. `certification.enabled` produces an
-Ed25519-signed manifest when `VIPERCAPTURE_CERTIFICATION_SECRET` is set to at
-least 32 bytes. Certification proves bundle integrity; it does not by itself
-make a legal-admissibility claim.
+- **Deterministic captures.** `deterministic.enabled` fixes `Date`, `Math.random`, Web Crypto random values and UUIDs, and the browser performance clock. It also waits for fonts and combines with animation stabilization.
+- **Full-page slices.** `slices` returns a ZIP of bounded-height sections covering a full page.
+- **Diagnostic bundles.** Bundles can include a redacted HAR 1.2 log, a redacted Playwright trace, and WARC files. The HAR log records HTTP versions from Chromium CDP or Resource Timing, allowlisted headers, MIME types, and timings, while omitting query strings, matrix and path parameters, cookies, credentials, and bodies. Firefox and WebKit HTTPS entries stay `unknown` without Resource Timing.
+- **Signed certification.** `certification.enabled` adds an Ed25519-signed manifest when `VIPERCAPTURE_CERTIFICATION_SECRET` is at least 32 bytes. Run `vipercapture verify <bundle>` to verify the Ed25519 signature, SHA-256 digests, and canonical manifest of a `--certify` ZIP bundle using `--public-key` or `/v1/certification/public-key`. Certification proves bundle integrity and does not make a legal-admissibility claim on its own.
 
 ## Configure distributed roles and observability
 
-`VIPERCAPTURE_ROLE=api` starts queue providers without consumers;
-`VIPERCAPTURE_ROLE=worker` consumes jobs and rejects public render traffic;
-`all` remains the default. Split roles require a shared job-store factory,
-shared artifact storage (S3/R2 or a factory), and `VIPERCAPTURE_JOB_SECRET`.
-This makes accidental split deployment with local SQLite/files impossible.
-The built-in SQLite control plane is restricted to `role=all`;
-split deployments must enforce shared authentication and quotas at their
-gateway. Schedules in split mode require a shared
-`VIPERCAPTURE_SCHEDULE_STORE_FACTORY`; disable them explicitly otherwise.
-Its paginated `list` operation must accept a `project_id` filter and apply it
-inside indexed storage rather than scanning other tenants' rows.
-The combined `all` role recovers its own interrupted claims on restart. Split
-workers require an external job store with lease-based `recover_stale()` so a
-replica can recover only expired claims and cannot steal live work.
+| `VIPERCAPTURE_ROLE` | Behavior |
+| --- | --- |
+| `all` (default) | Runs the API, local or external stores, and render workers in one process |
+| `api` | Serves API routes and starts queue providers without running render consumers |
+| `worker` | Consumes queued jobs and rejects public render traffic |
 
-`GET /metrics` exports Prometheus text. When the control plane is enabled it
-requires the administrator Bearer token unless
-`VIPERCAPTURE_METRICS_PUBLIC=1` is explicitly set. The supplied public gateway
-continues to block `/metrics` while Prometheus scrapes the internal listener.
-`GET /health` and `GET /ready` remain public; `/v1/admin/status` exposes
-authenticated operator state. Set
-`OTEL_EXPORTER_OTLP_ENDPOINT` to enable batched OpenTelemetry FastAPI traces.
+Split `api` and `worker` deployments require a shared `VIPERCAPTURE_JOB_STORE_FACTORY`, shared artifact storage (S3-compatible bucket or `VIPERCAPTURE_ARTIFACT_STORE_FACTORY`), and `VIPERCAPTURE_JOB_SECRET`. ViperCapture refuses to start split roles against local SQLite or local files.
+
+The bundled SQLite control plane supports only `role=all`, so split deployments must enforce shared authentication and quotas at their gateway. Running schedules in split mode requires a shared `VIPERCAPTURE_SCHEDULE_STORE_FACTORY`; otherwise disable schedules explicitly. A shared schedule store's paginated `list` method must accept `project_id` and filter inside indexed storage instead of scanning other tenants' rows. While `role=all` recovers its own interrupted claims on restart, split workers require an external job store with lease-based `recover_stale()` so replicas recover only expired claims and never steal live work.
+
+`GET /metrics` exports Prometheus metrics. When the control plane is on, `/metrics` requires the administrator Bearer token unless you set `VIPERCAPTURE_METRICS_PUBLIC=1`. The public deployment example blocks `/metrics` at the gateway while letting Prometheus scrape the internal listener. `GET /health` and `GET /ready` stay public, and `/v1/admin/status` returns authenticated operator state. Set `OTEL_EXPORTER_OTLP_ENDPOINT` to export batched OpenTelemetry traces for FastAPI.
 
 ## Use integrations
 
-The repository includes an importable n8n workflow and a small Terraform
-Docker module. Compatibility adapters reject unknown vendor options instead of
-silently changing render behavior.
+This repository ships an importable n8n workflow and a small Terraform Docker module. Compatibility adapters reject unknown vendor options instead of silently changing render behavior.
 
 ## Configure proxies, stealth, and CAPTCHA callbacks
 
-Per-request proxies are enabled by default in self-host mode and disabled by
-default in hosted mode. Set `VIPERCAPTURE_ALLOW_CUSTOM_PROXIES=0` to turn them
-off or `=1` to opt in. The setting controls HTTP(S), SOCKS4, and SOCKS5 proxy
-objects supplied under `network.proxy`; it does not weaken URL validation or
-the recommended network egress firewall.
+Per-request proxies under `network.proxy` (HTTP, HTTPS, SOCKS4, or SOCKS5) are on by default in self-host mode and off by default in hosted mode. Set `VIPERCAPTURE_ALLOW_CUSTOM_PROXIES=0` to disable them or `1` to opt in. Enabling custom proxies does not weaken URL validation or replace a network egress firewall.
 
-Stealth scripts are applied to each isolated context by default and align
-language, platform, and user-agent signals with the request. They are balanced
-evasive defaults, not a promise that a site cannot detect automation. Callers
-can set `stealth:false` for diagnosis and compatibility testing. These scripts
-run on standard Playwright. For Patchright plus Turnstile complete-when-possible
-/ harder challenge handling, use
-[ViperCapture Stealth](https://github.com/Viperisuseful/ViperCapture-Stealth)
-(0.1.0-beta). That fork is not a universal Cloudflare bypass; see its
-README for how-to.
+ViperCapture applies request-aware stealth scripts to each isolated context by default on standard Playwright to align language, platform, and user-agent signals with the request. These are balanced defaults, not a guarantee against bot detection. Callers can pass `stealth: false` for debugging or compatibility checks. For Patchright and harder Turnstile handling, use [ViperCapture Stealth](https://github.com/Viperisuseful/ViperCapture-Stealth) (`0.1.0-beta`), which is not a universal Cloudflare bypass; see its README for setup.
 
-ViperCapture only detects CAPTCHA/bot challenges. It does not solve or bypass
-them. To let an operator connect an approved internal or third-party
-integration, set
-`VIPERCAPTURE_CAPTCHA_HANDLER_FACTORY=package.module:create_handler`. The
-factory is called once at startup and must return an async callable with this
-contract:
+ViperCapture detects CAPTCHA and bot challenges without solving or bypassing them. To connect an operator-approved internal or third-party handler, set `VIPERCAPTURE_CAPTCHA_HANDLER_FACTORY=package.module:create_handler`. ViperCapture calls the factory once at startup and expects an async callable with this signature:
 
 ```python
 async def handler(page, challenge, solver_name, timeout_ms) -> bool:
@@ -131,22 +72,15 @@ def create_handler():
     return handler
 ```
 
-Requests opt in with `"captcha":{"action":"external",
-"solver":"operator-alias","timeout_ms":120000}`. The solver name is only a
-non-secret routing label, not a provider credential. Keep handler credentials
-in the operator-owned integration and out of render requests, target cookies,
-headers, and profiles. ViperCapture invokes only the configured factory's
-callable, enforces the timeout, re-runs detection, and fails if the challenge
-remains. No provider integration, provider affiliation, credentials, token
-injection, endorsement, solver, or challenge-bypass implementation ships with
-the project.
+Callers opt in per request with `"captcha":{"action":"external","solver":"operator-alias","timeout_ms":120000}`. `solver` is a non-secret routing label, never a provider credential. Keep handler credentials inside the operator integration and out of render requests, cookies, headers, and profiles. ViperCapture invokes only the configured callable, enforces the timeout, re-runs challenge detection, and fails the render if the challenge persists. No provider integration, credentials, solver, or challenge-bypass code ships with this repository.
 
-Callers may instead complete an authorized access flow independently and make
-a fresh render with short-lived, target-scoped session state as documented in
-[site access](site-access.md). That caller-managed flow does not invoke the
-operator handler. Neither flow relaxes same-origin header routing, hosted
-target-domain checks for `network.cookies`, or network egress policy. Hosted
-mode also keeps public-address and redirect validation. Imported profiles are
-not target-filtered, and self-host mode permits internal targets, so operators
-must use dedicated target-scoped profiles and enforce private and metadata-
-network blocks at the egress layer.
+Callers can instead finish an authorized access flow independently and submit a fresh render with short-lived, target-scoped session state as described in [site access](site-access.md). That flow does not invoke the operator handler. Neither path relaxes same-origin header routing, hosted target-domain checks for `network.cookies`, public-address and redirect validation in hosted mode, or egress policy. Because imported profiles are not target-filtered and self-host mode permits internal targets, use dedicated target-scoped profiles and block private and metadata networks at the egress layer.
+
+## Related
+
+- [API and workflows](api.md)
+- [Async jobs and queue providers](async-jobs.md)
+- [Self-hosting and local setup](self-hosting.md)
+- [Authorizing ViperCapture through Cloudflare or a WAF](site-access.md)
+- [Public API deployment example](../deploy/public-api/README.md)
+- [All docs](README.md)

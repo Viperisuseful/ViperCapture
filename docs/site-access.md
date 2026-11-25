@@ -1,23 +1,14 @@
-# Authorize ViperCapture through Cloudflare or another WAF
+# Authorize ViperCapture through Cloudflare or a WAF
 
-This guide is for owners and administrators authorizing captures of a site they
-control. ViperCapture detects blocking challenges and can record the page as
-shown, but it does not solve CAPTCHAs or evade another site's access controls.
-This repository uses standard Playwright and does not claim a Cloudflare
-bypass. For Patchright plus Turnstile complete-when-possible / harder
-challenge handling, use
-[ViperCapture Stealth](https://github.com/Viperisuseful/ViperCapture-Stealth)
-(0.1.0-beta). See that README for how-to; Stealth is not a universal
-Cloudflare bypass.
+Use this guide when you control a site and want to let ViperCapture capture it without disabling your WAF. ViperCapture detects blocking challenges and can capture the challenge page as shown, but it does not solve CAPTCHAs or evade another site's access controls.
+
+This repository uses standard Playwright and does not claim a Cloudflare bypass. For Patchright and harder Turnstile challenge handling, see [ViperCapture Stealth](https://github.com/Viperisuseful/ViperCapture-Stealth) (`0.1.0-beta`). Stealth is not a universal Cloudflare bypass.
 
 ## Create an access rule
 
-Create a dedicated preview hostname or path and require a random, revocable
-request header. Match the header with the fixed outbound address of the
-ViperCapture deployment. Skip only the security rule that blocks the request.
-Keep logging and unrelated protections enabled.
+Set up a dedicated preview hostname or path and require a long, random, revocable request header. Match both that header and the fixed outbound IP address of your ViperCapture deployment. Skip only the specific security rule that blocks the capture, and leave logging and all other protections enabled.
 
-For example, send an origin-scoped header with the render request:
+Send an origin-scoped header with your render request:
 
 ```bash
 curl http://127.0.0.1:8000/v1/render \
@@ -31,34 +22,17 @@ curl http://127.0.0.1:8000/v1/render \
   }' --output report.png
 ```
 
-Caller-supplied headers are applied only to the exact origin of `url`. Redirects
-and cross-origin assets do not receive the secret. Persistent profiles are a
-better fit for short-lived login sessions; do not copy a person's long-lived
-session into a request.
+ViperCapture sends caller-supplied headers only to the exact origin of `url`. Redirects and cross-origin assets never receive the secret. Use persistent profiles for short-lived login sessions instead of copying a person's long-lived session into a request.
 
 ## Hand off from an external challenge tool
 
-For a target you are authorized to test, a caller may complete the site's
-access flow outside ViperCapture with a tool of its choice and then submit a
-fresh render. Pass only short-lived, target-scoped state through an encrypted
-profile, `network.cookies`, or an exact-origin header. Do not put the external
-service's API key in target cookies, headers, profiles, or render payloads;
-keep service credentials in the caller or operator integration.
+For a target you are authorized to test, a caller can complete the site's access flow outside ViperCapture with its own tool and then start a fresh render. Pass only short-lived, target-scoped state through an encrypted profile, `network.cookies`, or an exact-origin header. Keep any external service's API key in the caller or operator integration, never in target cookies, headers, profiles, or render payloads.
 
-This caller-managed handoff is separate from the optional operator handler
-described in the [platform guide](platform.md). ViperCapture is not affiliated
-with external providers and does not bundle, call, endorse, or configure one
-for this workflow. It does not solve or bypass challenges. Same-origin header
-routing remains in force, and hosted mode keeps its target-domain check for
-`network.cookies` plus public-address and redirect validation. Imported profile
-state is not target-filtered, so create a dedicated profile containing only the
-authorized site's state. Self-hosters must enforce private and metadata-network
-blocks with the deployment's egress policy.
+This caller-managed handoff is separate from the optional operator handler in the [platform guide](platform.md). ViperCapture is not affiliated with external providers and does not bundle, call, endorse, or configure one. It does not solve or bypass challenges. Same-origin header routing stays active, and hosted mode keeps its target-domain check for `network.cookies` along with public-address and redirect validation. Because imported profile state is not target-filtered, create a dedicated profile holding only the authorized site's state. Self-hosters must still block private and metadata networks with an egress policy.
 
 ## Configure Cloudflare
 
-Create a WAF custom rule above the rule that blocks the renderer. Replace the
-address, host, path, and value below:
+Add a WAF custom rule above the rule that blocks the renderer. Replace the IP address, hostname, path prefix, and header secret below:
 
 ```text
 (
@@ -69,30 +43,22 @@ address, host, path, and value below:
 )
 ```
 
-Choose **Skip**, then select only the relevant managed rule, bot rule, or rate
-limit. Do not globally disable the WAF. A broad IP allow rule is a last resort
-because it cannot be limited by path and secret header. Cloudflare's current
-documentation covers [Skip rules](https://developers.cloudflare.com/waf/custom-rules/skip/)
-and [request-header expressions](https://developers.cloudflare.com/ruleset-engine/rules-language/fields/reference/http.request.headers/).
+Select **Skip** and pick only the managed rule, bot rule, or rate limit that triggers on the capture. Never disable the WAF globally. Treat a broad IP allow rule as a last resort because it cannot restrict access by path and secret header. See Cloudflare's documentation for [Skip rules](https://developers.cloudflare.com/waf/custom-rules/skip/) and [request-header expressions](https://developers.cloudflare.com/ruleset-engine/rules-language/fields/reference/http.request.headers/).
 
-The same least-privilege shape applies to other CDNs and WAFs: renderer source
-address, exact hostname, dedicated path, and a secret header. Check origin-side
-rate limits and security middleware too.
+Use the same least-privilege rule shape on other CDNs and WAFs: fixed renderer source IP, exact hostname, dedicated path, and a secret header. Check origin-side rate limits and security middleware as well.
 
 ## Troubleshooting
 
-- For a 403 or Cloudflare error 1020, inspect the provider event and exact rule
-  ID that matched.
-- For a 429, exempt only this narrow integration from the relevant edge or
-  origin limit.
-- For `captcha_detected`, remove the challenge from the authorized rule.
-  `proceed_on_captcha: true` captures the challenge as displayed; it does not
-  solve it. Harder Turnstile complete-when-possible handling is in the
-  [Stealth fork](https://github.com/Viperisuseful/ViperCapture-Stealth), not
-  this engine, and is not a universal bypass.
-- For missing fonts or images, inspect the diagnostic bundle for blocked
-  cross-origin assets and authorize an asset host only when you control it.
+- **HTTP 403 or Cloudflare error 1020.** Check the provider security event log for the exact rule ID that matched.
+- **HTTP 429.** Exempt only this narrow rule from the edge or origin rate limit.
+- **`captcha_detected`.** Remove the challenge from the authorized rule. Setting `proceed_on_captcha: true` captures the challenge page as displayed and does not solve it. Harder Turnstile handling lives in the [Stealth fork](https://github.com/Viperisuseful/ViperCapture-Stealth), not this engine, and is not a universal bypass.
+- **Missing fonts or images.** Inspect the diagnostic bundle for blocked cross-origin assets, and authorize an asset host only if you control it.
 
-Verify the first capture in both edge and origin logs, confirm requests without
-the secret remain protected, rotate the secret periodically, and remove the
-exception when the integration is no longer needed.
+Verify the first capture in both edge and origin logs, confirm that requests without the secret header stay blocked, rotate the secret regularly, and remove the rule when you no longer need it.
+
+## Related
+
+- [API and workflows](api.md)
+- [Projects, API keys, and observability](platform.md)
+- [Self-hosting and local setup](self-hosting.md)
+- [All docs](README.md)

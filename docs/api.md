@@ -1,89 +1,42 @@
 # API guide
 
-The API rejects unknown request fields. Each render request requires exactly
-one of `url`, `html`, or `markdown`. `RenderRequest` in
-`vipercapture/render_contract.py` is the canonical schema. When the service is
-running, the interactive OpenAPI reference is available at `/docs`.
-`vipercapture capture` sends this contract from the shell. `vipercapture capture --help`
-lists a flag for each major field (including `--from-json`, `--preset`, `--cookie-file`,
-`--js-file`, `--action-wait-text`, `--urls-file`, `--retries`, `--async --no-wait`, and
-`~/.vipercapture/config.toml` defaults). Companion CLI subcommands cover the rest of the
-API: `status`, `logs`, `gpu`, `preset`, `diff`, `baseline`, `bulk`, `job`, `schedule`,
-`profile`, `sign`, `verify`, `admin`, `completion`, and `version`.
+The ViperCapture API rejects unknown request fields and requires every render request to provide exactly one of `url`, `html`, or `markdown`. `RenderRequest` in `vipercapture/render_contract.py` defines the schema, and a running server serves the interactive OpenAPI reference at `/docs`.
+
+`vipercapture capture` sends this contract from the shell. Run `vipercapture capture --help` to see the flag for each major field, including `--from-json`, `--preset`, `--cookie-file`, `--js-file`, `--action-wait-text`, `--urls-file`, `--output-dir`, `--output-template`, `--retries`, `--retry-delay-ms`, `--async --no-wait`, `--open`, `--copy`, `--stop-server`, and `--certify`. Defaults can live in `~/.vipercapture/config.toml` (pass `--no-config` to `capture` to ignore it).
+
+Companion CLI subcommands cover the rest of the API: `version` (`--version`, `-V`), `status`, `logs`, `gpu`, `preset`, `diff`, `baseline`, `bulk`, `job`, `schedule`, `profile`, `sign`, `verify`, `admin`, and `completion`. See [self-hosting](self-hosting.md#local-commands) for the full command reference.
 
 ## Outputs
 
 | `output` | Response | Notes |
 | --- | --- | --- |
-| `png`, `jpeg`, `webp`, `avif` | image | Full page, viewport, selector, clip, resize, slices, or multi-viewport |
-| `pdf` | PDF | Print or single-page mode, paper/orientation/margins, optional tags |
-| `html` | UTF-8 HTML | Fully rendered document or article extraction |
+| `png`, `jpeg`, `webp`, `avif` | Image | Full page, viewport, selector, clip, resize, slices, or multi-viewport |
+| `pdf` | PDF | Print or single-page mode, paper size, orientation, margins, and optional tags |
+| `html` | UTF-8 HTML | Rendered document or article extraction |
 | `markdown` | UTF-8 Markdown | Document or readability-based article extraction |
 | `metadata` | JSON | Title, description, canonical URL, headings, links, images, and optional CSS-selector extraction |
-| `webm`, `mp4`, `gif` | video | Full-page top-to-bottom animation, or a 1–30 second viewport recording |
+| `webm`, `mp4`, `gif` | Video | Full-page top-to-bottom pan, or a 1 to 30 second viewport recording |
 
-`viewports` accepts two or three named image viewports and returns a ZIP with a
-manifest. `diagnostics.bundle` returns a ZIP containing the normal artifact,
-manifest, and optionally bounded console and network event files.
-`diagnostics.include_har=true` adds `network.har`, a redacted HAR 1.2 log with
-observed HTTP versions, allowlisted headers, mime types, and timings. Query
-strings, cookies, credentials, and bodies are omitted. Header values are
-emitted only for an allowlist of non-credential names; URL-bearing values
-such as `Location`, `Link`, and `Refresh` have query strings, fragments, and
-matrix/path parameters (for example `;jsessionid=`) stripped even when they
-are relative or unquoted. `Content-Disposition` filenames are redacted; `ETag`
-values are kept as opaque cache validators.
-`entry.time` excludes the HAR `ssl` subset of `connect`. Compressed responses
-keep `Content-Length` as transferred `bodySize` and leave decoded
-`content.size` unknown. Chromium can record HTTP versions via CDP; Firefox
-and WebKit backfill `nextHopProtocol` from Resource Timing, and HTTPS entries
-without that metadata stay `httpVersion` `unknown`.
-WebM setup/navigation frames are trimmed from the recording with Playwright's
-FFmpeg runtime, and `duration_ms` reports the verified encoded duration rather
-than merely echoing the request.
+### Engines, profiles, and caching
 
-Full-page GIF and WebM output pans from the top to the bottom of the prepared
-document over `video.duration_ms`. Set `video.transparent_background=true` to
-keep transparent page and side padding; opaque output uses black padding. MP4
-does not support transparency. With `full_page=false`, video records the live
-viewport and `video.scroll` optionally adds stepped scrolling.
-`video.fps` selects 1–60 FPS and `video.bitrate_mbps` selects a 1–100 Mbps
-target for WebM and MP4; defaults are 60 FPS and 20 Mbps. GIF output uses the
-selected frame rate and keeps the requested viewport size with a generated
-palette. When GPU mode is enabled, ViperCapture probes FFmpeg's NVIDIA, AMD,
-Intel, Apple, Windows Media Foundation, and Linux VA-API encoders with the
-installed driver before using one. Hardware video uses the requested bitrate
-and falls back to the software encoder if the probe or the real encode fails.
-Transparent WebM and GIF remain software encoded because portable hardware
-alpha-video and GIF encoders are not available.
+Set `engine` to `chromium` (default), `firefox`, or `webkit`. Each request runs in a fresh isolated browser context. Chromium starts in a managed pool; Firefox and WebKit start on first request. PDF output and `image.optimize_for_speed` require Chromium, and unsupported engine combinations fail validation instead of switching engines silently. On Firefox and WebKit, ViperCapture captures lossless frames and converts WebP and AVIF through the bounded image pipeline.
 
-Set `engine` to `chromium` (default), `firefox`, or `webkit`. Browsers start on
-first use and each request still receives a fresh isolated context. PDF and
-`image.optimize_for_speed` are Chromium-only; unsupported combinations fail
-validation instead of silently changing engines. WebP and AVIF on Firefox or
-WebKit are captured losslessly and converted by the bounded image pipeline.
+`profile` selects speed or completeness defaults:
 
-`profile` selects speed versus completeness defaults. `preview` (default)
-uses adaptive full-page lazy loading and Chromium's faster PNG/WebP encoder.
-`accurate` restores thorough lazy scrolling and the slower lossless encoder.
-Explicit `lazy_load` and `image.optimize_for_speed` values always win.
-Deterministic captures do not enable the fast encoder unless you set it.
-Successful image responses include `X-ViperCapture-Encode-Ms` and
-`X-ViperCapture-Profile`.
+- **`preview` (default).** Uses adaptive full-page lazy loading and Chromium's faster PNG and WebP encoder.
+- **`accurate`.** Uses thorough lazy scrolling and the slower lossless encoder.
 
-Cached image hits (`cache: true`) reuse an exact request fingerprint for
-`VIPERCAPTURE_CACHE_TTL_SECONDS` (24 hours by default). Set `cache_key` to
-keep multiple variants of the same request in cache.
+Explicit `lazy_load` and `image.optimize_for_speed` fields override the profile. Deterministic captures leave the fast encoder off unless you set it explicitly. Successful image responses include `X-ViperCapture-Encode-Ms` and `X-ViperCapture-Profile`.
 
-`image.width` and `image.height` constrain the final image while preserving its
-aspect ratio. HTML and Markdown requests may set `include_shadow_dom` to embed
-open shadow roots as declarative shadow DOM. PDF options include A0–A6, Legal,
-Letter, and Tabloid paper, optional page ranges, and bounded header/footer
-templates. Metadata includes icons, loaded fonts, forms, and JSON-LD samples.
-For structured extraction, set `output` to `metadata` and pass up to 32 unique
-`elements` selectors. The response reports every selector's total match count
-and includes up to 100 results across the request, with bounded text, inner
-HTML, attributes, and viewport-relative geometry:
+Set `cache: true` on a single-image request to reuse cached results matching the exact request fingerprint for `VIPERCAPTURE_CACHE_TTL_SECONDS` (24 hours by default). Set `cache_key` to store distinct cached variants of the same request.
+
+### Images, HTML, Markdown, PDF, and metadata
+
+`image.width` and `image.height` resize the output image while keeping its aspect ratio. For `html` and `markdown` outputs, set `include_shadow_dom: true` to serialize open shadow roots as declarative shadow DOM.
+
+PDF output supports A0 to A6, Legal, Letter, and Tabloid paper sizes, optional page ranges, and bounded header and footer templates. Set `pdf.tagged` explicitly to enable or disable Chromium's accessible PDF structure tags, or omit it to keep Chromium's default. Structure tags alone do not guarantee PDF/UA conformance; source document semantics and independent validation still apply.
+
+`metadata` output includes icons, loaded fonts, forms, and JSON-LD samples. For structured extraction, pass up to 32 unique `elements` selectors. ViperCapture reports each selector's total match count and returns up to 100 matched items per request, including bounded text, inner HTML, attributes, and viewport-relative geometry:
 
 ```json
 {
@@ -96,10 +49,10 @@ HTML, attributes, and viewport-relative geometry:
 }
 ```
 
-For several artifacts from one page load, request an image plus any unique
-`side_outputs` and up to five named `image.thumbnails`. ViperCapture returns a
-ZIP containing the primary image, requested side artifacts, thumbnails, and a
-manifest with media types, sizes, dimensions, and SHA-256 digests:
+### Multi-viewport packs, artifact bundles, and diagnostics
+
+- **Multi-viewport packs.** Pass two or three named entries in `viewports` for image output to receive a ZIP archive with a manifest.
+- **Artifact bundles.** Request a primary image together with unique `side_outputs` (`html`, `markdown`, `metadata`, or Chromium-only `mhtml`) and up to five named `image.thumbnails`. ViperCapture returns a ZIP with the primary image, requested side artifacts, thumbnails, and a manifest containing media types, sizes, dimensions, and SHA-256 digests. Thumbnail dimensions range from 10 to 2,000 pixels and preserve aspect ratio within the requested bounds. Artifact bundles cannot be combined with viewport packs, slices, diagnostics, certification, or cache. Handle `mhtml` with the same care as the source page because it can contain embedded resources and authenticated content.
 
 ```json
 {
@@ -116,53 +69,31 @@ manifest with media types, sizes, dimensions, and SHA-256 digests:
 }
 ```
 
-Side outputs support `html`, `markdown`, `metadata`, and Chromium-only `mhtml`.
-Thumbnail dimensions range from 10 to 2,000 pixels and preserve the primary
-image's aspect ratio within the requested bounds. Artifact bundles cannot be
-combined with viewport packs, slices, diagnostics, certification, or cache.
-MHTML may contain page resources and authenticated content; handle it with the
-same protections as the source page.
+- **Diagnostic bundles.** Set `diagnostics.bundle: true` to receive a ZIP with the primary artifact, a manifest, and optional bounded console and network logs.
+- **Redacted HAR 1.2.** Set `diagnostics.include_har: true` to include `network.har` with observed HTTP versions, allowlisted headers, MIME types, and timings. ViperCapture omits query strings, cookies, credentials, and bodies, and emits header values only for an allowlist of non-credential names. It strips query strings, fragments, and matrix or path parameters such as `;jsessionid=` from URL-bearing headers like `Location`, `Link`, and `Refresh`, even when relative or unquoted. It redacts `Content-Disposition` filenames and keeps `ETag` values as opaque cache validators. `entry.time` excludes the HAR `ssl` subset of `connect`. Compressed responses keep `Content-Length` as transferred `bodySize` and leave decoded `content.size` unknown. Chromium records HTTP versions from CDP; Firefox and WebKit backfill `nextHopProtocol` from Resource Timing, and HTTPS entries without that metadata keep `httpVersion` as `unknown`.
 
-Set `pdf.tagged` explicitly to request or suppress Chromium's accessible PDF
-structure tags. Omitting it preserves Chromium's default. Tags alone do not
-guarantee PDF/UA conformance; source semantics and independent validation still
-matter.
+### Video and GIF output
+
+Full-page GIF and WebM renders pan from the top to the bottom of the prepared document over `video.duration_ms`. Set `video.transparent_background: true` to preserve transparent page and side padding; opaque video uses black padding. MP4 does not support transparency. With `full_page: false`, video records the live viewport, and `video.scroll` adds optional stepped scrolling.
+
+`video.fps` accepts 1 to 60 FPS (default 60), and `video.bitrate_mbps` accepts 1 to 100 Mbps (default 20) for WebM and MP4. GIF uses the requested frame rate and viewport dimensions with a generated color palette. ViperCapture trims WebM setup and navigation frames with Playwright's FFmpeg runtime, and `duration_ms` reports the verified encoded duration rather than echoing the request value.
+
+When GPU mode is enabled, ViperCapture probes FFmpeg's NVIDIA, AMD, Intel, Apple, Windows Media Foundation, and Linux VA-API encoders with the installed driver before selecting one. Hardware encoding honors the requested bitrate and falls back to software encoding if the probe or encode fails. Transparent WebM and GIF stay software-encoded because portable hardware alpha-video and GIF encoders are unavailable.
 
 ## Configure the browser
 
-- `environment`: device preset, color scheme, reduced motion, CSS media, locale,
-  and timezone. A non-desktop `device` (`iphone_14`, `pixel_7`, `ipad`) applies
-  the matching Playwright descriptor: user agent, viewport, screen,
-  `device_scale_factor`, and touch. Explicit `viewport.width`,
-  `viewport.height`, or `viewport.device_scale_factor` values override the
-  descriptor. `{"environment": {"device": "iphone_14"}}` is enough to capture
-  at iPhone 14 metrics; you do not also need a matching `viewport`. Set
-  `media` to `screen` or `print` to apply it before the target loads. When
-  omitted, screenshots keep browser screen media and PDFs use print.
-- `network`: target-page JavaScript, user agent, geolocation, proxy, cookies,
-  CSP/HTTPS controls, URL glob blocks, and resource-type blocks. Set
-  `java_script_enabled: false` to prevent target-provided scripts from running.
-- `headers`: bounded target headers. Credential-bearing headers are stripped
-  from cross-origin requests.
-- `wait_for`: load event, selector plus `visible`, `attached`, `hidden`, or
-  `detached` state, optional complete-image readiness, body text, delay, and
-  timeout. Image readiness eagerly requests current lazy images and repeats
-  after full-page lazy loading.
-- `cleanup`: consent mode and ad/tracker/chat/newsletter blocking.
-- `custom_css`: up to 64 KiB of injected CSS.
-- `stealth`: applies balanced, request-aware automation evasions by default;
-  set it to `false` for debugging or strict browser-parity tests. These
-  run on standard Playwright; Patchright plus Turnstile complete-when-possible
-  / harder challenge handling is in
-  [ViperCapture Stealth](https://github.com/Viperisuseful/ViperCapture-Stealth)
-  (0.1.0-beta), not this engine.
-- `captcha`: chooses `error` (default), `capture`, or an operator-provided
-  `external` handler when a blocking challenge is detected. `solver` is a
-  non-secret operator routing alias, never a provider credential.
+- **`environment`.** Sets device preset, color scheme, reduced motion, CSS media, locale, and timezone. A non-desktop `device` (`iphone_14`, `pixel_7`, `ipad`) applies the Playwright descriptor for user agent, viewport, screen, `device_scale_factor`, and touch. Explicit `viewport.width`, `viewport.height`, or `viewport.device_scale_factor` values override the descriptor, so `{"environment": {"device": "iphone_14"}}` captures at iPhone 14 metrics on its own. Set `media` to `screen` or `print` to apply CSS media before page load; when omitted, screenshots use screen media and PDFs use print.
+- **`network`.** Controls target-page JavaScript, user agent, geolocation, proxy, cookies, CSP and HTTPS checks, URL glob blocks, and resource-type blocks. Set `java_script_enabled: false` to block scripts delivered by the target page.
+- **`headers`.** Sends bounded headers to the target origin and strips credential-bearing headers from cross-origin requests.
+- **`wait_for`.** Configures the navigation load event, a CSS selector with state `visible`, `attached`, `hidden`, or `detached`, complete-image readiness, body text, delay, and timeout. Image readiness requests current lazy images and repeats the check after full-page lazy scrolling.
+- **`cleanup`.** Controls cookie consent handling and ad, tracker, chat, and newsletter blocking.
+- **`custom_css`.** Injects up to 64 KiB of CSS.
+- **`stealth`.** Applies balanced, request-aware automation evasions by default on standard Playwright. Set `stealth: false` for debugging or strict browser-parity tests. For Patchright and harder Turnstile challenge handling, see [ViperCapture Stealth](https://github.com/Viperisuseful/ViperCapture-Stealth) (`0.1.0-beta`).
+- **`captcha`.** Chooses `error` (default), `capture`, or an operator-provided `external` handler when ViperCapture detects a blocking challenge. `solver` is a non-secret operator routing label, never a provider credential.
 
-Self-hosted mode accepts an HTTP, HTTPS, SOCKS4, or SOCKS5 proxy in
-`network.proxy`. Credentials are separate fields and are never embedded in the
-proxy URL:
+### Proxies
+
+Self-hosted mode accepts an HTTP, HTTPS, SOCKS4, or SOCKS5 proxy in `network.proxy`. Keep credentials in separate fields instead of embedding them in the proxy URL:
 
 ```json
 {
@@ -178,52 +109,27 @@ proxy URL:
 }
 ```
 
-The proxy is attached to the isolated browser context, so navigation and page
-subresources use it. Operators can disable it with
-`VIPERCAPTURE_ALLOW_CUSTOM_PROXIES=0`. Hosted mode defaults to disabled and
-must opt in with `VIPERCAPTURE_ALLOW_CUSTOM_PROXIES=1`. Proxy access does not
-replace container/host egress controls.
+ViperCapture attaches the proxy to the isolated browser context so navigation and subresources both use it. Operators can disable custom proxies with `VIPERCAPTURE_ALLOW_CUSTOM_PROXIES=0`. Hosted mode disables custom proxies by default; set `VIPERCAPTURE_ALLOW_CUSTOM_PROXIES=1` to opt in. Proxy routing does not replace container or host egress controls.
 
-CAPTCHA detection recognizes blocking interstitials from Cloudflare,
-reCAPTCHA, hCaptcha, Arkose Labs, DataDome, AWS WAF, GeeTest, Friendly Captcha,
-MTCaptcha, Imperva, and HUMAN/PerimeterX, including widgets inside open shadow
-roots. An ordinary embedded widget does not fail a capture until it becomes a
-blocking challenge. Detection is heuristic and returns the provider, kind,
-confidence, and signals in the error details; ViperCapture does not solve or
-bypass CAPTCHAs and does not claim a Cloudflare bypass. For Patchright plus
-Turnstile complete-when-possible / harder challenge handling, use
-[ViperCapture Stealth](https://github.com/Viperisuseful/ViperCapture-Stealth)
-(0.1.0-beta); see that README for how-to.
+### CAPTCHA detection and authorized access
 
-An authorized caller can also complete an access flow with an independent
-external tool, then submit a fresh render using short-lived, target-scoped
-cookies, a profile, or exact-origin headers. Keep external-service credentials
-outside render payloads. This does not invoke the operator handler or relax
-exact-origin header routing or, in hosted mode, the target-domain check for
-`network.cookies` and public-address/redirect validation. Imported profiles are
-not target-filtered. Self-host mode allows internal targets, so its operator
-must enforce private and metadata-network blocks with an egress policy.
-ViperCapture has no affiliation with or built-in integration for those tools;
-see [site access](site-access.md).
+ViperCapture detects blocking interstitials from Cloudflare, reCAPTCHA, hCaptcha, Arkose Labs, DataDome, AWS WAF, GeeTest, Friendly Captcha, MTCaptcha, Imperva, and HUMAN/PerimeterX, including widgets inside open shadow roots. An ordinary embedded widget does not fail a capture until it blocks the page. Detection is heuristic and reports the provider, kind, confidence, and signals in the error details. ViperCapture does not solve or bypass CAPTCHAs and does not claim a Cloudflare bypass. For Patchright and harder Turnstile handling, see [ViperCapture Stealth](https://github.com/Viperisuseful/ViperCapture-Stealth) (`0.1.0-beta`).
 
-Hosted mode also rejects non-public targets and subresources, cookies outside
-the target site, and unsafe redirects.
+An authorized caller can complete a site's access flow outside ViperCapture with an independent tool, then submit a fresh render with short-lived, target-scoped cookies, a profile, or exact-origin headers. Keep external service credentials out of render payloads. This handoff does not call the operator CAPTCHA handler or relax exact-origin header routing. In hosted mode, ViperCapture keeps its target-domain check for `network.cookies` and rejects non-public targets, non-public subresources, and unsafe redirects. Imported profiles are not target-filtered, and self-host mode allows internal targets, so operators must block private and metadata networks with an egress policy. ViperCapture has no affiliation with or built-in integration for external tools. See [site access](site-access.md).
 
 ## Import browser sessions
 
-With the project control plane enabled, `POST /v1/profiles/import` accepts up
-to 5 MiB of pasted/exported session data and encrypts the normalized Playwright
-storage state with `VIPERCAPTURE_CONTROL_SECRET`. Supported formats are:
+When the project control plane is enabled, `POST /v1/profiles/import` accepts up to 5 MiB of exported session data and encrypts the normalized Playwright storage state with `VIPERCAPTURE_CONTROL_SECRET`.
 
-- `playwright`: a Playwright `storageState` JSON object, including localStorage
-- `cookies_json`: the common Cookie-Editor-style JSON array exported by Chrome,
-  Edge, Brave, Firefox, and compatible browsers
-- `netscape`: a Netscape `cookies.txt` export
-- `cookie_header`: a pasted `Cookie` request header; this requires `origin`
-- `auto`: detects one of the above from its content
+| Format | Description |
+| --- | --- |
+| `playwright` | Playwright `storageState` JSON object, including `localStorage` |
+| `cookies_json` | Cookie-Editor-style JSON array exported from Chrome, Edge, Brave, Firefox, or compatible browsers |
+| `netscape` | Netscape `cookies.txt` export |
+| `cookie_header` | Pasted `Cookie` request header; requires `origin` |
+| `auto` | Detects one of the formats above from the input content |
 
-For example, import an exported file without putting its secrets on the command
-line, then use the returned `id` as `profile_id`:
+Import a file through stdin so secrets stay off the command line, then pass the returned `id` as `profile_id`:
 
 ```bash
 jq -Rs '{format:"auto", content:.}' browser-cookies.txt |
@@ -232,15 +138,11 @@ jq -Rs '{format:"auto", content:.}' browser-cookies.txt |
     -H 'Content-Type: application/json' --data-binary @-
 ```
 
-For a pasted header, send `{"format":"cookie_header",
-"origin":"https://example.com","content":"Cookie: sid=..."}`. Session exports
-are credentials: avoid shell history, logs, shared folders, and unencrypted
-transport. ViperCapture intentionally does not read or decrypt live browser
-profile databases on a user's machine.
+For a pasted header, send `{"format":"cookie_header","origin":"https://example.com","content":"Cookie: sid=..."}`. Treat session exports as credentials and keep them out of shell history, logs, shared folders, and unencrypted transport. ViperCapture never reads or decrypts live browser profile databases on disk.
 
 ## Actions and assertions
 
-Actions run in array order after navigation, waits, CSS, and initial cleanup:
+ViperCapture runs `actions` in array order after navigation, waits, custom CSS, and initial cleanup:
 
 ```json
 {
@@ -260,16 +162,13 @@ Actions run in array order after navigation, waits, CSS, and initial cleanup:
 }
 ```
 
-Supported action types are `click`, `hover`, `fill`, `press`, `select`,
-`scroll`, `wait`, `hide`, and `javascript`. JavaScript requires the operator to
-set `VIPERCAPTURE_ALLOW_SCRIPTS=1`.
+Supported action types are `click`, `hover`, `fill`, `press`, `select`, `scroll`, `wait`, `hide`, and `javascript`. The `javascript` action requires the operator to set `VIPERCAPTURE_ALLOW_SCRIPTS=1`.
 
 ## Submit async, bulk, and scheduled work
 
-`X-Request-Id` is a correlation value for logs and support. ViperCapture
-preserves a valid caller value or generates one; reusing it never deduplicates
-work. `POST /v1/jobs` returns 202 with a `Location` header. Send a stable
-`Idempotency-Key` to make creation retries safe:
+### Single async jobs
+
+`X-Request-Id` is a correlation ID for logs and support. ViperCapture preserves a valid caller value or generates one, and reusing it never deduplicates jobs. `POST /v1/jobs` returns HTTP 202 with a `Location` header. Send a stable `Idempotency-Key` to make creation retries safe:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/v1/jobs \
@@ -279,13 +178,11 @@ curl -X POST http://127.0.0.1:8000/v1/jobs \
   -d '{"url":"https://example.com","output":"png"}'
 ```
 
-The same key and normalized request replay the original job. The same key with
-a changed request returns 409 `idempotency_key_conflict`. Without the header,
-each submission creates a new job. Keys are project-scoped. Poll status and
-retrieve the result URL advertised in the job document. Only queued jobs can
-be cancelled.
+Sending the same key and normalized body replays the original job. Sending the same key with a different body returns HTTP 409 `idempotency_key_conflict`. Without `Idempotency-Key`, every request creates a new job. Keys are scoped per project. Poll the job document and download the artifact from the result URL it advertises. You can cancel only jobs that are still `queued`.
 
-`POST /v1/jobs/bulk` accepts:
+### Bulk jobs
+
+`POST /v1/jobs/bulk` accepts up to 100 items:
 
 ```json
 {
@@ -301,27 +198,21 @@ be cancelled.
 }
 ```
 
-Each processed envelope returns HTTP 200, including mixed or all-item failure.
-Every result contains `status`, `accepted`, `job`, and `error`; malformed,
-oversized, unauthenticated, or unavailable requests still use the normal
-request-level 4xx/5xx status. A bulk `Idempotency-Key` derives stable keys by
-item index, fingerprints the normalized whole envelope, and atomically claims
-that fingerprint before creating any item. Alternatively use per-item
-`idempotency_key` values; do not combine both forms. A retry reuses accepted
-jobs and retries rejected items.
+ViperCapture returns HTTP 200 for any processed envelope, even when some or all items fail. Each item result contains `status`, `accepted`, `job`, and `error`. Malformed, oversized, unauthenticated, or unavailable requests still return normal 4xx or 5xx HTTP statuses.
 
-Project RPM exhaustion returns 429 `rate_limit_exceeded` with `Retry-After`
-calculated from the oldest event in the sliding 60-second window. Render
-concurrency exhaustion returns the distinct `concurrency_limit_exceeded` code
-with a short heuristic delay. Payload/body limits use 413; persistent profile,
-baseline, and schedule project quotas use 403 with their specific error code
-and available `limit_count`, `used_count`, `limit_bytes`, and `used_bytes`
-details.
+A request-level `Idempotency-Key` derives stable keys by item index, fingerprints the normalized whole envelope, and atomically claims that fingerprint before creating any item. You can instead supply per-item `idempotency_key` values, but do not mix both forms. Retrying a bulk request reuses accepted jobs and retries rejected items.
 
-`PUT /v1/baselines/{name}` returns 201 and `Location` when it creates a
-baseline, or 200 when it replaces one.
+### Rate limits, quotas, and baselines
 
-Create a recurring job with `POST /v1/schedules`:
+- **Project RPM limit.** Returns HTTP 429 `rate_limit_exceeded` with `Retry-After` computed from the oldest event in the sliding 60-second window.
+- **Render concurrency limit.** Returns HTTP 429 `concurrency_limit_exceeded` with a short heuristic delay.
+- **Body and payload limits.** Returns HTTP 413.
+- **Project resource quotas.** Persistent profile, baseline, and schedule quota violations return HTTP 403 with a specific error code and any applicable `limit_count`, `used_count`, `limit_bytes`, and `used_bytes` fields.
+- **Baselines.** `PUT /v1/baselines/{name}` returns HTTP 201 with a `Location` header when creating a baseline, or HTTP 200 when replacing one.
+
+### Schedules
+
+Create a recurring capture with `POST /v1/schedules`:
 
 ```json
 {
@@ -336,15 +227,11 @@ Create a recurring job with `POST /v1/schedules`:
 }
 ```
 
-Schedules use exactly five cron fields. The next occurrence is calculated in
-the selected IANA timezone and stored in UTC. Inputs are encrypted with the
-same key as jobs. The scheduler advances the due time before idempotently
-submitting work, preventing a crash from creating a tight duplicate loop.
+Schedules accept five-field cron expressions. ViperCapture calculates the next run in the chosen IANA timezone, stores it in UTC, and encrypts schedule inputs with the same key as async jobs. The scheduler advances the due timestamp before submitting work idempotently so a crash cannot trigger a duplicate loop.
 
 ## Create signed links
 
-Set a random secret of at least 32 bytes in `VIPERCAPTURE_SIGNING_SECRET` and a
-separate administrator token in `VIPERCAPTURE_SIGNING_ADMIN_TOKEN`. Then:
+Set a random secret of at least 32 bytes in `VIPERCAPTURE_SIGNING_SECRET` and a separate token in `VIPERCAPTURE_SIGNING_ADMIN_TOKEN`, then mint a link:
 
 ```bash
 curl http://127.0.0.1:8000/v1/signed-url?ttl_seconds=3600 \
@@ -353,17 +240,11 @@ curl http://127.0.0.1:8000/v1/signed-url?ttl_seconds=3600 \
   -d '{"url":"https://example.com","full_page":false}'
 ```
 
-The returned GET URL contains a canonical base64url payload, absolute expiry,
-and versioned HMAC-SHA256 signature. The server rejects tampering, expiry, and
-links whose expiry exceeds the seven-day maximum. Large embedded HTML or
-Markdown inputs must use POST because signed links are limited to URL-sized payloads.
-Signing authenticates the payload; it does not encrypt it. Do not place secret
-headers, cookies, HTML, or Markdown in a URL that will be shared or logged.
+The returned GET URL carries a canonical base64url payload, an absolute expiry, and a versioned HMAC-SHA256 signature. ViperCapture rejects tampered signatures, expired links, and expiries longer than seven days. Use POST for large inline HTML or Markdown payloads because signed links must fit within URL length limits. Signing authenticates the payload without encrypting it, so never put secret headers, cookies, HTML, or Markdown in a URL that may be shared or logged.
 
 ## Verify webhooks
 
-Webhook bodies use canonical compact JSON. Verify the signature over
-`timestamp + "." + raw_body`:
+ViperCapture sends webhook bodies as canonical compact JSON. Verify `X-ViperCapture-Webhook-Signature` over `timestamp + "." + raw_body`:
 
 ```python
 import hashlib, hmac
@@ -376,33 +257,25 @@ expected = "v1=" + hmac.new(
 assert hmac.compare_digest(expected, signature_header)
 ```
 
-Callbacks have a stable event ID, never follow redirects, and retry bounded
-transport, 429, and server failures. Delivery failure does not rerender or
-change a successfully completed job. DNS is resolved once per delivery and the
-connection is pinned to the validated address while retaining the original
-Host and TLS server name. A terminal transition atomically creates an encrypted
-outbox entry; failed delivery remains pending across restarts until it is
-acknowledged.
+Callbacks carry a stable event ID, never follow redirects, and retry bounded transport, HTTP 429, and 5xx errors. A failed callback never rerenders or alters a completed job. ViperCapture resolves DNS once per delivery attempt and pins the socket to the validated IP address while keeping the original `Host` header and TLS SNI. Each terminal job transition creates an encrypted outbox row atomically, so undelivered webhooks stay queued across restarts until acknowledged.
 
 ## Configure S3-compatible storage
 
-Set `VIPERCAPTURE_S3_BUCKET`. Optional variables:
+Set `VIPERCAPTURE_S3_BUCKET` to enable S3-compatible artifact storage. Optional variables:
 
 | Variable | Purpose |
 | --- | --- |
-| `VIPERCAPTURE_S3_ENDPOINT_URL` | R2, MinIO, B2, or other compatible endpoint |
+| `VIPERCAPTURE_S3_ENDPOINT_URL` | Endpoint URL for Cloudflare R2, MinIO, Backblaze B2, or another compatible store |
 | `VIPERCAPTURE_S3_REGION` | Provider region; defaults to `us-east-1` |
 | `VIPERCAPTURE_S3_ADDRESSING_STYLE` | `auto`, `virtual`, or `path` |
 | `VIPERCAPTURE_S3_PREFIX` | Object key prefix |
-| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | Standard SDK credentials |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | Standard AWS SDK credentials |
 
-The adapter writes exclusive, unguessable object keys plus ViperCapture owner
-and expiry metadata. Maintenance deletes only objects with the expected
-prefix/UUID key shape and owner marker; unrelated objects under a shared prefix
-are never selected solely because of age. Also configure a provider lifecycle
-rule so objects still expire if application maintenance does not run.
+The adapter writes exclusive, unguessable object keys with ViperCapture owner and expiry metadata. Maintenance deletes only objects that match both the expected prefix and UUID key shape and the owner marker, so unrelated objects in a shared bucket are left untouched. Configure a bucket lifecycle rule as well so objects expire even if application maintenance does not run.
 
 ## Compare images
+
+Upload a baseline and current image to `POST /v1/diff`:
 
 ```bash
 curl http://127.0.0.1:8000/v1/diff \
@@ -411,20 +284,28 @@ curl http://127.0.0.1:8000/v1/diff \
   --output visual-diff.zip
 ```
 
-Inputs must have identical dimensions, be no larger than 20 MiB each, and
-contain no more than 8 million expanded pixels each. Diff computation runs in
-a bounded worker lane (`VIPERCAPTURE_DIFF_CONCURRENCY`, default 1) because
-decoded RGBA and mask buffers are substantially larger than compressed inputs.
-`report.json` records changed/total pixels, difference ratio, pass/fail, and
-the changed bounding box. `diff.png` highlights changes in magenta.
+Both images must share the same dimensions, stay at or under 20 MiB each, and expand to at most 8 million pixels each. Diff work runs in a bounded worker lane (`VIPERCAPTURE_DIFF_CONCURRENCY`, default `1`) because decoded RGBA and mask buffers use far more memory than compressed files. The returned ZIP contains `report.json` (changed pixel count, total pixels, difference ratio, pass or fail status, and changed bounding box) and `diff.png` with changes highlighted in magenta.
 
 ## Configuration variables
 
-See [self-hosting](self-hosting.md) for the security boundary and
-[async jobs](async-jobs.md) for queue/provider durability. Important feature
-flags include `VIPERCAPTURE_ASYNC_JOBS`, `VIPERCAPTURE_SCHEDULES`,
-`VIPERCAPTURE_ALLOW_SCRIPTS`, `VIPERCAPTURE_WEBHOOK_SECRET`,
-`VIPERCAPTURE_SIGNING_SECRET`, `VIPERCAPTURE_CACHE_TTL_SECONDS` (default 86400),
-`VIPERCAPTURE_CACHE_MAX_ENTRIES`, `VIPERCAPTURE_CACHE_MAX_BYTES` (default
-512 MiB), `VIPERCAPTURE_MAX_CONCURRENCY` (CPU-sized 2–8 when unset), and
-`VIPERCAPTURE_BROWSER_POOL_SIZE` (about half of concurrency for Chromium).
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `VIPERCAPTURE_ASYNC_JOBS` | `1` (`0` on Windows) | Enable or disable async jobs |
+| `VIPERCAPTURE_SCHEDULES` | `1` (`0` on Windows) | Enable or disable cron schedules |
+| `VIPERCAPTURE_ALLOW_SCRIPTS` | `0` | Allow `javascript` render actions |
+| `VIPERCAPTURE_WEBHOOK_SECRET` | unset | Secret for HMAC-SHA256 webhook signatures |
+| `VIPERCAPTURE_SIGNING_SECRET` | unset | Secret for signed GET render URLs |
+| `VIPERCAPTURE_CACHE_TTL_SECONDS` | `86400` | Exact-request image cache TTL in seconds |
+| `VIPERCAPTURE_CACHE_MAX_ENTRIES` | `1000` | Maximum cached image entries |
+| `VIPERCAPTURE_CACHE_MAX_BYTES` | `536870912` (512 MiB) | Maximum total cached image bytes |
+| `VIPERCAPTURE_MAX_CONCURRENCY` | CPU-sized (2 to 8) | Maximum simultaneous renders |
+| `VIPERCAPTURE_BROWSER_POOL_SIZE` | about half of concurrency | Chromium browser pool size |
+
+## Related
+
+- [Self-hosting and local setup](self-hosting.md)
+- [Async jobs and queue providers](async-jobs.md)
+- [Projects, API keys, and observability](platform.md)
+- [Authorizing ViperCapture through Cloudflare or a WAF](site-access.md)
+- [ScreenshotOne and Urlbox compatibility matrix](compatibility.md)
+- [All docs](README.md)

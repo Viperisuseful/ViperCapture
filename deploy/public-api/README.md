@@ -1,59 +1,38 @@
 # Public API deployment
 
-This stack defines the supported public deployment topology. It pins the released
-GHCR image, excludes administrative and metrics routes from the public gateway,
-applies global connection/request limits, uses project-level API keys and
-quotas, stores results in S3-compatible storage, exports Prometheus metrics,
-and gives the renderer a fixed Docker subnet for host-level egress filtering.
+This stack defines the supported topology for exposing ViperCapture on the public internet. It pins the released GHCR image, blocks administrative and metrics routes at the gateway, enforces global connection and request limits, authenticates callers with project API keys and quotas, stores results in S3-compatible storage, exports Prometheus metrics, and assigns the renderer a fixed Docker subnet for host egress filtering.
 
-You must also configure TLS termination, host patching, alert delivery,
-object-store durability, and an incident-response owner.
+You also need to configure TLS termination, host patching, alert delivery, object-store durability, and an incident-response owner.
 
 ## Deploy the stack
 
-1. Copy `.env.example` to `.env`, pin `VIPERCAPTURE_VERSION`, and replace every
-   placeholder. Generate each secret independently with `openssl rand -hex 32`.
-2. On the Linux Docker host, install the private-address egress policy:
+1. Copy `.env.example` to `.env`, pin `VIPERCAPTURE_VERSION`, and replace every placeholder. Generate each secret independently with `openssl rand -hex 32`.
+2. Install the private-address egress policy on the Linux Docker host:
 
    ```bash
    sudo ./egress-firewall.sh
    ```
 
-   This inserts one isolated chain into `DOCKER-USER` for only the renderer's
-   fixed `172.30.0.10/32` address; established replies to the gateway and
-   Prometheus remain allowed. It does not flush other firewall rules. Re-run it
-   after Docker/firewall replacement and verify it with
-   `sudo iptables -S VIPERCAPTURE_EGRESS`.
-3. Start and probe the pinned deployment:
+   This script inserts one isolated chain into `DOCKER-USER` for only the renderer's fixed `172.30.0.10/32` address while allowing established replies to the gateway and Prometheus. It leaves other firewall rules untouched. Re-run it after any Docker or firewall restart and verify it with `sudo iptables -S VIPERCAPTURE_EGRESS`.
+
+3. Pull, start, and probe the pinned stack:
 
    ```bash
    docker compose --env-file .env pull
    docker compose --env-file .env up -d
    curl --fail http://127.0.0.1:8080/ready
    ```
-4. Terminate HTTPS in a host reverse proxy, load balancer, or tunnel that sends
-   traffic only to `127.0.0.1:8080`. The front proxy must overwrite, not append,
-   `X-Forwarded-For` with the connecting client address. Nginx trusts only the
-   pinned Docker host gateway at `172.31.0.1` for that header. Do not expose the
-   container port directly.
-5. Create one project/key per customer or internal workload through an
-   authenticated maintenance connection. Never give callers the admin token.
 
-The application enforces project RPM/concurrency. Nginx adds a coarse per-IP
-ceiling for unauthenticated floods. Put upstream DDoS filtering in front of the
-host; neither layer replaces network-level abuse protection.
+4. Terminate HTTPS in a host reverse proxy, load balancer, or tunnel that forwards traffic only to `127.0.0.1:8080`. The front proxy must overwrite `X-Forwarded-For` with the connecting client address rather than appending to it. Nginx trusts only the pinned Docker host gateway at `172.31.0.1` for that header. Never expose the container port directly.
+5. Create one project and API key per customer or internal workload over an authenticated maintenance connection. Never share the admin token with callers.
+
+ViperCapture enforces per-project RPM and concurrency limits. Nginx adds a coarse per-IP ceiling against unauthenticated floods. Put upstream DDoS filtering in front of the host, because neither layer replaces network-level abuse protection.
 
 ## Back up and restore the deployment
 
-Enable bucket versioning and retention in S3/R2. The Docker volume contains
-control-plane state, encrypted queued inputs, schedules, and cache metadata. It
-does **not** contain the secrets needed to decrypt that state or the credentials
-needed to retrieve S3/R2 artifacts. Keep a separately encrypted recovery copy of
-the complete `.env`, including `VIPERCAPTURE_CONTROL_SECRET`,
-`VIPERCAPTURE_JOB_SECRET`, `VIPERCAPTURE_SIGNING_SECRET`, admin and webhook
-tokens, and every `VIPERCAPTURE_S3_*`/`AWS_*` value. For example, encrypt it to
-an offline recovery key with [age](https://age-encryption.org/) and never store
-the plaintext copy beside the volume archive:
+Turn on bucket versioning and retention in S3 or R2. The Docker volume holds control-plane state, encrypted queued inputs, schedules, and cache metadata, not the secrets required to decrypt that state or read S3 and R2 objects. Keep a separately encrypted recovery copy of the complete `.env` file, including `VIPERCAPTURE_CONTROL_SECRET`, `VIPERCAPTURE_JOB_SECRET`, `VIPERCAPTURE_SIGNING_SECRET`, admin and webhook tokens, and every `VIPERCAPTURE_S3_*` and `AWS_*` variable.
+
+For example, encrypt `.env` to an offline recovery key with [age](https://age-encryption.org/) and never store plaintext beside the volume archive:
 
 ```bash
 umask 077
@@ -63,9 +42,7 @@ age --encrypt --recipient "$VIPERCAPTURE_BACKUP_AGE_RECIPIENT" \
   --output "backups/vipercapture-env-${stamp}.age" .env
 ```
 
-Store that encrypted file and the age identity in separate access-controlled
-locations, and test that the object-store credentials still reach the retained
-bucket. Then take an offline volume backup so its encrypted state is consistent:
+Keep the encrypted `.env` file and the age identity in separate access-controlled locations, and verify that the object-store credentials still read the retained bucket. Then stop the container and archive the volume so its encrypted state is consistent:
 
 ```bash
 mkdir -p backups
@@ -78,8 +55,7 @@ docker compose --env-file .env start vipercapture
 curl --fail http://127.0.0.1:8080/ready
 ```
 
-At least monthly, restore the matching pair on a non-production host (replace
-the timestamp and identity path):
+At least monthly, restore both backups on a non-production host (replace `TIMESTAMP` and the identity path):
 
 ```bash
 umask 077
@@ -95,36 +71,30 @@ docker run --rm \
 docker compose --project-name "$COMPOSE_PROJECT_NAME" --env-file .env up -d
 ```
 
-Authenticate an admin status request and verify a retained
-job/profile/baseline plus an S3-backed artifact. Delete the recovered plaintext
-`.env` when the isolated drill is complete. A backup that has not passed this
-full state, secret, and object-store restore drill is not release evidence.
+Send an authenticated admin status request and verify a retained job, profile, baseline, and S3-backed artifact. Delete the recovered plaintext `.env` once the drill finishes. A backup does not count as release evidence until it passes a full state, secret, and object-store restore drill.
 
 ## Upgrade or roll back
 
-1. Record the current image digest and export the Compose config.
+1. Record the running image digest and export the current Compose config.
 2. Complete a backup and restore drill.
-3. Change only `VIPERCAPTURE_VERSION`, run `docker compose pull`, then
-   `docker compose up -d`.
-4. Probe `/ready`, render a controlled page, submit/poll/download an async job,
-   inspect Prometheus alerts, and watch error/queue rates for one hour.
-5. Roll back by restoring the previous version and running `up -d`. Restore the
-   data snapshot only when release notes explicitly identify an incompatible
-   migration; restoring data loses work accepted after the snapshot.
+3. Update only `VIPERCAPTURE_VERSION`, run `docker compose pull`, and run `docker compose up -d`.
+4. Probe `/ready`, render a controlled page, submit, poll, and download an async job, check Prometheus alerts, and watch error and queue rates for one hour.
+5. Roll back by restoring the previous version and running `docker compose up -d`. Restore the data snapshot only when release notes document an incompatible migration, because restoring data drops work accepted after the snapshot.
 
-## Configure abuse controls and support
+## Abuse controls and support
 
-- Require scoped project keys; revoke a key immediately when leaked.
-- API keys travel only in the `Authorization` header: this stack sets
-  `VIPERCAPTURE_ALLOW_QUERY_AUTH: "0"` so `/take?access_key=…` is rejected.
-  If a legacy integration depends on query-string keys, change the value to
-  `"1"` and rotate any key that may have been captured in request logs.
-- Start customers at low RPM, concurrency, pixel, output, and queue limits.
-- Retain gateway request IDs, status, timing, project audit events, and abuse
-  decisions without logging authorization headers or render payloads.
-- Publish acceptable-use, privacy, retention, takedown, vulnerability-report,
-  and support-contact policies before onboarding external users.
-- Maintain an operator kill switch: stop the gateway, revoke a project key, or
-  block a destination/IP while preserving evidence needed for investigation.
-- Do not promise an SLA until alert delivery, an on-call owner, recovery-time
-  measurements, and scheduled restore drills exist.
+- **Scoped keys.** Require project API keys and revoke leaked keys at once.
+- **Header authentication.** This stack sets `VIPERCAPTURE_ALLOW_QUERY_AUTH: "0"` so `/take?access_key=...` fails and API keys travel only in the `Authorization` header. If a legacy client requires query-string keys, set the flag to `"1"` and rotate any key that may have landed in request logs.
+- **Conservative defaults.** Start external callers with low RPM, concurrency, pixel, output, and queue limits.
+- **Privacy-safe logs.** Keep gateway request IDs, statuses, timings, project audit events, and abuse decisions without logging authorization headers or render payloads.
+- **Published policies.** Publish acceptable-use, privacy, retention, takedown, vulnerability-report, and support-contact policies before onboarding external users.
+- **Kill switch.** Keep an operator procedure to stop the gateway, revoke a project key, or block a destination or IP while preserving investigation evidence.
+- **SLAs.** Do not promise an SLA until alert delivery, an on-call owner, measured recovery times, and scheduled restore drills are in place.
+
+## Related
+
+- [Self-hosting and local setup](../../docs/self-hosting.md)
+- [Projects, API keys, and observability](../../docs/platform.md)
+- [Async jobs and queue providers](../../docs/async-jobs.md)
+- [Security policy](../../SECURITY.md)
+- [All docs](../../docs/README.md)
