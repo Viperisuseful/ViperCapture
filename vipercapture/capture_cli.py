@@ -13,6 +13,7 @@ import copy
 import datetime
 import hashlib
 import http.client
+import ipaddress
 import json
 import math
 import mimetypes
@@ -28,6 +29,7 @@ from http.cookies import CookieError, SimpleCookie
 from pathlib import Path
 from typing import TextIO
 from urllib.parse import urljoin, urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import launch
 from vipercapture.cli_config import load_cli_config
@@ -2241,9 +2243,9 @@ def _fast_validate_simple_payload(payload: dict[str, object]) -> bool:
 
 _FALLBACK_DICT_SECTIONS = frozenset({
     "viewport", "environment", "network", "assertions", "delivery", "diagnostics",
-    "deterministic", "certification", "image", "wait_for", "cleanup", "captcha", "headers",
+    "deterministic", "certification", "wait_for", "cleanup", "captcha", "headers",
 })
-_FALLBACK_NULLABLE_DICT_SECTIONS = frozenset({"slices", "video", "clip", "pdf"})
+_FALLBACK_NULLABLE_DICT_SECTIONS = frozenset({"image", "slices", "video", "clip", "pdf"})
 _FALLBACK_LIST_SECTIONS = frozenset({"actions", "fail_on_status"})
 _FALLBACK_NULLABLE_LIST_SECTIONS = frozenset({"viewports", "elements", "side_outputs"})
 _FALLBACK_NULLABLE_STR_FIELDS = frozenset({
@@ -2262,6 +2264,105 @@ _FALLBACK_ALLOWED_KEYS = (
     | _FALLBACK_BOOL_FIELDS
     | frozenset({"output", "engine", "lazy_load", "profile", "extract_mode"})
 )
+_CONTRACT_OUTPUTS = frozenset({
+    "png", "jpeg", "webp", "avif", "pdf", "html", "markdown", "metadata", "webm", "mp4", "gif",
+})
+_CONTRACT_SIDE_OUTPUTS = frozenset(_SIDES)
+_CONTRACT_RESOURCES = frozenset(_RESOURCES)
+_CONTRACT_ARTIFACT_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+_CONTRACT_PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_CONTRACT_CACHE_KEY_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_CONTRACT_LOCALE_RE = re.compile(r"^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$")
+_CONTRACT_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+_CONTRACT_SOLVER_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_CONTRACT_SAME_SITE_RE = re.compile(r"^(?:Strict|Lax|None)$")
+_CONTRACT_PAGE_RANGES_RE = re.compile(r"^\s*\d+(?:\s*-\s*\d+)?(?:\s*,\s*\d+(?:\s*-\s*\d+)?)*\s*$")
+_CONTRACT_BLOCKED_HEADERS = frozenset({
+    "connection", "content-length", "forwarded", "host", "keep-alive",
+    "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade",
+})
+_CONTRACT_BLOCKED_HEADER_PREFIXES = ("proxy-", "sec-", "x-forwarded-")
+_CONTRACT_PAPER_DIMS = {
+    "A0": (33.1, 46.8),
+    "A1": (23.4, 33.1),
+    "A2": (16.5, 23.4),
+    "A3": (11.7, 16.5),
+    "A4": (8.27, 11.69),
+    "A5": (5.83, 8.27),
+    "A6": (4.13, 5.83),
+    "Legal": (8.5, 14.0),
+    "Letter": (8.5, 11.0),
+    "Tabloid": (11.0, 17.0),
+}
+
+
+def _check_strict_keys(obj: dict[str, object], allowed: frozenset[str], field: str) -> None:
+    unknown = sorted(set(obj.keys()) - allowed)
+    if unknown:
+        raise ValueError(f"Unknown {field} field(s): {', '.join(unknown)}")
+
+
+def _parse_contract_str(
+    value: object,
+    field: str,
+    *,
+    min_len: int | None = None,
+    max_len: int | None = None,
+    pattern: re.Pattern[str] | None = None,
+) -> str:
+    """Validate and coerce a string matching Pydantic v2 non-strict str semantics."""
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"{field} must be a UTF-8 string.") from exc
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string.")
+    if min_len is not None and len(value) < min_len:
+        raise ValueError(f"{field} must be at least {min_len} characters.")
+    if max_len is not None and len(value) > max_len:
+        raise ValueError(f"{field} must be at most {max_len} characters.")
+    if pattern is not None and pattern.fullmatch(value) is None:
+        raise ValueError(f"{field} has an invalid format.")
+    return value
+
+
+def _parse_contract_enum(value: object, field: str, allowed: frozenset[str] | tuple[str, ...]) -> str:
+    """Validate and coerce a str Enum matching Pydantic v2 non-strict semantics."""
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"{field} is invalid.") from exc
+    if not isinstance(value, str) or value not in allowed:
+        raise ValueError(f"{field} must be one of: {', '.join(sorted(allowed))}")
+    return value
+
+
+def _parse_contract_http_url(value: object, field: str) -> str:
+    """Validate an HttpUrl value matching Pydantic v2 non-strict semantics."""
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"{field} must be a valid HTTP(S) URL.") from exc
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a valid HTTP(S) URL.")
+    cleaned = value.strip().replace("\t", "").replace("\r", "").replace("\n", "")
+    if not cleaned:
+        raise ValueError(f"{field} must be a valid HTTP(S) URL.")
+    try:
+        parsed = urlsplit(cleaned)
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"{field} must be a valid HTTP(S) URL.") from exc
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in parsed.hostname)
+    ):
+        raise ValueError(f"{field} must be a valid HTTP(S) URL.")
+    return cleaned
 
 
 def _parse_contract_bool(value: object, field: str) -> bool:
@@ -2284,7 +2385,7 @@ def _parse_contract_bool(value: object, field: str) -> bool:
     raise ValueError(f"{field} must be a boolean.")
 
 
-def _parse_contract_int(value: object, field: str, lo: int, hi: int) -> int:
+def _parse_contract_int(value: object, field: str, lo: int | None, hi: int | None) -> int:
     """Validate and coerce an integer matching Pydantic v2 non-strict int semantics."""
     if isinstance(value, bool):
         parsed = int(value)
@@ -2292,35 +2393,40 @@ def _parse_contract_int(value: object, field: str, lo: int, hi: int) -> int:
         parsed = value
     elif type(value) is float:
         if not math.isfinite(value) or not value.is_integer():
-            raise ValueError(f"{field} must be an integer between {lo} and {hi}.")
+            raise ValueError(f"{field} must be an integer.")
         parsed = int(value)
     else:
-        if isinstance(value, (bytes, bytearray)):
+        if isinstance(value, bytes):
             try:
                 value = value.decode("utf-8")
             except UnicodeDecodeError as exc:
-                raise ValueError(f"{field} must be an integer between {lo} and {hi}.") from exc
+                raise ValueError(f"{field} must be an integer.") from exc
         if not isinstance(value, str):
-            raise ValueError(f"{field} must be an integer between {lo} and {hi}.")
+            raise ValueError(f"{field} must be an integer.")
         stripped = value.strip()
-        match = re.fullmatch(r"([+-]?)([0-9](?:_?[0-9])*)(?:\.(0(?:_?0)*))?", stripped)
+        match = re.fullmatch(r"([+-]?)([0-9](?:_?[0-9])*)(?:\.(0+))?", stripped)
         if match is None:
-            raise ValueError(f"{field} must be an integer between {lo} and {hi}.")
+            raise ValueError(f"{field} must be an integer.")
         sign, int_part = match.group(1), match.group(2).replace("_", "")
         sig = int_part.lstrip("0") or "0"
-        if len(sig) > 20:
-            raise ValueError(f"{field} must be an integer between {lo} and {hi}.")
-        parsed = -int(sig) if sign == "-" else int(sig)
-    if parsed < lo or parsed > hi:
-        raise ValueError(f"{field} must be an integer between {lo} and {hi}.")
+        if hi is not None and len(sig) > 30:
+            raise ValueError(f"{field} is out of integer range.")
+        try:
+            parsed = -int(sig) if sign == "-" else int(sig)
+        except ValueError as exc:
+            raise ValueError(f"{field} is out of integer range.") from exc
+    if lo is not None and parsed < lo:
+        raise ValueError(f"{field} must be at least {lo}.")
+    if hi is not None and parsed > hi:
+        raise ValueError(f"{field} must be at most {hi}.")
     return parsed
 
 
 def _parse_contract_float(
     value: object,
     field: str,
-    lo: float,
-    hi: float,
+    lo: float | None = None,
+    hi: float | None = None,
     *,
     gt_lo: bool = False,
 ) -> float:
@@ -2333,37 +2439,97 @@ def _parse_contract_float(
         except OverflowError as exc:
             raise ValueError(f"{field} is out of numeric range.") from exc
     else:
-        if isinstance(value, (bytes, bytearray)):
+        if isinstance(value, bytes):
             try:
                 value = value.decode("utf-8")
             except UnicodeDecodeError as exc:
                 raise ValueError(f"{field} must be a number.") from exc
-        if not isinstance(value, str):
+        if not isinstance(value, str) or not value.isascii():
             raise ValueError(f"{field} must be a number.")
         try:
             parsed = float(value)
         except (ValueError, OverflowError) as exc:
             raise ValueError(f"{field} must be a number.") from exc
-    if not math.isfinite(parsed):
-        raise ValueError(f"{field} must be a finite number.")
-    if (parsed <= lo if gt_lo else parsed < lo) or parsed > hi:
-        raise ValueError(f"{field} must be between {lo} and {hi}.")
+    if lo is not None or hi is not None:
+        if not math.isfinite(parsed):
+            raise ValueError(f"{field} must be a finite number.")
+        if lo is not None and (parsed <= lo if gt_lo else parsed < lo):
+            raise ValueError(f"{field} is below minimum {lo}.")
+        if hi is not None and parsed > hi:
+            raise ValueError(f"{field} exceeds maximum {hi}.")
     return parsed
 
 
+def _validate_contract_headers_fallback(headers: dict[object, object]) -> None:
+    if len(headers) > 32:
+        raise ValueError("headers may contain at most 32 entries.")
+    total = 0
+    seen: set[str] = set()
+    for raw_name, raw_value in headers.items():
+        name = _parse_contract_str(raw_name, "headers key")
+        value = _parse_contract_str(raw_value, f"headers[{name!r}]")
+        name_bytes = name.encode("utf-8")
+        value_bytes = value.encode("utf-8")
+        lowered = name.lower()
+        if not name_bytes or len(name_bytes) > 128:
+            raise ValueError("header names must be 1 through 128 bytes.")
+        if not _CONTRACT_HEADER_NAME_RE.fullmatch(name):
+            raise ValueError("header names must use HTTP token characters.")
+        if lowered in seen:
+            raise ValueError("header names must be unique case-insensitively.")
+        seen.add(lowered)
+        if lowered in _CONTRACT_BLOCKED_HEADERS or lowered.startswith(_CONTRACT_BLOCKED_HEADER_PREFIXES):
+            raise ValueError(f"header {name!r} is managed by ViperCapture.")
+        if len(value_bytes) > 4_096:
+            raise ValueError("individual header values may not exceed 4096 bytes.")
+        if any(ord(character) < 32 or ord(character) == 127 for character in value):
+            raise ValueError("header values may not contain control characters.")
+        total += len(name_bytes) + len(value_bytes) + 4
+    if total > 16_384:
+        raise ValueError("serialized headers may not exceed 16384 bytes.")
+
+
 def _validate_payload_fallback(payload: dict[str, object]) -> None:
-    """Stdlib fallback validator used when Pydantic/RenderRequest is unavailable."""
+    """Stdlib fallback validator mirroring RenderRequest when Pydantic is unavailable."""
     if not isinstance(payload, dict):
         raise ValueError("Render payload must be a JSON object.")
-    unknown = sorted(set(payload.keys()) - _FALLBACK_ALLOWED_KEYS)
-    if unknown:
-        raise ValueError(f"Unknown render request field(s): {', '.join(unknown)}")
-    sources = sum(1 for k in ("url", "html", "markdown") if k in payload and payload[k] is not None)
-    if sources != 1:
+    _check_strict_keys(payload, _FALLBACK_ALLOWED_KEYS, "render request")
+
+    url_val = _parse_contract_http_url(payload["url"], "url") if payload.get("url") is not None else None
+    html_val = _parse_contract_str(payload["html"], "html") if payload.get("html") is not None else None
+    md_val = _parse_contract_str(payload["markdown"], "markdown") if payload.get("markdown") is not None else None
+    base_url_val = _parse_contract_http_url(payload["base_url"], "base_url") if payload.get("base_url") is not None else None
+    if sum(v is not None for v in (url_val, html_val, md_val)) != 1:
         raise ValueError("Render payload must specify exactly one of url, html, or markdown.")
-    for str_key in _FALLBACK_NULLABLE_STR_FIELDS:
-        if str_key in payload and payload[str_key] is not None and not isinstance(payload[str_key], str):
-            raise ValueError(f"{str_key} must be a string.")
+    for src in (html_val, md_val):
+        if src is not None and len(src.encode("utf-8")) > 5 * 1024 * 1024:
+            raise ValueError("HTML and Markdown input may not exceed 5242880 bytes.")
+    if base_url_val is not None and url_val is not None:
+        raise ValueError("base_url is accepted only with html or markdown input.")
+
+    profile_id_val = (
+        _parse_contract_str(payload["profile_id"], "profile_id", pattern=_CONTRACT_PROFILE_ID_RE)
+        if payload.get("profile_id") is not None
+        else None
+    )
+    cache_key_val = (
+        _parse_contract_str(payload["cache_key"], "cache_key", min_len=1, max_len=128, pattern=_CONTRACT_CACHE_KEY_RE)
+        if payload.get("cache_key") is not None
+        else None
+    )
+    selector_val = (
+        _parse_contract_str(payload["selector"], "selector", min_len=1, max_len=2_048)
+        if payload.get("selector") is not None
+        else None
+    )
+    custom_css_val = (
+        _parse_contract_str(payload["custom_css"], "custom_css")
+        if payload.get("custom_css") is not None
+        else None
+    )
+    if custom_css_val is not None and len(custom_css_val.encode("utf-8")) > 65_536:
+        raise ValueError("custom_css may not exceed 65536 UTF-8 bytes.")
+
     for dict_key in _FALLBACK_DICT_SECTIONS:
         if dict_key in payload and not isinstance(payload[dict_key], dict):
             raise ValueError(f"{dict_key} must be an object.")
@@ -2371,86 +2537,162 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
         if ndict_key in payload and payload[ndict_key] is not None and not isinstance(payload[ndict_key], dict):
             raise ValueError(f"{ndict_key} must be an object or null.")
     for list_key in _FALLBACK_LIST_SECTIONS:
-        if list_key in payload and not isinstance(payload[list_key], list):
+        if list_key in payload and not isinstance(payload[list_key], (list, tuple)):
             raise ValueError(f"{list_key} must be a list.")
     for nlist_key in _FALLBACK_NULLABLE_LIST_SECTIONS:
-        if nlist_key in payload and payload[nlist_key] is not None and not isinstance(payload[nlist_key], list):
+        if nlist_key in payload and payload[nlist_key] is not None and not isinstance(payload[nlist_key], (list, tuple)):
             raise ValueError(f"{nlist_key} must be a list or null.")
-    if "output" in payload:
-        out = payload["output"]
-        if not isinstance(out, str) or out not in _FORMATS:
-            raise ValueError(f"output must be one of: {', '.join(_FORMATS)}")
-    if "engine" in payload:
-        eng = payload["engine"]
-        if not isinstance(eng, str) or eng not in _ENGINES:
-            raise ValueError(f"engine must be one of: {', '.join(_ENGINES)}")
+
+    output_fmt = _parse_contract_enum(payload["output"], "output", _CONTRACT_OUTPUTS) if "output" in payload else "png"
+    engine_name = _parse_contract_enum(payload["engine"], "engine", _ENGINES) if "engine" in payload else "chromium"
+    if "lazy_load" in payload:
+        _parse_contract_enum(payload["lazy_load"], "lazy_load", _LAZY)
+    if "profile" in payload:
+        _parse_contract_enum(payload["profile"], "profile", _PROFILES)
+    extract_mode_val = (
+        _parse_contract_enum(payload["extract_mode"], "extract_mode", _EXTRACT)
+        if "extract_mode" in payload
+        else "document"
+    )
+
     coerced_bools: dict[str, bool] = {}
     for bool_key in _FALLBACK_BOOL_FIELDS:
         if bool_key in payload:
             coerced_bools[bool_key] = _parse_contract_bool(payload[bool_key], bool_key)
-    if "lazy_load" in payload and (not isinstance(payload["lazy_load"], str) or payload["lazy_load"] not in _LAZY):
-        raise ValueError(f"lazy_load must be one of: {', '.join(_LAZY)}")
-    if "profile" in payload and (not isinstance(payload["profile"], str) or payload["profile"] not in _PROFILES):
-        raise ValueError(f"profile must be one of: {', '.join(_PROFILES)}")
-    if "extract_mode" in payload and (not isinstance(payload["extract_mode"], str) or payload["extract_mode"] not in _EXTRACT):
-        raise ValueError(f"extract_mode must be one of: {', '.join(_EXTRACT)}")
-    if "viewport" in payload:
-        vp = payload["viewport"]
-        assert isinstance(vp, dict)
-        for dim in ("width", "height"):
-            if dim in vp:
-                _parse_contract_int(vp[dim], f"viewport.{dim}", 1, 65_535)
-        if "device_scale_factor" in vp:
-            _parse_contract_float(vp["device_scale_factor"], "viewport.device_scale_factor", 0.1, 8.0)
-    output_fmt = str(payload.get("output") or "png")
-    engine_name = str(payload.get("engine") or "chromium")
     full_page_val = coerced_bools.get("full_page", True)
     preserve_vp_width = coerced_bools.get("preserve_viewport_width", False)
     save_profile_val = coerced_bools.get("save_profile", False)
     cache_val = coerced_bools.get("cache", False)
     include_shadow_dom_val = coerced_bools.get("include_shadow_dom", False)
     proceed_on_captcha_val = coerced_bools.get("proceed_on_captcha", False)
+
     is_image_fmt = output_fmt in {"png", "jpeg", "webp", "avif"}
     is_video_fmt = output_fmt in {"webm", "mp4", "gif"}
     document_outputs = {"html", "markdown"}
-    side_outputs_raw = payload.get("side_outputs")
-    side_outputs_list = side_outputs_raw if isinstance(side_outputs_raw, list) else []
-    if side_outputs_raw is not None:
-        if not side_outputs_list or len(side_outputs_list) > 4:
+
+    if "viewport" in payload:
+        vp = payload["viewport"]
+        assert isinstance(vp, dict)
+        _check_strict_keys(vp, frozenset({"width", "height", "device_scale_factor"}), "viewport")
+        for dim in ("width", "height"):
+            if dim in vp:
+                _parse_contract_int(vp[dim], f"viewport.{dim}", 1, 65_535)
+        if "device_scale_factor" in vp:
+            _parse_contract_float(vp["device_scale_factor"], "viewport.device_scale_factor", 0.1, 8.0)
+
+    side_outputs_vals: list[str] = []
+    if payload.get("side_outputs") is not None:
+        raw_sides = payload["side_outputs"]
+        assert isinstance(raw_sides, (list, tuple))
+        if not raw_sides or len(raw_sides) > 4:
             raise ValueError("side_outputs must contain 1 to 4 entries.")
-        if len(set(side_outputs_list)) != len(side_outputs_list):
+        for item in raw_sides:
+            side_outputs_vals.append(_parse_contract_enum(item, "side_outputs", _CONTRACT_SIDE_OUTPUTS))
+        if len(set(side_outputs_vals)) != len(side_outputs_vals):
             raise ValueError("side_outputs must be unique.")
-    side_outputs_set = {str(item) for item in side_outputs_list}
+    side_outputs_set = set(side_outputs_vals)
     if "mhtml" in side_outputs_set and engine_name != "chromium":
         raise ValueError("MHTML side output requires the Chromium engine.")
-    img_raw = payload.get("image") if isinstance(payload.get("image"), dict) else {}
-    thumbnails_raw = img_raw.get("thumbnails") if isinstance(img_raw, dict) else None
-    if thumbnails_raw is not None:
-        if not isinstance(thumbnails_raw, list) or not thumbnails_raw:
-            raise ValueError("image.thumbnails must be a non-empty list.")
-        thumb_names: list[str] = []
-        for thumb in thumbnails_raw:
-            if not isinstance(thumb, dict) or not isinstance(thumb.get("name"), str) or not thumb["name"]:
-                raise ValueError("Each thumbnail must be an object with a name.")
-            if thumb.get("width") is None and thumb.get("height") is None:
-                raise ValueError("thumbnail width or height is required.")
-            if thumb.get("width") is not None:
-                _parse_contract_int(thumb["width"], "thumbnail.width", 10, 2_000)
-            if thumb.get("height") is not None:
-                _parse_contract_int(thumb["height"], "thumbnail.height", 10, 2_000)
-            thumb_names.append(thumb["name"])
-        if len(set(thumb_names)) != len(thumb_names):
-            raise ValueError("thumbnail names must be unique.")
+
+    img_raw = payload.get("image")
+    img_dict = img_raw if isinstance(img_raw, dict) else {}
+    thumbnails_raw = img_dict.get("thumbnails") if img_dict else None
+    if img_dict:
+        _check_strict_keys(
+            img_dict,
+            frozenset({"quality", "width", "height", "transparent_background", "optimize_for_speed", "thumbnails"}),
+            "image",
+        )
+        if "quality" in img_dict and img_dict["quality"] is not None:
+            _parse_contract_int(img_dict["quality"], "image.quality", 1, 100)
+            if output_fmt not in {"jpeg", "webp", "avif"}:
+                raise ValueError("quality is accepted only for JPEG, WebP, or AVIF.")
+        for dim in ("width", "height"):
+            if dim in img_dict and img_dict[dim] is not None:
+                _parse_contract_int(img_dict[dim], f"image.{dim}", 1, 65_535)
+        if img_dict.get("width") is not None or img_dict.get("height") is not None:
+            if not is_image_fmt or payload.get("viewports") is not None or payload.get("slices") is not None:
+                raise ValueError("image width and height require a single image output.")
+        img_transparent = (
+            _parse_contract_bool(img_dict["transparent_background"], "image.transparent_background")
+            if "transparent_background" in img_dict
+            else False
+        )
+        img_fast = (
+            _parse_contract_bool(img_dict["optimize_for_speed"], "image.optimize_for_speed")
+            if "optimize_for_speed" in img_dict
+            else False
+        )
+        if img_transparent and output_fmt not in {"png", "webp", "avif"}:
+            raise ValueError("transparent_background is accepted only for PNG, WebP, or AVIF.")
+        if img_fast:
+            if output_fmt not in {"png", "webp"}:
+                raise ValueError("optimize_for_speed is accepted only for PNG or WebP.")
+            if engine_name != "chromium":
+                raise ValueError("optimize_for_speed requires the Chromium engine.")
+        if thumbnails_raw is not None:
+            if not isinstance(thumbnails_raw, (list, tuple)) or not (1 <= len(thumbnails_raw) <= 5):
+                raise ValueError("image.thumbnails must contain 1 to 5 entries.")
+            thumb_names: list[str] = []
+            for thumb in thumbnails_raw:
+                if not isinstance(thumb, dict):
+                    raise ValueError("Each thumbnail must be an object.")
+                _check_strict_keys(thumb, frozenset({"name", "width", "height"}), "thumbnail")
+                if "name" not in thumb:
+                    raise ValueError("thumbnail.name is required.")
+                t_name = _parse_contract_str(thumb["name"], "thumbnail.name", pattern=_CONTRACT_ARTIFACT_NAME_RE)
+                t_width = _parse_contract_int(thumb["width"], "thumbnail.width", 10, 2_000) if thumb.get("width") is not None else None
+                t_height = _parse_contract_int(thumb["height"], "thumbnail.height", 10, 2_000) if thumb.get("height") is not None else None
+                if t_width is None and t_height is None:
+                    raise ValueError("thumbnail width or height is required.")
+                thumb_names.append(t_name)
+            if len(set(thumb_names)) != len(thumb_names):
+                raise ValueError("thumbnail names must be unique.")
+
     diag = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), dict) else {}
+    if diag:
+        _check_strict_keys(
+            diag,
+            frozenset({"bundle", "include_console", "include_network", "include_har", "include_trace", "include_warc"}),
+            "diagnostics",
+        )
     diag_bundle = _parse_contract_bool(diag["bundle"], "diagnostics.bundle") if "bundle" in diag else False
+    if "include_console" in diag:
+        _parse_contract_bool(diag["include_console"], "diagnostics.include_console")
+    if "include_network" in diag:
+        _parse_contract_bool(diag["include_network"], "diagnostics.include_network")
     diag_har = _parse_contract_bool(diag["include_har"], "diagnostics.include_har") if "include_har" in diag else False
     diag_trace = _parse_contract_bool(diag["include_trace"], "diagnostics.include_trace") if "include_trace" in diag else False
     diag_warc = _parse_contract_bool(diag["include_warc"], "diagnostics.include_warc") if "include_warc" in diag else False
     if (diag_har or diag_trace or diag_warc) and not diag_bundle:
         raise ValueError("HAR, trace, and WARC require diagnostics.bundle=true.")
+
     cert = payload.get("certification") if isinstance(payload.get("certification"), dict) else {}
+    if cert:
+        _check_strict_keys(cert, frozenset({"enabled"}), "certification")
     cert_enabled = _parse_contract_bool(cert["enabled"], "certification.enabled") if "enabled" in cert else False
-    has_artifact_bundle = bool(side_outputs_list or thumbnails_raw)
+
+    if "deterministic" in payload:
+        det = payload["deterministic"]
+        assert isinstance(det, dict)
+        _check_strict_keys(det, frozenset({"enabled", "timestamp_ms", "random_seed", "wait_for_fonts"}), "deterministic")
+        if "enabled" in det:
+            _parse_contract_bool(det["enabled"], "deterministic.enabled")
+        if "timestamp_ms" in det:
+            _parse_contract_int(det["timestamp_ms"], "deterministic.timestamp_ms", 0, None)
+        if "random_seed" in det:
+            _parse_contract_int(det["random_seed"], "deterministic.random_seed", 0, 2**32 - 1)
+        if "wait_for_fonts" in det:
+            _parse_contract_bool(det["wait_for_fonts"], "deterministic.wait_for_fonts")
+
+    if "delivery" in payload:
+        deliv = payload["delivery"]
+        assert isinstance(deliv, dict)
+        _check_strict_keys(deliv, frozenset({"webhook_url"}), "delivery")
+        if deliv.get("webhook_url") is not None:
+            _parse_contract_http_url(deliv["webhook_url"], "delivery.webhook_url")
+
+    has_artifact_bundle = bool(side_outputs_vals or thumbnails_raw)
     if has_artifact_bundle:
         if not is_image_fmt:
             raise ValueError("side outputs and thumbnails require an image output.")
@@ -2464,47 +2706,87 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
             raise ValueError(
                 "artifact bundles cannot use viewports, slices, diagnostics, certification, or cache."
             )
-    if payload.get("base_url") is not None and payload.get("url") is not None:
-        raise ValueError("base_url is accepted only with html or markdown input.")
+
     if payload.get("elements") is not None:
+        elems = payload["elements"]
+        assert isinstance(elems, (list, tuple))
+        if not (1 <= len(elems) <= 32):
+            raise ValueError("elements must contain 1 to 32 entries.")
+        elem_selectors: list[str] = []
+        for elem in elems:
+            if not isinstance(elem, dict):
+                raise ValueError("Each element extraction must be an object.")
+            _check_strict_keys(elem, frozenset({"selector"}), "element")
+            if "selector" not in elem:
+                raise ValueError("element.selector is required.")
+            elem_selectors.append(_parse_contract_str(elem["selector"], "element.selector", min_len=1, max_len=2_048))
         if output_fmt != "metadata" and "metadata" not in side_outputs_set:
             raise ValueError("elements requires primary or side metadata output.")
+        if len(set(elem_selectors)) != len(elem_selectors):
+            raise ValueError("elements selectors must be unique.")
+
+    if "fail_on_status" in payload:
+        statuses = payload["fail_on_status"]
+        assert isinstance(statuses, (list, tuple))
+        if len(statuses) > 32:
+            raise ValueError("fail_on_status may contain at most 32 entries.")
+        parsed_statuses = [_parse_contract_int(st, "fail_on_status", 100, 599) for st in statuses]
+        if len(set(parsed_statuses)) != len(parsed_statuses):
+            raise ValueError("fail_on_status values must be unique.")
+
     if preserve_vp_width:
         if not full_page_val:
             raise ValueError("preserve_viewport_width requires full_page=true.")
         if not is_image_fmt:
             raise ValueError("preserve_viewport_width requires an image output.")
-    if save_profile_val and payload.get("profile_id") is None:
+    if save_profile_val and profile_id_val is None:
         raise ValueError("save_profile requires profile_id.")
     if cache_val:
         if not is_image_fmt or payload.get("viewports") is not None:
             raise ValueError("cache is accepted only for a single PNG, JPEG, WebP, or AVIF output.")
         if diag_bundle:
             raise ValueError("cache cannot be combined with a diagnostic bundle.")
-        if payload.get("profile_id") is not None:
+        if profile_id_val is not None:
             raise ValueError("cache cannot be combined with a persistent profile.")
-    if payload.get("cache_key") is not None and not cache_val:
+    if cache_key_val is not None and not cache_val:
         raise ValueError("cache_key requires cache=true.")
-    if payload.get("extract_mode", "document") != "document" and output_fmt not in document_outputs and not side_outputs_set.intersection(document_outputs):
+    if extract_mode_val != "document" and output_fmt not in document_outputs and not side_outputs_set.intersection(document_outputs):
         raise ValueError("article extraction requires HTML or Markdown output.")
     if include_shadow_dom_val and output_fmt not in document_outputs and not side_outputs_set.intersection(document_outputs):
         raise ValueError("include_shadow_dom requires HTML or Markdown output.")
-    if proceed_on_captcha_val:
-        cap = payload.get("captcha")
-        if isinstance(cap, dict) and cap.get("action") == "external":
-            raise ValueError("proceed_on_captcha cannot be combined with captcha.action=external.")
-    if payload.get("selector") is not None and (full_page_val or not is_image_fmt):
+
+    captcha_action = "error"
+    if "captcha" in payload:
+        cap = payload["captcha"]
+        assert isinstance(cap, dict)
+        _check_strict_keys(cap, frozenset({"action", "solver", "timeout_ms"}), "captcha")
+        if "action" in cap:
+            captcha_action = _parse_contract_enum(cap["action"], "captcha.action", _CAPTCHA)
+        cap_solver = (
+            _parse_contract_str(cap["solver"], "captcha.solver", min_len=1, max_len=64, pattern=_CONTRACT_SOLVER_RE)
+            if cap.get("solver") is not None
+            else None
+        )
+        if "timeout_ms" in cap:
+            _parse_contract_int(cap["timeout_ms"], "captcha.timeout_ms", 1_000, 300_000)
+        if cap_solver is not None and captcha_action != "external":
+            raise ValueError("captcha.solver requires action=external.")
+    if proceed_on_captcha_val and captcha_action == "external":
+        raise ValueError("proceed_on_captcha cannot be combined with captcha.action=external.")
+
+    if selector_val is not None and (full_page_val or not is_image_fmt):
         raise ValueError("selector requires full_page=false and an image output.")
-    if payload.get("clip") is not None and payload.get("selector") is not None:
+    if payload.get("clip") is not None and selector_val is not None:
         raise ValueError("clip and selector are mutually exclusive.")
+
     if payload.get("viewports") is not None:
         vps = payload["viewports"]
-        assert isinstance(vps, list)
+        assert isinstance(vps, (list, tuple))
         if not is_image_fmt:
             raise ValueError("viewports requires PNG, JPEG, WebP, or AVIF output.")
         if full_page_val:
             raise ValueError("viewports requires full_page=false.")
-        if payload.get("selector") is not None or payload.get("clip") is not None:
+        if selector_val is not None or payload.get("clip") is not None:
             raise ValueError("viewports cannot be combined with selector or clip.")
         if diag_bundle:
             raise ValueError("diagnostic bundles cannot be combined with multi-viewports.")
@@ -2514,17 +2796,27 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
             raise ValueError("viewports must contain 2 or 3 entries.")
         vp_names: list[str] = []
         for entry in vps:
-            if not isinstance(entry, dict) or not isinstance(entry.get("name"), str) or not entry["name"]:
-                raise ValueError("Each viewport must be an object with a name.")
+            if not isinstance(entry, dict):
+                raise ValueError("Each viewport must be an object.")
+            _check_strict_keys(entry, frozenset({"name", "device", "width", "height", "device_scale_factor"}), "viewports")
+            if "name" not in entry:
+                raise ValueError("viewports.name is required.")
+            vp_name = _parse_contract_str(entry["name"], "viewports.name", min_len=1, max_len=32, pattern=_CONTRACT_ARTIFACT_NAME_RE)
+            if "device" in entry:
+                _parse_contract_enum(entry["device"], "viewports.device", _DEVICES)
             for dim in ("width", "height"):
                 if dim in entry:
                     _parse_contract_int(entry[dim], f"viewports.{dim}", 1, 65_535)
-            vp_names.append(entry["name"])
+            if "device_scale_factor" in entry:
+                _parse_contract_float(entry["device_scale_factor"], "viewports.device_scale_factor", 0.1, 8.0)
+            vp_names.append(vp_name)
         if len(set(vp_names)) != len(vp_names):
             raise ValueError("viewports names must be unique.")
+
     if payload.get("slices") is not None:
         sl = payload["slices"]
         assert isinstance(sl, dict)
+        _check_strict_keys(sl, frozenset({"height", "overlap"}), "slices")
         if not is_image_fmt or not full_page_val or payload.get("viewports") is not None:
             raise ValueError("slices require a single full-page image output.")
         if "height" not in sl:
@@ -2533,14 +2825,20 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
         sl_overlap = _parse_contract_int(sl["overlap"], "slices.overlap", 0, 1_000) if "overlap" in sl else 0
         if sl_overlap >= sl_height:
             raise ValueError("slice overlap must be smaller than slice height.")
+
     if is_video_fmt:
-        if payload.get("selector") is not None or payload.get("clip") is not None or payload.get("viewports") is not None:
+        if selector_val is not None or payload.get("clip") is not None or payload.get("viewports") is not None:
             raise ValueError("video cannot use selector, clip, or multi-viewports.")
         if diag_trace:
             raise ValueError("video diagnostics support console, network, HAR, and WARC.")
-    if "video" in payload and payload["video"] is not None:
+    if payload.get("video") is not None:
         vid = payload["video"]
         assert isinstance(vid, dict)
+        _check_strict_keys(
+            vid,
+            frozenset({"duration_ms", "fps", "bitrate_mbps", "scroll", "scroll_step", "scroll_delay_ms", "transparent_background"}),
+            "video",
+        )
         if not is_video_fmt:
             raise ValueError("video settings require WebM, MP4, or GIF output.")
         if "duration_ms" in vid:
@@ -2565,61 +2863,78 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
                 raise ValueError("transparent video requires full_page=true.")
             if output_fmt == "mp4":
                 raise ValueError("MP4 does not support transparent video.")
-    if "image" in payload and payload["image"] is not None:
-        img = payload["image"]
-        assert isinstance(img, dict)
-        if "quality" in img and img["quality"] is not None:
-            _parse_contract_int(img["quality"], "image.quality", 1, 100)
-            if output_fmt not in {"jpeg", "webp", "avif"}:
-                raise ValueError("quality is accepted only for JPEG, WebP, or AVIF.")
-        for dim in ("width", "height"):
-            if dim in img and img[dim] is not None:
-                _parse_contract_int(img[dim], f"image.{dim}", 1, 65_535)
-        if img.get("width") is not None or img.get("height") is not None:
-            if not is_image_fmt or payload.get("viewports") is not None or payload.get("slices") is not None:
-                raise ValueError("image width and height require a single image output.")
-        img_transparent = (
-            _parse_contract_bool(img["transparent_background"], "image.transparent_background")
-            if "transparent_background" in img
-            else False
-        )
-        img_fast = (
-            _parse_contract_bool(img["optimize_for_speed"], "image.optimize_for_speed")
-            if "optimize_for_speed" in img
-            else False
-        )
-        if img_transparent and output_fmt not in {"png", "webp", "avif"}:
-            raise ValueError("transparent_background is accepted only for PNG, WebP, or AVIF.")
-        if img_fast:
-            if output_fmt not in {"png", "webp"}:
-                raise ValueError("optimize_for_speed is accepted only for PNG or WebP.")
-            if engine_name != "chromium":
-                raise ValueError("optimize_for_speed requires the Chromium engine.")
+
     if payload.get("pdf") is not None:
         if output_fmt != "pdf":
             raise ValueError("pdf settings require PDF output.")
         pdf_cfg = payload["pdf"]
         assert isinstance(pdf_cfg, dict)
-        if "page_ranges" in pdf_cfg and pdf_cfg["page_ranges"] is not None:
-            pr = pdf_cfg["page_ranges"]
-            if (
-                not isinstance(pr, str)
-                or len(pr) > 256
-                or not re.fullmatch(r"\s*\d+(?:\s*-\s*\d+)?(?:\s*,\s*\d+(?:\s*-\s*\d+)?)*\s*", pr)
-            ):
-                raise ValueError("pdf.page_ranges must be a valid page range string.")
+        _check_strict_keys(
+            pdf_cfg,
+            frozenset({
+                "mode", "paper_size", "orientation", "print_background", "tagged",
+                "margins", "header_template", "footer_template", "page_ranges",
+            }),
+            "pdf",
+        )
+        pdf_mode = _parse_contract_enum(pdf_cfg["mode"], "pdf.mode", _PDF_MODES) if "mode" in pdf_cfg else "print"
+        pdf_paper = _parse_contract_enum(pdf_cfg["paper_size"], "pdf.paper_size", _PAPER) if "paper_size" in pdf_cfg else "A4"
+        pdf_orient = _parse_contract_enum(pdf_cfg["orientation"], "pdf.orientation", _ORIENTATION) if "orientation" in pdf_cfg else "portrait"
+        if "print_background" in pdf_cfg:
+            _parse_contract_bool(pdf_cfg["print_background"], "pdf.print_background")
+        if pdf_cfg.get("tagged") is not None:
+            _parse_contract_bool(pdf_cfg["tagged"], "pdf.tagged")
+        if pdf_cfg.get("header_template") is not None:
+            _parse_contract_str(pdf_cfg["header_template"], "pdf.header_template", max_len=16_384)
+        if pdf_cfg.get("footer_template") is not None:
+            _parse_contract_str(pdf_cfg["footer_template"], "pdf.footer_template", max_len=16_384)
+        margins = {"top": 0.4, "right": 0.4, "bottom": 0.4, "left": 0.4}
+        if "margins" in pdf_cfg:
+            raw_m = pdf_cfg["margins"]
+            if not isinstance(raw_m, dict):
+                raise ValueError("pdf.margins must be an object.")
+            _check_strict_keys(raw_m, frozenset({"top", "right", "bottom", "left"}), "pdf.margins")
+            for side in ("top", "right", "bottom", "left"):
+                if side in raw_m:
+                    margins[side] = _parse_contract_float(raw_m[side], f"pdf.margins.{side}", 0.0, 4.0)
+        if pdf_mode != "single_page":
+            pw, ph = _CONTRACT_PAPER_DIMS[pdf_paper]
+            if pdf_orient == "landscape":
+                pw, ph = ph, pw
+            if margins["left"] + margins["right"] >= pw:
+                raise ValueError("horizontal margins must leave printable page width.")
+            if margins["top"] + margins["bottom"] >= ph:
+                raise ValueError("vertical margins must leave printable page height.")
+        if pdf_cfg.get("page_ranges") is not None:
+            pr = _parse_contract_str(pdf_cfg["page_ranges"], "pdf.page_ranges", max_len=256, pattern=_CONTRACT_PAGE_RANGES_RE)
+            ranges: list[tuple[int, int]] = []
             for item in pr.split(","):
                 bounds = [int(part.strip()) for part in item.split("-", 1)]
                 start, end = bounds[0], bounds[-1]
                 if start < 1 or end < start:
                     raise ValueError("page_ranges must contain ascending positive pages.")
-            if pdf_cfg.get("mode") == "single_page":
+                ranges.append((start, end))
+            ranges.sort()
+            selected = 0
+            cur_start, cur_end = ranges[0]
+            for start, end in ranges[1:]:
+                if start <= cur_end + 1:
+                    cur_end = max(cur_end, end)
+                else:
+                    selected += cur_end - cur_start + 1
+                    cur_start, cur_end = start, end
+            selected += cur_end - cur_start + 1
+            if selected > 50:
+                raise ValueError("page_ranges may select at most 50 pages.")
+            if pdf_mode == "single_page":
                 raise ValueError("single-page PDF cannot use page_ranges.")
     if output_fmt == "pdf" and engine_name != "chromium":
         raise ValueError("PDF output requires the Chromium engine.")
-    if "clip" in payload and payload["clip"] is not None:
+
+    if payload.get("clip") is not None:
         clip = payload["clip"]
         assert isinstance(clip, dict)
+        _check_strict_keys(clip, frozenset({"x", "y", "width", "height"}), "clip")
         if full_page_val or not is_image_fmt:
             raise ValueError("clip requires full_page=false and an image output.")
         for coord in ("x", "y"):
@@ -2629,48 +2944,245 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
             if dim not in clip:
                 raise ValueError(f"clip.{dim} is required.")
             _parse_contract_float(clip[dim], f"clip.{dim}", 0.0, 100_000.0, gt_lo=True)
+
     if "environment" in payload:
         env = payload["environment"]
         assert isinstance(env, dict)
-        if "device" in env and (not isinstance(env["device"], str) or env["device"] not in _DEVICES):
-            raise ValueError("environment.device is invalid.")
-        if "color_scheme" in env and env["color_scheme"] is not None and (
-            not isinstance(env["color_scheme"], str) or env["color_scheme"] not in _COLOR_SCHEMES
-        ):
-            raise ValueError("environment.color_scheme is invalid.")
-        if "reduced_motion" in env and env["reduced_motion"] is not None and (
-            not isinstance(env["reduced_motion"], str) or env["reduced_motion"] not in _REDUCED_MOTION
-        ):
-            raise ValueError("environment.reduced_motion is invalid.")
-        if "media" in env and env["media"] is not None and (
-            not isinstance(env["media"], str) or env["media"] not in _MEDIA
-        ):
-            raise ValueError("environment.media is invalid.")
+        _check_strict_keys(
+            env,
+            frozenset({"device", "color_scheme", "reduced_motion", "media", "locale", "timezone"}),
+            "environment",
+        )
+        if "device" in env:
+            _parse_contract_enum(env["device"], "environment.device", _DEVICES)
+        if env.get("color_scheme") is not None:
+            _parse_contract_enum(env["color_scheme"], "environment.color_scheme", _COLOR_SCHEMES)
+        if env.get("reduced_motion") is not None:
+            _parse_contract_enum(env["reduced_motion"], "environment.reduced_motion", _REDUCED_MOTION)
+        if env.get("media") is not None:
+            _parse_contract_enum(env["media"], "environment.media", _MEDIA)
+        if env.get("locale") is not None:
+            _parse_contract_str(env["locale"], "environment.locale", min_len=2, max_len=64, pattern=_CONTRACT_LOCALE_RE)
+        if env.get("timezone") is not None:
+            tz = _parse_contract_str(env["timezone"], "environment.timezone", min_len=1, max_len=64)
+            try:
+                ZoneInfo(tz)
+            except ZoneInfoNotFoundError as exc:
+                raise ValueError("timezone must be a valid IANA time zone.") from exc
+
+    if "network" in payload:
+        net = payload["network"]
+        assert isinstance(net, dict)
+        _check_strict_keys(
+            net,
+            frozenset({
+                "java_script_enabled", "user_agent", "geolocation", "proxy", "cookies",
+                "block_url_patterns", "block_resource_types", "bypass_csp", "ignore_https_errors",
+            }),
+            "network",
+        )
+        if "java_script_enabled" in net:
+            _parse_contract_bool(net["java_script_enabled"], "network.java_script_enabled")
+        if net.get("user_agent") is not None:
+            _parse_contract_str(net["user_agent"], "network.user_agent", min_len=1, max_len=1_024)
+        if net.get("geolocation") is not None:
+            geo = net["geolocation"]
+            if not isinstance(geo, dict):
+                raise ValueError("network.geolocation must be an object.")
+            _check_strict_keys(geo, frozenset({"latitude", "longitude", "accuracy"}), "network.geolocation")
+            if "latitude" not in geo or "longitude" not in geo:
+                raise ValueError("network.geolocation requires latitude and longitude.")
+            _parse_contract_float(geo["latitude"], "network.geolocation.latitude", -90.0, 90.0)
+            _parse_contract_float(geo["longitude"], "network.geolocation.longitude", -180.0, 180.0)
+            if "accuracy" in geo:
+                _parse_contract_float(geo["accuracy"], "network.geolocation.accuracy", 0.0, 100_000.0)
+        if net.get("proxy") is not None:
+            prx = net["proxy"]
+            if not isinstance(prx, dict):
+                raise ValueError("network.proxy must be an object.")
+            _check_strict_keys(prx, frozenset({"server", "username", "password", "bypass"}), "network.proxy")
+            if "server" not in prx:
+                raise ValueError("network.proxy.server is required.")
+            srv = _parse_contract_str(prx["server"], "network.proxy.server", min_len=1, max_len=2_048)
+            try:
+                parsed_srv = urlsplit(srv)
+                _ = parsed_srv.port
+            except ValueError as exc:
+                raise ValueError("proxy server authority is invalid.") from exc
+            if (
+                parsed_srv.scheme.lower() not in {"http", "https", "socks4", "socks5"}
+                or not parsed_srv.hostname
+                or parsed_srv.username
+                or parsed_srv.password
+                or parsed_srv.query
+                or parsed_srv.fragment
+                or parsed_srv.path not in {"", "/"}
+            ):
+                raise ValueError("proxy server must use http, https, socks4, or socks5.")
+            if prx.get("username") is not None:
+                _parse_contract_str(prx["username"], "network.proxy.username", max_len=1_024)
+            if prx.get("password") is not None:
+                _parse_contract_str(prx["password"], "network.proxy.password", max_len=4_096)
+            if prx.get("bypass") is not None:
+                _parse_contract_str(prx["bypass"], "network.proxy.bypass", max_len=4_096)
+        if "cookies" in net:
+            cks = net["cookies"]
+            if not isinstance(cks, (list, tuple)) or len(cks) > 64:
+                raise ValueError("network.cookies must be a list of at most 64 cookies.")
+            for ck in cks:
+                if not isinstance(ck, dict):
+                    raise ValueError("Each cookie must be an object.")
+                _check_strict_keys(
+                    ck,
+                    frozenset({"name", "value", "domain", "path", "expires", "http_only", "secure", "same_site"}),
+                    "cookie",
+                )
+                for req in ("name", "value", "domain"):
+                    if req not in ck:
+                        raise ValueError(f"cookie.{req} is required.")
+                _parse_contract_str(ck["name"], "cookie.name", min_len=1, max_len=256)
+                _parse_contract_str(ck["value"], "cookie.value", max_len=4_096)
+                dom = _parse_contract_str(ck["domain"], "cookie.domain", min_len=1, max_len=253)
+                bare_dom = dom.removeprefix(".")
+                try:
+                    ipaddress.ip_address(bare_dom)
+                except ValueError:
+                    labels = bare_dom.split(".")
+                    if any(
+                        not label
+                        or len(label) > 63
+                        or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", label)
+                        for label in labels
+                    ):
+                        raise ValueError("cookie domain must be a hostname or IP address.")
+                if "path" in ck:
+                    cpath = _parse_contract_str(ck["path"], "cookie.path", min_len=1, max_len=1_024)
+                    if not cpath.startswith("/"):
+                        raise ValueError("cookie path must begin with /.")
+                if ck.get("expires") is not None:
+                    _parse_contract_float(ck["expires"], "cookie.expires")
+                if "http_only" in ck:
+                    _parse_contract_bool(ck["http_only"], "cookie.http_only")
+                if "secure" in ck:
+                    _parse_contract_bool(ck["secure"], "cookie.secure")
+                if "same_site" in ck:
+                    _parse_contract_str(ck["same_site"], "cookie.same_site", pattern=_CONTRACT_SAME_SITE_RE)
+        if "block_url_patterns" in net:
+            pats = net["block_url_patterns"]
+            if not isinstance(pats, (list, tuple)) or len(pats) > 64:
+                raise ValueError("network.block_url_patterns must be a list of at most 64 patterns.")
+            parsed_pats = [_parse_contract_str(p, "block_url_patterns", min_len=1, max_len=2_048) for p in pats]
+            if len(set(parsed_pats)) != len(parsed_pats):
+                raise ValueError("block URL patterns must be unique.")
+        if "block_resource_types" in net:
+            rtypes = net["block_resource_types"]
+            if not isinstance(rtypes, (list, set, frozenset, tuple)):
+                raise ValueError("network.block_resource_types must be a collection.")
+            for rt in rtypes:
+                _parse_contract_enum(rt, "network.block_resource_types", _CONTRACT_RESOURCES)
+        if "bypass_csp" in net:
+            _parse_contract_bool(net["bypass_csp"], "network.bypass_csp")
+        if "ignore_https_errors" in net:
+            _parse_contract_bool(net["ignore_https_errors"], "network.ignore_https_errors")
+
+    if "assertions" in payload:
+        asr = payload["assertions"]
+        assert isinstance(asr, dict)
+        _check_strict_keys(asr, frozenset({"content_includes", "content_excludes", "request_failures"}), "assertions")
+        for akey in ("content_includes", "content_excludes", "request_failures"):
+            if akey in asr:
+                alist = asr[akey]
+                if not isinstance(alist, (list, tuple)) or len(alist) > 32:
+                    raise ValueError(f"assertions.{akey} must be a list of at most 32 entries.")
+                parsed_a = [_parse_contract_str(x, f"assertions.{akey}", min_len=1, max_len=4_096) for x in alist]
+                if len(set(parsed_a)) != len(parsed_a):
+                    raise ValueError("assertions must be unique.")
+
+    if "cleanup" in payload:
+        cln = payload["cleanup"]
+        assert isinstance(cln, dict)
+        _check_strict_keys(
+            cln,
+            frozenset({"consent_mode", "block_ads", "block_trackers", "block_chats", "block_newsletters"}),
+            "cleanup",
+        )
+        if "consent_mode" in cln:
+            _parse_contract_enum(cln["consent_mode"], "cleanup.consent_mode", _CONSENT)
+        for cbool in ("block_ads", "block_trackers", "block_chats", "block_newsletters"):
+            if cbool in cln:
+                _parse_contract_bool(cln[cbool], f"cleanup.{cbool}")
+
     if "wait_for" in payload:
         wf = payload["wait_for"]
         assert isinstance(wf, dict)
-        if "event" in wf and (not isinstance(wf["event"], str) or wf["event"] not in _WAIT_EVENTS):
-            raise ValueError("wait_for.event is invalid.")
-        if "selector_state" in wf and (not isinstance(wf["selector_state"], str) or wf["selector_state"] not in _WAIT_STATES):
-            raise ValueError("wait_for.selector_state is invalid.")
+        _check_strict_keys(
+            wf,
+            frozenset({"event", "selector", "selector_state", "text", "images", "delay_ms", "timeout_ms"}),
+            "wait_for",
+        )
+        if "event" in wf:
+            _parse_contract_enum(wf["event"], "wait_for.event", _WAIT_EVENTS)
+        wf_sel = _parse_contract_str(wf["selector"], "wait_for.selector", min_len=1, max_len=2_048) if wf.get("selector") is not None else None
+        wf_state = _parse_contract_enum(wf["selector_state"], "wait_for.selector_state", _WAIT_STATES) if "selector_state" in wf else "visible"
+        if wf_sel is None and wf_state != "visible":
+            raise ValueError("selector_state requires wait_for.selector.")
+        if wf.get("text") is not None:
+            _parse_contract_str(wf["text"], "wait_for.text", min_len=1, max_len=4_096)
+        if "images" in wf:
+            _parse_contract_bool(wf["images"], "wait_for.images")
         if "delay_ms" in wf:
             _parse_contract_int(wf["delay_ms"], "wait_for.delay_ms", 0, 15_000)
         if "timeout_ms" in wf:
             _parse_contract_int(wf["timeout_ms"], "wait_for.timeout_ms", 1, 30_000)
+
     if "actions" in payload:
         acts = payload["actions"]
-        assert isinstance(acts, list)
+        assert isinstance(acts, (list, tuple))
+        if len(acts) > 32:
+            raise ValueError("actions may contain at most 32 entries.")
+        act_keys = frozenset({"type", "selector", "value", "values", "key", "x", "y", "delay_ms", "timeout_ms"})
         for act in acts:
-            if not isinstance(act, dict) or not isinstance(act.get("type"), str) or act["type"] not in _FAST_ALL_ACTIONS:
-                raise ValueError("Each action must be an object with a valid type.")
+            if not isinstance(act, dict):
+                raise ValueError("Each action must be an object.")
+            _check_strict_keys(act, act_keys, "action")
+            if "type" not in act:
+                raise ValueError("action.type is required.")
+            atype = _parse_contract_enum(act["type"], "action.type", _FAST_ALL_ACTIONS)
+            asel = _parse_contract_str(act["selector"], "action.selector", min_len=1, max_len=2_048) if act.get("selector") is not None else None
+            aval = _parse_contract_str(act["value"], "action.value", max_len=16_384) if act.get("value") is not None else None
+            avals: list[str] | None = None
+            if act.get("values") is not None:
+                raw_avals = act["values"]
+                if not isinstance(raw_avals, (list, tuple)) or not (1 <= len(raw_avals) <= 32):
+                    raise ValueError("action.values must contain 1 to 32 entries.")
+                avals = [_parse_contract_str(v, "action.values", max_len=16_384) for v in raw_avals]
+            akey = _parse_contract_str(act["key"], "action.key", min_len=1, max_len=128) if act.get("key") is not None else None
+            ax = _parse_contract_float(act["x"], "action.x", -100_000.0, 100_000.0) if act.get("x") is not None else None
+            ay = _parse_contract_float(act["y"], "action.y", -100_000.0, 100_000.0) if act.get("y") is not None else None
+            adelay = _parse_contract_int(act["delay_ms"], "action.delay_ms", 0, 15_000) if "delay_ms" in act else 0
+            if "timeout_ms" in act:
+                _parse_contract_int(act["timeout_ms"], "action.timeout_ms", 1, 30_000)
+            if atype in _FAST_SELECTOR_ACTIONS and asel is None:
+                raise ValueError(f"{atype} action requires selector.")
+            if atype == "fill" and aval is None:
+                raise ValueError("fill action requires value.")
+            if atype == "press" and akey is None:
+                raise ValueError("press action requires key.")
+            if atype == "select" and not avals:
+                raise ValueError("select action requires values.")
+            if atype == "scroll" and asel is None and ax is None and ay is None:
+                raise ValueError("scroll action requires selector, x, or y.")
+            if atype == "wait" and asel is None and aval is None and not adelay:
+                raise ValueError("wait action requires selector, text value, or delay_ms.")
+            if atype == "javascript" and aval is None:
+                raise ValueError("javascript action requires value.")
+
     if "headers" in payload:
         hdrs = payload["headers"]
         assert isinstance(hdrs, dict)
-        for k, v in hdrs.items():
-            if not isinstance(k, str) or not isinstance(v, str):
-                raise ValueError("headers must be a mapping of string names to string values.")
-            if any(ch in k or ch in v for ch in "\r\n\x00"):
-                raise ValueError("headers must not contain newlines or NUL bytes.")
+        if hdrs and url_val is None and base_url_val is None:
+            raise ValueError("base_url is required for raw input custom headers.")
+        _validate_contract_headers_fallback(hdrs)
 
 
 def validate_payload(payload: dict[str, object]) -> None:

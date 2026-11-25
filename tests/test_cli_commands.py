@@ -2266,6 +2266,82 @@ class CliCouncilHardeningTests(unittest.TestCase):
             with self.subTest(bad_r17=bad_r17), self.assertRaises(ValueError):
                 capture_cli._validate_payload_fallback(bad_r17)
 
+        # 7. Round 18 full contract parity: page_ranges 50-page cap + bytes, side_outputs enum/unhashable,
+        # thumbnails cap/pattern, named viewport full schema, numeric coercion (1.0_0, Unicode digits, bytearray),
+        # headers without base_url, elements, fail_on_status, custom_css, nested extra="forbid", margins, actions.
+        ok_r18 = (
+            {"url": "https://example.invalid", "output": "pdf", "pdf": {"page_ranges": "1-50"}},
+            {"url": "https://example.invalid", "output": "pdf", "pdf": {"page_ranges": "1-30,20-50"}},
+            {"url": "https://example.invalid", "output": "pdf", "pdf": {"page_ranges": b"1-2"}},
+            {"url": "https://example.invalid", "output": "png", "image": {"thumbnails": [{"name": f"t{i}", "width": 100} for i in range(5)]}},
+            {"url": "https://example.invalid", "output": "png", "image": None},
+            {"html": "<p>x</p>", "base_url": "https://example.invalid", "output": "png", "headers": {"X-Test": "1"}},
+            {"url": "https://example.invalid", "output": "metadata", "elements": [{"selector": "h1"}, {"selector": "h2"}]},
+            {"url": "https://example.invalid", "output": "png", "fail_on_status": [404, 500]},
+            {"url": "https://example.invalid", "output": "png", "custom_css": "x" * 65536},
+            {"url": "https://example.invalid", "output": "png", "wait_for": {"delay_ms": b"10"}},
+            {"url": "https://example.invalid", "output": "png", "viewport": {"device_scale_factor": b"1.5"}},
+            {"url": "https://example.invalid", "output": "png", "side_outputs": ("html",)},
+        )
+        bad_r18 = (
+            {"url": "https://example.invalid", "output": "pdf", "pdf": {"page_ranges": "1-51"}},
+            {"url": "https://example.invalid", "output": "pdf", "pdf": {"page_ranges": "1-40,50-60"}},
+            {"url": "https://example.invalid", "output": "png", "side_outputs": ["bogus"]},
+            {"url": "https://example.invalid", "output": "png", "side_outputs": [{"format": "html"}]},
+            {"url": "https://example.invalid", "output": "png", "image": {"thumbnails": [{"name": f"t{i}", "width": 100} for i in range(6)]}},
+            {"url": "https://example.invalid", "output": "png", "image": {"thumbnails": [{"name": "bad name", "width": 100}]}},
+            {"url": "https://example.invalid", "output": "png", "full_page": False, "viewports": [{"name": "a", "width": 800, "height": 600, "device_scale_factor": 99}, {"name": "b", "width": 800, "height": 600}]},
+            {"url": "https://example.invalid", "output": "png", "full_page": False, "viewports": [{"name": "a", "device": "bogus"}, {"name": "b"}]},
+            {"url": "https://example.invalid", "output": "png", "full_page": False, "viewports": [{"name": "bad name"}, {"name": "b"}]},
+            {"url": "https://example.invalid", "output": "png", "full_page": False, "viewports": [{"name": "a" * 33}, {"name": "b"}]},
+            {"url": "https://example.invalid", "output": "png", "wait_for": {"delay_ms": "1.0_0"}},
+            {"url": "https://example.invalid", "output": "png", "wait_for": {"delay_ms": bytearray(b"10")}},
+            {"url": "https://example.invalid", "output": "png", "viewport": {"device_scale_factor": "１"}},
+            {"url": "https://example.invalid", "output": "png", "viewport": {"device_scale_factor": "１.５"}},
+            {"url": "https://example.invalid", "output": "png", "viewport": {"device_scale_factor": bytearray(b"1.5")}},
+            {"html": "<p>x</p>", "output": "png", "headers": {"X-Test": "1"}},
+            {"url": "https://example.invalid", "output": "metadata", "elements": []},
+            {"url": "https://example.invalid", "output": "metadata", "elements": ["h1"]},
+            {"url": "https://example.invalid", "output": "metadata", "elements": [{"selector": "h1"}, {"selector": "h1"}]},
+            {"url": "https://example.invalid", "output": "png", "fail_on_status": [500, 500]},
+            {"url": "https://example.invalid", "output": "png", "fail_on_status": [99]},
+            {"url": "https://example.invalid", "output": "png", "custom_css": "x" * 65537},
+            {"url": "https://example.invalid", "output": "jpg"},
+            {"url": "https://example.invalid", "output": "pdf", "pdf": {"margins": {"left": 4.0, "right": 4.0}, "paper_size": "A6"}},
+            {"url": "https://example.invalid", "wait_for": {"selector_state": "attached"}},
+            {"url": "https://example.invalid", "captcha": {"action": "error", "solver": "abc"}},
+            {"url": "https://example.invalid", "headers": {"Host": "evil.invalid"}},
+            {"url": "https://example.invalid", "headers": {"X-Test": "1", "x-test": "2"}},
+            {"url": "https://example.invalid", "actions": [{"type": "click"}]},
+            {"url": "https://example.invalid", "viewport": {"unknown": 1}},
+        )
+        for ok_case in ok_r18:
+            with self.subTest(ok_r18=ok_case):
+                capture_cli._validate_payload_fallback(ok_case)
+        for bad_case in bad_r18:
+            with self.subTest(bad_r18=bad_case), self.assertRaises(ValueError):
+                capture_cli._validate_payload_fallback(bad_case)
+        # Differential check against real RenderRequest when Pydantic is installed
+        try:
+            import copy as _copy
+            from vipercapture.render_contract import RenderRequest as _RenderRequest
+        except ImportError:
+            _RenderRequest = None
+        if _RenderRequest is not None:
+            for case in (*ok_r18, *bad_r18):
+                with self.subTest(differential_case=case):
+                    try:
+                        _RenderRequest.model_validate(_copy.deepcopy(case))
+                        pyd_ok = True
+                    except Exception:
+                        pyd_ok = False
+                    try:
+                        capture_cli._validate_payload_fallback(_copy.deepcopy(case))
+                        fb_ok = True
+                    except ValueError:
+                        fb_ok = False
+                    self.assertEqual(fb_ok, pyd_ok)
+
 
 if __name__ == "__main__":
     unittest.main()
