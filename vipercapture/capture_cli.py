@@ -12,6 +12,7 @@ import argparse
 import copy
 import datetime
 import hashlib
+import http.client
 import json
 import math
 import mimetypes
@@ -2357,8 +2358,10 @@ def render_output_template(
     ext = ".zip" if artifact_is_archive(payload) else _EXTENSIONS.get(fmt, ".png")
     url_text = str(payload.get("url") or "")
     parsed = urlsplit(url_text) if url_text else None
-    host = safe_filename(parsed.hostname if parsed and parsed.hostname else "capture")
-    path_slug = safe_filename(parsed.path.strip("/").replace("/", "-")) if parsed and parsed.path.strip("/") else host
+    raw_host = safe_filename(parsed.hostname if parsed and parsed.hostname else "capture")
+    host = raw_host[:56].rstrip(" ._-") or "capture"
+    raw_slug = safe_filename(parsed.path.strip("/").replace("/", "-")) if parsed and parsed.path.strip("/") else raw_host
+    path_slug = raw_slug[:56].rstrip(" ._-") or "capture"
     stamp = timestamp or datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     try:
         rendered = template.format(
@@ -2377,7 +2380,11 @@ def render_output_template(
     if "/" in rendered or "\\" in rendered or rendered in {"", ".", ".."}:
         raise ValueError("--output-template must produce a filename without directory separators.")
     candidate = Path(rendered)
-    stem = safe_filename(candidate.stem)
+    raw_stem = candidate.stem
+    stem = safe_filename(raw_stem)
+    if len(raw_stem) > 80 and "{index}" in template and not stem.endswith(str(index)):
+        idx_suffix = f"-{index}"
+        stem = f"{safe_filename(raw_stem[: max(1, 80 - len(idx_suffix))])}{idx_suffix}"
     suffix = candidate.suffix
     if suffix and not re.fullmatch(r"\.[A-Za-z0-9]{1,10}", suffix):
         suffix = ext
@@ -2864,16 +2871,36 @@ def _expected_content_length(response) -> int | None:
     transfer_encoding = str(headers.get("Transfer-Encoding") or headers.get("transfer-encoding") or "").lower()
     if "chunked" in transfer_encoding:
         return None
-    raw = headers.get("Content-Length")
-    if raw is None:
-        raw = headers.get("content-length")
-    if raw is None:
+    raw_values: list[str] = []
+    if hasattr(headers, "get_all"):
+        for item in headers.get_all("Content-Length") or []:
+            raw_values.append(str(item))
+    else:
+        raw = headers.get("Content-Length")
+        if raw is None:
+            raw = headers.get("content-length")
+        if raw is not None:
+            raw_values.append(str(raw))
+    if not raw_values:
         return None
-    try:
-        parsed = int(str(raw).strip())
-    except ValueError:
+    parsed_values: list[int] = []
+    for raw_item in raw_values:
+        for part in raw_item.split(","):
+            token = part.strip()
+            if not token:
+                continue
+            try:
+                val = int(token)
+            except ValueError:
+                return None
+            if val < 0:
+                return None
+            parsed_values.append(val)
+    if not parsed_values:
         return None
-    return parsed if parsed >= 0 else None
+    if len(set(parsed_values)) > 1:
+        raise CaptureError("Conflicting Content-Length headers from API.")
+    return parsed_values[0]
 
 
 def _read_bounded(response, handle) -> int:
@@ -3354,9 +3381,17 @@ _MAX_JSON_BYTES = 1024 * 1024
 
 
 def _read_json_value(response) -> object:
-    raw = response.read(_MAX_JSON_BYTES + 1)
+    expected_length = _expected_content_length(response)
+    try:
+        raw = response.read(_MAX_JSON_BYTES + 1)
+    except (http.client.HTTPException, OSError, TimeoutError) as exc:
+        raise CaptureError(f"Incomplete response from API: {exc}") from exc
     if len(raw) > _MAX_JSON_BYTES:
         raise CaptureError("The API returned a JSON document that is too large.")
+    if expected_length is not None and len(raw) < expected_length:
+        raise CaptureError(
+            f"Incomplete response: expected {expected_length} bytes, received {len(raw)}."
+        )
     try:
         return json.loads(raw.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as exc:
@@ -3426,27 +3461,44 @@ def _execute_one(
         )
         return response_headers, total, None
 
-    response = open_response_with_retries(
-        root + "/v1/render",
-        method="POST",
-        payload=payload,
-        headers=request_headers(
-            args,
-            started_server=started_server,
-            json_body=True,
-            idempotency_key=effective_idem,
-        ),
-        timeout=timeout,
-        retries=retries,
-        retry_delay_ms=retry_delay_ms,
-        verbose=bool(args.verbose and not args.quiet),
-    )
-    try:
-        total = write_response(response, output)
-        response_headers = response.headers
-    finally:
-        response.close()
-    return response_headers, total, None
+    attempt = 0
+    while True:
+        remaining_retries = max(0, retries - attempt)
+        response = open_response_with_retries(
+            root + "/v1/render",
+            method="POST",
+            payload=payload,
+            headers=request_headers(
+                args,
+                started_server=started_server,
+                json_body=True,
+                idempotency_key=effective_idem,
+            ),
+            timeout=timeout,
+            retries=remaining_retries,
+            retry_delay_ms=retry_delay_ms,
+            verbose=bool(args.verbose and not args.quiet),
+        )
+        try:
+            total = write_response(response, output)
+            response_headers = response.headers
+            return response_headers, total, None
+        except CaptureError as exc:
+            is_truncated = "Incomplete response" in str(exc) or "empty capture" in str(exc)
+            if output is not None and is_truncated and attempt < retries:
+                delay_s = (retry_delay_ms / 1000.0) * (2**attempt)
+                if args.verbose and not args.quiet:
+                    write_line(
+                        sys.stderr,
+                        f"Retrying interrupted download ({attempt + 1}/{retries}) in {delay_s:.2f}s...",
+                    )
+                if delay_s > 0:
+                    time.sleep(delay_s)
+                attempt += 1
+                continue
+            raise
+        finally:
+            response.close()
 
 
 def execute(args: argparse.Namespace, payload: dict[str, object], *, started_server: bool) -> int:

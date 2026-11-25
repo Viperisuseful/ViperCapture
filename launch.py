@@ -2411,12 +2411,18 @@ def _terminate_process(
 
 
 def _normalize_shutdown_host(raw_host: str) -> str | None:
-    """Normalize a bind/record host to a connectable local address for graceful shutdown."""
+    """Normalize a bind/record host (IP literal or hostname) for graceful shutdown."""
     import ipaddress
 
     cleaned = raw_host.strip().strip("[]")
     if not cleaned:
         return None
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 or ch in "/\\?#@:" for ch in cleaned):
+        try:
+            ipaddress.ip_address(cleaned)
+            return cleaned
+        except ValueError:
+            return None
     lowered = cleaned.lower()
     if lowered in {"0.0.0.0", "127.0.0.1", "localhost"}:
         return "127.0.0.1"
@@ -2426,7 +2432,12 @@ def _normalize_shutdown_host(raw_host: str) -> str | None:
         ipaddress.ip_address(cleaned)
         return cleaned
     except ValueError:
+        pass
+    try:
+        ascii_host = cleaned.encode("idna").decode("ascii")
+    except UnicodeError:
         return None
+    return ascii_host if ascii_host else None
 
 
 def _connect_host_from_command(command: str) -> str | None:
@@ -2528,6 +2539,7 @@ def kill_all_instances(port: int = PORT) -> int:
         ),
     )
 
+    targeted_endpoints: list[tuple[str, int]] = []
     for identity in ordered:
         pid = identity.pid
         target_host = HOST
@@ -2538,6 +2550,10 @@ def kill_all_instances(port: int = PORT) -> int:
                 target_host = recorded_host
             if recorded_port is not None:
                 target_port = recorded_port
+            if recorded_port is not None:
+                endpoint = (target_host, target_port)
+                if endpoint not in targeted_endpoints:
+                    targeted_endpoints.append(endpoint)
         if target_host != HOST:
             success, reason = _terminate_process(identity, host=target_host, port=target_port)
         else:
@@ -2551,9 +2567,16 @@ def kill_all_instances(port: int = PORT) -> int:
 
     _prune_stale_server_records()
 
-    # Wait briefly for port to close if listening server was targeted
+    def _endpoint_open(ep_host: str, ep_port: int) -> bool:
+        if ep_host == HOST:
+            return port_open(port=ep_port)
+        return port_open(host=ep_host, port=ep_port)
+
+    ports_to_check = targeted_endpoints or [(HOST, port)]
+
+    # Wait briefly for targeted server port(s) to close
     deadline = time.monotonic() + 3.0
-    while time.monotonic() < deadline and port_open(port=port):
+    while time.monotonic() < deadline and any(_endpoint_open(h, p) for h, p in ports_to_check):
         time.sleep(0.03)
 
     if killed:
@@ -2569,9 +2592,10 @@ def kill_all_instances(port: int = PORT) -> int:
 
     # Port still open or processes failed -> return failure
     has_failure = bool(permission_errors or failed_pids)
-    if port_open(port=port):
-        print(f"  Warning: Port {port} is still in use.")
-        return 1
+    for ep_host, ep_port in ports_to_check:
+        if _endpoint_open(ep_host, ep_port):
+            print(f"  Warning: Port {ep_port} is still in use.")
+            return 1
 
     if has_failure:
         return 1
@@ -3786,15 +3810,18 @@ def main() -> None:
     deadline = wait_start + 30.0
     next_dot = wait_start + 1.0
     while time.monotonic() < deadline:
+        if server.poll() is not None:
+            # Server process already exited — don't wait the full 30s
+            break
         if port_open(connect_host, bind_port) if custom_bind else port_open():
             worker_pid = _record_endpoint_server_process(
                 server.pid, shutdown_token, bind_port, host=connect_host
             )
-            ready = True
-            break
-        if server.poll() is not None:
-            # Server process already exited — don't wait the full 30s
-            break
+            if server.poll() is not None:
+                break
+            if worker_pid is not None:
+                ready = True
+                break
         now = time.monotonic()
         if not one_window and now >= next_dot:
             print(".", end="", flush=True)

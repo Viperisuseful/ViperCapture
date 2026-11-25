@@ -1505,6 +1505,165 @@ class CliCouncilHardeningTests(unittest.TestCase):
             self.assertEqual(code, 2)
             self.assertFalse(new_dir.exists())
 
+    def test_round9_coalesced_cl_truncated_json_bulk_partial_retries_long_host_and_job_oserror(self) -> None:
+        from email.message import Message
+        import http.client as _hc
+        from vipercapture import capture_cli
+
+        # 1. Coalesced Content-Length: "100, 100" still detects 9-byte truncation and preserves existing file
+        with tempfile.TemporaryDirectory() as tmp:
+            existing = Path(tmp) / "existing.png"
+            existing.write_bytes(b"good-file")
+            hdrs = Message()
+            hdrs["Content-Length"] = "100, 100"
+
+            class _CoalescedResp:
+                status = 200
+                headers = hdrs
+
+                def __init__(self) -> None:
+                    self._chunks = [b"123456789", b""]
+
+                def read(self, _n: int = -1) -> bytes:
+                    return self._chunks.pop(0) if self._chunks else b""
+
+            with self.assertRaises(capture_cli.CaptureError):
+                capture_cli.write_response(_CoalescedResp(), existing)
+            self.assertEqual(existing.read_bytes(), b"good-file")
+
+        # 2. Truncated JSON (declared Content-Length > actual) and chunked IncompleteRead raise CaptureError
+        class _ShortJsonResp:
+            status = 200
+            headers = {"Content-Length": "50"}
+
+            def read(self, _n: int = -1) -> bytes:
+                return b'{"id":"1"}'
+
+        with self.assertRaises(capture_cli.CaptureError):
+            capture_cli._read_json_value(_ShortJsonResp())
+
+        class _BrokenChunkedResp:
+            status = 200
+            headers = {"Transfer-Encoding": "chunked"}
+
+            def read(self, _n: int = -1) -> bytes:
+                raise _hc.IncompleteRead(b'{"id":')
+
+        with self.assertRaises(capture_cli.CaptureError):
+            capture_cli._read_json_value(_BrokenChunkedResp())
+
+        # 3. --retries retries an interrupted artifact download when body is truncated on attempt 1
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "retried.png"
+            attempts = {"n": 0}
+
+            class _FlakyResp:
+                status = 200
+
+                def __init__(self, truncated: bool) -> None:
+                    self.headers = {"Content-Length": "8", "Content-Type": "image/png"}
+                    self._chunks = [b"123", b""] if truncated else [b"\x89PNG1234", b""]
+
+                def read(self, _n: int = -1) -> bytes:
+                    return self._chunks.pop(0) if self._chunks else b""
+
+                def close(self) -> None:
+                    return
+
+            def _fake_open(*_args, **_kwargs):
+                attempts["n"] += 1
+                return _FlakyResp(truncated=(attempts["n"] == 1))
+
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with (
+                mock.patch("sys.stdout", buf_out),
+                mock.patch("sys.stderr", buf_err),
+                mock.patch.object(capture_cli, "open_response_with_retries", side_effect=_fake_open),
+            ):
+                code = capture_cli.main([
+                    "https://example.org",
+                    "--output", str(target),
+                    "--retries", "1",
+                    "--retry-delay-ms", "0",
+                    "--server", self.server,
+                ])
+            self.assertEqual(code, 0, buf_err.getvalue())
+            self.assertEqual(attempts["n"], 2)
+            self.assertEqual(target.read_bytes(), b"\x89PNG1234")
+
+        # 4. Bulk submission of 101 URLs retains the first 100 accepted IDs when chunk 2 returns 503
+        with tempfile.TemporaryDirectory() as tmp:
+            urls_file = Path(tmp) / "urls.txt"
+            urls_file.write_text("\n".join(f"https://u{i}.example" for i in range(101)), encoding="utf-8")
+            orig_open = cli_commands.open_response
+            bulk_calls = {"n": 0}
+
+            def _fail_second_bulk(url, **kwargs):
+                if url.endswith("/v1/jobs/bulk"):
+                    bulk_calls["n"] += 1
+                    if bulk_calls["n"] == 2:
+                        raise capture_cli.CaptureError("Service Unavailable", status=503, code="service_unavailable")
+                return orig_open(url, **kwargs)
+
+            with mock.patch.object(cli_commands, "open_response", side_effect=_fail_second_bulk):
+                code, stdout, stderr = self._run([
+                    "bulk", str(urls_file),
+                    "--server", self.server,
+                    "--json",
+                ])
+            self.assertEqual(code, 1, stderr)
+            doc = json.loads(stdout)
+            self.assertEqual(doc["accepted"], 100)
+            self.assertEqual(doc["failed"], 1)
+            self.assertEqual(len(doc["results"]), 101)
+
+        # 5. Bulk invalid item (empty id) and invalid --request-timeout -1 exit 2 WITHOUT creating --output-dir
+        with tempfile.TemporaryDirectory() as tmp:
+            bad_items = Path(tmp) / "bad_items.json"
+            bad_items.write_text('[{"id":"","render":{"url":"https://example.org"}}]', encoding="utf-8")
+            new_dir_1 = Path(tmp) / "no_create_1"
+            code, _stdout, _stderr = self._run([
+                "bulk", str(bad_items), "--wait", "--output-dir", str(new_dir_1),
+            ])
+            self.assertEqual(code, 2)
+            self.assertFalse(new_dir_1.exists())
+
+            new_dir_2 = Path(tmp) / "no_create_2"
+            code, _stdout, _stderr = self._run([
+                "bulk", "--url", "https://example.org",
+                "--wait", "--output-dir", str(new_dir_2),
+                "--request-timeout", "-1",
+            ])
+            self.assertEqual(code, 2)
+            self.assertFalse(new_dir_2.exists())
+
+        # 6. job download --json returns structured JSON error (exit 1) on OSError instead of traceback
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = Path(tmp) / "existing-file"
+            blocker.write_text("x", encoding="utf-8")
+            code, _stdout, stderr = self._run([
+                "job", "download", "job-1",
+                "--output", str(blocker / "result.png"),
+                "--server", self.server,
+                "--json",
+            ])
+            self.assertEqual(code, 1)
+            err_doc = json.loads(stderr.strip())
+            self.assertFalse(err_doc["ok"])
+
+        # 7. Default multi-URL filename preserves unique -{index} even for 89-character hostnames
+        long_host = f"{'a' * 40}.{'b' * 40}.example"
+        with tempfile.TemporaryDirectory() as tmp:
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with mock.patch("sys.stdout", buf_out), mock.patch("sys.stderr", buf_err):
+                code = capture_cli.main([
+                    f"https://{long_host}/a",
+                    f"https://{long_host}/b",
+                    "--output-dir", tmp,
+                    "--dry-run",
+                ])
+            self.assertEqual(code, 0, buf_err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -15,6 +15,7 @@ import hashlib
 import io
 import itertools
 import json
+import math
 import os
 import re
 import sys
@@ -690,6 +691,8 @@ def cmd_preset(argv: list[str]) -> int:
             return 0
     except CaptureError as exc:
         return fail(str(exc), status=exc.status, code=exc.code, body=exc.body, exit_code=exc.exit_code)
+    except OSError as exc:
+        return fail(str(exc), exit_code=1)
     return 2
 
 
@@ -1047,6 +1050,8 @@ def cmd_baseline(argv: list[str]) -> int:
             )
     except CaptureError as exc:
         return fail(str(exc), status=exc.status, code=exc.code, body=exc.body, exit_code=exc.exit_code)
+    except OSError as exc:
+        return fail(str(exc), exit_code=1)
     return 2
 
 
@@ -1230,6 +1235,10 @@ def cmd_bulk(argv: list[str]) -> int:
         return fail("--concurrency must be 1 or greater.", exit_code=2)
     if args.poll_ms < 1:
         return fail("--poll-ms must be 1 or greater.", exit_code=2)
+    if args.request_timeout is not None and (
+        not math.isfinite(float(args.request_timeout)) or float(args.request_timeout) <= 0
+    ):
+        return fail("--request-timeout must be greater than 0.", exit_code=2)
 
     load_local_env()
     try:
@@ -1239,7 +1248,22 @@ def cmd_bulk(argv: list[str]) -> int:
         for source_key in ("url", "html", "markdown"):
             base_render.pop(source_key, None)
         items = _parse_bulk_input(args.urls_file, args.bulk_urls, base_render)
-        for item in items:
+        for idx, item in enumerate(items):
+            extra_keys = set(item.keys()) - {"id", "idempotency_key", "render"}
+            if extra_keys:
+                raise ValueError(f"Bulk item {idx} has unexpected field(s): {', '.join(sorted(extra_keys))}.")
+            item_id = item.get("id")
+            if item_id is not None:
+                if not isinstance(item_id, str) or not (1 <= len(item_id) <= 128):
+                    raise ValueError(f"Bulk item {idx} 'id' must be a non-empty string (1-128 chars).")
+            item_idem = item.get("idempotency_key")
+            if item_idem is not None:
+                if (
+                    not isinstance(item_idem, str)
+                    or not (1 <= len(item_idem) <= 128)
+                    or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", item_idem)
+                ):
+                    raise ValueError(f"Bulk item {idx} 'idempotency_key' is invalid.")
             validate_payload(item["render"])  # type: ignore[arg-type]
     except ValueError as exc:
         return fail(str(exc), exit_code=2)
@@ -1268,20 +1292,39 @@ def cmd_bulk(argv: list[str]) -> int:
                     if len(chunks) == 1
                     else derive_batch_idempotency_key(args.idempotency_key, f"batch-{batch_idx}")
                 )
-            resp = open_response(
-                root + "/v1/jobs/bulk",
-                method="POST",
-                payload={"items": chunk},
-                headers=_auth_headers(args, started_server=started, content_type="application/json", extra=extra),
-                timeout=min(60.0, args.request_timeout),
-            )
+            offset = (batch_idx - 1) * 100
             try:
-                doc = _read_json(resp)
-            finally:
-                resp.close()
+                resp = open_response(
+                    root + "/v1/jobs/bulk",
+                    method="POST",
+                    payload={"items": chunk},
+                    headers=_auth_headers(args, started_server=started, content_type="application/json", extra=extra),
+                    timeout=min(60.0, args.request_timeout),
+                )
+                try:
+                    doc = _read_json(resp)
+                finally:
+                    resp.close()
+            except CaptureError as exc:
+                if not all_results:
+                    raise
+                for local_idx, item in enumerate(chunk):
+                    failed_total += 1
+                    entry_err: dict[str, object] = {
+                        "index": offset + local_idx,
+                        "accepted": False,
+                        "error": {
+                            "code": exc.code or "bulk_batch_failed",
+                            "message": str(exc),
+                            "status": exc.status,
+                        },
+                    }
+                    if item.get("id") is not None:
+                        entry_err["id"] = item["id"]
+                    all_results.append(entry_err)
+                continue
             accepted_total += int(doc.get("accepted") or 0)
             failed_total += int(doc.get("failed") or 0)
-            offset = (batch_idx - 1) * 100
             for entry in doc.get("results") or []:
                 if isinstance(entry, dict):
                     copied = dict(entry)
@@ -1560,6 +1603,8 @@ def cmd_job(argv: list[str]) -> int:
             return 0
     except CaptureError as exc:
         return fail(str(exc), status=exc.status, code=exc.code, body=exc.body, exit_code=exc.exit_code)
+    except OSError as exc:
+        return fail(str(exc), exit_code=1)
     return 2
 
 
@@ -1758,6 +1803,8 @@ def cmd_schedule(argv: list[str]) -> int:
             return 0
     except CaptureError as exc:
         return fail(str(exc), status=exc.status, code=exc.code, body=exc.body, exit_code=exc.exit_code)
+    except OSError as exc:
+        return fail(str(exc), exit_code=1)
     return 2
 
 
@@ -1896,6 +1943,8 @@ def cmd_profile(argv: list[str]) -> int:
             return 0
     except CaptureError as exc:
         return fail(str(exc), status=exc.status, code=exc.code, body=exc.body, exit_code=exc.exit_code)
+    except OSError as exc:
+        return fail(str(exc), exit_code=1)
     return 2
 
 
@@ -2393,6 +2442,8 @@ def cmd_admin(argv: list[str]) -> int:
             return 0
     except CaptureError as exc:
         return fail(str(exc), status=exc.status, code=exc.code, body=exc.body, exit_code=exc.exit_code)
+    except OSError as exc:
+        return fail(str(exc), exit_code=1)
     return 2
 
 

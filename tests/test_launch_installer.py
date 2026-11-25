@@ -2850,6 +2850,79 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
                     ("192.0.2.20", 9123),
                 )
 
+            # Resolvable LAN hostname bind preserves the hostname for graceful shutdown
+            host_identity = launch.ProcessIdentity(
+                pid=42427,
+                kind="server",
+                command="python -m uvicorn vipercapture.main:app --host workbox.local --port 9124",
+                start_time="12348",
+            )
+            (runtime_dir / "server-42427.json").write_text(
+                json.dumps({
+                    "service": "vipercapture",
+                    "install_id": launch._installation_id(),
+                    "pid": 42427,
+                    "host": "workbox.local",
+                    "port": 9124,
+                    "start_time": "12348",
+                    "token": "secret-shutdown-token",
+                }),
+                encoding="utf-8",
+            )
+            with mock.patch("launch.Path.home", return_value=fake_home):
+                self.assertEqual(
+                    launch._verified_server_record_endpoint(host_identity),
+                    ("workbox.local", 9124),
+                )
+
+            # kill exits 0 after stopping ViperCapture on 9100 even if unrelated service holds default port 8000
+            with (
+                mock.patch("launch.Path.home", return_value=fake_home),
+                mock.patch("launch.find_vipercapture_processes", return_value={42424: identity}),
+                mock.patch("launch._is_vipercapture_endpoint", return_value=None),
+                mock.patch("launch.port_open", side_effect=lambda host=launch.HOST, port=launch.PORT: port == 8000),
+                mock.patch("launch._terminate_process", return_value=(True, None)),
+                mock.patch("launch._prune_stale_server_records"),
+                mock.patch("sys.stdout", io.StringIO()),
+            ):
+                self.assertEqual(launch.kill_all_instances(), 0)
+
+    def test_startup_race_exited_child_with_unrelated_listener_fails_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp) / "home"
+            fake_home.mkdir()
+            fake_proc = mock.MagicMock()
+            fake_proc.pid = 55555
+            fake_proc.poll.return_value = 1
+            fake_subproc = mock.MagicMock(Popen=mock.MagicMock(return_value=fake_proc), STDOUT=-2, PIPE=-1)
+            real_mod = launch._mod
+            browser_mock = mock.MagicMock()
+
+            def _fake_mod(name: str):
+                if name == "subprocess":
+                    return fake_subproc
+                if name == "webbrowser":
+                    return browser_mock
+                return real_mod(name)
+
+            with (
+                mock.patch("launch.Path.home", return_value=fake_home),
+                mock.patch("launch.sys.argv", ["launch.py", "--port", "9125"]),
+                mock.patch("launch.ensure_venv"),
+                mock.patch("launch.ensure_deps"),
+                mock.patch("launch.ensure_playwright"),
+                mock.patch("launch.port_open", side_effect=[False, True]),
+                mock.patch("launch._record_server_process"),
+                mock.patch("launch._record_endpoint_server_process", return_value=None),
+                mock.patch("launch._mod", side_effect=_fake_mod),
+                mock.patch("launch.wait_and_exit", side_effect=SystemExit(1)),
+                mock.patch("sys.stdout", io.StringIO()),
+            ):
+                with self.assertRaises(SystemExit) as ctx:
+                    launch.main()
+            self.assertEqual(ctx.exception.code, 1)
+            browser_mock.open.assert_not_called()
+
     def test_custom_port_occupied_by_unrelated_service_exits_nonzero(self) -> None:
         stderr = io.StringIO()
         with (
