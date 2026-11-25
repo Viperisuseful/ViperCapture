@@ -65,7 +65,7 @@ Run `vipercapture`. On Linux and macOS, open a new terminal first. The first run
 Run the published image:
 
 ```bash
-docker run --rm --init -p 127.0.0.1:8000:8000 -v vipercapture-data:/data ghcr.io/viperisuseful/vipercapture:1.1.1
+docker run --rm --init -p 127.0.0.1:8000:8000 -v vipercapture-data:/data ghcr.io/viperisuseful/vipercapture:1.1.2
 ```
 
 Or build and run with Compose from a clone of this repository:
