@@ -893,6 +893,62 @@ class CliCommandsTests(unittest.TestCase):
         self.assertIn("scopes: render", stdout)
         self.assertIn("warning: Save this key now, it will not be shown again.", stdout)
 
+        with tempfile.TemporaryDirectory() as tmp:
+            plain_out = Path(tmp) / "nested" / "key.txt"
+            code, stdout, stderr = self._run([
+                "admin", "keys", "create", "proj_1", "--name", "ci-out", "--scope", "render",
+                "--out", str(plain_out), "--server", self.server, "--admin-token", token,
+            ])
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(stderr, "")
+            self.assertNotIn("vcp_abcd1234_secretvalue", stdout)
+            self.assertNotIn("secretvalue", stdout)
+            self.assertNotIn(token, stdout)
+            self.assertEqual(stdout.strip(), str(plain_out))
+            self.assertEqual(plain_out.read_text(encoding="utf-8").strip(), "vcp_abcd1234_secretvalue")
+            if os.name != "nt":
+                self.assertEqual(plain_out.stat().st_mode & 0o777, 0o600)
+
+            json_out = Path(tmp) / "key-json.txt"
+            code, stdout, stderr = self._run([
+                "admin", "keys", "create", "proj_1", "--name", "ci-out-json", "--scope", "render",
+                "--out", str(json_out), "--server", self.server, "--admin-token", token, "--json",
+            ])
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(stderr, "")
+            self.assertNotIn("vcp_abcd1234_secretvalue", stdout)
+            self.assertNotIn("secretvalue", stdout)
+            self.assertNotIn(token, stdout)
+            out_doc = json.loads(stdout)
+            self.assertEqual(out_doc["api_key"], "***")
+            self.assertEqual(out_doc["key_file"], str(json_out))
+            self.assertEqual(out_doc["warning"], "Save this key now, it will not be shown again.")
+            self.assertEqual(json_out.read_text(encoding="utf-8").strip(), "vcp_abcd1234_secretvalue")
+            if os.name != "nt":
+                self.assertEqual(json_out.stat().st_mode & 0o777, 0o600)
+
+            before_requests = len(self.httpd.requests)  # type: ignore[attr-defined]
+            code, _stdout, stderr = self._run([
+                "admin", "keys", "create", "proj_1", "--out", "-",
+                "--server", self.server, "--admin-token", token,
+            ])
+            self.assertEqual(code, 2)
+            self.assertIn("--out", stderr)
+            code, _stdout, stderr = self._run([
+                "admin", "keys", "create", "proj_1", "--out", tmp,
+                "--server", self.server, "--admin-token", token,
+            ])
+            self.assertEqual(code, 2)
+            self.assertIn("directory", stderr)
+            blocker_file = Path(tmp) / "not-a-dir"
+            blocker_file.write_text("x", encoding="utf-8")
+            code, _stdout, _stderr = self._run([
+                "admin", "keys", "create", "proj_1", "--out", str(blocker_file / "key.txt"),
+                "--server", self.server, "--admin-token", token,
+            ])
+            self.assertEqual(code, 1)
+            self.assertEqual(len(self.httpd.requests), before_requests)  # type: ignore[attr-defined]
+
         code, stdout, stderr = self._run(["admin", "keys", "revoke", "key_1", "--server", self.server, "--admin-token", token, "--json"])
         self.assertEqual(code, 0, stderr)
         self.assertEqual(json.loads(stdout)["revoked"], "key_1")
