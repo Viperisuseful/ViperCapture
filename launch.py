@@ -496,10 +496,15 @@ def png_rgba(png: bytes) -> tuple[int, int, bytes]:
     ):
         raise ValueError("unsupported png")
     channels = 4 if color_type == 6 else 3
-    raw = zlib.decompress(bytes(idat))
     stride = width * channels
     expected = height * (stride + 1)
-    if len(raw) < expected:
+    if expected > 64 * 1024 * 1024:
+        raise ValueError("png too large")
+    decompressor = zlib.decompressobj()
+    raw = decompressor.decompress(bytes(idat), expected + 1)
+    if len(raw) > expected or decompressor.unconsumed_tail:
+        raise ValueError("png exceeds expected raster size")
+    if len(raw) < expected or not decompressor.eof:
         raise ValueError("truncated png")
     rows: list[bytearray] = []
     pos = 0
@@ -569,6 +574,7 @@ def encode_sixel(width: int, height: int, rgba: bytes) -> bytes:
     while True:
         palette.clear()
         indexes = bytearray(width * height)
+        overflowed = False
         for pixel in range(width * height):
             offset = pixel * 4
             if rgba[offset + 3] < 128:
@@ -580,10 +586,13 @@ def encode_sixel(width: int, height: int, rgba: bytes) -> bytes:
             )
             index = palette.get(color)
             if index is None:
+                if len(palette) >= 255:
+                    overflowed = True
+                    break
                 index = len(palette) + 1
                 palette[color] = index
             indexes[pixel] = index
-        if len(palette) <= 256 or bits == 3:
+        if not overflowed or bits == 2:
             break
         bits -= 1
     parts = [f'\x1bPq"1;1;{width};{height}'.encode("ascii")]
@@ -3179,7 +3188,8 @@ usage: vipercapture [--one-window]
        vipercapture update [--check]
        vipercapture kill
        vipercapture capture URL --output FILE [options]
-       vipercapture --gui [--viewport WIDTH HEIGHT]
+       vipercapture --gui [URL] [--viewport WIDTH HEIGHT] [--output-dir DIR]
+                          [--server URL] [--preset NAME] [--url URL]
 
 Start ViperCapture in this terminal. Ghostty and Kitty open request
 logs in another window and show a full-screen status view.
@@ -3198,11 +3208,19 @@ logs in another window and show a full-screen status view.
                  each major API field. The same flags work on Linux, macOS,
                  and Windows.
   --gui          Open a full-screen capture menu in this terminal.
-                 Type a website link, press Tab to switch png, gif, and
-                 mp4, and press Ctrl+P to switch between the full page and
-                 the viewport. Nothing else is opened. --GUI is accepted too.
+                 Type a website link, press Tab / Shift+Tab to switch output
+                 formats, Ctrl+P for full page, Ctrl+R for viewport presets,
+                 Ctrl+G for advanced options, Ctrl+F for saved presets,
+                 Ctrl+L for history, and F1 for all keybinds. Nothing else
+                 is opened. --GUI is accepted too.
   --viewport     With --gui, set the page size in pixels. The default
                  is 1920 1080.
+  --output-dir   With --gui, save captures to DIR instead of the current
+                 directory.
+  --server       With --gui, connect to an existing or remote ViperCapture
+                 server URL instead of starting a local one.
+  --preset       With --gui, load a saved preset by name on startup.
+  --url          With --gui, pre-fill the URL bar (or pass URL positionally).
   -h, --help     Show this help.
 
 Windows always uses one window. --gui stays in this window on every OS.
@@ -3219,6 +3237,10 @@ class CliArgs:
         "capture",
         "capture_argv",
         "viewport",
+        "output_dir",
+        "server",
+        "preset",
+        "url",
     )
 
     def __init__(
@@ -3231,6 +3253,10 @@ class CliArgs:
         capture: bool = False,
         capture_argv: tuple[str, ...] = (),
         viewport: tuple[int, int] | None = None,
+        output_dir: str | None = None,
+        server: str | None = None,
+        preset: str | None = None,
+        url: str | None = None,
     ) -> None:
         object.__setattr__(self, "one_window", one_window)
         object.__setattr__(self, "update", update)
@@ -3240,6 +3266,10 @@ class CliArgs:
         object.__setattr__(self, "capture", capture)
         object.__setattr__(self, "capture_argv", capture_argv)
         object.__setattr__(self, "viewport", viewport)
+        object.__setattr__(self, "output_dir", output_dir)
+        object.__setattr__(self, "server", server)
+        object.__setattr__(self, "preset", preset)
+        object.__setattr__(self, "url", url)
 
     def __setattr__(self, name: str, value: object) -> None:
         raise AttributeError("CliArgs is immutable")
@@ -3250,15 +3280,18 @@ class CliArgs:
         return (
             self.one_window, self.update, self.check, self.gui,
             self.kill, self.capture, self.capture_argv, self.viewport,
+            self.output_dir, self.server, self.preset, self.url,
         ) == (
             other.one_window, other.update, other.check, other.gui,
             other.kill, other.capture, other.capture_argv, other.viewport,
+            other.output_dir, other.server, other.preset, other.url,
         )
 
     def __hash__(self) -> int:
         return hash((
             self.one_window, self.update, self.check, self.gui,
             self.kill, self.capture, self.capture_argv, self.viewport,
+            self.output_dir, self.server, self.preset, self.url,
         ))
 
     def __repr__(self) -> str:
@@ -3266,7 +3299,8 @@ class CliArgs:
             f"CliArgs(one_window={self.one_window!r}, update={self.update!r}, "
             f"check={self.check!r}, gui={self.gui!r}, kill={self.kill!r}, "
             f"capture={self.capture!r}, capture_argv={self.capture_argv!r}, "
-            f"viewport={self.viewport!r})"
+            f"viewport={self.viewport!r}, output_dir={self.output_dir!r}, "
+            f"server={self.server!r}, preset={self.preset!r}, url={self.url!r})"
         )
 
 
@@ -3282,6 +3316,42 @@ def _viewport_edge(token: str) -> int:
     if value < 1 or value > 16_384:
         _reject_arg(f"Invalid viewport size: {token}")
     return value
+
+
+def _validate_server_url(token: str) -> str:
+    import urllib.parse
+
+    value = token.strip()
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        _reject_arg(f"Invalid server URL: {token}")
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        _reject_arg(f"Invalid server URL: {token}")
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or "?" in value
+        or "#" in value
+        or parsed.query
+        or parsed.fragment
+        or (port is not None and not (1 <= port <= 65535))
+    ):
+        _reject_arg(f"Invalid server URL: {token}")
+    hostname = parsed.hostname
+    if ":" in hostname:
+        ascii_host = f"[{hostname}]"
+    else:
+        try:
+            ascii_host = hostname.encode("idna").decode("ascii")
+        except UnicodeError:
+            _reject_arg(f"Invalid server URL: {token}")
+    netloc = f"{ascii_host}:{port}" if port is not None else ascii_host
+    encoded_path = urllib.parse.quote(parsed.path, safe="/:@!$&'()*+,;=-._~%").rstrip("/")
+    return urllib.parse.urlunsplit((parsed.scheme.lower(), netloc, encoded_path, "", "")).rstrip("/")
 
 
 def parse_cli(argv: list[str] | None = None) -> CliArgs:
@@ -3312,6 +3382,11 @@ def parse_cli(argv: list[str] | None = None) -> CliArgs:
     gui = False
     one_window = False
     viewport: tuple[int, int] | None = None
+    output_dir: str | None = None
+    server: str | None = None
+    preset: str | None = None
+    url: str | None = None
+    positionals: list[str] = []
     index = 0
     while index < len(args):
         arg = args[index]
@@ -3332,12 +3407,98 @@ def parse_cli(argv: list[str] | None = None) -> CliArgs:
             viewport = (_viewport_edge(args[index + 1]), _viewport_edge(args[index + 2]))
             index += 3
             continue
+        gui_flags = {"-h", "--help", "--gui", "--one-window", "--viewport", "--output-dir", "--server", "--preset", "--url"}
+
+        def _is_gui_flag_token(tok: str) -> bool:
+            low = tok.lower()
+            return low in gui_flags or low.startswith("--")
+
+        if arg == "--output-dir" or arg.startswith("--output-dir="):
+            if arg.startswith("--output-dir="):
+                val = arg.split("=", 1)[1]
+                if not val.strip():
+                    _reject_arg("--output-dir needs a directory path.")
+                output_dir = val
+                index += 1
+                continue
+            if index + 1 >= len(args) or not args[index + 1].strip() or _is_gui_flag_token(args[index + 1]):
+                _reject_arg("--output-dir needs a directory path.")
+            output_dir = args[index + 1]
+            index += 2
+            continue
+        if arg == "--server" or arg.startswith("--server="):
+            if arg.startswith("--server="):
+                val = arg.split("=", 1)[1]
+                if not val.strip():
+                    _reject_arg("--server needs an http:// or https:// URL.")
+                server = _validate_server_url(val)
+                index += 1
+                continue
+            if index + 1 >= len(args) or not args[index + 1].strip() or _is_gui_flag_token(args[index + 1]):
+                _reject_arg("--server needs an http:// or https:// URL.")
+            server = _validate_server_url(args[index + 1])
+            index += 2
+            continue
+        if arg == "--preset" or arg.startswith("--preset="):
+            if arg.startswith("--preset="):
+                val = arg.split("=", 1)[1].strip()
+                if not val:
+                    _reject_arg("--preset needs a preset name.")
+                preset = val
+                index += 1
+                continue
+            if index + 1 >= len(args) or not args[index + 1].strip() or _is_gui_flag_token(args[index + 1]):
+                _reject_arg("--preset needs a preset name.")
+            preset = args[index + 1].strip()
+            index += 2
+            continue
+        if arg == "--url" or arg.startswith("--url="):
+            if arg.startswith("--url="):
+                val = arg.split("=", 1)[1].strip()
+                if not val:
+                    _reject_arg("--url needs a website link.")
+                url = val
+                index += 1
+                continue
+            if index + 1 >= len(args) or not args[index + 1].strip() or _is_gui_flag_token(args[index + 1]):
+                _reject_arg("--url needs a website link.")
+            url = args[index + 1].strip()
+            index += 2
+            continue
+        if not arg.startswith("-"):
+            positionals.append(arg)
+            index += 1
+            continue
         _reject_arg(f"Unknown argument: {arg}")
-    if viewport is not None and not gui:
-        _reject_arg("--viewport is only used with --gui.")
+    if positionals:
+        if not gui:
+            _reject_arg(f"Unknown argument: {positionals[0]}")
+        if url is not None or len(positionals) > 1:
+            extra = positionals[0] if url is not None else positionals[1]
+            _reject_arg(f"Unknown argument: {extra}")
+        url = positionals[0].strip()
+    if not gui:
+        if viewport is not None:
+            _reject_arg("--viewport is only used with --gui.")
+        if output_dir is not None:
+            _reject_arg("--output-dir is only used with --gui.")
+        if server is not None:
+            _reject_arg("--server is only used with --gui.")
+        if preset is not None:
+            _reject_arg("--preset is only used with --gui.")
+        if url is not None:
+            _reject_arg("--url is only used with --gui.")
     if gui and one_window:
         _reject_arg("--gui already keeps everything in this terminal.")
-    return CliArgs(one_window=one_window, gui=gui, viewport=viewport)
+    return CliArgs(
+        one_window=one_window,
+        gui=gui,
+        viewport=viewport,
+        output_dir=output_dir,
+        server=server,
+        preset=preset,
+        url=url,
+    )
 
 
 def parse_launch_args(argv: list[str] | None = None) -> bool:
@@ -3382,10 +3543,20 @@ def main() -> None:
         raise SystemExit(updater.run_update(ROOT, check_only=cli.check))
     _clear_application_shutdown_request()
     if cli.gui:
-        ensure_venv()
+        if not cli.server:
+            ensure_venv()
         import gui
         viewport = cli.viewport if cli.viewport is not None else (1920, 1080)
-        raise SystemExit(gui.run_capture_gui(viewport))
+        raise SystemExit(
+            gui.run_capture_gui(
+                viewport,
+                directory=Path(cli.output_dir) if cli.output_dir else None,
+                server=cli.server,
+                preset=cli.preset,
+                initial_url=cli.url or "",
+                custom_viewport=cli.viewport is not None,
+            )
+        )
     one_window = use_one_window(cli.one_window)
     ensure_venv()    # may re-exec this script under the venv Python
 

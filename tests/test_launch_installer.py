@@ -534,6 +534,61 @@ class LaunchArgsTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 2)
         self.assertIn("already keeps everything in this terminal", stderr.getvalue())
 
+    def test_gui_extended_flags_and_positional_url(self) -> None:
+        parsed = launch.parse_cli(
+            [
+                "--gui",
+                "https://example.com/demo",
+                "--viewport",
+                "1280",
+                "720",
+                "--output-dir",
+                "captures",
+                "--server",
+                "http://127.0.0.1:9000/",
+                "--preset",
+                "Blog dark",
+            ]
+        )
+        self.assertTrue(parsed.gui)
+        self.assertEqual(parsed.url, "https://example.com/demo")
+        self.assertEqual(parsed.viewport, (1280, 720))
+        self.assertEqual(parsed.output_dir, "captures")
+        self.assertEqual(parsed.server, "http://127.0.0.1:9000")
+        self.assertEqual(parsed.preset, "Blog dark")
+
+        with_flag_url = launch.parse_cli(["--gui", "--url", "example.org"])
+        self.assertEqual(with_flag_url.url, "example.org")
+
+        url_first = launch.parse_cli(["example.net", "--gui"])
+        self.assertTrue(url_first.gui)
+        self.assertEqual(url_first.url, "example.net")
+
+    def test_gui_extended_flags_require_gui_and_valid_values(self) -> None:
+        for argv, expected in (
+            (["--output-dir", "out"], "only used with --gui"),
+            (["--server", "http://127.0.0.1:8000"], "only used with --gui"),
+            (["--preset", "demo"], "only used with --gui"),
+            (["--url", "https://example.com"], "only used with --gui"),
+            (["https://example.com"], "Unknown argument"),
+            (["--gui", "--server", "ftp://bad.example"], "Invalid server URL"),
+            (["--gui", "--server", "http://[::1"], "Invalid server URL"),
+            (["--gui", "--server", "http://localhost:foo"], "Invalid server URL"),
+            (["--gui", "--server", "http://127.0.0.1:8000?x=1"], "Invalid server URL"),
+            (["--gui", "--server", "http://127.0.0.1:8000#frag"], "Invalid server URL"),
+            (["--gui", "--server", "http://user:pass@127.0.0.1:8000"], "Invalid server URL"),
+            (["--gui", "--url", "a.com", "b.com"], "Unknown argument"),
+            (["--gui", "--output-dir"], "--output-dir needs"),
+            (["--gui", "--preset"], "--preset needs"),
+        ):
+            with self.subTest(argv=argv):
+                stderr = io.StringIO()
+                with mock.patch("sys.stderr", stderr):
+                    with self.assertRaises(SystemExit) as caught:
+                        launch.parse_cli(argv)
+                self.assertEqual(caught.exception.code, 2)
+                self.assertIn(expected, stderr.getvalue())
+
     def test_windows_stays_in_one_window_without_the_flag(self) -> None:
         self.assertTrue(launch.use_one_window(False, "win32"))
         self.assertFalse(launch.use_one_window(False, "linux"))
@@ -1229,6 +1284,7 @@ class InstallScriptTests(unittest.TestCase):
                 ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_body],
                 env=env,
                 text=True,
+                errors="replace",
                 capture_output=True,
                 check=False,
             )
@@ -1286,6 +1342,7 @@ class InstallScriptTests(unittest.TestCase):
                 ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_body],
                 env=env,
                 text=True,
+                errors="replace",
                 capture_output=True,
                 check=False,
             )
@@ -2589,6 +2646,48 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
             launch.main()
         port_open.assert_called_once()
         mod_mock.assert_called_once_with("webbrowser")
+
+    def test_validate_server_url_rejects_query_and_fragment_delimiters(self) -> None:
+        self.assertEqual(launch._validate_server_url("https://example.com/api/"), "https://example.com/api")
+        self.assertEqual(
+            launch._validate_server_url("http://例子.test:8000/café/"),
+            "http://xn--fsqu00a.test:8000/caf%C3%A9",
+        )
+        for bad in (
+            "https://example.com?",
+            "https://example.com#",
+            "https://example.com/?a=1",
+            "https://example.com/#frag",
+        ):
+            with self.subTest(url=bad):
+                with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit) as ctx:
+                    launch._validate_server_url(bad)
+                self.assertEqual(ctx.exception.code, 2)
+
+    def test_gui_flags_reject_missing_value_followed_by_flag(self) -> None:
+        for argv in (
+            ["--gui", "--output-dir", "--preset", "example.com"],
+            ["--gui", "--preset", "--url", "example.com"],
+            ["--gui", "--url", "--server", "http://127.0.0.1:8000"],
+            ["--gui", "--server", "--preset", "default"],
+            ["--gui", "--preset", "--url=https://example.com"],
+            ["--gui", "--output-dir", "--server=https://api.example"],
+            ["--gui", "--output-dir", "--unknown"],
+            ["--gui", "--preset", "--unknown"],
+            ["--gui", "--url", "--unknown"],
+        ):
+            with self.subTest(argv=argv):
+                with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit) as ctx:
+                    launch.parse_cli(argv)
+                self.assertEqual(ctx.exception.code, 2)
+        # Valid preset names starting with '-' (not a known launcher flag) are accepted,
+        # and --preset=<name> accepts even flag-like preset names such as --help.
+        parsed = launch.parse_cli(["--gui", "--preset", "-mobile"])
+        self.assertTrue(parsed.gui)
+        self.assertEqual(parsed.preset, "-mobile")
+        parsed_eq = launch.parse_cli(["--gui", "--preset=--help"])
+        self.assertTrue(parsed_eq.gui)
+        self.assertEqual(parsed_eq.preset, "--help")
 
 
 if __name__ == "__main__":

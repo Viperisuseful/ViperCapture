@@ -3329,7 +3329,7 @@ if not HOSTED:
         presets = await asyncio.to_thread(_save_preset, name, settings)
         return JSONResponse({"presets": presets}, status_code=201)
 
-    @app.delete("/local/presets/{name}")
+    @app.delete("/local/presets/{name:path}")
     async def delete_local_preset(name: str, request: Request):
         _check_local_request(request)
         return {"presets": await asyncio.to_thread(_delete_preset, name)}
