@@ -2187,6 +2187,22 @@ class CliCouncilHardeningTests(unittest.TestCase):
         self.assertEqual(code_cmd, 2)
         self.assertFalse(json.loads(err_cmd.strip())["ok"])
 
+        # 4. Stdlib fallback matches Pydantic bool-string coercion, image.width/format rules, and wait_for caps
+        capture_cli._validate_payload_fallback({
+            "url": "https://example.invalid",
+            "output": "webm",
+            "video": {"scroll": "false", "transparent_background": "0"},
+        })
+        for bad_payload in (
+            {"url": "https://example.invalid", "output": "jpeg", "image": {"optimize_for_speed": "yes"}},
+            {"url": "https://example.invalid", "output": "jpeg", "image": {"transparent_background": "yes"}},
+            {"url": "https://example.invalid", "output": "webm", "image": {"width": 640}},
+            {"url": "https://example.invalid", "output": "png", "wait_for": {"delay_ms": 15001}},
+            {"url": "https://example.invalid", "output": "png", "wait_for": {"timeout_ms": 30001}},
+        ):
+            with self.subTest(payload=bad_payload), self.assertRaises(ValueError):
+                capture_cli._validate_payload_fallback(bad_payload)
+
 
 if __name__ == "__main__":
     unittest.main()

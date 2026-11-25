@@ -2264,6 +2264,21 @@ _FALLBACK_ALLOWED_KEYS = (
 )
 
 
+def _parse_contract_bool(value: object, field: str) -> bool:
+    """Validate and coerce a boolean matching Pydantic v2 non-strict bool semantics."""
+    if isinstance(value, bool):
+        return value
+    if type(value) is int and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in _TRUE or lowered in {"t", "y"}:
+            return True
+        if lowered in _FALSE or lowered in {"f", "n"}:
+            return False
+    raise ValueError(f"{field} must be a boolean.")
+
+
 def _validate_payload_fallback(payload: dict[str, object]) -> None:
     """Stdlib fallback validator used when Pydantic/RenderRequest is unavailable."""
     if not isinstance(payload, dict):
@@ -2298,8 +2313,8 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
         if not isinstance(eng, str) or eng not in _ENGINES:
             raise ValueError(f"engine must be one of: {', '.join(_ENGINES)}")
     for bool_key in _FALLBACK_BOOL_FIELDS:
-        if bool_key in payload and type(payload[bool_key]) is not bool:
-            raise ValueError(f"{bool_key} must be a boolean.")
+        if bool_key in payload:
+            _parse_contract_bool(payload[bool_key], bool_key)
     if "lazy_load" in payload and (not isinstance(payload["lazy_load"], str) or payload["lazy_load"] not in _LAZY):
         raise ValueError(f"lazy_load must be one of: {', '.join(_LAZY)}")
     if "profile" in payload and (not isinstance(payload["profile"], str) or payload["profile"] not in _PROFILES):
@@ -2321,7 +2336,7 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
             raise ValueError("viewport.device_scale_factor must be between 0.1 and 8.")
     output_fmt = str(payload.get("output") or "png")
     engine_name = str(payload.get("engine") or "chromium")
-    full_page_val = payload.get("full_page", True)
+    full_page_val = _parse_contract_bool(payload["full_page"], "full_page") if "full_page" in payload else True
     is_image_fmt = output_fmt in {"png", "jpeg", "webp", "avif"}
     is_video_fmt = output_fmt in {"webm", "mp4", "gif"}
     if "video" in payload and payload["video"] is not None:
@@ -2339,10 +2354,14 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
             raise ValueError("video.scroll_step must be an integer between 1 and 4320.")
         if "scroll_delay_ms" in vid and (not _is_int(vid["scroll_delay_ms"]) or vid["scroll_delay_ms"] < 50 or vid["scroll_delay_ms"] > 2_000):  # type: ignore[operator]
             raise ValueError("video.scroll_delay_ms must be an integer between 50 and 2000.")
-        for bkey in ("scroll", "transparent_background"):
-            if bkey in vid and type(vid[bkey]) is not bool:
-                raise ValueError(f"video.{bkey} must be a boolean.")
-        if vid.get("transparent_background") is True:
+        if "scroll" in vid:
+            _parse_contract_bool(vid["scroll"], "video.scroll")
+        vid_transparent = (
+            _parse_contract_bool(vid["transparent_background"], "video.transparent_background")
+            if "transparent_background" in vid
+            else False
+        )
+        if vid_transparent:
             if not full_page_val:
                 raise ValueError("transparent video requires full_page=true.")
             if output_fmt == "mp4":
@@ -2358,13 +2377,30 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
         for dim in ("width", "height"):
             if dim in img and img[dim] is not None and (not _is_int(img[dim]) or img[dim] < 1 or img[dim] > 65_535):  # type: ignore[operator]
                 raise ValueError(f"image.{dim} must be an integer between 1 and 65535.")
-        if img.get("transparent_background") is True and output_fmt not in {"png", "webp", "avif"}:
+        if img.get("width") is not None or img.get("height") is not None:
+            if not is_image_fmt or payload.get("viewports") is not None or payload.get("slices") is not None:
+                raise ValueError("image width and height require a single image output.")
+        img_transparent = (
+            _parse_contract_bool(img["transparent_background"], "image.transparent_background")
+            if "transparent_background" in img
+            else False
+        )
+        img_fast = (
+            _parse_contract_bool(img["optimize_for_speed"], "image.optimize_for_speed")
+            if "optimize_for_speed" in img
+            else False
+        )
+        if img_transparent and output_fmt not in {"png", "webp", "avif"}:
             raise ValueError("transparent_background is accepted only for PNG, WebP, or AVIF.")
-        if img.get("optimize_for_speed") is True:
+        if img_fast:
             if output_fmt not in {"png", "webp"}:
                 raise ValueError("optimize_for_speed is accepted only for PNG or WebP.")
             if engine_name != "chromium":
                 raise ValueError("optimize_for_speed requires the Chromium engine.")
+    if payload.get("pdf") is not None and output_fmt != "pdf":
+        raise ValueError("pdf settings require PDF output.")
+    if output_fmt == "pdf" and engine_name != "chromium":
+        raise ValueError("PDF output requires the Chromium engine.")
     if "clip" in payload and payload["clip"] is not None:
         clip = payload["clip"]
         assert isinstance(clip, dict)
@@ -2400,10 +2436,10 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
             raise ValueError("wait_for.event is invalid.")
         if "selector_state" in wf and (not isinstance(wf["selector_state"], str) or wf["selector_state"] not in _WAIT_STATES):
             raise ValueError("wait_for.selector_state is invalid.")
-        if "delay_ms" in wf and (not _is_int(wf["delay_ms"]) or wf["delay_ms"] < 0 or wf["delay_ms"] > 30_000):  # type: ignore[operator]
-            raise ValueError("wait_for.delay_ms must be an integer between 0 and 30000.")
-        if "timeout_ms" in wf and (not _is_int(wf["timeout_ms"]) or wf["timeout_ms"] < 1 or wf["timeout_ms"] > 60_000):  # type: ignore[operator]
-            raise ValueError("wait_for.timeout_ms must be an integer between 1 and 60000.")
+        if "delay_ms" in wf and (not _is_int(wf["delay_ms"]) or wf["delay_ms"] < 0 or wf["delay_ms"] > 15_000):  # type: ignore[operator]
+            raise ValueError("wait_for.delay_ms must be an integer between 0 and 15000.")
+        if "timeout_ms" in wf and (not _is_int(wf["timeout_ms"]) or wf["timeout_ms"] < 1 or wf["timeout_ms"] > 30_000):  # type: ignore[operator]
+            raise ValueError("wait_for.timeout_ms must be an integer between 1 and 30000.")
     if "actions" in payload:
         acts = payload["actions"]
         assert isinstance(acts, list)
