@@ -289,6 +289,7 @@ class _ApiMockHandler(BaseHTTPRequestHandler):
                 "prefix": "abcd1234",
                 "scopes": doc.get("scopes", ["render"]),
                 "api_key": "vcp_abcd1234_secretvalue",
+                **state.get("extra_key_fields", {}),
             })
             return
         self._send_json(404, {"error": {"code": "not_found", "message": "Not found"}})
@@ -856,13 +857,97 @@ class CliCommandsTests(unittest.TestCase):
         self.assertEqual(code, 0, stderr)
         self.assertEqual(json.loads(stdout)["count"], 1)
 
+        self.httpd.state["extra_key_fields"] = {"signing_secret": "extra-raw-secret"}  # type: ignore[attr-defined]
+        try:
+            code, stdout, stderr = self._run([
+                "admin", "keys", "create", "proj_1", "--name", "ci", "--scope", "render", "--scope", "jobs",
+                "--server", self.server, "--admin-token", token, "--json",
+            ])
+        finally:
+            self.httpd.state.pop("extra_key_fields", None)  # type: ignore[attr-defined]
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn(token, stdout)
+        self.assertNotIn(token, stderr)
+        self.assertNotIn("extra-raw-secret", stdout)
+        self.assertNotIn("extra-raw-secret", stderr)
+        self.assertEqual(stderr, "")
+        self.assertEqual(stdout.count("vcp_abcd1234_secretvalue"), 1)
+        key_doc = json.loads(stdout)
+        self.assertEqual(key_doc["scopes"], ["render", "jobs"])
+        self.assertEqual(key_doc["prefix"], "abcd1234")
+        self.assertEqual(key_doc["api_key"], "vcp_abcd1234_secretvalue")
+        self.assertEqual(key_doc["signing_secret"], "***")
+        self.assertEqual(key_doc["warning"], "Save this key now, it will not be shown again.")
+
         code, stdout, stderr = self._run([
-            "admin", "keys", "create", "proj_1", "--name", "ci", "--scope", "render", "--scope", "jobs",
-            "--server", self.server, "--admin-token", token, "--json",
+            "admin", "keys", "create", "proj_1", "--name", "ci-plain", "--scope", "render",
+            "--server", self.server, "--admin-token", token,
         ])
         self.assertEqual(code, 0, stderr)
         self.assertNotIn(token, stdout)
-        self.assertEqual(json.loads(stdout)["scopes"], ["render", "jobs"])
+        self.assertNotIn(token, stderr)
+        self.assertEqual(stderr, "")
+        self.assertEqual(stdout.count("vcp_abcd1234_secretvalue"), 1)
+        self.assertIn("id: key_1", stdout)
+        self.assertIn("api_key: vcp_abcd1234_secretvalue", stdout)
+        self.assertIn("scopes: render", stdout)
+        self.assertIn("warning: Save this key now, it will not be shown again.", stdout)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plain_out = Path(tmp) / "nested" / "key.txt"
+            code, stdout, stderr = self._run([
+                "admin", "keys", "create", "proj_1", "--name", "ci-out", "--scope", "render",
+                "--out", str(plain_out), "--server", self.server, "--admin-token", token,
+            ])
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(stderr, "")
+            self.assertNotIn("vcp_abcd1234_secretvalue", stdout)
+            self.assertNotIn("secretvalue", stdout)
+            self.assertNotIn(token, stdout)
+            self.assertEqual(Path(stdout.strip()).resolve(), plain_out.resolve())
+            self.assertEqual(plain_out.read_text(encoding="utf-8").strip(), "vcp_abcd1234_secretvalue")
+            if os.name != "nt":
+                self.assertEqual(plain_out.stat().st_mode & 0o777, 0o600)
+
+            json_out = Path(tmp) / "key-json.txt"
+            code, stdout, stderr = self._run([
+                "admin", "keys", "create", "proj_1", "--name", "ci-out-json", "--scope", "render",
+                "--out", str(json_out), "--server", self.server, "--admin-token", token, "--json",
+            ])
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(stderr, "")
+            self.assertNotIn("vcp_abcd1234_secretvalue", stdout)
+            self.assertNotIn("secretvalue", stdout)
+            self.assertNotIn(token, stdout)
+            out_doc = json.loads(stdout)
+            self.assertEqual(out_doc["api_key"], "***")
+            self.assertEqual(Path(out_doc["key_file"]).resolve(), json_out.resolve())
+            self.assertEqual(out_doc["warning"], "Save this key now, it will not be shown again.")
+            self.assertEqual(json_out.read_text(encoding="utf-8").strip(), "vcp_abcd1234_secretvalue")
+            if os.name != "nt":
+                self.assertEqual(json_out.stat().st_mode & 0o777, 0o600)
+
+            before_requests = len(self.httpd.requests)  # type: ignore[attr-defined]
+            code, _stdout, stderr = self._run([
+                "admin", "keys", "create", "proj_1", "--out", "-",
+                "--server", self.server, "--admin-token", token,
+            ])
+            self.assertEqual(code, 2)
+            self.assertIn("--out", stderr)
+            code, _stdout, stderr = self._run([
+                "admin", "keys", "create", "proj_1", "--out", tmp,
+                "--server", self.server, "--admin-token", token,
+            ])
+            self.assertEqual(code, 2)
+            self.assertIn("directory", stderr)
+            blocker_file = Path(tmp) / "not-a-dir"
+            blocker_file.write_text("x", encoding="utf-8")
+            code, _stdout, _stderr = self._run([
+                "admin", "keys", "create", "proj_1", "--out", str(blocker_file / "key.txt"),
+                "--server", self.server, "--admin-token", token,
+            ])
+            self.assertEqual(code, 1)
+            self.assertEqual(len(self.httpd.requests), before_requests)  # type: ignore[attr-defined]
 
         code, stdout, stderr = self._run(["admin", "keys", "revoke", "key_1", "--server", self.server, "--admin-token", token, "--json"])
         self.assertEqual(code, 0, stderr)

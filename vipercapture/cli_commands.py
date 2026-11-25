@@ -22,6 +22,7 @@ import sys
 import time
 import zipfile
 from pathlib import Path
+from typing import TextIO
 from urllib.parse import quote, urlencode, urlsplit
 
 import launch
@@ -2275,6 +2276,49 @@ def cmd_verify(argv: list[str]) -> int:
 # ── admin ─────────────────────────────────────────────────────
 
 
+_ONE_TIME_KEY_WARNING = "Save this key now, it will not be shown again."
+
+
+def _write_one_time_key_reveal(stream: TextIO, text: str) -> None:
+    """Write a newly created API key once for the operator.
+
+    Kept separate from ``write_line`` so generic CLI output stays checked by
+    CodeQL while one-time key creation can display the unrecoverable key.
+    """
+    try:
+        stream.write(text + "\n")
+        stream.flush()
+    except UnicodeEncodeError:
+        buffer = getattr(stream, "buffer", None)
+        if buffer is None:
+            fallback = text.encode("utf-8", errors="replace").decode("ascii", "replace") + "\n"
+            stream.write(fallback)
+            stream.flush()
+            return
+        buffer.write((text + "\n").encode("utf-8"))
+        buffer.flush()
+
+
+def _open_restricted_temp_file(path: Path) -> tuple[int, Path]:
+    """Create a 0600 temporary file next to ``path`` before creating a key."""
+    directory = path.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.is_dir():
+        raise CaptureError(f"{path} is a directory.")
+    import tempfile
+
+    descriptor, name = tempfile.mkstemp(prefix=".vipercapture-key-", suffix=".part", dir=directory)
+    temporary = Path(name)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+    except Exception:
+        os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+        raise
+    return descriptor, temporary
+
+
 def _add_admin_flags(parser: argparse.ArgumentParser) -> None:
     _add_common_client_flags(parser, include_no_start=True, include_api_key=True)
     parser.add_argument(
@@ -2313,6 +2357,10 @@ def cmd_admin(argv: list[str]) -> int:
         action="append",
         choices=_ADMIN_SCOPES,
         help="Allowed scope (repeatable; defaults to all scopes).",
+    )
+    p_key_create.add_argument(
+        "--out",
+        help="Write the newly created API key to a 0600 file and print only the path.",
     )
     _add_admin_flags(p_key_create)
 
@@ -2389,26 +2437,74 @@ def cmd_admin(argv: list[str]) -> int:
             return 0
 
         if args.section == "keys" and args.key_action == "create":
-            scopes = list(dict.fromkeys(args.scopes)) if args.scopes else list(_ADMIN_SCOPES)
-            encoded = quote(args.project_id.strip(), safe="")
-            resp = open_response(
-                root + f"/v1/admin/projects/{encoded}/keys",
-                method="POST",
-                payload={"name": args.name, "scopes": scopes},
-                headers=_auth_headers(args, started_server=started, content_type="application/json", token_override=token),
-                timeout=30.0,
-            )
+            out_path: Path | None = None
+            temp_fd: int | None = None
+            temp_path: Path | None = None
+            if args.out is not None:
+                if not args.out.strip() or args.out.strip() == "-":
+                    return fail("--out must be a file path.", exit_code=2)
+                out_path = Path(args.out).expanduser()
+                if out_path.exists() and out_path.is_dir():
+                    return fail(f"--out path is a directory: {out_path}", exit_code=2)
+                temp_fd, temp_path = _open_restricted_temp_file(out_path)
             try:
-                doc = _read_json(resp)
+                scopes = list(dict.fromkeys(args.scopes)) if args.scopes else list(_ADMIN_SCOPES)
+                encoded = quote(args.project_id.strip(), safe="")
+                resp = open_response(
+                    root + f"/v1/admin/projects/{encoded}/keys",
+                    method="POST",
+                    payload={"name": args.name, "scopes": scopes},
+                    headers=_auth_headers(args, started_server=started, content_type="application/json", token_override=token),
+                    timeout=30.0,
+                )
+                try:
+                    doc = _read_json(resp)
+                finally:
+                    resp.close()
+                safe_doc = public_payload(doc)
+                created_value = next((val for key, val in doc.items() if key == "api_key"), None)
+                if out_path is not None:
+                    assert temp_fd is not None and temp_path is not None
+                    if not isinstance(created_value, str) or not created_value:
+                        return fail("Server response did not include an API key.", exit_code=1)
+                    fd_to_write = temp_fd
+                    temp_fd = None
+                    with os.fdopen(fd_to_write, "wb") as handle:
+                        handle.write((created_value + "\n").encode("utf-8"))
+                    os.replace(temp_path, out_path)
+                    temp_path = None
+                    shown_path = display_path(out_path)
+                    if args.json:
+                        _emit_json({
+                            "ok": True,
+                            **safe_doc,
+                            "key_file": shown_path,
+                            "warning": _ONE_TIME_KEY_WARNING,
+                        })
+                    else:
+                        write_line(sys.stdout, shown_path)
+                else:
+                    reveal_doc = dict(safe_doc)
+                    if created_value is not None:
+                        reveal_doc["api_key"] = created_value
+                    reveal_doc["warning"] = _ONE_TIME_KEY_WARNING
+                    if args.json:
+                        _write_one_time_key_reveal(
+                            sys.stdout,
+                            json.dumps({"ok": True, **reveal_doc}, ensure_ascii=False, indent=2),
+                        )
+                    else:
+                        lines = [
+                            f"{field}: {', '.join(reveal_doc.get('scopes', [])) if field == 'scopes' else reveal_doc.get(field)}"
+                            for field in ("id", "api_key", "scopes", "warning")
+                        ]
+                        _write_one_time_key_reveal(sys.stdout, "\n".join(lines))
+                return 0
             finally:
-                resp.close()
-            if args.json:
-                _emit_json({"ok": True, **doc})
-            else:
-                write_line(sys.stdout, f"id: {doc.get('id')}")
-                write_line(sys.stdout, f"api_key: {doc.get('api_key')}")
-                write_line(sys.stdout, f"scopes: {', '.join(doc.get('scopes', []))}")
-            return 0
+                if temp_fd is not None:
+                    os.close(temp_fd)
+                if temp_path is not None:
+                    temp_path.unlink(missing_ok=True)
 
         if args.section == "keys" and args.key_action == "revoke":
             encoded = quote(args.key_id.strip(), safe="")
