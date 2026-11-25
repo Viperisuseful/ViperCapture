@@ -2992,3 +2992,117 @@ class GuiCouncilHardeningTests(TestCase):
             headers = {"X-ViperCapture-Render-Ms": "nan", "X-ViperCapture-Encode-Ms": "42"}
 
         self.assertEqual(gui._response_encode_ms(_NanTimingResp()), 42)
+
+    def test_round12_history_lock_timeout_persist_failure_redirects_slow_drip_and_subms_render(self) -> None:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import tempfile as _tempfile
+        import threading as _threading
+        import time as _time
+
+        # 1. History persistence failure (e.g. parent is a file / lock timeout) returns None
+        #    and _start_capture preserves existing session url_history in memory
+        with _tempfile.TemporaryDirectory() as tmp:
+            blocker = Path(tmp) / "not-a-dir"
+            blocker.write_text("x", encoding="utf-8")
+            self.assertIsNone(gui.save_url_history(("https://new.example",), blocker / "gui_history.json"))
+
+        box: dict[str, gui.GuiState] = {}
+        st_in = gui.GuiState(
+            url="https://new.example",
+            url_history=("https://older.example",),
+        )
+        st_out = gui.GuiState(
+            url="https://new.example",
+            saved="/tmp/shot.png",
+            url_history=("https://new.example", "https://older.example"),
+        )
+        with (
+            mock.patch.object(gui, "perform_capture", return_value=st_out),
+            mock.patch.object(gui, "save_url_history", return_value=None),
+        ):
+            t_cap = gui._start_capture(
+                st_in,
+                Path("."),
+                gui.CancelFlag(),
+                box,
+                started_server=False,
+            )
+            t_cap.join(timeout=2.0)
+        self.assertEqual(box["state"].url_history, ("https://new.example", "https://older.example"))
+
+        # 2. GET /app-config follows 308 redirect; POST /local/presets 307 returns error (not success);
+        #    slow-drip 503 error body respects total wall-clock timeout
+        class _R12Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == "/app-config":
+                    self.send_response(308)
+                    self.send_header("Location", "/real-config")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if self.path == "/real-config":
+                    body = json.dumps({"presets": True, "output_formats": ["png"]}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                if self.path == "/slow-503":
+                    self.send_response(503)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", "12")
+                    self.end_headers()
+                    for _ in range(12):
+                        try:
+                            self.wfile.write(b"x")
+                            self.wfile.flush()
+                            _time.sleep(0.06)
+                        except OSError:
+                            break
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(length)
+                self.send_response(307)
+                self.send_header("Location", "/other")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _R12Handler)
+        t_srv = _threading.Thread(target=srv.serve_forever, daemon=True)
+        t_srv.start()
+        try:
+            port = srv.server_address[1]
+            cfg = gui.fetch_app_config(f"http://127.0.0.1:{port}", timeout=2.0)
+            self.assertIsNotNone(cfg)
+            self.assertEqual(cfg.get("output_formats"), ["png"])  # type: ignore[union-attr]
+
+            _presets, err = gui.save_preset_remote(
+                f"http://127.0.0.1:{port}",
+                "demo",
+                {"output": "png"},
+                timeout=2.0,
+            )
+            self.assertTrue(err)
+
+            t0 = _time.monotonic()
+            st_code, _doc, _err = gui._json_request(f"http://127.0.0.1:{port}/slow-503", timeout=0.25)
+            elapsed = _time.monotonic() - t0
+            self.assertEqual(st_code, 503)
+            self.assertLess(elapsed, 0.55)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+        # 3. Sub-millisecond Render-Ms (0.5 / 0.9) falls back to Encode-Ms instead of returning 0
+        class _SubMsResp:
+            headers = {"X-ViperCapture-Render-Ms": "0.5", "X-ViperCapture-Encode-Ms": "25"}
+
+        self.assertEqual(gui._response_encode_ms(_SubMsResp()), 25)

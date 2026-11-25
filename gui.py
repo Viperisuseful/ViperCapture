@@ -1559,7 +1559,7 @@ def _url_history_lock(target: Path) -> Iterator[None]:
             if handle.tell() == 0:
                 handle.write(b"0")
                 handle.flush()
-            deadline = time.monotonic() + 2.0
+            deadline = time.monotonic() + 5.0
             while True:
                 handle.seek(0)
                 try:
@@ -1568,7 +1568,7 @@ def _url_history_lock(target: Path) -> Iterator[None]:
                     break
                 except OSError:
                     if time.monotonic() >= deadline:
-                        break
+                        raise TimeoutError("Timed out acquiring URL history lock.")
                     time.sleep(0.01)
         else:
             import fcntl
@@ -1598,7 +1598,7 @@ def save_url_history(
     path: Path | None = None,
     *,
     limit: int = HISTORY_LIMIT,
-) -> tuple[str, ...]:
+) -> tuple[str, ...] | None:
     target = history_file_path() if path is None else path
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1635,7 +1635,7 @@ def save_url_history(
                 raise
             return tuple(items)
     except OSError:
-        return tuple(urls)[:limit]
+        return None
 
 
 def _no_window_kwargs() -> dict[str, object]:
@@ -1990,6 +1990,31 @@ def _safe_read_error_body(exc: urllib.error.HTTPError, limit: int = 64 * 1024) -
         return b""
 
 
+def _read_with_deadline(response: object, limit: int, deadline: float, *, chunk_size: int = 16 * 1024) -> bytes:
+    """Read up to ``limit`` bytes from ``response`` without exceeding ``deadline``."""
+    chunks: list[bytes] = []
+    total = 0
+    conn = getattr(response, "_connection", None)
+    sock = getattr(conn, "sock", None) if conn is not None else None
+    read_fn = getattr(response, "read1", None) or getattr(response, "read")
+    while total < limit:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Timed out reading response body.")
+        if sock is not None and hasattr(sock, "settimeout"):
+            try:
+                sock.settimeout(remaining)
+            except OSError:
+                pass
+        want = min(chunk_size, limit - total)
+        piece = read_fn(want)
+        if not piece:
+            break
+        chunks.append(piece)
+        total += len(piece)
+    return b"".join(chunks)
+
+
 def _json_request(
     url: str,
     *,
@@ -2004,39 +2029,63 @@ def _json_request(
         headers["Content-Type"] = "application/json"
         data = json.dumps(payload).encode("utf-8")
     try:
-        normalized_url = _normalize_http_url(url)
+        current_url = _normalize_http_url(url)
     except ValueError as exc:
         return 0, None, str(exc) or "Invalid server URL."
-    req = urllib.request.Request(normalized_url, data=data, headers=headers, method=method)
-    try:
-        cm = (
-            _open_capture(req, timeout, None)
-            if opener is None
-            else opener(req, timeout=timeout)  # type: ignore[operator]
-        )
-        with cm as response:
-            status = getattr(response, "status", None)
-            if status is None:
-                status = getattr(response, "code", 200)
-            if status >= 400:
-                try:
-                    raw = response.read(64 * 1024)
-                except (TimeoutError, OSError, http.client.HTTPException):
-                    raw = b""
-                return status, None, error_text(status, raw)
-            body = response.read(4 * 1024 * 1024)
-    except urllib.error.HTTPError as exc:
-        raw = _safe_read_error_body(exc, 64 * 1024)
-        return exc.code, None, error_text(exc.code, raw)
-    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, UnicodeError, ValueError) as exc:
-        return 0, None, str(exc) or "Could not reach server."
+    deadline = time.monotonic() + max(0.05, float(timeout))
+    max_redirects = 5
+    status = 0
+    body = b""
+    for _hop in range(max_redirects + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return 0, None, "Request timed out."
+        req = urllib.request.Request(current_url, data=data, headers=headers, method=method)
+        try:
+            cm = (
+                _open_capture(req, remaining, None)
+                if opener is None
+                else opener(req, timeout=remaining)  # type: ignore[operator]
+            )
+            with cm as response:
+                status = getattr(response, "status", None)
+                if status is None:
+                    status = getattr(response, "code", 200)
+                if status in {301, 302, 303, 307, 308}:
+                    location = _response_header(response, "Location")
+                    if method.upper() == "GET" and location and _hop < max_redirects:
+                        next_url = urllib.parse.urljoin(current_url, location.strip())
+                        parsed_next = urllib.parse.urlsplit(next_url)
+                        if parsed_next.scheme.lower() in {"http", "https"} and parsed_next.hostname:
+                            current_url = _normalize_http_url(next_url)
+                            continue
+                    try:
+                        raw = _read_with_deadline(response, 64 * 1024, deadline, chunk_size=4096)
+                    except (TimeoutError, OSError, http.client.HTTPException):
+                        raw = b""
+                    return status, None, error_text(status, raw)
+                if not (200 <= status < 300):
+                    try:
+                        raw = _read_with_deadline(response, 64 * 1024, deadline, chunk_size=4096)
+                    except (TimeoutError, OSError, http.client.HTTPException):
+                        raw = b""
+                    return status, None, error_text(status, raw)
+                body = _read_with_deadline(response, 4 * 1024 * 1024, deadline, chunk_size=64 * 1024)
+                break
+        except urllib.error.HTTPError as exc:
+            raw = _safe_read_error_body(exc, 64 * 1024)
+            return exc.code, None, error_text(exc.code, raw)
+        except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, UnicodeError, ValueError) as exc:
+            return 0, None, str(exc) or "Could not reach server."
+    else:
+        return status, None, "Too many redirects."
     try:
         parsed = json.loads(body.decode("utf-8")) if body else {}
     except (UnicodeDecodeError, json.JSONDecodeError):
         return status, None, "Server returned invalid JSON."
     if not isinstance(parsed, dict):
         return status, None, "Server returned unexpected JSON."
-    if status >= 400:
+    if not (200 <= status < 300):
         return status, parsed, error_text(status, body)
     return status, parsed, ""
 
@@ -3289,7 +3338,9 @@ def _response_encode_ms(response: object) -> int:
             try:
                 parsed = float(raw.strip())
                 if math.isfinite(parsed) and parsed > 0:
-                    return int(parsed)
+                    ms = int(parsed)
+                    if ms > 0:
+                        return ms
             except (ValueError, OverflowError):
                 pass
     return 0
@@ -3497,6 +3548,9 @@ class _CaptureResponse:
 
     def read(self, size: int) -> bytes:
         return self._response.read(size)
+
+    def read1(self, size: int = -1) -> bytes:
+        return self._response.read1(size)
 
     def close(self) -> None:
         try:
@@ -4335,7 +4389,7 @@ def _start_capture(
             )
             if result.saved and result.url_history:
                 merged_history = save_url_history((result.url_history[0],))
-                if merged_history:
+                if merged_history is not None:
                     result = _replace(result, url_history=merged_history)
             box["state"] = result
         except Exception as exc:

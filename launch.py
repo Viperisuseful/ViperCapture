@@ -3411,7 +3411,7 @@ def parse_cli(argv: list[str] | None = None) -> CliArgs:
 
         def _is_gui_flag_token(tok: str) -> bool:
             low = tok.lower()
-            return low in gui_flags or low.startswith(("--output-dir=", "--server=", "--preset=", "--url="))
+            return low in gui_flags or low.startswith("--")
 
         if arg == "--output-dir" or arg.startswith("--output-dir="):
             if arg.startswith("--output-dir="):

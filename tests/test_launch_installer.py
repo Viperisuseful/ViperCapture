@@ -2670,6 +2670,9 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
             ["--gui", "--server", "--preset", "default"],
             ["--gui", "--preset", "--url=https://example.com"],
             ["--gui", "--output-dir", "--server=https://api.example"],
+            ["--gui", "--output-dir", "--unknown"],
+            ["--gui", "--preset", "--unknown"],
+            ["--gui", "--url", "--unknown"],
         ):
             with self.subTest(argv=argv):
                 with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit) as ctx:
