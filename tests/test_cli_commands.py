@@ -2203,6 +2203,36 @@ class CliCouncilHardeningTests(unittest.TestCase):
             with self.subTest(payload=bad_payload), self.assertRaises(ValueError):
                 capture_cli._validate_payload_fallback(bad_payload)
 
+        # 5. Exact Pydantic v2 parity for bool/int coercion, cross-field rules, and single-page PDF page_ranges
+        for ok_payload in (
+            {"url": "https://example.invalid", "output": "jpeg", "image": {"transparent_background": 0.0}},
+            {"url": "https://example.invalid", "output": "png", "full_page": 1.0},
+            {"url": "https://example.invalid", "output": "png", "full_page": b"true"},
+            {"url": "https://example.invalid", "output": "png", "wait_for": {"delay_ms": True, "timeout_ms": True}},
+            {"url": "https://example.invalid", "output": "png", "wait_for": {"delay_ms": 15000.0}},
+        ):
+            with self.subTest(ok_payload=ok_payload):
+                capture_cli._validate_payload_fallback(ok_payload)
+
+        for parity_bad in (
+            {"url": "https://example.invalid", "output": "png", "full_page": " false "},
+            {"url": "https://example.invalid", "output": "webm", "cache": "yes"},
+            {"url": "https://example.invalid", "output": "webm", "cache": 1},
+            {"url": "https://example.invalid", "output": "png", "cache": "false", "cache_key": "abc"},
+            {"url": "https://example.invalid", "output": "png", "preserve_viewport_width": "true", "full_page": "false"},
+            {"url": "https://example.invalid", "output": "webm", "preserve_viewport_width": 1},
+            {"url": "https://example.invalid", "output": "png", "save_profile": 1},
+            {"url": "https://example.invalid", "output": "png", "include_shadow_dom": "yes"},
+            {"url": "https://example.invalid", "output": "png", "full_page": "true", "selector": "h1"},
+            {"url": "https://example.invalid", "output": "png", "full_page": "false", "slices": {"height": 200}},
+            {"url": "https://example.invalid", "output": "png", "proceed_on_captcha": "yes", "captcha": {"action": "external"}},
+            {"url": "https://example.invalid", "output": "png", "cache": "true", "profile_id": "abc"},
+            {"url": "https://example.invalid", "output": "pdf", "pdf": {"mode": "single_page", "page_ranges": "1-2"}},
+            {"url": "https://example.invalid", "output": "png", "wait_for": {"delay_ms": 15001.0}},
+        ):
+            with self.subTest(parity_bad=parity_bad), self.assertRaises(ValueError):
+                capture_cli._validate_payload_fallback(parity_bad)
+
 
 if __name__ == "__main__":
     unittest.main()

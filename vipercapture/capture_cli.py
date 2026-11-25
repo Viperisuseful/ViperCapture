@@ -2268,15 +2268,42 @@ def _parse_contract_bool(value: object, field: str) -> bool:
     """Validate and coerce a boolean matching Pydantic v2 non-strict bool semantics."""
     if isinstance(value, bool):
         return value
-    if type(value) is int and value in {0, 1}:
+    if type(value) in {int, float} and value in {0, 1}:
         return bool(value)
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"{field} must be a boolean.") from exc
     if isinstance(value, str):
-        lowered = value.strip().lower()
+        lowered = value.lower()
         if lowered in _TRUE or lowered in {"t", "y"}:
             return True
         if lowered in _FALSE or lowered in {"f", "n"}:
             return False
     raise ValueError(f"{field} must be a boolean.")
+
+
+def _parse_contract_int(value: object, field: str, lo: int, hi: int) -> int:
+    """Validate and coerce an integer matching Pydantic v2 non-strict int semantics."""
+    if isinstance(value, bool):
+        parsed = int(value)
+    elif type(value) is int:
+        parsed = value
+    elif type(value) is float:
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError(f"{field} must be an integer between {lo} and {hi}.")
+        parsed = int(value)
+    elif isinstance(value, str):
+        stripped = value.strip()
+        if not stripped or len(stripped) > 32 or not re.fullmatch(r"[+-]?[0-9]+", stripped):
+            raise ValueError(f"{field} must be an integer between {lo} and {hi}.")
+        parsed = int(stripped)
+    else:
+        raise ValueError(f"{field} must be an integer between {lo} and {hi}.")
+    if parsed < lo or parsed > hi:
+        raise ValueError(f"{field} must be an integer between {lo} and {hi}.")
+    return parsed
 
 
 def _validate_payload_fallback(payload: dict[str, object]) -> None:
@@ -2312,9 +2339,10 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
         eng = payload["engine"]
         if not isinstance(eng, str) or eng not in _ENGINES:
             raise ValueError(f"engine must be one of: {', '.join(_ENGINES)}")
+    coerced_bools: dict[str, bool] = {}
     for bool_key in _FALLBACK_BOOL_FIELDS:
         if bool_key in payload:
-            _parse_contract_bool(payload[bool_key], bool_key)
+            coerced_bools[bool_key] = _parse_contract_bool(payload[bool_key], bool_key)
     if "lazy_load" in payload and (not isinstance(payload["lazy_load"], str) or payload["lazy_load"] not in _LAZY):
         raise ValueError(f"lazy_load must be one of: {', '.join(_LAZY)}")
     if "profile" in payload and (not isinstance(payload["profile"], str) or payload["profile"] not in _PROFILES):
@@ -2325,8 +2353,8 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
         vp = payload["viewport"]
         assert isinstance(vp, dict)
         for dim in ("width", "height"):
-            if dim in vp and (not _is_int(vp[dim]) or vp[dim] < 1 or vp[dim] > 65_535):  # type: ignore[operator]
-                raise ValueError(f"viewport.{dim} must be an integer between 1 and 65535.")
+            if dim in vp:
+                _parse_contract_int(vp[dim], f"viewport.{dim}", 1, 65_535)
         if "device_scale_factor" in vp and (
             not _is_number(vp["device_scale_factor"])
             or not math.isfinite(float(vp["device_scale_factor"]))  # type: ignore[arg-type]
@@ -2336,24 +2364,74 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
             raise ValueError("viewport.device_scale_factor must be between 0.1 and 8.")
     output_fmt = str(payload.get("output") or "png")
     engine_name = str(payload.get("engine") or "chromium")
-    full_page_val = _parse_contract_bool(payload["full_page"], "full_page") if "full_page" in payload else True
+    full_page_val = coerced_bools.get("full_page", True)
+    preserve_vp_width = coerced_bools.get("preserve_viewport_width", False)
+    save_profile_val = coerced_bools.get("save_profile", False)
+    cache_val = coerced_bools.get("cache", False)
+    include_shadow_dom_val = coerced_bools.get("include_shadow_dom", False)
+    proceed_on_captcha_val = coerced_bools.get("proceed_on_captcha", False)
     is_image_fmt = output_fmt in {"png", "jpeg", "webp", "avif"}
     is_video_fmt = output_fmt in {"webm", "mp4", "gif"}
+    document_outputs = {"html", "markdown"}
+    side_outputs_raw = payload.get("side_outputs") or []
+    side_outputs_set = {str(item) for item in side_outputs_raw} if isinstance(side_outputs_raw, list) else set()
+    diag = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), dict) else {}
+    diag_bundle = _parse_contract_bool(diag["bundle"], "diagnostics.bundle") if "bundle" in diag else False
+    diag_har = _parse_contract_bool(diag["include_har"], "diagnostics.include_har") if "include_har" in diag else False
+    diag_trace = _parse_contract_bool(diag["include_trace"], "diagnostics.include_trace") if "include_trace" in diag else False
+    diag_warc = _parse_contract_bool(diag["include_warc"], "diagnostics.include_warc") if "include_warc" in diag else False
+    if (diag_har or diag_trace or diag_warc) and not diag_bundle:
+        raise ValueError("HAR, trace, and WARC require diagnostics.bundle=true.")
+    if preserve_vp_width:
+        if not full_page_val:
+            raise ValueError("preserve_viewport_width requires full_page=true.")
+        if not is_image_fmt:
+            raise ValueError("preserve_viewport_width requires an image output.")
+    if save_profile_val and payload.get("profile_id") is None:
+        raise ValueError("save_profile requires profile_id.")
+    if cache_val:
+        if not is_image_fmt or payload.get("viewports") is not None:
+            raise ValueError("cache is accepted only for a single PNG, JPEG, WebP, or AVIF output.")
+        if diag_bundle:
+            raise ValueError("cache cannot be combined with a diagnostic bundle.")
+        if payload.get("profile_id") is not None:
+            raise ValueError("cache cannot be combined with a persistent profile.")
+    if payload.get("cache_key") is not None and not cache_val:
+        raise ValueError("cache_key requires cache=true.")
+    if include_shadow_dom_val and output_fmt not in document_outputs and not side_outputs_set.intersection(document_outputs):
+        raise ValueError("include_shadow_dom requires HTML or Markdown output.")
+    if proceed_on_captcha_val:
+        cap = payload.get("captcha")
+        if isinstance(cap, dict) and cap.get("action") == "external":
+            raise ValueError("proceed_on_captcha cannot be combined with captcha.action=external.")
+    if payload.get("selector") is not None and (full_page_val or not is_image_fmt):
+        raise ValueError("selector requires full_page=false and an image output.")
+    if payload.get("clip") is not None and payload.get("selector") is not None:
+        raise ValueError("clip and selector are mutually exclusive.")
+    if payload.get("viewports") is not None:
+        if not is_image_fmt:
+            raise ValueError("viewports requires PNG, JPEG, WebP, or AVIF output.")
+        if full_page_val:
+            raise ValueError("viewports requires full_page=false.")
+        if payload.get("selector") is not None or payload.get("clip") is not None:
+            raise ValueError("viewports cannot be combined with selector or clip.")
+    if payload.get("slices") is not None and (not is_image_fmt or not full_page_val or payload.get("viewports") is not None):
+        raise ValueError("slices require a single full-page image output.")
     if "video" in payload and payload["video"] is not None:
         vid = payload["video"]
         assert isinstance(vid, dict)
         if not is_video_fmt:
             raise ValueError("video settings require WebM, MP4, or GIF output.")
-        if "duration_ms" in vid and (not _is_int(vid["duration_ms"]) or vid["duration_ms"] < 1_000 or vid["duration_ms"] > 30_000):  # type: ignore[operator]
-            raise ValueError("video.duration_ms must be an integer between 1000 and 30000.")
-        if "fps" in vid and (not _is_int(vid["fps"]) or vid["fps"] < 1 or vid["fps"] > 60):  # type: ignore[operator]
-            raise ValueError("video.fps must be an integer between 1 and 60.")
-        if "bitrate_mbps" in vid and (not _is_int(vid["bitrate_mbps"]) or vid["bitrate_mbps"] < 1 or vid["bitrate_mbps"] > 100):  # type: ignore[operator]
-            raise ValueError("video.bitrate_mbps must be an integer between 1 and 100.")
-        if "scroll_step" in vid and (not _is_int(vid["scroll_step"]) or vid["scroll_step"] < 1 or vid["scroll_step"] > 4_320):  # type: ignore[operator]
-            raise ValueError("video.scroll_step must be an integer between 1 and 4320.")
-        if "scroll_delay_ms" in vid and (not _is_int(vid["scroll_delay_ms"]) or vid["scroll_delay_ms"] < 50 or vid["scroll_delay_ms"] > 2_000):  # type: ignore[operator]
-            raise ValueError("video.scroll_delay_ms must be an integer between 50 and 2000.")
+        if "duration_ms" in vid:
+            _parse_contract_int(vid["duration_ms"], "video.duration_ms", 1_000, 30_000)
+        if "fps" in vid:
+            _parse_contract_int(vid["fps"], "video.fps", 1, 60)
+        if "bitrate_mbps" in vid:
+            _parse_contract_int(vid["bitrate_mbps"], "video.bitrate_mbps", 1, 100)
+        if "scroll_step" in vid:
+            _parse_contract_int(vid["scroll_step"], "video.scroll_step", 1, 4_320)
+        if "scroll_delay_ms" in vid:
+            _parse_contract_int(vid["scroll_delay_ms"], "video.scroll_delay_ms", 50, 2_000)
         if "scroll" in vid:
             _parse_contract_bool(vid["scroll"], "video.scroll")
         vid_transparent = (
@@ -2370,13 +2448,12 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
         img = payload["image"]
         assert isinstance(img, dict)
         if "quality" in img and img["quality"] is not None:
-            if not _is_int(img["quality"]) or img["quality"] < 1 or img["quality"] > 100:  # type: ignore[operator]
-                raise ValueError("image.quality must be an integer between 1 and 100.")
+            _parse_contract_int(img["quality"], "image.quality", 1, 100)
             if output_fmt not in {"jpeg", "webp", "avif"}:
                 raise ValueError("quality is accepted only for JPEG, WebP, or AVIF.")
         for dim in ("width", "height"):
-            if dim in img and img[dim] is not None and (not _is_int(img[dim]) or img[dim] < 1 or img[dim] > 65_535):  # type: ignore[operator]
-                raise ValueError(f"image.{dim} must be an integer between 1 and 65535.")
+            if dim in img and img[dim] is not None:
+                _parse_contract_int(img[dim], f"image.{dim}", 1, 65_535)
         if img.get("width") is not None or img.get("height") is not None:
             if not is_image_fmt or payload.get("viewports") is not None or payload.get("slices") is not None:
                 raise ValueError("image width and height require a single image output.")
@@ -2397,8 +2474,13 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
                 raise ValueError("optimize_for_speed is accepted only for PNG or WebP.")
             if engine_name != "chromium":
                 raise ValueError("optimize_for_speed requires the Chromium engine.")
-    if payload.get("pdf") is not None and output_fmt != "pdf":
-        raise ValueError("pdf settings require PDF output.")
+    if payload.get("pdf") is not None:
+        if output_fmt != "pdf":
+            raise ValueError("pdf settings require PDF output.")
+        pdf_cfg = payload["pdf"]
+        assert isinstance(pdf_cfg, dict)
+        if pdf_cfg.get("mode") == "single_page" and pdf_cfg.get("page_ranges"):
+            raise ValueError("single-page PDF cannot use page_ranges.")
     if output_fmt == "pdf" and engine_name != "chromium":
         raise ValueError("PDF output requires the Chromium engine.")
     if "clip" in payload and payload["clip"] is not None:
@@ -2436,10 +2518,10 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
             raise ValueError("wait_for.event is invalid.")
         if "selector_state" in wf and (not isinstance(wf["selector_state"], str) or wf["selector_state"] not in _WAIT_STATES):
             raise ValueError("wait_for.selector_state is invalid.")
-        if "delay_ms" in wf and (not _is_int(wf["delay_ms"]) or wf["delay_ms"] < 0 or wf["delay_ms"] > 15_000):  # type: ignore[operator]
-            raise ValueError("wait_for.delay_ms must be an integer between 0 and 15000.")
-        if "timeout_ms" in wf and (not _is_int(wf["timeout_ms"]) or wf["timeout_ms"] < 1 or wf["timeout_ms"] > 30_000):  # type: ignore[operator]
-            raise ValueError("wait_for.timeout_ms must be an integer between 1 and 30000.")
+        if "delay_ms" in wf:
+            _parse_contract_int(wf["delay_ms"], "wait_for.delay_ms", 0, 15_000)
+        if "timeout_ms" in wf:
+            _parse_contract_int(wf["timeout_ms"], "wait_for.timeout_ms", 1, 30_000)
     if "actions" in payload:
         acts = payload["actions"]
         assert isinstance(acts, list)
