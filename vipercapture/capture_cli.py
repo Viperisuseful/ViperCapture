@@ -25,7 +25,6 @@ import string
 import subprocess
 import sys
 import time
-import unicodedata
 from collections import deque
 from http.cookies import CookieError, SimpleCookie
 from pathlib import Path
@@ -2336,112 +2335,27 @@ _CONTRACT_RUST_WS = (
     "\t\n\x0b\x0c\r \x85\xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005"
     "\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
 )
-_CONTRACT_IDNA_IGNORED = frozenset({
-    0xAD, 0x34F, 0x180B, 0x180C, 0x180D, 0x180F, 0x200B, 0x2060, 0x2064,
-    *range(0xFE00, 0xFE10), 0xFEFF,
-})
 _CONTRACT_IDNA_DOTS = ("\u3002", "\uff0e", "\uff61")
-_CONTRACT_IDNA_FORBIDDEN_CATS = frozenset({"Cc", "Cs", "Co", "Cn", "Zl", "Zp", "Zs"})
-_CONTRACT_IDNA_EXTRA_DISALLOWED = (
-    (0x4C0, 0x4C0), (0x10A0, 0x10C5), (0x115F, 0x1160), (0x17B4, 0x17B5),
-    (0x1806, 0x1806), (0x2024, 0x2026), (0x2132, 0x2132), (0x2135, 0x2138),
-    (0x2183, 0x2183), (0x2488, 0x249B), (0x2FF0, 0x2FFB), (0x3164, 0x3164),
-    (0x33C2, 0x33C2), (0x33C7, 0x33C7), (0x33D8, 0x33D8), (0xFE12, 0xFE12),
-    (0xFE19, 0xFE19), (0xFE30, 0xFE30), (0xFE52, 0xFE52), (0xFFA0, 0xFFA0),
-    (0xFFFC, 0xFFFD),
-)
-_CONTRACT_BIDI_RTL_ALLOWED = frozenset({"R", "AL", "AN", "EN", "ES", "CS", "ET", "ON", "BN", "NSM"})
-_CONTRACT_BIDI_RTL_END = frozenset({"R", "AL", "EN", "AN"})
 
 
-def _is_idna_disallowed_char(ch: str) -> bool:
-    cp = ord(ch)
-    cat = unicodedata.category(ch)
-    if cat in _CONTRACT_IDNA_FORBIDDEN_CATS:
-        return True
-    if any(lo <= cp <= hi for lo, hi in _CONTRACT_IDNA_EXTRA_DISALLOWED):
-        return True
-    nfkc = unicodedata.normalize("NFKC", ch)
-    return any(
-        c.isspace() or ord(c) <= 0x20 or ord(c) == 0x7F or c in _CONTRACT_FORBIDDEN_HOST_CHARS
-        for c in nfkc
-    )
-
-
-def _is_valid_zwnj_context(target: str, idx: int) -> bool:
-    if idx > 0 and unicodedata.combining(target[idx - 1]) == 9:
-        return True
-    # RFC 5892 CONTEXTJ A.1: joining-type Left/Dual before and Right/Dual after (e.g. Arabic/Persian)
-    def _is_joining_letter(c: str) -> bool:
-        cp = ord(c)
-        return (
-            (0x0620 <= cp <= 0x064A)
-            or (0x066E <= cp <= 0x06D5)
-            or (0x06EE <= cp <= 0x06FF)
-            or (0x0710 <= cp <= 0x072F)
-            or (0x0750 <= cp <= 0x077F)
-            or (0x08A0 <= cp <= 0x08FF)
-        )
-    before = idx - 1
-    while before >= 0 and unicodedata.category(target[before]) == "Mn":
-        before -= 1
-    after = idx + 1
-    while after < len(target) and unicodedata.category(target[after]) == "Mn":
-        after += 1
-    return before >= 0 and after < len(target) and _is_joining_letter(target[before]) and _is_joining_letter(target[after])
-
-
-def _validate_idna_label(label: str, field: str) -> None:
-    if not label:
+def _validate_punycode_label_syntax(label: str, field: str) -> None:
+    """Check basic RFC 3492 punycode syntax on xn-- labels without emulating full UTS-46 tables."""
+    if not label.lower().startswith("xn--"):
         return
-    is_alabel = label.lower().startswith("xn--")
-    if is_alabel:
-        raw_puny = label[4:]
-        if not raw_puny or not raw_puny.isascii():
-            raise ValueError(f"{field} has an invalid punycode host label.")
-        try:
-            decoded = raw_puny.encode("ascii").decode("punycode")
-            reencoded = decoded.encode("punycode").decode("ascii")
-        except UnicodeError as exc:
-            raise ValueError(f"{field} has an invalid punycode host label.") from exc
-        if (
-            decoded.isascii()
-            or reencoded.lower() != raw_puny.lower()
-            or unicodedata.normalize("NFC", decoded) != decoded
-            or any(ch.isupper() or unicodedata.category(ch) == "Lt" or ord(ch) in _CONTRACT_IDNA_IGNORED for ch in decoded)
-        ):
-            raise ValueError(f"{field} has an invalid punycode host label.")
-        target = decoded
-    elif not label.isascii():
-        target = unicodedata.normalize("NFC", label)
-    else:
-        return
-    if not target or unicodedata.category(target[0]).startswith("M"):
-        raise ValueError(f"{field} has an invalid international domain name.")
-    for idx, ch in enumerate(target):
-        if unicodedata.category(ch) == "Cf":
-            if ch == "\u200c":
-                if not _is_valid_zwnj_context(target, idx):
-                    raise ValueError(f"{field} has an invalid ZWNJ context.")
-                continue
-            if ch == "\u200d":
-                if idx == 0 or unicodedata.combining(target[idx - 1]) != 9:
-                    raise ValueError(f"{field} has an invalid ZWJ context.")
-                continue
-            raise ValueError(f"{field} has an invalid international domain name.")
-        if _is_idna_disallowed_char(ch):
-            raise ValueError(f"{field} has an invalid international domain name.")
-    bidis = [unicodedata.bidirectional(ch) for ch in target]
-    if any(b in {"R", "AL", "AN"} for b in bidis):
-        if bidis[0] not in {"R", "AL"}:
-            raise ValueError(f"{field} violates IDNA bidirectional rules.")
-        if any(b not in _CONTRACT_BIDI_RTL_ALLOWED for b in bidis):
-            raise ValueError(f"{field} violates IDNA bidirectional rules.")
-        last_non_nsm = next((b for b in reversed(bidis) if b != "NSM"), None)
-        if last_non_nsm not in _CONTRACT_BIDI_RTL_END:
-            raise ValueError(f"{field} violates IDNA bidirectional rules.")
-        if "EN" in bidis and "AN" in bidis:
-            raise ValueError(f"{field} violates IDNA bidirectional rules.")
+    raw_puny = label[4:]
+    if not raw_puny or not raw_puny.isascii():
+        raise ValueError(f"{field} has an invalid punycode host label.")
+    try:
+        decoded = raw_puny.lower().encode("ascii").decode("punycode")
+        reencoded = decoded.encode("punycode").decode("ascii")
+    except UnicodeError as exc:
+        raise ValueError(f"{field} has an invalid punycode host label.") from exc
+    if (
+        decoded.isascii()
+        or reencoded.lower() != raw_puny.lower()
+        or any(ord(ch) <= 0x20 or 0x7F <= ord(ch) <= 0x9F for ch in decoded)
+    ):
+        raise ValueError(f"{field} has an invalid punycode host label.")
 
 
 def _parse_whatwg_ipv4_number(part: str) -> tuple[bool, int | None]:
@@ -2478,7 +2392,14 @@ def _parse_contract_enum(value: object, field: str, allowed: frozenset[str] | tu
 
 
 def _parse_contract_http_url(value: object, field: str) -> str:
-    """Validate an HttpUrl value matching Pydantic v2 WHATWG URL semantics."""
+    """Best-effort stdlib HTTP(S) URL check when Pydantic is unavailable.
+
+    Validates UTF-8 encoding, 2083-byte cap, WHATWG C0/space trimming, scheme,
+    authority/port, IPv6 (no zone IDs), IPv4, forbidden host characters, and
+    basic punycode label syntax. Full UTS-46 IDNA / Unicode 15.1 host validation
+    is deferred to RenderRequest (Pydantic HttpUrl) and the server so valid
+    internationalized domains are never falsely rejected in stdlib-only mode.
+    """
     if isinstance(value, (bytes, bytearray)):
         try:
             value = value.decode("utf-8")
@@ -2572,7 +2493,6 @@ def _parse_contract_http_url(value: object, field: str) -> str:
         for ch in host_text
     ):
         raise ValueError(f"{field} contains forbidden host characters.")
-    host_text = "".join(ch for ch in host_text if ord(ch) not in _CONTRACT_IDNA_IGNORED)
     for dot in _CONTRACT_IDNA_DOTS:
         if dot in host_text:
             host_text = host_text.replace(dot, ".")
@@ -2580,7 +2500,7 @@ def _parse_contract_http_url(value: object, field: str) -> str:
         raise ValueError(f"{field} must include a host.")
     parts = host_text.split(".")
     for label in parts:
-        _validate_idna_label(label, field)
+        _validate_punycode_label_syntax(label, field)
     ipv4_parts = parts[:-1] if parts and parts[-1] == "" else parts
     if ipv4_parts:
         last_is_num, _ = _parse_whatwg_ipv4_number(ipv4_parts[-1])
@@ -2728,7 +2648,12 @@ def _validate_contract_headers_fallback(headers: dict[object, object]) -> None:
 
 
 def _validate_payload_fallback(payload: dict[str, object]) -> None:
-    """Stdlib fallback validator mirroring RenderRequest when Pydantic is unavailable."""
+    """Best-effort stdlib fallback validator used only when Pydantic is unavailable.
+
+    Mirrors RenderRequest schema, strict keys, bounds, coercion, cross-field
+    rules, and ASCII/IPv4/IPv6 URL checks; full UTS-46 IDNA host validation is
+    performed by RenderRequest when Pydantic is installed and by the server.
+    """
     if not isinstance(payload, dict):
         raise ValueError("Render payload must be a JSON object.")
     _check_strict_keys(payload, _FALLBACK_ALLOWED_KEYS, "render request")
