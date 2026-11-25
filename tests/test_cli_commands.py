@@ -862,7 +862,26 @@ class CliCommandsTests(unittest.TestCase):
         ])
         self.assertEqual(code, 0, stderr)
         self.assertNotIn(token, stdout)
-        self.assertEqual(json.loads(stdout)["scopes"], ["render", "jobs"])
+        self.assertNotIn("vcp_abcd1234_secretvalue", stdout)
+        self.assertNotIn("secretvalue", stdout)
+        self.assertNotIn("secretvalue", stderr)
+        key_doc = json.loads(stdout)
+        self.assertEqual(key_doc["scopes"], ["render", "jobs"])
+        self.assertEqual(key_doc["prefix"], "abcd1234")
+        self.assertEqual(key_doc["api_key"], "***")
+
+        code, stdout, stderr = self._run([
+            "admin", "keys", "create", "proj_1", "--name", "ci-plain", "--scope", "render",
+            "--server", self.server, "--admin-token", token,
+        ])
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn(token, stdout)
+        self.assertNotIn("vcp_abcd1234_secretvalue", stdout)
+        self.assertNotIn("secretvalue", stdout)
+        self.assertNotIn("secretvalue", stderr)
+        self.assertIn("id: key_1", stdout)
+        self.assertIn("api_key: vcp_abcd1234_***", stdout)
+        self.assertIn("scopes: render", stdout)
 
         code, stdout, stderr = self._run(["admin", "keys", "revoke", "key_1", "--server", self.server, "--admin-token", token, "--json"])
         self.assertEqual(code, 0, stderr)

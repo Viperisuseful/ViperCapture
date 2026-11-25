@@ -166,11 +166,32 @@ _SENSITIVE_HEADER_TOKENS = (
 )
 
 
+_SENSITIVE_KEY_FIELD_NAMES = frozenset({
+    "apikey",
+    "accesskey",
+    "adminkey",
+    "secretkey",
+    "privatekey",
+    "signingkey",
+})
+_SENSITIVE_FIELD_SUFFIXES = (
+    "password",
+    "passwd",
+    "token",
+    "secret",
+)
+
+
 def _is_sensitive_header_name(name: str) -> bool:
     lowered = name.strip().lower()
     if lowered in _SENSITIVE_HEADER_NAMES:
         return True
     return any(tok in lowered for tok in _SENSITIVE_HEADER_TOKENS)
+
+
+def _is_sensitive_field_name(name: str) -> bool:
+    normalized = name.strip().lower().replace("-", "").replace("_", "")
+    return normalized in _SENSITIVE_KEY_FIELD_NAMES or normalized.endswith(_SENSITIVE_FIELD_SUFFIXES)
 _RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
 _OPEN_JOBS = {"queued", "running"}
 _STARTED_SERVER_HANDLE: tuple[object, int | None] | None = None
@@ -603,14 +624,14 @@ def _redact_headers_string(raw: str) -> str:
 
 
 def public_payload(payload: dict[str, object]) -> dict[str, object]:
-    """A copy that can be printed. Passwords, cookie values, and auth headers are redacted."""
+    """A copy that can be printed. Passwords, keys, tokens, secrets, cookie values, and auth headers are redacted."""
 
     def walk(value: object, *, parent_key: str = "") -> object:
         if isinstance(value, dict):
             printed: dict[str, object] = {}
             for key, item in value.items():
                 lowered = str(key).lower()
-                if lowered == "password":
+                if _is_sensitive_field_name(lowered):
                     printed[key] = "***"
                 elif lowered == "headers" and isinstance(item, str):
                     printed[key] = _redact_headers_string(item)

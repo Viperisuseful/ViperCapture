@@ -2402,12 +2402,15 @@ def cmd_admin(argv: list[str]) -> int:
                 doc = _read_json(resp)
             finally:
                 resp.close()
+            safe_doc = public_payload(doc)
             if args.json:
-                _emit_json({"ok": True, **doc})
+                _emit_json({"ok": True, **safe_doc})
             else:
-                write_line(sys.stdout, f"id: {doc.get('id')}")
-                write_line(sys.stdout, f"api_key: {doc.get('api_key')}")
-                write_line(sys.stdout, f"scopes: {', '.join(doc.get('scopes', []))}")
+                prefix = safe_doc.get("prefix")
+                redacted = f"vcp_{prefix.strip()}_***" if isinstance(prefix, str) and prefix.strip() else "***"
+                write_line(sys.stdout, f"id: {safe_doc.get('id')}")
+                write_line(sys.stdout, f"api_key: {redacted}")
+                write_line(sys.stdout, f"scopes: {', '.join(safe_doc.get('scopes', []))}")
             return 0
 
         if args.section == "keys" and args.key_action == "revoke":

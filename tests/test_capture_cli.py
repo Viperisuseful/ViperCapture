@@ -376,6 +376,56 @@ class PayloadTests(unittest.TestCase):
             printed = public_payload(build_payload(parse_capture_args(env_argv)))
         self.assertEqual(printed["network"]["proxy"]["password"], "***")
 
+    def test_public_payload_redacts_tokens_keys_and_secrets_but_keeps_non_secrets(self) -> None:
+        raw = {
+            "url": "https://example.com",
+            "cache_key": "homepage-v1",
+            "idempotency_key": "idem-123",
+            "public_key": "ed25519-pub-abc",
+            "actions": [{"type": "press", "key": "Enter"}],
+            "api_key": "vcp_1234_rawsecret",
+            "access_key": "raw-access-key",
+            "admin_key": "raw-admin-key",
+            "admin_token": "raw-admin-token",
+            "signingToken": "raw-signing-token",
+            "proxy_password": "raw-proxy-password",
+            "nested": {
+                "token": "raw-nested-token",
+                "session_token": "raw-session-token",
+                "api_secret": "raw-api-secret",
+                "client_secret": "raw-client-secret",
+            },
+        }
+        redacted = public_payload(raw)
+        serialized = json.dumps(redacted)
+        for secret in (
+            "vcp_1234_rawsecret",
+            "raw-access-key",
+            "raw-admin-key",
+            "raw-admin-token",
+            "raw-signing-token",
+            "raw-proxy-password",
+            "raw-nested-token",
+            "raw-session-token",
+            "raw-api-secret",
+            "raw-client-secret",
+        ):
+            self.assertNotIn(secret, serialized)
+        self.assertEqual(redacted["api_key"], "***")
+        self.assertEqual(redacted["access_key"], "***")
+        self.assertEqual(redacted["admin_key"], "***")
+        self.assertEqual(redacted["admin_token"], "***")
+        self.assertEqual(redacted["signingToken"], "***")
+        self.assertEqual(redacted["proxy_password"], "***")
+        self.assertEqual(redacted["nested"]["token"], "***")
+        self.assertEqual(redacted["nested"]["session_token"], "***")
+        self.assertEqual(redacted["nested"]["api_secret"], "***")
+        self.assertEqual(redacted["nested"]["client_secret"], "***")
+        self.assertEqual(redacted["cache_key"], "homepage-v1")
+        self.assertEqual(redacted["idempotency_key"], "idem-123")
+        self.assertEqual(redacted["public_key"], "ed25519-pub-abc")
+        self.assertEqual(redacted["actions"][0]["key"], "Enter")
+
     def test_job_urls_stay_on_the_api_host(self) -> None:
         root = "http://127.0.0.1:8000"
         self.assertEqual(resolve_api_url(root, "/v1/jobs/1"), "http://127.0.0.1:8000/v1/jobs/1")
