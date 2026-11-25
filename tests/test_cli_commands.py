@@ -289,6 +289,7 @@ class _ApiMockHandler(BaseHTTPRequestHandler):
                 "prefix": "abcd1234",
                 "scopes": doc.get("scopes", ["render"]),
                 "api_key": "vcp_abcd1234_secretvalue",
+                **state.get("extra_key_fields", {}),
             })
             return
         self._send_json(404, {"error": {"code": "not_found", "message": "Not found"}})
@@ -856,19 +857,27 @@ class CliCommandsTests(unittest.TestCase):
         self.assertEqual(code, 0, stderr)
         self.assertEqual(json.loads(stdout)["count"], 1)
 
-        code, stdout, stderr = self._run([
-            "admin", "keys", "create", "proj_1", "--name", "ci", "--scope", "render", "--scope", "jobs",
-            "--server", self.server, "--admin-token", token, "--json",
-        ])
+        self.httpd.state["extra_key_fields"] = {"signing_secret": "extra-raw-secret"}  # type: ignore[attr-defined]
+        try:
+            code, stdout, stderr = self._run([
+                "admin", "keys", "create", "proj_1", "--name", "ci", "--scope", "render", "--scope", "jobs",
+                "--server", self.server, "--admin-token", token, "--json",
+            ])
+        finally:
+            self.httpd.state.pop("extra_key_fields", None)  # type: ignore[attr-defined]
         self.assertEqual(code, 0, stderr)
         self.assertNotIn(token, stdout)
-        self.assertNotIn("vcp_abcd1234_secretvalue", stdout)
-        self.assertNotIn("secretvalue", stdout)
-        self.assertNotIn("secretvalue", stderr)
+        self.assertNotIn(token, stderr)
+        self.assertNotIn("extra-raw-secret", stdout)
+        self.assertNotIn("extra-raw-secret", stderr)
+        self.assertEqual(stderr, "")
+        self.assertEqual(stdout.count("vcp_abcd1234_secretvalue"), 1)
         key_doc = json.loads(stdout)
         self.assertEqual(key_doc["scopes"], ["render", "jobs"])
         self.assertEqual(key_doc["prefix"], "abcd1234")
-        self.assertEqual(key_doc["api_key"], "***")
+        self.assertEqual(key_doc["api_key"], "vcp_abcd1234_secretvalue")
+        self.assertEqual(key_doc["signing_secret"], "***")
+        self.assertEqual(key_doc["warning"], "Save this key now, it will not be shown again.")
 
         code, stdout, stderr = self._run([
             "admin", "keys", "create", "proj_1", "--name", "ci-plain", "--scope", "render",
@@ -876,12 +885,13 @@ class CliCommandsTests(unittest.TestCase):
         ])
         self.assertEqual(code, 0, stderr)
         self.assertNotIn(token, stdout)
-        self.assertNotIn("vcp_abcd1234_secretvalue", stdout)
-        self.assertNotIn("secretvalue", stdout)
-        self.assertNotIn("secretvalue", stderr)
+        self.assertNotIn(token, stderr)
+        self.assertEqual(stderr, "")
+        self.assertEqual(stdout.count("vcp_abcd1234_secretvalue"), 1)
         self.assertIn("id: key_1", stdout)
-        self.assertIn("api_key: vcp_abcd1234_***", stdout)
+        self.assertIn("api_key: vcp_abcd1234_secretvalue", stdout)
         self.assertIn("scopes: render", stdout)
+        self.assertIn("warning: Save this key now, it will not be shown again.", stdout)
 
         code, stdout, stderr = self._run(["admin", "keys", "revoke", "key_1", "--server", self.server, "--admin-token", token, "--json"])
         self.assertEqual(code, 0, stderr)

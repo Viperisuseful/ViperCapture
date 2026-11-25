@@ -22,6 +22,7 @@ import sys
 import time
 import zipfile
 from pathlib import Path
+from typing import TextIO
 from urllib.parse import quote, urlencode, urlsplit
 
 import launch
@@ -2275,6 +2276,29 @@ def cmd_verify(argv: list[str]) -> int:
 # ── admin ─────────────────────────────────────────────────────
 
 
+_ONE_TIME_KEY_WARNING = "Save this key now, it will not be shown again."
+
+
+def _write_one_time_key_reveal(stream: TextIO, text: str) -> None:
+    """Write a newly created API key once for the operator.
+
+    Kept separate from ``write_line`` so generic CLI output stays checked by
+    CodeQL while one-time key creation can display the unrecoverable key.
+    """
+    try:
+        stream.write(text + "\n")  # lgtm[py/clear-text-logging-sensitive-data]
+        stream.flush()
+    except UnicodeEncodeError:
+        buffer = getattr(stream, "buffer", None)
+        if buffer is None:
+            fallback = text.encode("utf-8", errors="replace").decode("ascii", "replace") + "\n"
+            stream.write(fallback)  # lgtm[py/clear-text-logging-sensitive-data]
+            stream.flush()
+            return
+        buffer.write((text + "\n").encode("utf-8"))
+        buffer.flush()
+
+
 def _add_admin_flags(parser: argparse.ArgumentParser) -> None:
     _add_common_client_flags(parser, include_no_start=True, include_api_key=True)
     parser.add_argument(
@@ -2402,15 +2426,23 @@ def cmd_admin(argv: list[str]) -> int:
                 doc = _read_json(resp)
             finally:
                 resp.close()
-            safe_doc = public_payload(doc)
             if args.json:
-                _emit_json({"ok": True, **safe_doc})
+                json_doc = public_payload(doc)
+                if "api_key" in doc:
+                    json_doc["api_key"] = doc["api_key"]
+                _write_one_time_key_reveal(
+                    sys.stdout,
+                    json.dumps(
+                        {"ok": True, **json_doc, "warning": _ONE_TIME_KEY_WARNING},
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                )
             else:
-                prefix = safe_doc.get("prefix")
-                redacted = f"vcp_{prefix.strip()}_***" if isinstance(prefix, str) and prefix.strip() else "***"
-                write_line(sys.stdout, f"id: {safe_doc.get('id')}")
-                write_line(sys.stdout, f"api_key: {redacted}")
-                write_line(sys.stdout, f"scopes: {', '.join(safe_doc.get('scopes', []))}")
+                write_line(sys.stdout, f"id: {doc.get('id')}")
+                _write_one_time_key_reveal(sys.stdout, f"api_key: {doc.get('api_key')}")
+                write_line(sys.stdout, f"scopes: {', '.join(doc.get('scopes', []))}")
+                write_line(sys.stdout, f"warning: {_ONE_TIME_KEY_WARNING}")
             return 0
 
         if args.section == "keys" and args.key_action == "revoke":
