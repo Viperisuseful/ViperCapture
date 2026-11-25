@@ -3365,3 +3365,45 @@ class GuiCouncilHardeningTests(TestCase):
             )
         self.assertTrue(res.error)
         self.assertLessEqual(read_counter["bytes"], 64 * 1024)
+
+    def test_round15_tls_in_tls_flush_and_connect_enforce_per_send_deadline(self) -> None:
+        import time as _time
+
+        class _FlowControlledOuter:
+            def __init__(self) -> None:
+                self.timeouts: list[float] = []
+                self.sent = 0
+
+            def settimeout(self, val: float) -> None:
+                self.timeouts.append(val)
+
+            def send(self, buf: memoryview) -> int:
+                _time.sleep(0.005)
+                self.sent += 1
+                return 1
+
+            def sendall(self, _data: object) -> None:
+                raise AssertionError("sendall must not be called when deadline is active")
+
+        outer = _FlowControlledOuter()
+        t0 = _time.monotonic()
+        tls_sock = gui._TlsInTlsSocket(
+            outer,  # type: ignore[arg-type]
+            gui._default_ssl_context(),
+            "example.com",
+            deadline=t0 + 0.08,
+        )
+        tls_sock._out_bio.write(b"x" * 1024)
+        with self.assertRaises(TimeoutError):
+            tls_sock._flush_out()
+        elapsed = _time.monotonic() - t0
+        self.assertLess(elapsed, 0.25)
+        self.assertGreater(len(outer.timeouts), 1)
+        self.assertLess(outer.timeouts[-1], outer.timeouts[0])
+
+        outer2 = _FlowControlledOuter()
+        t1 = _time.monotonic()
+        with self.assertRaises(TimeoutError):
+            gui._sendall_with_deadline(outer2, b"CONNECT example.com:443 HTTP/1.1\r\n\r\n" + b"x" * 200, deadline=t1 + 0.06)
+        self.assertLess(_time.monotonic() - t1, 0.20)
+        self.assertGreater(len(outer2.timeouts), 1)

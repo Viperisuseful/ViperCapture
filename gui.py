@@ -3772,6 +3772,36 @@ def _default_ssl_context() -> ssl.SSLContext:
     return ctx
 
 
+def _sendall_with_deadline(
+    sock: object,
+    data: bytes | bytearray | memoryview,
+    *,
+    deadline: float | None,
+    cancel: CancelFlag | None = None,
+) -> None:
+    """Write ``data`` to ``sock`` while re-arming the shared monotonic deadline before every send()."""
+    if deadline is None or not hasattr(sock, "send"):
+        if cancel is not None and cancel.is_requested():
+            raise _Cancelled()
+        sock.sendall(data)  # type: ignore[attr-defined]
+        return
+    view = memoryview(data)
+    sent = 0
+    total = len(view)
+    while sent < total:
+        if cancel is not None and cancel.is_requested():
+            raise _Cancelled()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("timed out")
+        if hasattr(sock, "settimeout"):
+            sock.settimeout(remaining)
+        n = sock.send(view[sent:])  # type: ignore[attr-defined]
+        if n <= 0:
+            raise OSError("Socket connection broken during send.")
+        sent += n
+
+
 class _CancellableRawIO(io.RawIOBase):
     """RawIO adapter that checks cancellation and re-arms the shared monotonic deadline before every read."""
 
@@ -3965,8 +3995,7 @@ class _TlsInTlsSocket:
     def _flush_out(self) -> None:
         pending = self._out_bio.read()
         if pending:
-            self._arm_outer_deadline()
-            self._outer.sendall(pending)
+            _sendall_with_deadline(self._outer, pending, deadline=self._deadline)
 
     def _pump_in(self) -> None:
         self._arm_outer_deadline()
@@ -4295,8 +4324,12 @@ def _open_capture(
                 connect_lines.append("")
                 if cancel is not None and cancel.requested:
                     raise _Cancelled()
-                sock.settimeout(_left())
-                sock.sendall("\r\n".join(connect_lines).encode("ascii"))
+                _sendall_with_deadline(
+                    sock,
+                    "\r\n".join(connect_lines).encode("ascii"),
+                    deadline=deadline,
+                    cancel=cancel,
+                )
                 status_code, reason = _read_tunnel_response(sock, deadline=deadline)
                 if status_code != 200:
                     raise http.client.HTTPException(f"Tunnel connection failed: {status_code} {reason}")
