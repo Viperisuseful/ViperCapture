@@ -3367,10 +3367,11 @@ class GuiCouncilHardeningTests(TestCase):
         self.assertLessEqual(read_counter["bytes"], 64 * 1024)
 
     def test_round15_tls_in_tls_flush_and_connect_enforce_per_send_deadline(self) -> None:
-        import time as _time
+        clock = {"now": 100.0}
 
         class _FlowControlledOuter:
-            def __init__(self) -> None:
+            def __init__(self, step_s: float) -> None:
+                self._step = step_s
                 self.timeouts: list[float] = []
                 self.sent = 0
 
@@ -3378,32 +3379,36 @@ class GuiCouncilHardeningTests(TestCase):
                 self.timeouts.append(val)
 
             def send(self, buf: memoryview) -> int:
-                _time.sleep(0.005)
+                clock["now"] += self._step
                 self.sent += 1
                 return 1
 
             def sendall(self, _data: object) -> None:
                 raise AssertionError("sendall must not be called when deadline is active")
 
-        outer = _FlowControlledOuter()
-        t0 = _time.monotonic()
+        ctx = gui._default_ssl_context()
+        outer = _FlowControlledOuter(step_s=0.25)
         tls_sock = gui._TlsInTlsSocket(
             outer,  # type: ignore[arg-type]
-            gui._default_ssl_context(),
+            ctx,
             "example.com",
-            deadline=t0 + 0.08,
+            deadline=101.0,
         )
         tls_sock._out_bio.write(b"x" * 1024)
-        with self.assertRaises(TimeoutError):
-            tls_sock._flush_out()
-        elapsed = _time.monotonic() - t0
-        self.assertLess(elapsed, 0.25)
-        self.assertGreater(len(outer.timeouts), 1)
-        self.assertLess(outer.timeouts[-1], outer.timeouts[0])
+        with mock.patch.object(gui.time, "monotonic", side_effect=lambda: clock["now"]):
+            with self.assertRaises(TimeoutError):
+                tls_sock._flush_out()
+        self.assertEqual(outer.sent, 4)
+        self.assertEqual(outer.timeouts, [1.0, 0.75, 0.5, 0.25])
 
-        outer2 = _FlowControlledOuter()
-        t1 = _time.monotonic()
-        with self.assertRaises(TimeoutError):
-            gui._sendall_with_deadline(outer2, b"CONNECT example.com:443 HTTP/1.1\r\n\r\n" + b"x" * 200, deadline=t1 + 0.06)
-        self.assertLess(_time.monotonic() - t1, 0.20)
-        self.assertGreater(len(outer2.timeouts), 1)
+        clock["now"] = 200.0
+        outer2 = _FlowControlledOuter(step_s=0.25)
+        with mock.patch.object(gui.time, "monotonic", side_effect=lambda: clock["now"]):
+            with self.assertRaises(TimeoutError):
+                gui._sendall_with_deadline(
+                    outer2,
+                    b"CONNECT example.com:443 HTTP/1.1\r\n\r\n" + b"x" * 200,
+                    deadline=200.75,
+                )
+        self.assertEqual(outer2.sent, 3)
+        self.assertEqual(outer2.timeouts, [0.75, 0.5, 0.25])
