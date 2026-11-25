@@ -2294,15 +2294,60 @@ def _parse_contract_int(value: object, field: str, lo: int, hi: int) -> int:
         if not math.isfinite(value) or not value.is_integer():
             raise ValueError(f"{field} must be an integer between {lo} and {hi}.")
         parsed = int(value)
-    elif isinstance(value, str):
-        stripped = value.strip()
-        if not stripped or len(stripped) > 32 or not re.fullmatch(r"[+-]?[0-9]+", stripped):
-            raise ValueError(f"{field} must be an integer between {lo} and {hi}.")
-        parsed = int(stripped)
     else:
-        raise ValueError(f"{field} must be an integer between {lo} and {hi}.")
+        if isinstance(value, (bytes, bytearray)):
+            try:
+                value = value.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"{field} must be an integer between {lo} and {hi}.") from exc
+        if not isinstance(value, str):
+            raise ValueError(f"{field} must be an integer between {lo} and {hi}.")
+        stripped = value.strip()
+        match = re.fullmatch(r"([+-]?)([0-9](?:_?[0-9])*)(?:\.(0(?:_?0)*))?", stripped)
+        if match is None:
+            raise ValueError(f"{field} must be an integer between {lo} and {hi}.")
+        sign, int_part = match.group(1), match.group(2).replace("_", "")
+        sig = int_part.lstrip("0") or "0"
+        if len(sig) > 20:
+            raise ValueError(f"{field} must be an integer between {lo} and {hi}.")
+        parsed = -int(sig) if sign == "-" else int(sig)
     if parsed < lo or parsed > hi:
         raise ValueError(f"{field} must be an integer between {lo} and {hi}.")
+    return parsed
+
+
+def _parse_contract_float(
+    value: object,
+    field: str,
+    lo: float,
+    hi: float,
+    *,
+    gt_lo: bool = False,
+) -> float:
+    """Validate and coerce a float matching Pydantic v2 non-strict float semantics."""
+    if isinstance(value, bool):
+        parsed = float(int(value))
+    elif type(value) in {int, float}:
+        try:
+            parsed = float(value)  # type: ignore[arg-type]
+        except OverflowError as exc:
+            raise ValueError(f"{field} is out of numeric range.") from exc
+    else:
+        if isinstance(value, (bytes, bytearray)):
+            try:
+                value = value.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"{field} must be a number.") from exc
+        if not isinstance(value, str):
+            raise ValueError(f"{field} must be a number.")
+        try:
+            parsed = float(value)
+        except (ValueError, OverflowError) as exc:
+            raise ValueError(f"{field} must be a number.") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"{field} must be a finite number.")
+    if (parsed <= lo if gt_lo else parsed < lo) or parsed > hi:
+        raise ValueError(f"{field} must be between {lo} and {hi}.")
     return parsed
 
 
@@ -2355,13 +2400,8 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
         for dim in ("width", "height"):
             if dim in vp:
                 _parse_contract_int(vp[dim], f"viewport.{dim}", 1, 65_535)
-        if "device_scale_factor" in vp and (
-            not _is_number(vp["device_scale_factor"])
-            or not math.isfinite(float(vp["device_scale_factor"]))  # type: ignore[arg-type]
-            or vp["device_scale_factor"] < 0.1  # type: ignore[operator]
-            or vp["device_scale_factor"] > 8  # type: ignore[operator]
-        ):
-            raise ValueError("viewport.device_scale_factor must be between 0.1 and 8.")
+        if "device_scale_factor" in vp:
+            _parse_contract_float(vp["device_scale_factor"], "viewport.device_scale_factor", 0.1, 8.0)
     output_fmt = str(payload.get("output") or "png")
     engine_name = str(payload.get("engine") or "chromium")
     full_page_val = coerced_bools.get("full_page", True)
@@ -2373,8 +2413,34 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
     is_image_fmt = output_fmt in {"png", "jpeg", "webp", "avif"}
     is_video_fmt = output_fmt in {"webm", "mp4", "gif"}
     document_outputs = {"html", "markdown"}
-    side_outputs_raw = payload.get("side_outputs") or []
-    side_outputs_set = {str(item) for item in side_outputs_raw} if isinstance(side_outputs_raw, list) else set()
+    side_outputs_raw = payload.get("side_outputs")
+    side_outputs_list = side_outputs_raw if isinstance(side_outputs_raw, list) else []
+    if side_outputs_raw is not None:
+        if not side_outputs_list or len(side_outputs_list) > 4:
+            raise ValueError("side_outputs must contain 1 to 4 entries.")
+        if len(set(side_outputs_list)) != len(side_outputs_list):
+            raise ValueError("side_outputs must be unique.")
+    side_outputs_set = {str(item) for item in side_outputs_list}
+    if "mhtml" in side_outputs_set and engine_name != "chromium":
+        raise ValueError("MHTML side output requires the Chromium engine.")
+    img_raw = payload.get("image") if isinstance(payload.get("image"), dict) else {}
+    thumbnails_raw = img_raw.get("thumbnails") if isinstance(img_raw, dict) else None
+    if thumbnails_raw is not None:
+        if not isinstance(thumbnails_raw, list) or not thumbnails_raw:
+            raise ValueError("image.thumbnails must be a non-empty list.")
+        thumb_names: list[str] = []
+        for thumb in thumbnails_raw:
+            if not isinstance(thumb, dict) or not isinstance(thumb.get("name"), str) or not thumb["name"]:
+                raise ValueError("Each thumbnail must be an object with a name.")
+            if thumb.get("width") is None and thumb.get("height") is None:
+                raise ValueError("thumbnail width or height is required.")
+            if thumb.get("width") is not None:
+                _parse_contract_int(thumb["width"], "thumbnail.width", 10, 2_000)
+            if thumb.get("height") is not None:
+                _parse_contract_int(thumb["height"], "thumbnail.height", 10, 2_000)
+            thumb_names.append(thumb["name"])
+        if len(set(thumb_names)) != len(thumb_names):
+            raise ValueError("thumbnail names must be unique.")
     diag = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), dict) else {}
     diag_bundle = _parse_contract_bool(diag["bundle"], "diagnostics.bundle") if "bundle" in diag else False
     diag_har = _parse_contract_bool(diag["include_har"], "diagnostics.include_har") if "include_har" in diag else False
@@ -2382,6 +2448,27 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
     diag_warc = _parse_contract_bool(diag["include_warc"], "diagnostics.include_warc") if "include_warc" in diag else False
     if (diag_har or diag_trace or diag_warc) and not diag_bundle:
         raise ValueError("HAR, trace, and WARC require diagnostics.bundle=true.")
+    cert = payload.get("certification") if isinstance(payload.get("certification"), dict) else {}
+    cert_enabled = _parse_contract_bool(cert["enabled"], "certification.enabled") if "enabled" in cert else False
+    has_artifact_bundle = bool(side_outputs_list or thumbnails_raw)
+    if has_artifact_bundle:
+        if not is_image_fmt:
+            raise ValueError("side outputs and thumbnails require an image output.")
+        if any((
+            payload.get("viewports") is not None,
+            payload.get("slices") is not None,
+            diag_bundle,
+            cert_enabled,
+            cache_val,
+        )):
+            raise ValueError(
+                "artifact bundles cannot use viewports, slices, diagnostics, certification, or cache."
+            )
+    if payload.get("base_url") is not None and payload.get("url") is not None:
+        raise ValueError("base_url is accepted only with html or markdown input.")
+    if payload.get("elements") is not None:
+        if output_fmt != "metadata" and "metadata" not in side_outputs_set:
+            raise ValueError("elements requires primary or side metadata output.")
     if preserve_vp_width:
         if not full_page_val:
             raise ValueError("preserve_viewport_width requires full_page=true.")
@@ -2398,6 +2485,8 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
             raise ValueError("cache cannot be combined with a persistent profile.")
     if payload.get("cache_key") is not None and not cache_val:
         raise ValueError("cache_key requires cache=true.")
+    if payload.get("extract_mode", "document") != "document" and output_fmt not in document_outputs and not side_outputs_set.intersection(document_outputs):
+        raise ValueError("article extraction requires HTML or Markdown output.")
     if include_shadow_dom_val and output_fmt not in document_outputs and not side_outputs_set.intersection(document_outputs):
         raise ValueError("include_shadow_dom requires HTML or Markdown output.")
     if proceed_on_captcha_val:
@@ -2409,14 +2498,46 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
     if payload.get("clip") is not None and payload.get("selector") is not None:
         raise ValueError("clip and selector are mutually exclusive.")
     if payload.get("viewports") is not None:
+        vps = payload["viewports"]
+        assert isinstance(vps, list)
         if not is_image_fmt:
             raise ValueError("viewports requires PNG, JPEG, WebP, or AVIF output.")
         if full_page_val:
             raise ValueError("viewports requires full_page=false.")
         if payload.get("selector") is not None or payload.get("clip") is not None:
             raise ValueError("viewports cannot be combined with selector or clip.")
-    if payload.get("slices") is not None and (not is_image_fmt or not full_page_val or payload.get("viewports") is not None):
-        raise ValueError("slices require a single full-page image output.")
+        if diag_bundle:
+            raise ValueError("diagnostic bundles cannot be combined with multi-viewports.")
+        if cert_enabled:
+            raise ValueError("certification cannot be combined with multi-viewports.")
+        if len(vps) < 2 or len(vps) > 3:
+            raise ValueError("viewports must contain 2 or 3 entries.")
+        vp_names: list[str] = []
+        for entry in vps:
+            if not isinstance(entry, dict) or not isinstance(entry.get("name"), str) or not entry["name"]:
+                raise ValueError("Each viewport must be an object with a name.")
+            for dim in ("width", "height"):
+                if dim in entry:
+                    _parse_contract_int(entry[dim], f"viewports.{dim}", 1, 65_535)
+            vp_names.append(entry["name"])
+        if len(set(vp_names)) != len(vp_names):
+            raise ValueError("viewports names must be unique.")
+    if payload.get("slices") is not None:
+        sl = payload["slices"]
+        assert isinstance(sl, dict)
+        if not is_image_fmt or not full_page_val or payload.get("viewports") is not None:
+            raise ValueError("slices require a single full-page image output.")
+        if "height" not in sl:
+            raise ValueError("slices.height is required.")
+        sl_height = _parse_contract_int(sl["height"], "slices.height", 100, 10_000)
+        sl_overlap = _parse_contract_int(sl["overlap"], "slices.overlap", 0, 1_000) if "overlap" in sl else 0
+        if sl_overlap >= sl_height:
+            raise ValueError("slice overlap must be smaller than slice height.")
+    if is_video_fmt:
+        if payload.get("selector") is not None or payload.get("clip") is not None or payload.get("viewports") is not None:
+            raise ValueError("video cannot use selector, clip, or multi-viewports.")
+        if diag_trace:
+            raise ValueError("video diagnostics support console, network, HAR, and WARC.")
     if "video" in payload and payload["video"] is not None:
         vid = payload["video"]
         assert isinstance(vid, dict)
@@ -2479,8 +2600,21 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
             raise ValueError("pdf settings require PDF output.")
         pdf_cfg = payload["pdf"]
         assert isinstance(pdf_cfg, dict)
-        if pdf_cfg.get("mode") == "single_page" and pdf_cfg.get("page_ranges"):
-            raise ValueError("single-page PDF cannot use page_ranges.")
+        if "page_ranges" in pdf_cfg and pdf_cfg["page_ranges"] is not None:
+            pr = pdf_cfg["page_ranges"]
+            if (
+                not isinstance(pr, str)
+                or len(pr) > 256
+                or not re.fullmatch(r"\s*\d+(?:\s*-\s*\d+)?(?:\s*,\s*\d+(?:\s*-\s*\d+)?)*\s*", pr)
+            ):
+                raise ValueError("pdf.page_ranges must be a valid page range string.")
+            for item in pr.split(","):
+                bounds = [int(part.strip()) for part in item.split("-", 1)]
+                start, end = bounds[0], bounds[-1]
+                if start < 1 or end < start:
+                    raise ValueError("page_ranges must contain ascending positive pages.")
+            if pdf_cfg.get("mode") == "single_page":
+                raise ValueError("single-page PDF cannot use page_ranges.")
     if output_fmt == "pdf" and engine_name != "chromium":
         raise ValueError("PDF output requires the Chromium engine.")
     if "clip" in payload and payload["clip"] is not None:
@@ -2489,11 +2623,12 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
         if full_page_val or not is_image_fmt:
             raise ValueError("clip requires full_page=false and an image output.")
         for coord in ("x", "y"):
-            if coord in clip and (not _is_number(clip[coord]) or not math.isfinite(float(clip[coord])) or clip[coord] < 0 or clip[coord] > 100_000):  # type: ignore[arg-type,operator]
-                raise ValueError(f"clip.{coord} must be between 0 and 100000.")
+            if coord in clip:
+                _parse_contract_float(clip[coord], f"clip.{coord}", 0.0, 100_000.0)
         for dim in ("width", "height"):
-            if dim not in clip or not _is_number(clip[dim]) or not math.isfinite(float(clip[dim])) or clip[dim] <= 0 or clip[dim] > 100_000:  # type: ignore[arg-type,operator]
-                raise ValueError(f"clip.{dim} must be greater than 0 and at most 100000.")
+            if dim not in clip:
+                raise ValueError(f"clip.{dim} is required.")
+            _parse_contract_float(clip[dim], f"clip.{dim}", 0.0, 100_000.0, gt_lo=True)
     if "environment" in payload:
         env = payload["environment"]
         assert isinstance(env, dict)

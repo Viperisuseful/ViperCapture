@@ -2233,6 +2233,39 @@ class CliCouncilHardeningTests(unittest.TestCase):
             with self.subTest(parity_bad=parity_bad), self.assertRaises(ValueError):
                 capture_cli._validate_payload_fallback(parity_bad)
 
+        # 6. Round 17 differential parity: decimal/underscore/bytes/padded ints, floats, artifact bundles, diagnostics, slices, extract_mode, page_ranges
+        for ok_r17 in (
+            {"url": "https://example.invalid", "output": "webm", "video": {"duration_ms": "5000.0"}},
+            {"url": "https://example.invalid", "output": "webm", "video": {"duration_ms": "5_000"}},
+            {"url": "https://example.invalid", "output": "webm", "video": {"duration_ms": "5_000.0"}},
+            {"url": "https://example.invalid", "output": "webm", "video": {"duration_ms": "0" * 30 + "5000"}},
+            {"url": "https://example.invalid", "output": "png", "wait_for": {"delay_ms": "0" * 33}},
+            {"url": "https://example.invalid", "output": "png", "wait_for": {"delay_ms": b" 10 "}},
+            {"url": "https://example.invalid", "output": "png", "wait_for": {"delay_ms": b"1.0"}},
+            {"url": "https://example.invalid", "output": "png", "viewport": {"device_scale_factor": True}},
+            {"url": "https://example.invalid", "output": "png", "viewport": {"device_scale_factor": "1.5"}},
+        ):
+            with self.subTest(ok_r17=ok_r17):
+                capture_cli._validate_payload_fallback(ok_r17)
+
+        for bad_r17 in (
+            {"url": "https://example.invalid", "output": "png", "wait_for": {"delay_ms": "1.5"}},
+            {"url": "https://example.invalid", "output": "png", "wait_for": {"delay_ms": "1e3"}},
+            {"url": "https://example.invalid", "output": "pdf", "pdf": {"mode": "single_page", "page_ranges": ""}},
+            {"url": "https://example.invalid", "output": "pdf", "pdf": {"mode": "single_page", "page_ranges": 0}},
+            {"url": "https://example.invalid", "output": "pdf", "pdf": {"mode": "single_page", "page_ranges": False}},
+            {"url": "https://example.invalid", "output": "png", "cache": True, "side_outputs": ["metadata"]},
+            {"url": "https://example.invalid", "output": "png", "cache": True, "image": {"thumbnails": [{"name": "small", "width": 100}]}},
+            {"url": "https://example.invalid", "output": "png", "full_page": False, "diagnostics": {"bundle": True}, "viewports": [{"name": "a", "width": 800, "height": 600}, {"name": "b", "width": 1024, "height": 768}]},
+            {"url": "https://example.invalid", "output": "webm", "diagnostics": {"bundle": True, "include_trace": True}},
+            {"url": "https://example.invalid", "output": "png", "full_page": False, "viewports": [{"name": "a", "width": 800, "height": 600}, {"name": "a", "width": 1024, "height": 768}]},
+            {"url": "https://example.invalid", "output": "png", "slices": {"height": 50}},
+            {"url": "https://example.invalid", "output": "png", "slices": {"height": 200, "overlap": 200}},
+            {"url": "https://example.invalid", "output": "png", "extract_mode": "article"},
+        ):
+            with self.subTest(bad_r17=bad_r17), self.assertRaises(ValueError):
+                capture_cli._validate_payload_fallback(bad_r17)
+
 
 if __name__ == "__main__":
     unittest.main()
