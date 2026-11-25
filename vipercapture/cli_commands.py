@@ -54,6 +54,7 @@ from vipercapture.capture_cli import (
     open_response,
     open_response_with_retries,
     payload_to_preset_settings,
+    positive_finite_float,
     public_payload,
     read_response_bytes,
     resolve_api_url,
@@ -125,7 +126,7 @@ def _add_common_client_flags(
     if include_timeout:
         group.add_argument(
             "--request-timeout",
-            type=float,
+            type=positive_finite_float,
             default=60.0,
             help="HTTP timeout in seconds.",
         )
@@ -847,6 +848,8 @@ def cmd_diff(argv: list[str]) -> int:
         )
     except CaptureError as exc:
         return fail(str(exc), status=exc.status, code=exc.code, body=exc.body, exit_code=exc.exit_code)
+    except OSError as exc:
+        return fail(str(exc), exit_code=1)
 
 
 # ── baseline ──────────────────────────────────────────────────
@@ -1511,6 +1514,8 @@ def cmd_job(argv: list[str]) -> int:
     _add_common_client_flags(p_dl, include_timeout=True)
 
     args = parser.parse_args(argv)
+    if args.action in {"status", "download"} and args.poll_ms < 1:
+        return fail("--poll-ms must be 1 or greater.", exit_code=2)
     load_local_env()
     try:
         root = api_root(args.server)
@@ -2708,6 +2713,8 @@ def main(argv: list[str] | None = None) -> int:
         return fail("Cancelled.", exit_code=130)
     except BrokenPipeError:
         return 0
+    except OSError as exc:
+        return fail(str(exc), exit_code=1)
 
 
 if __name__ == "__main__":

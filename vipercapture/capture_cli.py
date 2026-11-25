@@ -20,6 +20,7 @@ import os
 import re
 import secrets
 import shutil
+import string
 import subprocess
 import sys
 import time
@@ -268,6 +269,16 @@ def normalize_url(text: str) -> str:
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
         raise ValueError("URL must start with http:// or https://.")
     return value
+
+
+def positive_finite_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid float value: {value!r}") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a finite number greater than 0")
+    return parsed
 
 
 def paper_size(value: str) -> str:
@@ -850,7 +861,7 @@ def build_parser() -> CaptureParser:
     client.add_argument("--api-key", help="Bearer token. Otherwise VIPERCAPTURE_API_KEY or VIPERCAPTURE_ADMIN_TOKEN.")
     client.add_argument("--request-id", help="X-Request-Id value.")
     client.add_argument("--idempotency-key", help="Idempotency-Key for --async.")
-    client.add_argument("--request-timeout", type=float, help="Seconds to wait for the render. Video defaults to 180 and images to 120.")
+    client.add_argument("--request-timeout", type=positive_finite_float, help="Seconds to wait for the render. Video defaults to 180 and images to 120.")
     client.add_argument("--async", dest="async_job", action="store_true", help="Submit /v1/jobs, poll, and save the result.")
     client.add_argument("--no-wait", dest="no_wait", action="store_true", help="With --async, print the job ID (or JSON) and exit immediately.")
     client.add_argument("--poll-ms", type=int, default=500, help="Async poll interval in milliseconds.")
@@ -2363,15 +2374,18 @@ def render_output_template(
     raw_slug = safe_filename(parsed.path.strip("/").replace("/", "-")) if parsed and parsed.path.strip("/") else raw_host
     path_slug = raw_slug[:56].rstrip(" ._-") or "capture"
     stamp = timestamp or datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    fields = {
+        "host": host,
+        "index": index,
+        "slug": path_slug,
+        "timestamp": stamp,
+        "format": fmt,
+        "ext": ext,
+    }
+    formatter = string.Formatter()
     try:
-        rendered = template.format(
-            host=host,
-            index=index,
-            slug=path_slug,
-            timestamp=stamp,
-            format=fmt,
-            ext=ext,
-        )
+        rendered = template.format(**fields)
+        parsed_parts = list(formatter.parse(template))
     except (KeyError, ValueError, IndexError, AttributeError, TypeError) as exc:
         raise ValueError(
             f"Invalid --output-template {template!r}: {exc}. "
@@ -2381,10 +2395,36 @@ def render_output_template(
         raise ValueError("--output-template must produce a filename without directory separators.")
     candidate = Path(rendered)
     raw_stem = candidate.stem
+    cleaned_untruncated = _BAD_FILENAME.sub("_", raw_stem).strip(" .")
     stem = safe_filename(raw_stem)
-    if len(raw_stem) > 80 and "{index}" in template and not stem.endswith(str(index)):
-        idx_suffix = f"-{index}"
-        stem = f"{safe_filename(raw_stem[: max(1, 80 - len(idx_suffix))])}{idx_suffix}"
+    if len(cleaned_untruncated) > 80:
+        index_formatted: str | None = None
+        index_spans: list[tuple[int, int]] = []
+        cursor = 0
+        for literal, field_name, format_spec, conversion in parsed_parts:
+            cursor += len(literal)
+            if field_name is not None:
+                val, _ = formatter.get_field(field_name, (), fields)
+                val = formatter.convert_field(val, conversion)
+                piece = formatter.format_field(val, format_spec or "")
+                start = cursor
+                cursor += len(piece)
+                if field_name == "index" or field_name.startswith(("index.", "index[")):
+                    index_spans.append((start, cursor))
+                    if index_formatted is None:
+                        index_formatted = safe_filename(piece) if piece else str(index)
+        if index_spans:
+            lead_strip = len(raw_stem) - len(_BAD_FILENAME.sub("_", raw_stem).lstrip(" ."))
+            survived = any(
+                (start - lead_strip) >= 0 and (end - lead_strip) <= 80 and end <= len(raw_stem)
+                for start, end in index_spans
+            )
+            if not survived:
+                idx_token = index_formatted or str(index)
+                idx_suffix = f"-{idx_token}"
+                prefix_limit = max(1, 80 - len(idx_suffix))
+                prefix = safe_filename(raw_stem[:prefix_limit]).rstrip(" ._-") or "capture"
+                stem = f"{prefix}{idx_suffix}"
     suffix = candidate.suffix
     if suffix and not re.fullmatch(r"\.[A-Za-z0-9]{1,10}", suffix):
         suffix = ext
@@ -2691,7 +2731,10 @@ def _open_local_http(
             raise CaptureError(f"The API did not answer: {exc}") from exc
         if resp.status in {301, 302, 303, 307, 308}:
             location = resp.getheader("Location")
-            resp.read(4096)
+            try:
+                resp.read(4096)
+            except (http.client.HTTPException, OSError, TimeoutError):
+                pass
             conn.close()
             if not location:
                 raise CaptureError(f"HTTP {resp.status}", status=resp.status)
@@ -2716,7 +2759,10 @@ def _open_local_http(
             continue
         if not (200 <= resp.status < 300):
             try:
-                raw = resp.read(64 * 1024)
+                try:
+                    raw = resp.read(64 * 1024)
+                except (http.client.HTTPException, OSError, TimeoutError):
+                    raw = b""
             finally:
                 conn.close()
             raise _error_from_body(resp.status, raw, resp.headers)
@@ -2732,6 +2778,13 @@ def open_raw_response(
     headers: dict[str, str],
     timeout: float,
 ):
+    if (
+        not isinstance(timeout, (int, float))
+        or isinstance(timeout, bool)
+        or not math.isfinite(float(timeout))
+        or float(timeout) <= 0
+    ):
+        raise CaptureError("Request timeout must be a finite number greater than 0.", exit_code=2)
     parsed = urlsplit(url)
     if parsed.scheme == "http" and (parsed.hostname or "").lower() in _LOOPBACK_HOSTS:
         return _open_local_http(
@@ -2749,7 +2802,10 @@ def open_raw_response(
         return _open(request, timeout)
     except urllib.error.HTTPError as exc:
         try:
-            raw = exc.read(64 * 1024)
+            try:
+                raw = exc.read(64 * 1024)
+            except (http.client.HTTPException, OSError, TimeoutError):
+                raw = b""
         finally:
             exc.close()
         raise _error_from_body(exc.code, raw, exc.headers) from exc
@@ -2758,6 +2814,8 @@ def open_raw_response(
         raise CaptureError(f"The API did not answer: {reason}") from exc
     except TimeoutError as exc:
         raise CaptureError("The API did not answer before the timeout.") from exc
+    except (http.client.HTTPException, OSError) as exc:
+        raise CaptureError(f"The API did not answer: {exc}") from exc
 
 
 def open_response(
@@ -2885,19 +2943,14 @@ def _expected_content_length(response) -> int | None:
         return None
     parsed_values: list[int] = []
     for raw_item in raw_values:
-        for part in raw_item.split(","):
+        parts = raw_item.split(",")
+        for part in parts:
             token = part.strip()
-            if not token:
-                continue
-            try:
-                val = int(token)
-            except ValueError:
-                return None
-            if val < 0:
-                return None
-            parsed_values.append(val)
+            if not token or not (token.isascii() and token.isdigit()):
+                raise CaptureError(f"Invalid Content-Length header from API: {raw_item!r}.")
+            parsed_values.append(int(token))
     if not parsed_values:
-        return None
+        raise CaptureError("Invalid Content-Length header from API.")
     if len(set(parsed_values)) > 1:
         raise CaptureError("Conflicting Content-Length headers from API.")
     return parsed_values[0]
@@ -2906,11 +2959,20 @@ def _expected_content_length(response) -> int | None:
 def _read_bounded(response, handle) -> int:
     limit = max_capture_bytes()
     expected_length = _expected_content_length(response)
+    if expected_length is not None and expected_length > limit:
+        raise CaptureError(f"The capture is larger than {limit} bytes.")
     total = 0
     while True:
+        if expected_length is not None:
+            remaining = expected_length - total
+            if remaining <= 0:
+                return total
+            chunk_size = min(1024 * 1024, remaining)
+        else:
+            chunk_size = 1024 * 1024
         try:
-            block = response.read(1024 * 1024)
-        except http.client.IncompleteRead as exc:
+            block = response.read(chunk_size)
+        except (http.client.IncompleteRead, http.client.HTTPException, TimeoutError, OSError) as exc:
             raise CaptureError(f"Incomplete response from API: {exc}") from exc
         if not block:
             if expected_length is not None and total < expected_length:
@@ -3382,16 +3444,35 @@ _MAX_JSON_BYTES = 1024 * 1024
 
 def _read_json_value(response) -> object:
     expected_length = _expected_content_length(response)
-    try:
-        raw = response.read(_MAX_JSON_BYTES + 1)
-    except (http.client.HTTPException, OSError, TimeoutError) as exc:
-        raise CaptureError(f"Incomplete response from API: {exc}") from exc
-    if len(raw) > _MAX_JSON_BYTES:
+    if expected_length is not None and expected_length > _MAX_JSON_BYTES:
         raise CaptureError("The API returned a JSON document that is too large.")
-    if expected_length is not None and len(raw) < expected_length:
-        raise CaptureError(
-            f"Incomplete response: expected {expected_length} bytes, received {len(raw)}."
-        )
+    if expected_length is None:
+        try:
+            raw = response.read(_MAX_JSON_BYTES + 1)
+        except (http.client.IncompleteRead, http.client.HTTPException, OSError, TimeoutError) as exc:
+            raise CaptureError(f"Incomplete response from API: {exc}") from exc
+        if len(raw) > _MAX_JSON_BYTES:
+            raise CaptureError("The API returned a JSON document that is too large.")
+    else:
+        chunks: list[bytes] = []
+        total = 0
+        while total < expected_length:
+            to_read = min(64 * 1024, expected_length - total)
+            try:
+                block = response.read(to_read)
+            except (http.client.IncompleteRead, http.client.HTTPException, OSError, TimeoutError) as exc:
+                raise CaptureError(f"Incomplete response from API: {exc}") from exc
+            if not block:
+                break
+            chunks.append(block)
+            total += len(block)
+            if total > _MAX_JSON_BYTES:
+                raise CaptureError("The API returned a JSON document that is too large.")
+        if total < expected_length:
+            raise CaptureError(
+                f"Incomplete response: expected {expected_length} bytes, received {total}."
+            )
+        raw = b"".join(chunks)
     try:
         return json.loads(raw.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as exc:
@@ -3403,6 +3484,58 @@ def _read_json(response) -> dict[str, object]:
     if not isinstance(parsed, dict):
         raise CaptureError("The API did not return a JSON object.")
     return parsed
+
+
+def _open_json_with_retries(
+    url: str,
+    *,
+    method: str,
+    payload: dict[str, object] | None,
+    headers: dict[str, str],
+    timeout_fn,
+    retries: int = 0,
+    retry_delay_ms: int = 500,
+    verbose: bool = False,
+    deadline: float | None = None,
+) -> tuple[object, dict[str, object]]:
+    base_delay = max(0, int(retry_delay_ms)) / 1000.0
+    for attempt in range(max(0, int(retries)) + 1):
+        opened_ok = False
+        try:
+            resp = open_response_with_retries(
+                url,
+                method=method,
+                payload=payload,
+                headers=headers,
+                timeout=timeout_fn(),
+                retries=0,
+                retry_delay_ms=retry_delay_ms,
+                verbose=verbose,
+            )
+            opened_ok = True
+            try:
+                doc = _read_json(resp)
+                resp_headers = resp.headers
+            finally:
+                resp.close()
+            return resp_headers, doc
+        except CaptureError as exc:
+            if opened_ok:
+                retryable = "Incomplete response" in str(exc)
+            else:
+                retryable = exc.status is None or exc.status in _RETRYABLE_STATUSES
+            if not retryable or attempt >= retries:
+                raise
+            delay_s = exc.retry_after if exc.retry_after is not None else (base_delay * (2**attempt))
+            if verbose:
+                write_line(
+                    sys.stderr,
+                    f"Retry {attempt + 1}/{retries} in {delay_s:.2f}s after error: {exc}",
+                )
+            if delay_s > 0:
+                sleep_s = min(delay_s, _remaining(deadline)) if deadline is not None else delay_s
+                time.sleep(sleep_s)
+    raise CaptureError("Request failed after retries.")
 
 
 def _execute_one(
@@ -3427,7 +3560,7 @@ def _execute_one(
         write_line(sys.stderr, f"POST {display_server(root)}{route}")
     if args.async_job:
         if getattr(args, "no_wait", False):
-            submitted = open_response_with_retries(
+            headers, job = _open_json_with_retries(
                 root + "/v1/jobs",
                 method="POST",
                 payload=payload,
@@ -3437,16 +3570,11 @@ def _execute_one(
                     json_body=True,
                     idempotency_key=effective_idem,
                 ),
-                timeout=min(30.0, timeout),
+                timeout_fn=lambda: min(30.0, timeout),
                 retries=retries,
                 retry_delay_ms=retry_delay_ms,
                 verbose=bool(args.verbose and not args.quiet),
             )
-            try:
-                job = _read_json(submitted)
-                headers = submitted.headers
-            finally:
-                submitted.close()
             return headers, 0, job
         response_headers, total = _execute_async(
             args,
@@ -3545,7 +3673,8 @@ def _execute_async(
 ) -> tuple[object, int]:
     deadline = time.monotonic() + timeout
     verbose = bool(args.verbose and not args.quiet)
-    submitted = open_response_with_retries(
+    base_delay = max(0, int(retry_delay_ms)) / 1000.0
+    _, job = _open_json_with_retries(
         root + "/v1/jobs",
         method="POST",
         payload=payload,
@@ -3555,35 +3684,54 @@ def _execute_async(
             json_body=True,
             idempotency_key=idempotency_key,
         ),
-        timeout=min(30, _remaining(deadline)),
+        timeout_fn=lambda: min(30, _remaining(deadline)),
         retries=retries,
         retry_delay_ms=retry_delay_ms,
         verbose=verbose,
+        deadline=deadline,
     )
-    try:
-        job = _read_json(submitted)
-    finally:
-        submitted.close()
     while True:
         status = str(job.get("status") or "")
         if status == "succeeded":
             result_url = job.get("result_url")
             if not isinstance(result_url, str) or not result_url:
                 raise CaptureError("The async job did not include a result URL.")
-            result = open_response_with_retries(
-                resolve_api_url(root, result_url),
-                method="GET",
-                payload=None,
-                headers=request_headers(args, started_server=started_server, json_body=False),
-                timeout=_remaining(deadline),
-                retries=retries,
-                retry_delay_ms=retry_delay_ms,
-                verbose=verbose,
-            )
-            try:
-                return result.headers, write_response(result, output)
-            finally:
-                result.close()
+            resolved_result_url = resolve_api_url(root, result_url)
+            for attempt in range(max(0, int(retries)) + 1):
+                opened_ok = False
+                try:
+                    result = open_response_with_retries(
+                        resolved_result_url,
+                        method="GET",
+                        payload=None,
+                        headers=request_headers(args, started_server=started_server, json_body=False),
+                        timeout=_remaining(deadline),
+                        retries=0,
+                        retry_delay_ms=retry_delay_ms,
+                        verbose=verbose,
+                    )
+                    opened_ok = True
+                    try:
+                        return result.headers, write_response(result, output)
+                    finally:
+                        result.close()
+                except CaptureError as exc:
+                    if opened_ok:
+                        is_truncated = "Incomplete response" in str(exc) or "empty capture" in str(exc)
+                        retryable = output is not None and is_truncated
+                    else:
+                        retryable = exc.status is None or exc.status in _RETRYABLE_STATUSES
+                    if not retryable or attempt >= retries:
+                        raise
+                    delay_s = exc.retry_after if exc.retry_after is not None else (base_delay * (2**attempt))
+                    if verbose:
+                        write_line(
+                            sys.stderr,
+                            f"Retry {attempt + 1}/{retries} in {delay_s:.2f}s after error: {exc}",
+                        )
+                    if delay_s > 0:
+                        time.sleep(min(delay_s, _remaining(deadline)))
+            raise CaptureError("Async result download failed after retries.")
         if status not in _OPEN_JOBS:
             error = job.get("error")
             message = status or "The async job failed."
@@ -3597,20 +3745,17 @@ def _execute_async(
         if not isinstance(status_url, str) or not status_url:
             raise CaptureError("The async job did not include a status URL.")
         time.sleep(min(max(args.poll_ms, 1) / 1000, _remaining(deadline)))
-        polled = open_response_with_retries(
+        _, job = _open_json_with_retries(
             resolve_api_url(root, status_url),
             method="GET",
             payload=None,
             headers=request_headers(args, started_server=started_server, json_body=False),
-            timeout=min(30, _remaining(deadline)),
+            timeout_fn=lambda: min(30, _remaining(deadline)),
             retries=retries,
             retry_delay_ms=retry_delay_ms,
             verbose=verbose,
+            deadline=deadline,
         )
-        try:
-            job = _read_json(polled)
-        finally:
-            polled.close()
 
 
 def _remaining(deadline: float) -> float:
@@ -3653,6 +3798,18 @@ def _collect_multi_urls(args: argparse.Namespace) -> list[str] | None:
 def _validate_client_options(args: argparse.Namespace) -> None:
     if getattr(args, "no_wait", False) and not args.async_job:
         raise ValueError("--no-wait requires --async.")
+    raw_timeout = getattr(args, "request_timeout", None)
+    if raw_timeout is not None:
+        if (
+            not isinstance(raw_timeout, (int, float))
+            or isinstance(raw_timeout, bool)
+            or not math.isfinite(float(raw_timeout))
+            or float(raw_timeout) <= 0
+        ):
+            raise ValueError("--request-timeout must be a finite number greater than 0.")
+    poll_ms = getattr(args, "poll_ms", 500)
+    if poll_ms is not None and int(poll_ms) < 1:
+        raise ValueError("--poll-ms must be 1 or greater.")
     if getattr(args, "retries", 0) is not None and int(args.retries) < 0:
         raise ValueError("--retries must be 0 or greater.")
     if getattr(args, "retry_delay_ms", 500) is not None and int(args.retry_delay_ms) < 0:

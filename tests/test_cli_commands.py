@@ -1714,6 +1714,300 @@ class CliCouncilHardeningTests(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertEqual(call_count["n"], 2)
 
+    def test_round11_framing_retries_template_diff_and_timeout_hardening(self) -> None:
+        import socket
+        import time
+        from vipercapture import capture_cli
+
+        # 1. Coalesced Content-Length: 8, 8 on HTTP/1.1 keep-alive returns immediately (both binary & JSON)
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        port = srv.getsockname()[1]
+        hold_open = threading.Event()
+        kept_sockets: list[socket.socket] = []
+
+        def _serve_keepalive() -> None:
+            try:
+                for payload_bytes, ctype in (
+                    (b"ABCDEFGH", "application/octet-stream"),
+                    (b'{"ok":1}', "application/json"),
+                ):
+                    conn, _ = srv.accept()
+                    kept_sockets.append(conn)
+                    conn.recv(4096)
+                    hdr = (
+                        f"HTTP/1.1 200 OK\r\n"
+                        f"Content-Type: {ctype}\r\n"
+                        f"Content-Length: 8, 8\r\n"
+                        f"Connection: keep-alive\r\n\r\n"
+                    ).encode("ascii")
+                    conn.sendall(hdr + payload_bytes)
+                hold_open.wait(timeout=3.0)
+            finally:
+                for sock in kept_sockets:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                srv.close()
+
+        t = threading.Thread(target=_serve_keepalive, daemon=True)
+        t.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                out_file = Path(tmp) / "coalesced.bin"
+                t0 = time.monotonic()
+                resp = capture_cli.open_raw_response(
+                    f"http://127.0.0.1:{port}/bin",
+                    method="GET",
+                    body=None,
+                    headers={},
+                    timeout=1.5,
+                )
+                try:
+                    n = capture_cli.write_response(resp, out_file)
+                finally:
+                    resp.close()
+                elapsed_bin = time.monotonic() - t0
+                self.assertEqual(n, 8)
+                self.assertEqual(out_file.read_bytes(), b"ABCDEFGH")
+                self.assertLess(elapsed_bin, 0.8)
+
+                t1 = time.monotonic()
+                resp_json = capture_cli.open_raw_response(
+                    f"http://127.0.0.1:{port}/json",
+                    method="GET",
+                    body=None,
+                    headers={},
+                    timeout=1.5,
+                )
+                try:
+                    doc = capture_cli._read_json(resp_json)
+                finally:
+                    resp_json.close()
+                elapsed_json = time.monotonic() - t1
+                self.assertEqual(doc, {"ok": 1})
+                self.assertLess(elapsed_json, 0.8)
+        finally:
+            hold_open.set()
+            t.join(timeout=2.0)
+
+        # 2. Stalled keep-alive body raises CaptureError and is retried under --retries
+        srv2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv2.bind(("127.0.0.1", 0))
+        srv2.listen(4)
+        port2 = srv2.getsockname()[1]
+        stall_done = threading.Event()
+        conns2 = {"n": 0}
+        sockets2: list[socket.socket] = []
+
+        def _drain_http_request(conn: socket.socket) -> None:
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                buf += chunk
+            head, body = buf.split(b"\r\n\r\n", 1)
+            cl = 0
+            for line in head.decode("iso-8859-1").splitlines()[1:]:
+                if line.lower().startswith("content-length:"):
+                    cl = int(line.split(":", 1)[1].strip())
+                    break
+            while len(body) < cl:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                body += chunk
+
+        def _serve_stall_then_ok() -> None:
+            try:
+                # Attempt 1: send 9 bytes of 100 and stall
+                c1, _ = srv2.accept()
+                conns2["n"] += 1
+                sockets2.append(c1)
+                _drain_http_request(c1)
+                c1.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: image/png\r\n"
+                    b"Content-Length: 100\r\n"
+                    b"Connection: keep-alive\r\n\r\n"
+                    b"123456789"
+                )
+                # Attempt 2: return complete body
+                c2, _ = srv2.accept()
+                conns2["n"] += 1
+                sockets2.append(c2)
+                _drain_http_request(c2)
+                c2.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: image/png\r\n"
+                    b"Content-Length: 8\r\n"
+                    b"Connection: close\r\n\r\n"
+                    b"\x89PNG\r\n\x1a\n"
+                )
+                try:
+                    c2.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+                stall_done.wait(timeout=3.0)
+            finally:
+                for s in sockets2:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+                srv2.close()
+
+        t2 = threading.Thread(target=_serve_stall_then_ok, daemon=True)
+        t2.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                out_stall = Path(tmp) / "recovered.png"
+                args = capture_cli.parse_capture_args([
+                    "https://example.org",
+                    "--output", str(out_stall),
+                    "--server", f"http://127.0.0.1:{port2}",
+                    "--request-timeout", "0.35",
+                    "--retries", "1",
+                    "--retry-delay-ms", "0",
+                    "--no-start",
+                    "--no-config",
+                ])
+                _, total, _ = capture_cli._execute_one(
+                    args,
+                    {"url": "https://example.org", "output": "png"},
+                    root=f"http://127.0.0.1:{port2}",
+                    output=out_stall,
+                    started_server=False,
+                )
+                self.assertEqual(conns2["n"], 2)
+                self.assertEqual(total, 8)
+                self.assertEqual(out_stall.read_bytes(), b"\x89PNG\r\n\x1a\n")
+        finally:
+            stall_done.set()
+            t2.join(timeout=2.0)
+
+        # 3. Unparsable Content-Length token raises CaptureError (never turns completeness check off)
+        class _BadClResp:
+            status = 200
+            headers = {"Content-Length": "100, nope"}
+
+            def read(self, _n: int = -1) -> bytes:
+                return b"123456789"
+
+        with self.assertRaises(capture_cli.CaptureError):
+            capture_cli._expected_content_length(_BadClResp())
+
+        # 4. Async result downloads retry truncated bodies under unified open+body counter
+        with tempfile.TemporaryDirectory() as tmp:
+            async_out = Path(tmp) / "async_retry.png"
+            calls: list[str] = []
+
+            class _FakeResp:
+                def __init__(self, body: bytes, cl: str) -> None:
+                    self.status = 200
+                    self.headers = {"Content-Length": cl, "Content-Type": "application/json"}
+                    self._chunks = [body, b""]
+
+                def read(self, _n: int = -1) -> bytes:
+                    return self._chunks.pop(0) if self._chunks else b""
+
+                def close(self) -> None:
+                    return
+
+            def _fake_async_open(url, **_kwargs):
+                calls.append(url)
+                if len(calls) == 1:
+                    body = json.dumps({
+                        "id": "job-1",
+                        "status": "succeeded",
+                        "result_url": "/v1/jobs/job-1/result",
+                    }).encode("utf-8")
+                    return _FakeResp(body, str(len(body)))
+                if len(calls) == 2:
+                    return _FakeResp(b"1234", "20")
+                return _FakeResp(b"01234567890123456789", "20")
+
+            args = capture_cli.parse_capture_args([
+                "https://example.org",
+                "--async",
+                "--output", str(async_out),
+                "--retries", "1",
+                "--retry-delay-ms", "0",
+                "--server", self.server,
+                "--no-start",
+                "--no-config",
+            ])
+            with mock.patch.object(capture_cli, "open_response_with_retries", side_effect=_fake_async_open):
+                _, total = capture_cli._execute_async(
+                    args,
+                    {"url": "https://example.org", "output": "png"},
+                    root=self.server,
+                    output=async_out,
+                    timeout=30.0,
+                    started_server=False,
+                    retries=1,
+                    retry_delay_ms=0,
+                )
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(total, 20)
+            self.assertEqual(async_out.read_bytes(), b"01234567890123456789")
+
+        # 5. {index} preservation does not collide when truncated slug happens to end in the index digits
+        host = "h" * 56
+        slug = "a" * 21 + "11" + "b" * 33
+        template = "{host}-{slug}-{index}{ext}"
+        payload = {"url": f"https://{host}.com/{slug}", "output": "png"}
+        f1 = capture_cli.render_output_template(template, payload=payload, index=1)
+        f2 = capture_cli.render_output_template(template, payload=payload, index=2)
+        f11 = capture_cli.render_output_template(template, payload=payload, index=11)
+        self.assertEqual(len({f1, f2, f11}), 3)
+        self.assertTrue(f1.endswith("-1.png"), f1)
+        self.assertTrue(f11.endswith("-11.png"), f11)
+        # Leading {index} survives truncation without duplicate suffix
+        lead1 = capture_cli.render_output_template("{index}-{host}-{slug}{ext}", payload=payload, index=1)
+        self.assertTrue(lead1.startswith("1-"), lead1)
+        self.assertFalse(lead1.endswith("-1.png"), lead1)
+
+        # 6. diff --output under an existing file returns structured JSON error (exit 1, no traceback)
+        with tempfile.TemporaryDirectory() as tmp:
+            png_stub = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+            p_a = Path(tmp) / "a.png"
+            p_b = Path(tmp) / "b.png"
+            p_a.write_bytes(png_stub)
+            p_b.write_bytes(png_stub)
+            blocker = Path(tmp) / "block"
+            blocker.write_text("file", encoding="utf-8")
+            code, _stdout, stderr = self._run([
+                "diff", str(p_a), str(p_b),
+                "--output", str(blocker / "out.zip"),
+                "--server", self.server,
+                "--no-start",
+            ])
+            self.assertEqual(code, 1)
+            err_doc = json.loads(stderr.strip())
+            self.assertFalse(err_doc["ok"])
+
+        # 7. Negative/zero/NaN --request-timeout rejected cleanly with exit 2 across commands
+        for argv in (
+            ["job", "status", "job-1", "--server", self.server, "--no-start", "--request-timeout", "-1"],
+            ["job", "status", "job-1", "--server", self.server, "--no-start", "--request-timeout", "nan"],
+            ["diff", "a.png", "b.png", "--server", self.server, "--no-start", "--request-timeout", "0"],
+            ["baseline", "compare", "home", "a.png", "--server", self.server, "--no-start", "--request-timeout", "inf"],
+        ):
+            code, _stdout, stderr = self._run(argv)
+            self.assertEqual(code, 2, argv)
+            err_doc = json.loads(stderr.strip())
+            self.assertFalse(err_doc["ok"])
+
+        buf_out, buf_err = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdout", buf_out), mock.patch("sys.stderr", buf_err):
+            code = capture_cli.main(["https://example.org", "--request-timeout", "-1"])
+        self.assertEqual(code, 2)
+        self.assertFalse(json.loads(buf_err.getvalue().strip())["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()
