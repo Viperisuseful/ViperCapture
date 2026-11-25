@@ -3106,3 +3106,182 @@ class GuiCouncilHardeningTests(TestCase):
             headers = {"X-ViperCapture-Render-Ms": "0.5", "X-ViperCapture-Encode-Ms": "25"}
 
         self.assertEqual(gui._response_encode_ms(_SubMsResp()), 25)
+
+    def test_round13_close_deadline_dns_connect_budget_posix_lock_and_exclusive_save(self) -> None:
+        import errno as _errno
+        import socket as _socket
+        import sys as _sys
+        import tempfile
+        import threading as _threading
+        import time as _time
+        import types as _types
+        from datetime import datetime as _dt, timezone as _tz
+
+        # 1. Connection: close body read respects remaining deadline via fp.raw._sock
+        srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(2)
+        port = srv.getsockname()[1]
+        done_evt = _threading.Event()
+
+        def _serve_close_slow_body() -> None:
+            try:
+                conn, _ = srv.accept()
+                try:
+                    conn.recv(4096)
+                    _time.sleep(0.16)
+                    conn.sendall(
+                        b"HTTP/1.1 200 OK\r\n"
+                        b"Content-Type: application/json\r\n"
+                        b"Connection: close\r\n\r\n"
+                    )
+                    done_evt.wait(timeout=1.0)
+                    try:
+                        conn.sendall(b'{"ok":true}')
+                    except OSError:
+                        pass
+                finally:
+                    conn.close()
+            finally:
+                srv.close()
+
+        t_srv = _threading.Thread(target=_serve_close_slow_body, daemon=True)
+        t_srv.start()
+        try:
+            t0 = _time.monotonic()
+            st, doc, err = gui._json_request(f"http://127.0.0.1:{port}/cfg", timeout=0.25)
+            elapsed = _time.monotonic() - t0
+            self.assertEqual(st, 0)
+            self.assertIsNone(doc)
+            self.assertTrue(err)
+            self.assertLess(elapsed, 0.36)
+        finally:
+            done_evt.set()
+            t_srv.join(timeout=2.0)
+
+        # 2. Multi-answer DNS connect shares a single wall-clock deadline
+        fake_infos = [
+            (_socket.AF_INET, _socket.SOCK_STREAM, 6, "", ("192.0.2.1", 9)),
+            (_socket.AF_INET, _socket.SOCK_STREAM, 6, "", ("192.0.2.2", 9)),
+            (_socket.AF_INET, _socket.SOCK_STREAM, 6, "", ("192.0.2.3", 9)),
+        ]
+        recorded_timeouts: list[float] = []
+
+        class _SlowSocket:
+            def __init__(self, *_a: object) -> None:
+                self._t = 0.0
+
+            def settimeout(self, val: float) -> None:
+                self._t = val
+                recorded_timeouts.append(val)
+
+            def connect(self, _sa: object) -> None:
+                _time.sleep(self._t)
+                raise TimeoutError("timed out")
+
+            def shutdown(self, _how: int) -> None:
+                return
+
+            def close(self) -> None:
+                return
+
+        with (
+            mock.patch.object(gui.socket, "getaddrinfo", return_value=fake_infos),
+            mock.patch.object(gui.socket, "socket", side_effect=_SlowSocket),
+        ):
+            t0 = _time.monotonic()
+            st2, _doc2, err2 = gui._json_request("http://multi.example/app-config", timeout=0.25)
+            elapsed2 = _time.monotonic() - t0
+        self.assertEqual(st2, 0)
+        self.assertTrue(err2)
+        self.assertLess(elapsed2, 0.42)
+        self.assertEqual(len(recorded_timeouts), 1)
+
+        # 3. POSIX _url_history_lock uses LOCK_EX | LOCK_NB and times out cleanly
+        flock_flags: list[int] = []
+        fake_fcntl = _types.ModuleType("fcntl")
+        fake_fcntl.LOCK_EX = 2  # type: ignore[attr-defined]
+        fake_fcntl.LOCK_NB = 4  # type: ignore[attr-defined]
+        fake_fcntl.LOCK_UN = 8  # type: ignore[attr-defined]
+
+        def _fake_flock(_fd: int, flags: int) -> None:
+            flock_flags.append(flags)
+            raise BlockingIOError(_errno.EAGAIN, "Resource temporarily unavailable")
+
+        fake_fcntl.flock = _fake_flock  # type: ignore[attr-defined]
+        ticks = iter([0.0, 0.0, 6.0])
+        with tempfile.TemporaryDirectory() as tmp:
+            hist_path = Path(tmp) / "gui_history.json"
+            with (
+                mock.patch.object(gui.os, "name", "posix"),
+                mock.patch.dict(_sys.modules, {"fcntl": fake_fcntl}),
+                mock.patch.object(gui.time, "monotonic", side_effect=lambda: next(ticks, 10.0)),
+                mock.patch.object(gui.time, "sleep", return_value=None),
+            ):
+                saved_hist = gui.save_url_history(["https://example.com"], hist_path)
+            self.assertIsNone(saved_hist)
+            self.assertFalse(hist_path.exists())
+            self.assertTrue(flock_flags)
+            self.assertTrue(all(f == (2 | 4) for f in flock_flags))
+
+        # 4. Concurrent captures at the same timestamp never overwrite each other (os.link AND O_EXCL fallback)
+        moment = _dt(2026, 1, 1, 12, 0, 0, tzinfo=_tz.utc)
+        for force_fallback in (False, True):
+            with tempfile.TemporaryDirectory() as tmp:
+                out_dir = Path(tmp)
+                barrier = _threading.Barrier(2, timeout=3.0)
+                orig_output_path = gui.output_path
+
+                def _synced_output_path(*a: object, **kw: object) -> Path:
+                    res = orig_output_path(*a, **kw)  # type: ignore[misc]
+                    barrier.wait()
+                    return res
+
+                results: list[gui.GuiState] = []
+
+                def _worker(size_pad: int) -> None:
+                    png_body = b"\x89PNG\r\n\x1a\n" + (b"x" * size_pad)
+                    st_in = gui.GuiState(url="https://example.com", output="png")
+
+                    class _OkResp:
+                        status = 200
+                        headers = {"Content-Type": "image/png"}
+
+                        def __init__(self) -> None:
+                            self._chunks = [png_body, b""]
+
+                        def read(self, _n: int = -1) -> bytes:
+                            return self._chunks.pop(0) if self._chunks else b""
+
+                        def __enter__(self) -> "_OkResp":
+                            return self
+
+                        def __exit__(self, *_a: object) -> bool:
+                            return False
+
+                    res = gui.perform_capture(
+                        st_in,
+                        directory=out_dir,
+                        opener=lambda _req, timeout=0: _OkResp(),
+                        moment=moment,
+                    )
+                    results.append(res)
+
+                ctx_link = (
+                    mock.patch.object(gui.os, "link", side_effect=OSError(_errno.EPERM, "no hardlinks"))
+                    if force_fallback
+                    else mock.patch.object(gui.os, "link", wraps=gui.os.link)
+                )
+                with mock.patch.object(gui, "output_path", side_effect=_synced_output_path), ctx_link:
+                    t1 = _threading.Thread(target=_worker, args=(10,))
+                    t2 = _threading.Thread(target=_worker, args=(20,))
+                    t1.start()
+                    t2.start()
+                    t1.join(timeout=5.0)
+                    t2.join(timeout=5.0)
+
+                self.assertEqual(len(results), 2)
+                self.assertEqual([r.error for r in results], ["", ""])
+                self.assertEqual(len({r.saved for r in results}), 2)
+                saved_sizes = sorted(p.stat().st_size for p in out_dir.glob("*.png"))
+                self.assertEqual(saved_sizes, [18, 28])

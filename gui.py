@@ -1463,6 +1463,20 @@ def looks_like_output(
     return False
 
 
+def _output_stem_and_ext(
+    url: str,
+    fmt: str,
+    moment: datetime,
+    *,
+    diagnostics: bool = False,
+) -> tuple[str, str]:
+    parsed = urllib.parse.urlparse(url)
+    host = _HOST.sub("-", parsed.hostname or "page").strip("-") or "page"
+    stamp = moment.astimezone().strftime("%Y%m%d-%H%M%S")
+    ext = output_extension(fmt, diagnostics=diagnostics)
+    return f"vipercapture-{host}-{stamp}", ext
+
+
 def output_path(
     directory: Path,
     url: str,
@@ -1471,14 +1485,11 @@ def output_path(
     *,
     diagnostics: bool = False,
 ) -> Path:
-    parsed = urllib.parse.urlparse(url)
-    host = _HOST.sub("-", parsed.hostname or "page").strip("-") or "page"
-    stamp = moment.astimezone().strftime("%Y%m%d-%H%M%S")
-    ext = output_extension(fmt, diagnostics=diagnostics)
-    path = directory / f"vipercapture-{host}-{stamp}.{ext}"
+    stem, ext = _output_stem_and_ext(url, fmt, moment, diagnostics=diagnostics)
+    path = directory / f"{stem}.{ext}"
     suffix = 2
     while path.exists():
-        path = directory / f"vipercapture-{host}-{stamp}-{suffix}.{ext}"
+        path = directory / f"{stem}-{suffix}.{ext}"
         suffix += 1
     return path
 
@@ -1571,10 +1582,26 @@ def _url_history_lock(target: Path) -> Iterator[None]:
                         raise TimeoutError("Timed out acquiring URL history lock.")
                     time.sleep(0.01)
         else:
+            import errno
             import fcntl
 
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            locked = True
+            deadline = time.monotonic() + 5.0
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Timed out acquiring URL history lock.")
+                    time.sleep(0.01)
+                except OSError as exc:
+                    if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("Timed out acquiring URL history lock.")
+                        time.sleep(0.01)
+                    else:
+                        raise
         yield
     finally:
         if locked:
@@ -1990,17 +2017,33 @@ def _safe_read_error_body(exc: urllib.error.HTTPError, limit: int = 64 * 1024) -
         return b""
 
 
+def _response_socket(response: object) -> object | None:
+    """Locate the live socket backing ``response`` even when Connection: close cleared connection.sock."""
+    inner = getattr(response, "_response", response)
+    fp = getattr(inner, "fp", None)
+    raw = getattr(fp, "raw", None) if fp is not None else None
+    sock = getattr(raw, "_sock", None) if raw is not None else None
+    if sock is not None and hasattr(sock, "settimeout"):
+        return sock
+    conn = getattr(response, "_connection", None)
+    conn_sock = getattr(conn, "sock", None) if conn is not None else None
+    if conn_sock is not None and hasattr(conn_sock, "settimeout"):
+        return conn_sock
+    return None
+
+
 def _read_with_deadline(response: object, limit: int, deadline: float, *, chunk_size: int = 16 * 1024) -> bytes:
     """Read up to ``limit`` bytes from ``response`` without exceeding ``deadline``."""
     chunks: list[bytes] = []
     total = 0
-    conn = getattr(response, "_connection", None)
-    sock = getattr(conn, "sock", None) if conn is not None else None
+    sock = _response_socket(response)
     read_fn = getattr(response, "read1", None) or getattr(response, "read")
     while total < limit:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("Timed out reading response body.")
+        if sock is None:
+            sock = _response_socket(response)
         if sock is not None and hasattr(sock, "settimeout"):
             try:
                 sock.settimeout(remaining)
@@ -3435,8 +3478,9 @@ def perform_capture(
     when = moment or datetime.now(timezone.utc)
     try:
         directory.mkdir(parents=True, exist_ok=True)
-        path = output_path(directory, url, state.output, when, diagnostics=state.diagnostics)
-        _save_exclusive(directory, path, body)
+        base_stem, base_ext = _output_stem_and_ext(url, state.output, when, diagnostics=state.diagnostics)
+        candidate = output_path(directory, url, state.output, when, diagnostics=state.diagnostics)
+        path = _save_exclusive(directory, candidate, body, base_stem=base_stem, ext=base_ext)
     except OSError as exc:
         return _replace(state, busy=False, cancelling=False, error=sanitize_terminal_text(str(exc)))
     cleanup_cfg = effective_cleanup(state)
@@ -3491,17 +3535,61 @@ def perform_capture(
     )
 
 
-def _save_exclusive(directory: Path, path: Path, body: bytes) -> None:
-    """Write the capture to a new file, then rename it into place."""
+def _save_exclusive(
+    directory: Path,
+    path: Path,
+    body: bytes,
+    *,
+    base_stem: str | None = None,
+    ext: str | None = None,
+) -> Path:
+    """Atomically save ``body`` without overwriting an existing file; retries suffixed names on collision."""
+    stem_root = base_stem if base_stem is not None else path.stem
+    ext_clean = ext if ext is not None else path.suffix.lstrip(".")
+    suffix_str = f".{ext_clean}" if ext_clean else ""
+
+    def _candidates() -> Iterator[Path]:
+        yield path
+        seen = {path}
+        idx = 2
+        while True:
+            cand = directory / f"{stem_root}-{idx}{suffix_str}"
+            idx += 1
+            if cand in seen:
+                continue
+            seen.add(cand)
+            yield cand
+
     fd, name = tempfile.mkstemp(prefix=".vipercapture-", suffix=".part", dir=directory)
     temporary = Path(name)
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(body)
-        os.replace(temporary, path)
-    except Exception:
+        use_excl_fallback = False
+        for candidate in _candidates():
+            if not use_excl_fallback:
+                try:
+                    os.link(temporary, candidate)
+                    return candidate
+                except FileExistsError:
+                    continue
+                except OSError:
+                    use_excl_fallback = True
+            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+            try:
+                dest_fd = os.open(str(candidate), flags, 0o600)
+            except FileExistsError:
+                continue
+            try:
+                with os.fdopen(dest_fd, "wb") as dest_handle:
+                    dest_handle.write(body)
+            except Exception:
+                candidate.unlink(missing_ok=True)
+                raise
+            return candidate
+    finally:
         temporary.unlink(missing_ok=True)
-        raise
+    raise OSError("Could not allocate a unique output filename.")
 
 
 def _outgoing_headers(request: urllib.request.Request) -> dict[str, str]:
@@ -3610,9 +3698,14 @@ def _close_socket(sock: object | None) -> None:
         pass
 
 
-def _read_tunnel_response(sock: socket.socket) -> tuple[int, str]:
+def _read_tunnel_response(sock: socket.socket, *, deadline: float | None = None) -> tuple[int, str]:
     buf = bytearray()
     while not buf.endswith(b"\r\n\r\n"):
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out")
+            sock.settimeout(remaining)
         chunk = sock.recv(1)
         if not chunk:
             break
@@ -3927,11 +4020,15 @@ def _create_connection_cancellable(
         cancel.bind(abort_cb)
     if cancel is not None and cancel.is_requested():
         raise _Cancelled()
+    deadline = time.monotonic() + max(0.0, float(timeout))
     last_err: OSError | None = None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("timed out")
     infos = _resolve_host_cancellable(
         host,
         port,
-        timeout,
+        remaining,
         cancel=cancel,
         abort_cb=abort_cb,
     )
@@ -3940,10 +4037,13 @@ def _create_connection_cancellable(
     for af, socktype, proto, _canonname, sa in infos:
         if cancel is not None and cancel.is_requested():
             raise _Cancelled()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("timed out")
         sock: socket.socket | None = None
         try:
             sock = socket.socket(af, socktype, proto)
-            sock.settimeout(timeout)
+            sock.settimeout(remaining)
             live_sock[0] = sock
             if cancel is not None and cancel.is_requested():
                 raise _Cancelled()
@@ -4002,6 +4102,13 @@ def _open_capture(
     proxy_raw = _proxy_for_url(request.full_url, parsed.scheme, parsed.hostname, port)
     live_sock: list[object | None] = [None]
     connection: http.client.HTTPConnection | None = None
+    deadline = time.monotonic() + max(0.001, float(timeout))
+
+    def _left() -> float:
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            raise TimeoutError("timed out")
+        return rem
 
     def _abort_active() -> None:
         if connection is not None:
@@ -4030,13 +4137,14 @@ def _open_capture(
             sock: socket.socket = _create_connection_cancellable(
                 ascii_proxy_host,
                 proxy_port,
-                timeout,
+                _left(),
                 live_sock=live_sock,
                 cancel=cancel,
                 abort_cb=_abort_active,
             )
 
             if proxy_parsed.scheme == "https":
+                sock.settimeout(_left())
                 sock = _wrap_tls_cancellable(
                     sock,
                     _default_ssl_context(),
@@ -4056,10 +4164,12 @@ def _open_capture(
                 connect_lines.append("")
                 if cancel is not None and cancel.requested:
                     raise _Cancelled()
+                sock.settimeout(_left())
                 sock.sendall("\r\n".join(connect_lines).encode("ascii"))
-                status_code, reason = _read_tunnel_response(sock)
+                status_code, reason = _read_tunnel_response(sock, deadline=deadline)
                 if status_code != 200:
                     raise http.client.HTTPException(f"Tunnel connection failed: {status_code} {reason}")
+                sock.settimeout(_left())
                 if isinstance(sock, ssl.SSLSocket):
                     tunnel_sock: object = _TlsInTlsSocket(sock, _default_ssl_context(), ascii_dest_host)
                     live_sock[0] = tunnel_sock
@@ -4074,13 +4184,13 @@ def _open_capture(
                         live_sock=live_sock,
                         cancel=cancel,
                     )
-                connection = _CancellableHTTPSConnection(ascii_dest_host, port, timeout=timeout, cancel=cancel)
+                connection = _CancellableHTTPSConnection(ascii_dest_host, port, timeout=_left(), cancel=cancel)
                 connection.sock = _CancellableSocket(tunnel_sock, cancel)  # type: ignore[assignment]
             else:
                 if proxy_parsed.scheme == "https":
-                    connection = _CancellableHTTPSConnection(ascii_proxy_host, proxy_port, timeout=timeout, cancel=cancel)
+                    connection = _CancellableHTTPSConnection(ascii_proxy_host, proxy_port, timeout=_left(), cancel=cancel)
                 else:
-                    connection = _CancellableHTTPConnection(ascii_proxy_host, proxy_port, timeout=timeout, cancel=cancel)
+                    connection = _CancellableHTTPConnection(ascii_proxy_host, proxy_port, timeout=_left(), cancel=cancel)
                 connection.sock = _CancellableSocket(sock, cancel)  # type: ignore[assignment]
                 dest_authority = f"{dest_host_hdr}:{parsed.port}" if parsed.port is not None else dest_host_hdr
                 request_target = f"{parsed.scheme}://{dest_authority}{path}"
@@ -4090,11 +4200,12 @@ def _open_capture(
             raw_sock = _create_connection_cancellable(
                 ascii_dest_host,
                 port,
-                timeout,
+                _left(),
                 live_sock=live_sock,
                 cancel=cancel,
                 abort_cb=_abort_active,
             )
+            raw_sock.settimeout(_left())
             tls_sock = _wrap_tls_cancellable(
                 raw_sock,
                 _default_ssl_context(),
@@ -4102,23 +4213,25 @@ def _open_capture(
                 live_sock=live_sock,
                 cancel=cancel,
             )
-            connection = _CancellableHTTPSConnection(ascii_dest_host, port, timeout=timeout, cancel=cancel)
+            connection = _CancellableHTTPSConnection(ascii_dest_host, port, timeout=_left(), cancel=cancel)
             connection.sock = _CancellableSocket(tls_sock, cancel)  # type: ignore[assignment]
         else:
             raw_sock = _create_connection_cancellable(
                 ascii_dest_host,
                 port,
-                timeout,
+                _left(),
                 live_sock=live_sock,
                 cancel=cancel,
                 abort_cb=_abort_active,
             )
-            connection = _CancellableHTTPConnection(ascii_dest_host, port, timeout=timeout, cancel=cancel)
+            connection = _CancellableHTTPConnection(ascii_dest_host, port, timeout=_left(), cancel=cancel)
             connection.sock = _CancellableSocket(raw_sock, cancel)  # type: ignore[assignment]
 
         connection.auto_open = 0
         if cancel is not None and cancel.requested:
             raise _Cancelled()
+        if connection.sock is not None and hasattr(connection.sock, "settimeout"):
+            connection.sock.settimeout(_left())
         connection.request(
             request.get_method(),
             request_target,
@@ -4127,6 +4240,8 @@ def _open_capture(
         )
         if cancel is not None and cancel.requested:
             raise _Cancelled()
+        if connection.sock is not None and hasattr(connection.sock, "settimeout"):
+            connection.sock.settimeout(_left())
         response = connection.getresponse()
     except _Cancelled:
         _abort_active()
