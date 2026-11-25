@@ -2327,9 +2327,34 @@ def _parse_contract_str(
     return value
 
 
+_CONTRACT_LIST_TYPES = (list, tuple, set, frozenset)
+_CONTRACT_FORBIDDEN_HOST_CHARS = frozenset("#/:<>?@[\\]^|%")
+
+
+def _parse_whatwg_ipv4_number(part: str) -> tuple[bool, int | None]:
+    """Parse one WHATWG IPv4 number segment. Returns (is_numeric_syntax, value_or_None)."""
+    if not part:
+        return (False, None)
+    lowered = part.lower()
+    if lowered.startswith("0x"):
+        digits = lowered[2:]
+        if not digits:
+            return (True, 0)
+        if all(ch in "0123456789abcdef" for ch in digits):
+            return (True, int(digits, 16))
+        return (False, None)
+    if not part.isascii() or not part.isdigit():
+        return (False, None)
+    if len(part) > 1 and part[0] == "0":
+        if all(ch in "01234567" for ch in part):
+            return (True, int(part, 8))
+        return (True, None)
+    return (True, int(part, 10))
+
+
 def _parse_contract_enum(value: object, field: str, allowed: frozenset[str] | tuple[str, ...]) -> str:
     """Validate and coerce a str Enum matching Pydantic v2 non-strict semantics."""
-    if isinstance(value, bytes):
+    if isinstance(value, (bytes, bytearray)):
         try:
             value = value.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -2346,8 +2371,8 @@ def _parse_contract_http_url(value: object, field: str) -> str:
             value = value.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise ValueError(f"{field} must be a valid HTTP(S) URL.") from exc
-    if not isinstance(value, str):
-        raise ValueError(f"{field} must be a valid HTTP(S) URL.")
+    if not isinstance(value, str) or len(value) > 2_083:
+        raise ValueError(f"{field} must be a valid HTTP(S) URL of at most 2083 characters.")
     cleaned = value.strip().replace("\t", "").replace("\r", "").replace("\n", "")
     if not cleaned:
         raise ValueError(f"{field} must be a valid HTTP(S) URL.")
@@ -2356,12 +2381,68 @@ def _parse_contract_http_url(value: object, field: str) -> str:
         _ = parsed.port
     except ValueError as exc:
         raise ValueError(f"{field} must be a valid HTTP(S) URL.") from exc
-    if (
-        parsed.scheme.lower() not in {"http", "https"}
-        or not parsed.hostname
-        or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in parsed.hostname)
-    ):
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
         raise ValueError(f"{field} must be a valid HTTP(S) URL.")
+    authority = parsed.netloc
+    if "@" in authority:
+        authority = authority.rsplit("@", 1)[1]
+    if authority.startswith("["):
+        end_bracket = authority.find("]")
+        if end_bracket < 0:
+            raise ValueError(f"{field} has an invalid IPv6 host.")
+        ipv6_text = authority[1:end_bracket]
+        rest = authority[end_bracket + 1 :]
+        if rest and not rest.startswith(":"):
+            raise ValueError(f"{field} has an invalid IPv6 host.")
+        try:
+            ipaddress.IPv6Address(ipv6_text)
+        except ValueError as exc:
+            raise ValueError(f"{field} has an invalid IPv6 host.") from exc
+        return cleaned
+    if "[" in authority or "]" in authority:
+        raise ValueError(f"{field} has an invalid host.")
+    raw_host = authority.split(":", 1)[0]
+    if not raw_host:
+        raise ValueError(f"{field} must include a host.")
+    if "%" in raw_host:
+        i = 0
+        decoded_bytes = bytearray()
+        while i < len(raw_host):
+            if raw_host[i] == "%":
+                if i + 2 >= len(raw_host):
+                    raise ValueError(f"{field} has an invalid percent-escape in host.")
+                hex_pair = raw_host[i + 1 : i + 3]
+                if not all(ch in "0123456789abcdefABCDEF" for ch in hex_pair):
+                    raise ValueError(f"{field} has an invalid percent-escape in host.")
+                decoded_bytes.append(int(hex_pair, 16))
+                i += 3
+            else:
+                decoded_bytes.extend(raw_host[i].encode("utf-8"))
+                i += 1
+        try:
+            host_text = decoded_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"{field} has an invalid host.") from exc
+    else:
+        host_text = raw_host
+    if any(ord(ch) <= 0x20 or ord(ch) == 0x7F or ch in _CONTRACT_FORBIDDEN_HOST_CHARS for ch in host_text):
+        raise ValueError(f"{field} contains forbidden host characters.")
+    parts = host_text.split(".")
+    if parts and parts[-1] == "":
+        parts = parts[:-1]
+    if parts:
+        last_is_num, _ = _parse_whatwg_ipv4_number(parts[-1])
+        if last_is_num:
+            if len(parts) > 4:
+                raise ValueError(f"{field} has an invalid IPv4 host.")
+            nums: list[int] = []
+            for part in parts:
+                is_num, num_val = _parse_whatwg_ipv4_number(part)
+                if not is_num or num_val is None:
+                    raise ValueError(f"{field} has an invalid IPv4 host.")
+                nums.append(num_val)
+            if any(n >= 256 for n in nums[:-1]) or nums[-1] >= 256 ** (5 - len(nums)):
+                raise ValueError(f"{field} has an invalid IPv4 host.")
     return cleaned
 
 
@@ -2444,10 +2525,15 @@ def _parse_contract_float(
                 value = value.decode("utf-8")
             except UnicodeDecodeError as exc:
                 raise ValueError(f"{field} must be a number.") from exc
-        if not isinstance(value, str) or not value.isascii():
+        if not isinstance(value, str):
+            raise ValueError(f"{field} must be a number.")
+        stripped = value.strip()
+        if not stripped or not stripped.isascii():
+            raise ValueError(f"{field} must be a number.")
+        if stripped.startswith("_") or stripped.endswith("_") or "__" in stripped:
             raise ValueError(f"{field} must be a number.")
         try:
-            parsed = float(value)
+            parsed = float(stripped.replace("_", ""))
         except (ValueError, OverflowError) as exc:
             raise ValueError(f"{field} must be a number.") from exc
     if lo is not None or hi is not None:
@@ -2537,10 +2623,10 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
         if ndict_key in payload and payload[ndict_key] is not None and not isinstance(payload[ndict_key], dict):
             raise ValueError(f"{ndict_key} must be an object or null.")
     for list_key in _FALLBACK_LIST_SECTIONS:
-        if list_key in payload and not isinstance(payload[list_key], (list, tuple)):
+        if list_key in payload and not isinstance(payload[list_key], _CONTRACT_LIST_TYPES):
             raise ValueError(f"{list_key} must be a list.")
     for nlist_key in _FALLBACK_NULLABLE_LIST_SECTIONS:
-        if nlist_key in payload and payload[nlist_key] is not None and not isinstance(payload[nlist_key], (list, tuple)):
+        if nlist_key in payload and payload[nlist_key] is not None and not isinstance(payload[nlist_key], _CONTRACT_LIST_TYPES):
             raise ValueError(f"{nlist_key} must be a list or null.")
 
     output_fmt = _parse_contract_enum(payload["output"], "output", _CONTRACT_OUTPUTS) if "output" in payload else "png"
@@ -2583,7 +2669,7 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
     side_outputs_vals: list[str] = []
     if payload.get("side_outputs") is not None:
         raw_sides = payload["side_outputs"]
-        assert isinstance(raw_sides, (list, tuple))
+        assert isinstance(raw_sides, _CONTRACT_LIST_TYPES)
         if not raw_sides or len(raw_sides) > 4:
             raise ValueError("side_outputs must contain 1 to 4 entries.")
         for item in raw_sides:
@@ -2631,7 +2717,7 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
             if engine_name != "chromium":
                 raise ValueError("optimize_for_speed requires the Chromium engine.")
         if thumbnails_raw is not None:
-            if not isinstance(thumbnails_raw, (list, tuple)) or not (1 <= len(thumbnails_raw) <= 5):
+            if not isinstance(thumbnails_raw, _CONTRACT_LIST_TYPES) or not (1 <= len(thumbnails_raw) <= 5):
                 raise ValueError("image.thumbnails must contain 1 to 5 entries.")
             thumb_names: list[str] = []
             for thumb in thumbnails_raw:
@@ -2709,7 +2795,7 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
 
     if payload.get("elements") is not None:
         elems = payload["elements"]
-        assert isinstance(elems, (list, tuple))
+        assert isinstance(elems, _CONTRACT_LIST_TYPES)
         if not (1 <= len(elems) <= 32):
             raise ValueError("elements must contain 1 to 32 entries.")
         elem_selectors: list[str] = []
@@ -2727,7 +2813,7 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
 
     if "fail_on_status" in payload:
         statuses = payload["fail_on_status"]
-        assert isinstance(statuses, (list, tuple))
+        assert isinstance(statuses, _CONTRACT_LIST_TYPES)
         if len(statuses) > 32:
             raise ValueError("fail_on_status may contain at most 32 entries.")
         parsed_statuses = [_parse_contract_int(st, "fail_on_status", 100, 599) for st in statuses]
@@ -2781,7 +2867,7 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
 
     if payload.get("viewports") is not None:
         vps = payload["viewports"]
-        assert isinstance(vps, (list, tuple))
+        assert isinstance(vps, _CONTRACT_LIST_TYPES)
         if not is_image_fmt:
             raise ValueError("viewports requires PNG, JPEG, WebP, or AVIF output.")
         if full_page_val:
@@ -3027,7 +3113,7 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
                 _parse_contract_str(prx["bypass"], "network.proxy.bypass", max_len=4_096)
         if "cookies" in net:
             cks = net["cookies"]
-            if not isinstance(cks, (list, tuple)) or len(cks) > 64:
+            if not isinstance(cks, _CONTRACT_LIST_TYPES) or len(cks) > 64:
                 raise ValueError("network.cookies must be a list of at most 64 cookies.")
             for ck in cks:
                 if not isinstance(ck, dict):
@@ -3069,7 +3155,7 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
                     _parse_contract_str(ck["same_site"], "cookie.same_site", pattern=_CONTRACT_SAME_SITE_RE)
         if "block_url_patterns" in net:
             pats = net["block_url_patterns"]
-            if not isinstance(pats, (list, tuple)) or len(pats) > 64:
+            if not isinstance(pats, _CONTRACT_LIST_TYPES) or len(pats) > 64:
                 raise ValueError("network.block_url_patterns must be a list of at most 64 patterns.")
             parsed_pats = [_parse_contract_str(p, "block_url_patterns", min_len=1, max_len=2_048) for p in pats]
             if len(set(parsed_pats)) != len(parsed_pats):
@@ -3092,7 +3178,7 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
         for akey in ("content_includes", "content_excludes", "request_failures"):
             if akey in asr:
                 alist = asr[akey]
-                if not isinstance(alist, (list, tuple)) or len(alist) > 32:
+                if not isinstance(alist, _CONTRACT_LIST_TYPES) or len(alist) > 32:
                     raise ValueError(f"assertions.{akey} must be a list of at most 32 entries.")
                 parsed_a = [_parse_contract_str(x, f"assertions.{akey}", min_len=1, max_len=4_096) for x in alist]
                 if len(set(parsed_a)) != len(parsed_a):
@@ -3137,7 +3223,7 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
 
     if "actions" in payload:
         acts = payload["actions"]
-        assert isinstance(acts, (list, tuple))
+        assert isinstance(acts, _CONTRACT_LIST_TYPES)
         if len(acts) > 32:
             raise ValueError("actions may contain at most 32 entries.")
         act_keys = frozenset({"type", "selector", "value", "values", "key", "x", "y", "delay_ms", "timeout_ms"})
@@ -3153,7 +3239,7 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
             avals: list[str] | None = None
             if act.get("values") is not None:
                 raw_avals = act["values"]
-                if not isinstance(raw_avals, (list, tuple)) or not (1 <= len(raw_avals) <= 32):
+                if not isinstance(raw_avals, _CONTRACT_LIST_TYPES) or not (1 <= len(raw_avals) <= 32):
                     raise ValueError("action.values must contain 1 to 32 entries.")
                 avals = [_parse_contract_str(v, "action.values", max_len=16_384) for v in raw_avals]
             akey = _parse_contract_str(act["key"], "action.key", min_len=1, max_len=128) if act.get("key") is not None else None

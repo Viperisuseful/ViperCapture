@@ -726,9 +726,19 @@ class RenderRequest(StrictModel):
         output = data.get("output", OutputFormat.PNG.value)
         if hasattr(output, "value"):
             output = output.value
+        elif isinstance(output, (bytes, bytearray)):
+            try:
+                output = output.decode("utf-8")
+            except UnicodeDecodeError:
+                output = None
         engine = data.get("engine", BrowserEngine.CHROMIUM.value)
         if hasattr(engine, "value"):
             engine = engine.value
+        elif isinstance(engine, (bytes, bytearray)):
+            try:
+                engine = engine.decode("utf-8")
+            except UnicodeDecodeError:
+                engine = None
         deterministic = data.get("deterministic") or {}
         deterministic_enabled = bool(
             deterministic.get("enabled") if isinstance(deterministic, dict) else False
@@ -738,6 +748,7 @@ class RenderRequest(StrictModel):
                 data["lazy_load"] = LazyLoadMode.ADAPTIVE.value
             if (
                 "optimize_for_speed" not in image
+                and isinstance(output, str)
                 and output in {OutputFormat.PNG.value, OutputFormat.WEBP.value}
                 and engine == BrowserEngine.CHROMIUM.value
                 and not deterministic_enabled
