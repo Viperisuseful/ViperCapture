@@ -2310,10 +2310,72 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
         vp = payload["viewport"]
         assert isinstance(vp, dict)
         for dim in ("width", "height"):
-            if dim in vp and (not _is_int(vp[dim]) or vp[dim] < 1):  # type: ignore[operator]
-                raise ValueError(f"viewport.{dim} must be a positive integer.")
-        if "device_scale_factor" in vp and (not _is_number(vp["device_scale_factor"]) or vp["device_scale_factor"] <= 0):  # type: ignore[operator]
-            raise ValueError("viewport.device_scale_factor must be a positive number.")
+            if dim in vp and (not _is_int(vp[dim]) or vp[dim] < 1 or vp[dim] > 65_535):  # type: ignore[operator]
+                raise ValueError(f"viewport.{dim} must be an integer between 1 and 65535.")
+        if "device_scale_factor" in vp and (
+            not _is_number(vp["device_scale_factor"])
+            or not math.isfinite(float(vp["device_scale_factor"]))  # type: ignore[arg-type]
+            or vp["device_scale_factor"] < 0.1  # type: ignore[operator]
+            or vp["device_scale_factor"] > 8  # type: ignore[operator]
+        ):
+            raise ValueError("viewport.device_scale_factor must be between 0.1 and 8.")
+    output_fmt = str(payload.get("output") or "png")
+    engine_name = str(payload.get("engine") or "chromium")
+    full_page_val = payload.get("full_page", True)
+    is_image_fmt = output_fmt in {"png", "jpeg", "webp", "avif"}
+    is_video_fmt = output_fmt in {"webm", "mp4", "gif"}
+    if "video" in payload and payload["video"] is not None:
+        vid = payload["video"]
+        assert isinstance(vid, dict)
+        if not is_video_fmt:
+            raise ValueError("video settings require WebM, MP4, or GIF output.")
+        if "duration_ms" in vid and (not _is_int(vid["duration_ms"]) or vid["duration_ms"] < 1_000 or vid["duration_ms"] > 30_000):  # type: ignore[operator]
+            raise ValueError("video.duration_ms must be an integer between 1000 and 30000.")
+        if "fps" in vid and (not _is_int(vid["fps"]) or vid["fps"] < 1 or vid["fps"] > 60):  # type: ignore[operator]
+            raise ValueError("video.fps must be an integer between 1 and 60.")
+        if "bitrate_mbps" in vid and (not _is_int(vid["bitrate_mbps"]) or vid["bitrate_mbps"] < 1 or vid["bitrate_mbps"] > 100):  # type: ignore[operator]
+            raise ValueError("video.bitrate_mbps must be an integer between 1 and 100.")
+        if "scroll_step" in vid and (not _is_int(vid["scroll_step"]) or vid["scroll_step"] < 1 or vid["scroll_step"] > 4_320):  # type: ignore[operator]
+            raise ValueError("video.scroll_step must be an integer between 1 and 4320.")
+        if "scroll_delay_ms" in vid and (not _is_int(vid["scroll_delay_ms"]) or vid["scroll_delay_ms"] < 50 or vid["scroll_delay_ms"] > 2_000):  # type: ignore[operator]
+            raise ValueError("video.scroll_delay_ms must be an integer between 50 and 2000.")
+        for bkey in ("scroll", "transparent_background"):
+            if bkey in vid and type(vid[bkey]) is not bool:
+                raise ValueError(f"video.{bkey} must be a boolean.")
+        if vid.get("transparent_background") is True:
+            if not full_page_val:
+                raise ValueError("transparent video requires full_page=true.")
+            if output_fmt == "mp4":
+                raise ValueError("MP4 does not support transparent video.")
+    if "image" in payload and payload["image"] is not None:
+        img = payload["image"]
+        assert isinstance(img, dict)
+        if "quality" in img and img["quality"] is not None:
+            if not _is_int(img["quality"]) or img["quality"] < 1 or img["quality"] > 100:  # type: ignore[operator]
+                raise ValueError("image.quality must be an integer between 1 and 100.")
+            if output_fmt not in {"jpeg", "webp", "avif"}:
+                raise ValueError("quality is accepted only for JPEG, WebP, or AVIF.")
+        for dim in ("width", "height"):
+            if dim in img and img[dim] is not None and (not _is_int(img[dim]) or img[dim] < 1 or img[dim] > 65_535):  # type: ignore[operator]
+                raise ValueError(f"image.{dim} must be an integer between 1 and 65535.")
+        if img.get("transparent_background") is True and output_fmt not in {"png", "webp", "avif"}:
+            raise ValueError("transparent_background is accepted only for PNG, WebP, or AVIF.")
+        if img.get("optimize_for_speed") is True:
+            if output_fmt not in {"png", "webp"}:
+                raise ValueError("optimize_for_speed is accepted only for PNG or WebP.")
+            if engine_name != "chromium":
+                raise ValueError("optimize_for_speed requires the Chromium engine.")
+    if "clip" in payload and payload["clip"] is not None:
+        clip = payload["clip"]
+        assert isinstance(clip, dict)
+        if full_page_val or not is_image_fmt:
+            raise ValueError("clip requires full_page=false and an image output.")
+        for coord in ("x", "y"):
+            if coord in clip and (not _is_number(clip[coord]) or not math.isfinite(float(clip[coord])) or clip[coord] < 0 or clip[coord] > 100_000):  # type: ignore[arg-type,operator]
+                raise ValueError(f"clip.{coord} must be between 0 and 100000.")
+        for dim in ("width", "height"):
+            if dim not in clip or not _is_number(clip[dim]) or not math.isfinite(float(clip[dim])) or clip[dim] <= 0 or clip[dim] > 100_000:  # type: ignore[arg-type,operator]
+                raise ValueError(f"clip.{dim} must be greater than 0 and at most 100000.")
     if "environment" in payload:
         env = payload["environment"]
         assert isinstance(env, dict)
@@ -2338,6 +2400,10 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
             raise ValueError("wait_for.event is invalid.")
         if "selector_state" in wf and (not isinstance(wf["selector_state"], str) or wf["selector_state"] not in _WAIT_STATES):
             raise ValueError("wait_for.selector_state is invalid.")
+        if "delay_ms" in wf and (not _is_int(wf["delay_ms"]) or wf["delay_ms"] < 0 or wf["delay_ms"] > 30_000):  # type: ignore[operator]
+            raise ValueError("wait_for.delay_ms must be an integer between 0 and 30000.")
+        if "timeout_ms" in wf and (not _is_int(wf["timeout_ms"]) or wf["timeout_ms"] < 1 or wf["timeout_ms"] > 60_000):  # type: ignore[operator]
+            raise ValueError("wait_for.timeout_ms must be an integer between 1 and 60000.")
     if "actions" in payload:
         acts = payload["actions"]
         assert isinstance(acts, list)
@@ -2347,8 +2413,11 @@ def _validate_payload_fallback(payload: dict[str, object]) -> None:
     if "headers" in payload:
         hdrs = payload["headers"]
         assert isinstance(hdrs, dict)
-        if not all(isinstance(k, str) and isinstance(v, str) for k, v in hdrs.items()):
-            raise ValueError("headers must be a mapping of string names to string values.")
+        for k, v in hdrs.items():
+            if not isinstance(k, str) or not isinstance(v, str):
+                raise ValueError("headers must be a mapping of string names to string values.")
+            if any(ch in k or ch in v for ch in "\r\n\x00"):
+                raise ValueError("headers must not contain newlines or NUL bytes.")
 
 
 def validate_payload(payload: dict[str, object]) -> None:
@@ -2406,14 +2475,50 @@ def render_output_template(
         "ext": ext,
     }
     formatter = string.Formatter()
+    rendered_parts: list[str] = []
+    has_index_field = False
+    index_formatted: str | None = None
+    index_spans: list[tuple[int, int]] = []
+    cursor = 0
     try:
-        rendered = template.format(**fields)
         parsed_parts = list(formatter.parse(template))
-    except (KeyError, ValueError, IndexError, AttributeError, TypeError) as exc:
+        for literal, field_name, format_spec, conversion in parsed_parts:
+            if "/" in literal or "\\" in literal:
+                raise ValueError("--output-template must produce a filename without directory separators.")
+            rendered_parts.append(literal)
+            cursor += len(literal)
+            if field_name is not None:
+                val, _ = formatter.get_field(field_name, (), fields)
+                val = formatter.convert_field(val, conversion)
+                piece = formatter.format_field(val, format_spec or "")
+                is_index_field = field_name == "index" or field_name.startswith(("index.", "index["))
+                if is_index_field:
+                    has_index_field = True
+                    cleaned_piece = _BAD_FILENAME.sub("_", piece).strip(" .")
+                    if cleaned_piece != piece or not cleaned_piece or len(cleaned_piece) > 16:
+                        piece = str(index)
+                        cleaned_piece = piece
+                    if index_formatted is None:
+                        index_formatted = cleaned_piece
+                    start = cursor
+                    cursor += len(piece)
+                    index_spans.append((start, cursor))
+                else:
+                    cursor += len(piece)
+                rendered_parts.append(piece)
+    except ValueError as exc:
+        if "--output-template must produce a filename without directory separators." in str(exc):
+            raise
         raise ValueError(
             f"Invalid --output-template {template!r}: {exc}. "
             "Supported placeholders: {host}, {index}, {slug}, {timestamp}, {format}, {ext}."
         ) from exc
+    except (KeyError, IndexError, AttributeError, TypeError) as exc:
+        raise ValueError(
+            f"Invalid --output-template {template!r}: {exc}. "
+            "Supported placeholders: {host}, {index}, {slug}, {timestamp}, {format}, {ext}."
+        ) from exc
+    rendered = "".join(rendered_parts)
     if "/" in rendered or "\\" in rendered or rendered in {"", ".", ".."}:
         raise ValueError("--output-template must produce a filename without directory separators.")
     candidate = Path(rendered)
@@ -2426,28 +2531,6 @@ def render_output_template(
         raw_stem = rendered
         suffix = ""
     stem = safe_filename(raw_stem)
-    has_index_field = False
-    index_formatted: str | None = None
-    index_spans: list[tuple[int, int]] = []
-    cursor = 0
-    for literal, field_name, format_spec, conversion in parsed_parts:
-        cursor += len(literal)
-        if field_name is not None:
-            val, _ = formatter.get_field(field_name, (), fields)
-            val = formatter.convert_field(val, conversion)
-            piece = formatter.format_field(val, format_spec or "")
-            start = cursor
-            cursor += len(piece)
-            if field_name == "index" or field_name.startswith(("index.", "index[")):
-                has_index_field = True
-                cleaned_piece = _BAD_FILENAME.sub("_", piece).strip(" .")
-                if cleaned_piece == piece and cleaned_piece:
-                    index_spans.append((start, cursor))
-                if index_formatted is None:
-                    if cleaned_piece == piece and cleaned_piece and len(cleaned_piece) <= 16:
-                        index_formatted = cleaned_piece
-                    else:
-                        index_formatted = str(index)
     if has_index_field:
         lead_strip = len(raw_stem) - len(_BAD_FILENAME.sub("_", raw_stem).lstrip(" ."))
         survived = any(
@@ -2573,7 +2656,7 @@ def _header_token(value: str) -> str:
 def bearer_token(args: argparse.Namespace, *, started_server: bool) -> str:
     api_key = getattr(args, "api_key", None)
     if api_key is not None:
-        return _header_token(api_key)
+        return _validate_header_value(str(api_key), "--api-key").strip()
     server = getattr(args, "server", None)
     project_key = _header_token(os.environ.get("VIPERCAPTURE_API_KEY", ""))
     if not project_key and not getattr(args, "no_config", False):
@@ -2605,6 +2688,9 @@ def request_headers(
     token = bearer_token(args, started_server=started_server)
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    api_key = getattr(args, "api_key", None)
+    if api_key is not None:
+        _validate_header_value(str(api_key), "--api-key")
     req_id = getattr(args, "request_id", None)
     if req_id:
         headers["X-Request-Id"] = _validate_header_value(str(req_id), "--request-id")
@@ -3874,6 +3960,9 @@ def _validate_client_options(args: argparse.Namespace) -> None:
         int(args.retry_delay_ms) < 0 or int(args.retry_delay_ms) > _MAX_INT_OPTION
     ):
         raise ValueError(f"--retry-delay-ms must be between 0 and {_MAX_INT_OPTION}.")
+    api_key = getattr(args, "api_key", None)
+    if api_key is not None:
+        _validate_header_value(str(api_key), "--api-key")
     req_id = getattr(args, "request_id", None)
     if req_id is not None:
         _validate_header_value(str(req_id), "--request-id")

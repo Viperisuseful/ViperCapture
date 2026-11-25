@@ -36,6 +36,7 @@ from vipercapture.capture_cli import (
     _read_json,
     _read_json_value,
     _read_text,
+    _validate_header_value,
     add_render_option_groups,
     api_root,
     bearer_token,
@@ -166,9 +167,12 @@ def _load_local_env_for_target(args: argparse.Namespace) -> None:
 
 
 def _admin_token(args: argparse.Namespace) -> str:
-    explicit = getattr(args, "admin_token", None) or getattr(args, "api_key", None)
-    if explicit is not None:
-        return _header_token(explicit)
+    explicit_admin = getattr(args, "admin_token", None)
+    if explicit_admin is not None:
+        return _validate_header_value(str(explicit_admin), "--admin-token").strip()
+    explicit_api = getattr(args, "api_key", None)
+    if explicit_api is not None:
+        return _validate_header_value(str(explicit_api), "--api-key").strip()
     if not getattr(args, "no_config", False):
         try:
             cfg = load_cli_config()
@@ -186,11 +190,15 @@ def _admin_token(args: argparse.Namespace) -> str:
 
 def _signing_token(args: argparse.Namespace) -> str:
     explicit_sign = getattr(args, "signing_token", None)
-    if explicit_sign is not None and explicit_sign.strip():
-        return _header_token(explicit_sign)
+    if explicit_sign is not None:
+        val = _validate_header_value(str(explicit_sign), "--signing-token").strip()
+        if val:
+            return val
     explicit_api = getattr(args, "api_key", None)
-    if explicit_api is not None and explicit_api.strip():
-        return _header_token(explicit_api)
+    if explicit_api is not None:
+        val = _validate_header_value(str(explicit_api), "--api-key").strip()
+        if val:
+            return val
     if not getattr(args, "no_config", False):
         try:
             cfg = load_cli_config()
@@ -2720,7 +2728,7 @@ def main(argv: list[str] | None = None) -> int:
         return fail("Cancelled.", exit_code=130)
     except BrokenPipeError:
         return 0
-    except OverflowError as exc:
+    except (ValueError, OverflowError) as exc:
         return fail(str(exc), exit_code=2)
     except OSError as exc:
         return fail(str(exc), exit_code=1)

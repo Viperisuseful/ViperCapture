@@ -2133,6 +2133,60 @@ class CliCouncilHardeningTests(unittest.TestCase):
 
         self.assertEqual(capture_cli._expected_content_length(_PaddedCl()), 8)
 
+    def test_round14_stdlib_fallback_validation_index_sep_chars_and_crlf_api_key(self) -> None:
+        from vipercapture import capture_cli
+
+        # 1. Stdlib fallback validation (without pydantic) rejects invalid video.duration_ms and quality on png
+        with self.assertRaises(ValueError):
+            capture_cli._validate_payload_fallback({
+                "url": "https://example.invalid",
+                "output": "webm",
+                "video": {"duration_ms": 0},
+            })
+        with self.assertRaises(ValueError):
+            capture_cli._validate_payload_fallback({
+                "url": "https://example.invalid",
+                "output": "png",
+                "image": {"quality": 90},
+            })
+        with self.assertRaises(ValueError):
+            capture_cli._validate_payload_fallback({
+                "url": "https://example.invalid",
+                "output": "png",
+                "headers": {"X-Bad": "a\r\nb"},
+            })
+
+        # 2. {index:c} at index 47 ('/') and 92 ('\') canonicalizes to decimal instead of raising ValueError
+        p = {"url": "https://example.com", "output": "png"}
+        r47 = capture_cli.render_output_template("{host}-{index:c}{ext}", payload=p, index=47)
+        r92 = capture_cli.render_output_template("{host}-{index:c}{ext}", payload=p, index=92)
+        self.assertEqual(r47, "example.com-47.png")
+        self.assertEqual(r92, "example.com-92.png")
+        with self.assertRaises(ValueError):
+            capture_cli.render_output_template("sub/{host}-{index}{ext}", payload=p, index=1)
+
+        # 3. CR/LF/NUL in --api-key is rejected with exit 2 instead of silently dropped
+        buf_out, buf_err = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdout", buf_out), mock.patch("sys.stderr", buf_err):
+            code = capture_cli.main([
+                "https://example.org",
+                "--api-key", "abc\r\nX-Injected: 1",
+                "--server", self.server,
+                "--no-config",
+                "--no-start",
+            ])
+        self.assertEqual(code, 2)
+        self.assertFalse(json.loads(buf_err.getvalue().strip())["ok"])
+
+        code_cmd, _out_cmd, err_cmd = self._run([
+            "job", "status", "job-1",
+            "--api-key", "abc\r\nX-Injected: 1",
+            "--server", self.server,
+            "--no-start",
+        ])
+        self.assertEqual(code_cmd, 2)
+        self.assertFalse(json.loads(err_cmd.strip())["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()
