@@ -902,5 +902,547 @@ class FastValidationTests(unittest.TestCase):
         port_open.assert_called_once()
 
 
+class NewCaptureFeaturesTests(unittest.TestCase):
+    def test_action_wait_text_and_js_file_preserve_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "script.js"
+            script.write_text("document.title = 'updated';", encoding="utf-8")
+            payload = _payload([
+                "https://example.com",
+                "--action-delay-ms", "25",
+                "--action-wait-text", "Ready to go",
+                "--js-file", str(script),
+                "--click", "#go",
+            ])
+        self.assertEqual(
+            payload["actions"],
+            [
+                {"type": "wait", "value": "Ready to go", "delay_ms": 25},
+                {"type": "javascript", "value": "document.title = 'updated';", "delay_ms": 25},
+                {"type": "click", "selector": "#go", "delay_ms": 25},
+            ],
+        )
+
+    def test_cookie_file_formats_and_secret_redaction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            netscape = Path(directory) / "cookies.txt"
+            netscape.write_text(
+                "# Netscape HTTP Cookie File\n"
+                "#HttpOnly_.example.com\tTRUE\t/\tTRUE\t1893456000\tsid\tSECRET_NS_VAL\n",
+                encoding="utf-8",
+            )
+            payload = _payload(["https://example.com", "--cookie-file", str(netscape)])
+            self.assertEqual(payload["network"]["cookies"][0]["name"], "sid")
+            self.assertEqual(payload["network"]["cookies"][0]["value"], "SECRET_NS_VAL")
+            self.assertTrue(payload["network"]["cookies"][0]["http_only"])
+            self.assertTrue(payload["network"]["cookies"][0]["secure"])
+            redacted = public_payload(payload)
+            self.assertEqual(redacted["network"]["cookies"][0]["value"], "***")
+
+            cookie_json = Path(directory) / "cookies.json"
+            cookie_json.write_text(
+                json.dumps([{"name": "tok", "value": "SECRET_JSON_VAL", "domain": "example.com", "sameSite": "strict"}]),
+                encoding="utf-8",
+            )
+            payload2 = _payload(["https://example.com", "--cookie-file", str(cookie_json)])
+            self.assertEqual(payload2["network"]["cookies"][0]["same_site"], "Strict")
+
+            hdr_file = Path(directory) / "hdr.txt"
+            hdr_file.write_text("Cookie: a=1; b=SECRET_HDR", encoding="utf-8")
+            payload3 = _payload(["https://example.com", "--cookie-file", str(hdr_file)])
+            self.assertEqual(len(payload3["network"]["cookies"]), 2)
+            self.assertEqual(payload3["network"]["cookies"][0]["domain"], "example.com")
+
+            # --dry-run must redact cookie values and sensitive headers
+            stdout = io.StringIO()
+            with mock.patch("sys.stdout", stdout):
+                code = main([
+                    "--dry-run",
+                    "--no-config",
+                    "https://example.com",
+                    "--cookie-file", str(netscape),
+                    "--header", "Authorization: Bearer TOP_SECRET_BEARER",
+                ])
+            self.assertEqual(code, 0)
+            out_text = stdout.getvalue()
+            self.assertNotIn("SECRET_NS_VAL", out_text)
+            self.assertNotIn("TOP_SECRET_BEARER", out_text)
+
+    def test_from_json_and_cli_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory) / "base.json"
+            base.write_text(
+                json.dumps({
+                    "url": "https://base.example",
+                    "output": "webp",
+                    "full_page": False,
+                    "viewport": {"width": 1280, "height": 720},
+                    "environment": {"color_scheme": "dark", "locale": "fr-FR"},
+                }),
+                encoding="utf-8",
+            )
+            payload = _payload([
+                "--from-json", str(base),
+                "--full-page=true",
+                "--scale", "2",
+                "--color-scheme", "light",
+            ])
+        self.assertEqual(payload["url"], "https://base.example")
+        self.assertEqual(payload["output"], "webp")
+        self.assertTrue(payload["full_page"])
+        self.assertEqual(payload["viewport"], {"width": 1280, "height": 720, "device_scale_factor": 2.0})
+        self.assertEqual(payload["environment"], {"color_scheme": "light", "locale": "fr-FR"})
+
+    def test_preset_loads_web_ui_preset_from_local_file_with_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            presets_dir = Path(directory) / "presets"
+            presets_dir.mkdir()
+            (presets_dir / "presets.json").write_text(
+                json.dumps([
+                    {
+                        "name": "mobile-dark",
+                        "settings": {
+                            "output": "png",
+                            "width": 390,
+                            "height": 844,
+                            "density": 2,
+                            "fullPage": False,
+                            "colorScheme": "dark",
+                            "waitDelay": 2,
+                            "blockAds": True,
+                        },
+                    }
+                ]),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"VIPERCAPTURE_DATA_DIR": directory}, clear=False):
+                payload = _payload([
+                    "https://example.com",
+                    "--preset", "mobile-dark",
+                    "--format", "jpeg",
+                    "--server", "http://127.0.0.1:1",
+                ])
+        self.assertEqual(payload["url"], "https://example.com")
+        self.assertEqual(payload["output"], "jpeg")
+        self.assertFalse(payload["full_page"])
+        self.assertEqual(payload["viewport"], {"width": 390, "height": 844, "device_scale_factor": 2.0})
+        self.assertEqual(payload["environment"]["color_scheme"], "dark")
+        self.assertEqual(payload["wait_for"]["delay_ms"], 2000)
+        self.assertTrue(payload["cleanup"]["block_ads"])
+
+    def test_config_toml_defaults_and_no_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = Path(directory) / "config.toml"
+            cfg.write_text(
+                "[capture]\n"
+                'format = "webp"\n'
+                "viewport = [1600, 900]\n"
+                'color_scheme = "dark"\n'
+                "full_page = false\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"VIPERCAPTURE_CONFIG": str(cfg)}, clear=False):
+                stdout = io.StringIO()
+                with mock.patch("sys.stdout", stdout):
+                    code = main(["--dry-run", "https://example.com"])
+                self.assertEqual(code, 0)
+                doc = json.loads(stdout.getvalue())
+                self.assertEqual(doc["output"], "webp")
+                self.assertEqual(doc["viewport"], {"width": 1600, "height": 900})
+                self.assertEqual(doc["environment"]["color_scheme"], "dark")
+                self.assertFalse(doc["full_page"])
+
+                # CLI flag overrides config.toml
+                stdout = io.StringIO()
+                with mock.patch("sys.stdout", stdout):
+                    code = main(["--dry-run", "https://example.com", "--format", "png"])
+                self.assertEqual(code, 0)
+                self.assertEqual(json.loads(stdout.getvalue())["output"], "png")
+
+                # --no-config ignores config.toml
+                stdout = io.StringIO()
+                with mock.patch("sys.stdout", stdout):
+                    code = main(["--dry-run", "--no-config", "https://example.com"])
+                self.assertEqual(code, 0)
+                doc_no_cfg = json.loads(stdout.getvalue())
+                self.assertEqual(doc_no_cfg["output"], "png")
+                self.assertNotIn("viewport", doc_no_cfg)
+
+    def test_async_no_wait_and_retries_and_multi_url_and_stop_server(self) -> None:
+        attempts = {"render": 0}
+
+        class _FlakyHandler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(length)
+                if self.path == "/v1/jobs":
+                    body = json.dumps({"id": "async-job-99", "status": "queued", "status_url": "/v1/jobs/async-job-99"}).encode()
+                    self.send_response(202)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                attempts["render"] += 1
+                if attempts["render"] == 1:
+                    body = b'{"error":{"code":"busy","message":"try again"}}'
+                    self.send_response(503)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Retry-After", "0")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                body = b"\x89PNG\r\n\x1a\nOK"
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args) -> None:
+                return
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _FlakyHandler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            url = f"http://127.0.0.1:{srv.server_address[1]}"
+            # --no-wait without --async fails with exit 2
+            stderr = io.StringIO()
+            with mock.patch("sys.stderr", stderr):
+                self.assertEqual(main(["--no-config", "https://example.com", "--no-wait"]), 2)
+
+            # --async --no-wait prints job id immediately
+            stdout = io.StringIO()
+            with (
+                mock.patch("sys.stdout", stdout),
+                mock.patch("vipercapture.capture_cli.is_local_default", return_value=False),
+                mock.patch("vipercapture.capture_cli.load_local_env"),
+            ):
+                code = main(["--no-config", "--server", url, "--async", "--no-wait", "https://example.com"])
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout.getvalue().strip(), "async-job-99")
+
+            # --retries recovers from 503 and --open / --copy / --stop-server hooks are called
+            with tempfile.TemporaryDirectory() as directory:
+                out = Path(directory) / "shot.png"
+                stdout = io.StringIO()
+                with (
+                    mock.patch("sys.stdout", stdout),
+                    mock.patch("vipercapture.capture_cli.ensure_server", return_value=True),
+                    mock.patch("vipercapture.capture_cli.stop_started_server") as stop_mock,
+                    mock.patch("vipercapture.capture_cli.open_saved_file") as open_mock,
+                    mock.patch("vipercapture.capture_cli.copy_output_to_clipboard", return_value="path") as copy_mock,
+                    mock.patch("vipercapture.capture_cli.load_local_env"),
+                ):
+                    code = main([
+                        "--no-config",
+                        "--server", url,
+                        "--retries", "2",
+                        "--retry-delay-ms", "1",
+                        "--open",
+                        "--copy",
+                        "--stop-server",
+                        "https://example.com",
+                        "--output", str(out),
+                    ])
+                self.assertEqual(code, 0)
+                self.assertEqual(attempts["render"], 2)
+                self.assertEqual(out.read_bytes(), b"\x89PNG\r\n\x1a\nOK")
+                open_mock.assert_called_once()
+                copy_mock.assert_called_once()
+                stop_mock.assert_called_once()
+
+                # Multi-URL with --urls-file, --output-dir, --output-template
+                urls_file = Path(directory) / "urls.txt"
+                urls_file.write_text("https://one.example\nhttps://two.example\n", encoding="utf-8")
+                out_dir = Path(directory) / "batch"
+                stdout = io.StringIO()
+                with (
+                    mock.patch("sys.stdout", stdout),
+                    mock.patch("vipercapture.capture_cli.is_local_default", return_value=False),
+                    mock.patch("vipercapture.capture_cli.load_local_env"),
+                ):
+                    code = main([
+                        "--no-config",
+                        "--server", url,
+                        "--urls-file", str(urls_file),
+                        "--output-dir", str(out_dir),
+                        "--output-template", "{index}-{host}{ext}",
+                        "--json",
+                    ])
+                self.assertEqual(code, 0)
+                summary = json.loads(stdout.getvalue())
+                self.assertTrue(summary["ok"])
+                self.assertEqual(summary["succeeded"], 2)
+                self.assertTrue((out_dir / "1-one.example.png").is_file())
+                self.assertTrue((out_dir / "2-two.example.png").is_file())
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_council_hardening_regressions(self) -> None:
+        # 1. allow_abbrev=False rejects abbreviated flags like --serv
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", stderr):
+            self.assertEqual(main(["--no-config", "--serv", "http://127.0.0.1:8000", "https://example.com"]), 2)
+
+        # 2. --cookie-file rejects partitioned cookies (partitionKey)
+        with tempfile.TemporaryDirectory() as tmp:
+            part_file = Path(tmp) / "part.json"
+            part_file.write_text(
+                json.dumps([{"name": "sid", "value": "v", "domain": "example.com", "partitionKey": {"topLevelSite": "https://a.test"}}]),
+                encoding="utf-8",
+            )
+            stderr = io.StringIO()
+            with mock.patch("sys.stderr", stderr):
+                self.assertEqual(main(["--no-config", "--dry-run", "https://example.com", "--cookie-file", str(part_file)]), 2)
+            self.assertIn("partitionKey", stderr.getvalue())
+
+            # 3. Malformed --from-json with non-string enum/section types exits 2 even without pydantic,
+            # while nullable environment fields (color_scheme: null) remain valid
+            bad_json = Path(tmp) / "bad.json"
+            bad_json.write_text(json.dumps({"url": "https://example.com", "engine": ["chromium"]}), encoding="utf-8")
+            bad_img_json = Path(tmp) / "bad_img.json"
+            bad_img_json.write_text(json.dumps({"url": "https://example.com", "image": []}), encoding="utf-8")
+            bad_pdf_json = Path(tmp) / "bad_pdf.json"
+            bad_pdf_json.write_text(json.dumps({"url": "https://example.com", "output": "pdf", "pdf": []}), encoding="utf-8")
+            null_env_json = Path(tmp) / "null_env.json"
+            null_env_json.write_text(
+                json.dumps({"url": "https://example.com", "environment": {"color_scheme": None}}),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(sys.modules, {"pydantic": None}):
+                for bad_path in (bad_json, bad_img_json, bad_pdf_json):
+                    stderr = io.StringIO()
+                    with mock.patch("sys.stderr", stderr):
+                        self.assertEqual(main(["--no-config", "--dry-run", "--from-json", str(bad_path)]), 2)
+                stdout = io.StringIO()
+                with mock.patch("sys.stdout", stdout):
+                    self.assertEqual(main(["--no-config", "--dry-run", "--from-json", str(null_env_json)]), 0)
+
+            # 3a. Malformed config.toml server or missing (None) target fails closed for credentials
+            from vipercapture.capture_cli import _config_credential_for_server, payload_to_preset_settings, preset_settings_to_payload
+            self.assertEqual(
+                _config_credential_for_server(
+                    {"server": "capture.internal", "api_key": "secret-key"},
+                    "api_key",
+                    "https://other.example",
+                ),
+                "",
+            )
+            self.assertEqual(
+                _config_credential_for_server(
+                    {"server": "https://prod.example", "api_key": "secret-key"},
+                    "api_key",
+                    None,
+                ),
+                "",
+            )
+            # String false cleanup booleans (e.g. from --from-json) must serialize as False, not True
+            str_false_saved = payload_to_preset_settings({
+                "output": "png",
+                "cleanup": {"consent_mode": "none", "block_ads": "false", "block_trackers": "0"},
+            })
+            self.assertFalse(str_false_saved["blockAds"])
+            self.assertFalse(str_false_saved["blockTrackers"])
+
+            # 3a2. Flat CLI presets with only quality/locale/diagnostics/GIF bitrate round-trip cleanly & preserve cleanup defaults
+            for cli_payload, expected_check in (
+                ({"output": "jpeg", "image": {"quality": 72}}, lambda p: p["image"]["quality"] == 72),
+                ({"output": "png", "environment": {"locale": "fr-FR"}}, lambda p: p["environment"]["locale"] == "fr-FR"),
+                ({"output": "png", "diagnostics": {"bundle": True}}, lambda p: p["diagnostics"]["bundle"] is True),
+                (
+                    {"output": "gif", "full_page": False, "video": {"bitrate_mbps": 3}},
+                    lambda p: p["video"]["bitrate_mbps"] == 3 and p["full_page"] is False,
+                ),
+            ):
+                saved = payload_to_preset_settings(cli_payload)
+                self.assertEqual(saved["consent"], "none")
+                self.assertFalse(saved["blockAds"])
+                self.assertFalse(saved["blockTrackers"])
+                self.assertFalse(saved["blockChats"])
+                self.assertFalse(saved["blockNewsletters"])
+                reloaded = preset_settings_to_payload(saved)
+                self.assertTrue(expected_check(reloaded), f"Failed round-trip for {cli_payload}: {reloaded}")
+                # Also verify minimal flat presets without cleanup keys still decode properly
+            self.assertEqual(preset_settings_to_payload({"output": "jpeg", "quality": 72})["image"], {"quality": 72})
+            self.assertEqual(preset_settings_to_payload({"output": "png", "diagnostics": True})["diagnostics"], {"bundle": True})
+
+            # 3b. Batch idempotency key derivation stays <= 128 chars for max-length keys
+            from vipercapture.capture_cli import derive_batch_idempotency_key
+            long_key = "k" * 128
+            derived_1 = derive_batch_idempotency_key(long_key, "1")
+            derived_2 = derive_batch_idempotency_key(long_key, "2")
+            self.assertLessEqual(len(derived_1), 128)
+            self.assertLessEqual(len(derived_2), 128)
+            self.assertNotEqual(derived_1, derived_2)
+            self.assertEqual(derived_1, derive_batch_idempotency_key(long_key, "1"))
+
+            # 4. Mixed-host multi-URL rejects domainless Cookie header file so cookies cannot leak across hosts
+            hdr_file = Path(tmp) / "hdr.txt"
+            hdr_file.write_text("Cookie: sid=secret", encoding="utf-8")
+            stderr = io.StringIO()
+            with mock.patch("sys.stderr", stderr):
+                code = main([
+                    "--no-config", "--dry-run",
+                    "--cookie-file", str(hdr_file),
+                    "https://one.example", "https://two.example",
+                ])
+            self.assertEqual(code, 2)
+
+            # 5. Stdin-backed --cookie-file - works across multi-URL batch; multiple stdin flags fail exit 2
+            stdout = io.StringIO()
+            cookie_stdin = json.dumps([{"name": "sid", "value": "S1", "domain": "one.example"}])
+            with mock.patch("sys.stdin", io.StringIO(cookie_stdin)), mock.patch("sys.stdout", stdout):
+                code = main([
+                    "--no-config", "--dry-run",
+                    "--cookie-file", "-",
+                    "https://one.example/a", "https://one.example/b",
+                ])
+            self.assertEqual(code, 0)
+            docs = json.loads(stdout.getvalue())
+            self.assertEqual(len(docs), 2)
+            self.assertEqual(docs[1]["network"]["cookies"][0]["value"], "***")
+
+            stderr = io.StringIO()
+            with mock.patch("sys.stderr", stderr):
+                code = main(["--no-config", "--dry-run", "--urls-file", "-", "--cookie-file", "-"])
+            self.assertEqual(code, 2)
+
+            # 6. Explicit single-capture --output overrides config.toml output_dir/output_template
+            cfg = Path(tmp) / "config.toml"
+            cfg.write_text(
+                f'output_dir = "{(Path(tmp) / "cfg_out").as_posix()}"\n'
+                'output_template = "{host}-{timestamp}{ext}"\n',
+                encoding="utf-8",
+            )
+            explicit_out = Path(tmp) / "exact.png"
+            with mock.patch.dict(os.environ, {"VIPERCAPTURE_CONFIG": str(cfg)}, clear=False):
+                args = parse_capture_args(["https://example.com", "--output", str(explicit_out)])
+                from vipercapture.capture_cli import apply_config_defaults, build_payload, resolve_output
+                apply_config_defaults(args)
+                resolved = resolve_output(args, build_payload(args))
+            self.assertEqual(resolved, explicit_out)
+
+            # 7. Remote --preset must NEVER fall back to local presets.json
+            presets_dir = Path(tmp) / "presets"
+            presets_dir.mkdir()
+            (presets_dir / "presets.json").write_text(
+                json.dumps([{"name": "secret-local", "settings": {"output": "png", "headers": '{"Authorization":"Bearer local-secret"}'}}]),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"VIPERCAPTURE_DATA_DIR": tmp}, clear=False):
+                with mock.patch("vipercapture.capture_cli.open_response", side_effect=CaptureError("unreachable")):
+                    stderr = io.StringIO()
+                    with mock.patch("sys.stderr", stderr):
+                        code = main([
+                            "--no-config", "--dry-run",
+                            "--server", "https://remote.example",
+                            "--preset", "secret-local",
+                            "https://example.com",
+                        ])
+            self.assertEqual(code, 2)
+            self.assertIn("remote server", stderr.getvalue())
+
+            # 8. Token-bearing custom headers (X-Access-Token, X-Custom-Secret) redacted in --dry-run
+            stdout = io.StringIO()
+            with mock.patch("sys.stdout", stdout):
+                code = main([
+                    "--no-config", "--dry-run",
+                    "--header", "X-Access-Token: secret-access-999",
+                    "--header", "X-Custom-Secret: secret-custom-888",
+                    "--header", "X-Trace-Id: safe-trace",
+                    "https://example.com",
+                ])
+            self.assertEqual(code, 0)
+            self.assertNotIn("secret-access-999", stdout.getvalue())
+            self.assertNotIn("secret-custom-888", stdout.getvalue())
+            self.assertIn("safe-trace", stdout.getvalue())
+
+            # 9. Colliding multi-URL --output-template fails preflight exit 2
+            stderr = io.StringIO()
+            with mock.patch("sys.stderr", stderr):
+                code = main([
+                    "--no-config", "--dry-run",
+                    "--output-dir", tmp,
+                    "--output-template", "{host}{ext}",
+                    "https://example.com/a", "https://example.com/b",
+                ])
+            self.assertEqual(code, 2)
+            self.assertIn("same output file", stderr.getvalue())
+
+    def test_async_retry_auto_idempotency_and_multi_url_per_item_keys(self) -> None:
+        seen_keys: list[str | None] = []
+        attempts = {"jobs": 0}
+
+        class _AsyncRetryHandler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(length)
+                seen_keys.append(self.headers.get("Idempotency-Key"))
+                attempts["jobs"] += 1
+                if attempts["jobs"] == 1:
+                    body = b'{"error":{"code":"busy","message":"retry"}}'
+                    self.send_response(503)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Retry-After", "0")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                body = json.dumps({"id": f"job-{attempts['jobs']}", "status": "queued", "status_url": "/v1/jobs/j"}).encode()
+                self.send_response(202)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args) -> None:
+                return
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _AsyncRetryHandler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            url = f"http://127.0.0.1:{srv.server_address[1]}"
+            stdout = io.StringIO()
+            with (
+                mock.patch("sys.stdout", stdout),
+                mock.patch("vipercapture.capture_cli.is_local_default", return_value=False),
+                mock.patch("vipercapture.capture_cli.load_local_env"),
+            ):
+                code = main([
+                    "--no-config", "--server", url,
+                    "--async", "--no-wait",
+                    "--retries", "1", "--retry-delay-ms", "1",
+                    "https://example.com",
+                ])
+            self.assertEqual(code, 0)
+            self.assertEqual(len(seen_keys), 2)
+            self.assertIsNotNone(seen_keys[0])
+            self.assertEqual(seen_keys[0], seen_keys[1])
+
+            seen_keys.clear()
+            stdout = io.StringIO()
+            with (
+                mock.patch("sys.stdout", stdout),
+                mock.patch("vipercapture.capture_cli.is_local_default", return_value=False),
+                mock.patch("vipercapture.capture_cli.load_local_env"),
+            ):
+                code = main([
+                    "--no-config", "--server", url,
+                    "--async", "--no-wait",
+                    "--idempotency-key", "batch-run",
+                    "https://one.example", "https://two.example",
+                ])
+            self.assertEqual(code, 0)
+            self.assertEqual(seen_keys, ["batch-run-1", "batch-run-2"])
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5,7 +5,11 @@ one of `url`, `html`, or `markdown`. `RenderRequest` in
 `vipercapture/render_contract.py` is the canonical schema. When the service is
 running, the interactive OpenAPI reference is available at `/docs`.
 `vipercapture capture` sends this contract from the shell. `vipercapture capture --help`
-lists a flag for each major field.
+lists a flag for each major field (including `--from-json`, `--preset`, `--cookie-file`,
+`--js-file`, `--action-wait-text`, `--urls-file`, `--retries`, `--async --no-wait`, and
+`~/.vipercapture/config.toml` defaults). Companion CLI subcommands cover the rest of the
+API: `status`, `logs`, `gpu`, `preset`, `diff`, `baseline`, `bulk`, `job`, `schedule`,
+`profile`, `sign`, `verify`, `admin`, `completion`, and `version`.
 
 ## Outputs
 

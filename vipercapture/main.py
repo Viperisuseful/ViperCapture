@@ -3160,6 +3160,7 @@ async def app_config():
     if not await _settled_thread(ffmpeg_has_encoder, "libx264"):
         output_formats.remove(OutputFormat.MP4.value)
     return {
+        "version": APP_VERSION,
         "control_plane": CONTROL_ENABLED,
         "presets": not HOSTED,
         "max_screenshot_pixels": MAX_SCREENSHOT_PIXELS,
