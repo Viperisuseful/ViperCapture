@@ -2076,7 +2076,10 @@ def _fast_validate_simple_payload(payload: dict[str, object]) -> bool:
             if "." not in host:
                 return False
             labels = host.split(".")
-            if any(not _FAST_SIMPLE_LABEL.fullmatch(label) for label in labels):
+            if any(
+                not _FAST_SIMPLE_LABEL.fullmatch(label) or label.lower().startswith("xn--")
+                for label in labels
+            ):
                 return False
             if not labels[-1].isalpha() or len(labels[-1]) < 2:
                 return False
@@ -2353,7 +2356,14 @@ def _validate_punycode_label_syntax(label: str, field: str) -> None:
     if (
         decoded.isascii()
         or reencoded.lower() != raw_puny.lower()
-        or any(ord(ch) <= 0x20 or 0x7F <= ord(ch) <= 0x9F for ch in decoded)
+        or any(
+            ch.isspace()
+            or ord(ch) <= 0x20
+            or 0x7F <= ord(ch) <= 0x9F
+            or 0xD800 <= ord(ch) <= 0xDFFF
+            or ch in _CONTRACT_FORBIDDEN_HOST_CHARS
+            for ch in decoded
+        )
     ):
         raise ValueError(f"{field} has an invalid punycode host label.")
 

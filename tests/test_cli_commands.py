@@ -2333,6 +2333,8 @@ class CliCouncilHardeningTests(unittest.TestCase):
             {"url": "http://a%c2%a0b.com", "output": "png"},
             {"url": "http://xn--.com", "output": "png"},
             {"url": "http://xn--a.com", "output": "png"},
+            {"url": "http://xn--vug.com", "output": "png"},
+            {"url": "http://xn--ib9b.com", "output": "png"},
             {"url": "http://example.xn--", "output": "png"},
             {"url": "http://\ud800.com", "output": "png"},
             {"url": "http://[fe80::1%eth0]", "output": "png"},
@@ -2387,6 +2389,15 @@ class CliCouncilHardeningTests(unittest.TestCase):
         for bad_case in bad_r18:
             with self.subTest(bad_r18=bad_case), self.assertRaises(ValueError):
                 capture_cli._validate_payload_fallback(bad_case)
+        for bad_e2e in (
+            {"url": "http://xn--a.com", "output": "png"},
+            {"url": "http://xn--vug.com", "output": "png"},
+            {"url": "http://xn--ib9b.com", "output": "png"},
+        ):
+            with self.subTest(bad_e2e=bad_e2e):
+                self.assertFalse(capture_cli._fast_validate_simple_payload(bad_e2e))
+                with self.assertRaises(ValueError):
+                    capture_cli.validate_payload(bad_e2e)
         # Differential check against real RenderRequest when Pydantic is installed
         from collections import deque as _deque
         for deque_case in (
