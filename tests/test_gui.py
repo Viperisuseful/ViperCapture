@@ -3285,3 +3285,83 @@ class GuiCouncilHardeningTests(TestCase):
                 self.assertEqual(len({r.saved for r in results}), 2)
                 saved_sizes = sorted(p.stat().st_size for p in out_dir.glob("*.png"))
                 self.assertEqual(saved_sizes, [18, 28])
+
+    def test_round14_header_trickle_deadline_and_non_2xx_error_body_cap(self) -> None:
+        import socket as _socket
+        import tempfile
+        import threading as _threading
+        import time as _time
+
+        # 1. Slow-trickling response headers (1 byte every 55ms) abort at wall-clock deadline
+        srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(2)
+        port = srv.getsockname()[1]
+        stop_evt = _threading.Event()
+
+        def _serve_trickle_headers() -> None:
+            try:
+                conn, _ = srv.accept()
+                try:
+                    conn.recv(4096)
+                    header_bytes = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n"
+                    for i in range(len(header_bytes)):
+                        if stop_evt.is_set():
+                            break
+                        try:
+                            conn.sendall(header_bytes[i : i + 1])
+                        except OSError:
+                            break
+                        _time.sleep(0.055)
+                finally:
+                    conn.close()
+            finally:
+                srv.close()
+
+        t = _threading.Thread(target=_serve_trickle_headers, daemon=True)
+        t.start()
+        try:
+            t0 = _time.monotonic()
+            st, doc, err = gui._json_request(f"http://127.0.0.1:{port}/cfg", timeout=0.22)
+            elapsed = _time.monotonic() - t0
+            self.assertEqual(st, 0)
+            self.assertIsNone(doc)
+            self.assertTrue(err)
+            self.assertLess(elapsed, 0.45)
+        finally:
+            stop_evt.set()
+            t.join(timeout=2.0)
+
+        # 2. Non-2xx capture response stops reading after 64 KiB cap instead of buffering megabytes
+        read_counter = {"bytes": 0}
+
+        class _Huge500Resp:
+            status = 500
+            headers = {"Content-Type": "text/plain"}
+
+            def __init__(self) -> None:
+                self._remaining = 40
+
+            def read(self, n: int = -1) -> bytes:
+                if self._remaining <= 0:
+                    return b""
+                self._remaining -= 1
+                size = 64 * 1024 if n < 0 else min(n, 64 * 1024)
+                chunk = b"x" * size
+                read_counter["bytes"] += len(chunk)
+                return chunk
+
+            def __enter__(self) -> "_Huge500Resp":
+                return self
+
+            def __exit__(self, *_a: object) -> bool:
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            res = gui.perform_capture(
+                gui.GuiState(url="https://example.com", output="png"),
+                directory=Path(tmp),
+                opener=lambda _req, timeout=0: _Huge500Resp(),
+            )
+        self.assertTrue(res.error)
+        self.assertLessEqual(read_counter["bytes"], 64 * 1024)

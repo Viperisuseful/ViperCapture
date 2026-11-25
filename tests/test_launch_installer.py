@@ -1284,6 +1284,7 @@ class InstallScriptTests(unittest.TestCase):
                 ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_body],
                 env=env,
                 text=True,
+                errors="replace",
                 capture_output=True,
                 check=False,
             )
@@ -1341,6 +1342,7 @@ class InstallScriptTests(unittest.TestCase):
                 ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_body],
                 env=env,
                 text=True,
+                errors="replace",
                 capture_output=True,
                 check=False,
             )

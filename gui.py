@@ -16,6 +16,7 @@ import json
 import math
 import os
 import re
+import select
 import shutil
 import socket
 import ssl
@@ -3389,6 +3390,29 @@ def _response_encode_ms(response: object) -> int:
     return 0
 
 
+def _read_error_response_body(
+    response: object,
+    *,
+    limit: int = 64 * 1024,
+    cancel: CancelFlag | None = None,
+) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    read_fn = getattr(response, "read1", None) or getattr(response, "read")
+    while total < limit:
+        if cancel is not None and cancel.is_requested():
+            raise _Cancelled()
+        try:
+            piece = read_fn(min(16 * 1024, limit - total))
+        except (TimeoutError, OSError, http.client.HTTPException):
+            break
+        if not piece:
+            break
+        chunks.append(piece)
+        total += len(piece)
+    return b"".join(chunks)
+
+
 def perform_capture(
     state: GuiState,
     *,
@@ -3433,9 +3457,12 @@ def perform_capture(
             status = getattr(response, "status", None)
             if status is None:
                 status = getattr(response, "code", 200)
-            encode_ms = _response_encode_ms(response)
-            content_type = _response_header(response, "Content-Type")
-            body = read_capture(response, cancel=cancel)
+            if not (200 <= status < 300):
+                body = _read_error_response_body(response, limit=64 * 1024, cancel=cancel)
+            else:
+                encode_ms = _response_encode_ms(response)
+                content_type = _response_header(response, "Content-Type")
+                body = read_capture(response, cancel=cancel)
     except _Cancelled:
         return _cancelled_state(state)
     except urllib.error.HTTPError as exc:
@@ -3543,7 +3570,7 @@ def _save_exclusive(
     base_stem: str | None = None,
     ext: str | None = None,
 ) -> Path:
-    """Atomically save ``body`` without overwriting an existing file; retries suffixed names on collision."""
+    """Save ``body`` to a unique filename without overwriting existing files (atomic via os.link, exclusive O_EXCL fallback)."""
     stem_root = base_stem if base_stem is not None else path.stem
     ext_clean = ext if ext is not None else path.suffix.lstrip(".")
     suffix_str = f".{ext_clean}" if ext_clean else ""
@@ -3745,10 +3772,41 @@ def _default_ssl_context() -> ssl.SSLContext:
     return ctx
 
 
+class _CancellableRawIO(io.RawIOBase):
+    """RawIO adapter that checks cancellation and re-arms the shared monotonic deadline before every read."""
+
+    def __init__(self, wrapper: "_CancellableSocket") -> None:
+        self._sock = wrapper
+        self._inner_fp = wrapper._sock.makefile("rb", buffering=0)  # type: ignore[attr-defined]
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b: bytearray | memoryview) -> int:  # type: ignore[override]
+        self._sock._check_cancel()
+        self._sock._arm_deadline()
+        return self._inner_fp.readinto(b)  # type: ignore[no-any-return]
+
+    def close(self) -> None:
+        if not self.closed:
+            super().close()
+            try:
+                self._inner_fp.close()
+            except OSError:
+                pass
+
+
 class _CancellableSocket:
-    def __init__(self, sock: object, cancel: CancelFlag | None) -> None:
+    def __init__(
+        self,
+        sock: object,
+        cancel: CancelFlag | None,
+        *,
+        deadline: float | None = None,
+    ) -> None:
         self._sock = sock
         self._cancel = cancel
+        self._deadline = deadline
 
     def _check_cancel(self) -> None:
         cancel = self._cancel
@@ -3757,24 +3815,59 @@ class _CancellableSocket:
                 if cancel.requested:
                     raise _Cancelled()
 
+    def _arm_deadline(self) -> None:
+        if self._deadline is None:
+            return
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("timed out")
+        if hasattr(self._sock, "settimeout"):
+            self._sock.settimeout(remaining)
+
     def send(self, data: object, *args: object) -> int:
         self._check_cancel()
+        self._arm_deadline()
         return self._sock.send(data, *args)  # type: ignore[attr-defined, no-any-return]
 
     def sendall(self, data: object, *args: object) -> None:
         self._check_cancel()
-        self._sock.sendall(data, *args)  # type: ignore[attr-defined]
+        self._arm_deadline()
+        if args or self._deadline is None or not hasattr(self._sock, "send") or not isinstance(data, (bytes, bytearray, memoryview)):
+            self._sock.sendall(data, *args)  # type: ignore[attr-defined]
+            return
+        view = memoryview(data)
+        sent = 0
+        total = len(view)
+        while sent < total:
+            self._check_cancel()
+            self._arm_deadline()
+            n = self._sock.send(view[sent:])  # type: ignore[attr-defined]
+            if n <= 0:
+                raise OSError("Socket connection broken during sendall.")
+            sent += n
 
     def recv(self, bufsize: int, *args: object) -> bytes:
         self._check_cancel()
+        self._arm_deadline()
         return self._sock.recv(bufsize, *args)  # type: ignore[attr-defined, no-any-return]
 
     def recv_into(self, buffer: bytearray | memoryview, *args: object) -> int:
         self._check_cancel()
+        self._arm_deadline()
         return self._sock.recv_into(buffer, *args)  # type: ignore[attr-defined, no-any-return]
 
-    def makefile(self, *args: object, **kwargs: object) -> object:
-        return self._sock.makefile(*args, **kwargs)  # type: ignore[attr-defined]
+    def makefile(self, mode: str = "rb", buffering: int = -1, *args: object, **kwargs: object) -> object:
+        if (
+            self._deadline is not None
+            and mode in {"r", "rb"}
+            and not args
+            and not kwargs
+        ):
+            raw = _CancellableRawIO(self)
+            if buffering == 0:
+                return raw
+            return io.BufferedReader(raw, buffer_size=buffering if buffering > 0 else io.DEFAULT_BUFFER_SIZE)
+        return self._sock.makefile(mode, buffering, *args, **kwargs)  # type: ignore[attr-defined]
 
     def shutdown(self, how: int) -> None:
         self._sock.shutdown(how)  # type: ignore[attr-defined]
@@ -3845,6 +3938,8 @@ class _TlsInTlsSocket:
         outer: ssl.SSLSocket,
         context: ssl.SSLContext,
         server_hostname: str,
+        *,
+        deadline: float | None = None,
     ) -> None:
         self._outer = outer
         self._in_bio = ssl.MemoryBIO()
@@ -3854,16 +3949,27 @@ class _TlsInTlsSocket:
             self._out_bio,
             server_hostname=server_hostname,
         )
+        self._deadline = deadline
         self._io_refs = 0
         self._close_requested = False
         self._closed = False
 
+    def _arm_outer_deadline(self) -> None:
+        if self._deadline is None:
+            return
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("timed out")
+        self._outer.settimeout(remaining)
+
     def _flush_out(self) -> None:
         pending = self._out_bio.read()
         if pending:
+            self._arm_outer_deadline()
             self._outer.sendall(pending)
 
     def _pump_in(self) -> None:
+        self._arm_outer_deadline()
         data = self._outer.recv(16_384)
         if not data:
             self._in_bio.write_eof()
@@ -4070,6 +4176,7 @@ def _wrap_tls_cancellable(
     server_hostname: str,
     live_sock: list[object | None],
     cancel: CancelFlag | None,
+    deadline: float | None = None,
 ) -> ssl.SSLSocket:
     tls_sock = context.wrap_socket(
         sock,
@@ -4079,8 +4186,31 @@ def _wrap_tls_cancellable(
     live_sock[0] = tls_sock
     if cancel is not None and cancel.requested:
         raise _Cancelled()
-    tls_sock.do_handshake()
-    return tls_sock
+    if deadline is None:
+        tls_sock.do_handshake()
+        return tls_sock
+    orig_timeout = tls_sock.gettimeout()
+    tls_sock.setblocking(False)
+    try:
+        while True:
+            if cancel is not None and cancel.is_requested():
+                raise _Cancelled()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out")
+            try:
+                tls_sock.do_handshake()
+                return tls_sock
+            except ssl.SSLWantReadError:
+                select.select([tls_sock], [], [], min(remaining, 0.05))
+            except ssl.SSLWantWriteError:
+                select.select([], [tls_sock], [], min(remaining, 0.05))
+    finally:
+        try:
+            rem_after = deadline - time.monotonic()
+            tls_sock.settimeout(max(0.001, rem_after) if rem_after > 0 else orig_timeout)
+        except OSError:
+            pass
 
 
 def _open_capture(
@@ -4151,6 +4281,7 @@ def _open_capture(
                     server_hostname=ascii_proxy_host,
                     live_sock=live_sock,
                     cancel=cancel,
+                    deadline=deadline,
                 )
 
             if parsed.scheme == "https":
@@ -4171,7 +4302,12 @@ def _open_capture(
                     raise http.client.HTTPException(f"Tunnel connection failed: {status_code} {reason}")
                 sock.settimeout(_left())
                 if isinstance(sock, ssl.SSLSocket):
-                    tunnel_sock: object = _TlsInTlsSocket(sock, _default_ssl_context(), ascii_dest_host)
+                    tunnel_sock: object = _TlsInTlsSocket(
+                        sock,
+                        _default_ssl_context(),
+                        ascii_dest_host,
+                        deadline=deadline,
+                    )
                     live_sock[0] = tunnel_sock
                     if cancel is not None and cancel.requested:
                         raise _Cancelled()
@@ -4183,15 +4319,16 @@ def _open_capture(
                         server_hostname=ascii_dest_host,
                         live_sock=live_sock,
                         cancel=cancel,
+                        deadline=deadline,
                     )
                 connection = _CancellableHTTPSConnection(ascii_dest_host, port, timeout=_left(), cancel=cancel)
-                connection.sock = _CancellableSocket(tunnel_sock, cancel)  # type: ignore[assignment]
+                connection.sock = _CancellableSocket(tunnel_sock, cancel, deadline=deadline)  # type: ignore[assignment]
             else:
                 if proxy_parsed.scheme == "https":
                     connection = _CancellableHTTPSConnection(ascii_proxy_host, proxy_port, timeout=_left(), cancel=cancel)
                 else:
                     connection = _CancellableHTTPConnection(ascii_proxy_host, proxy_port, timeout=_left(), cancel=cancel)
-                connection.sock = _CancellableSocket(sock, cancel)  # type: ignore[assignment]
+                connection.sock = _CancellableSocket(sock, cancel, deadline=deadline)  # type: ignore[assignment]
                 dest_authority = f"{dest_host_hdr}:{parsed.port}" if parsed.port is not None else dest_host_hdr
                 request_target = f"{parsed.scheme}://{dest_authority}{path}"
                 headers["Host"] = dest_authority
@@ -4212,9 +4349,10 @@ def _open_capture(
                 server_hostname=ascii_dest_host,
                 live_sock=live_sock,
                 cancel=cancel,
+                deadline=deadline,
             )
             connection = _CancellableHTTPSConnection(ascii_dest_host, port, timeout=_left(), cancel=cancel)
-            connection.sock = _CancellableSocket(tls_sock, cancel)  # type: ignore[assignment]
+            connection.sock = _CancellableSocket(tls_sock, cancel, deadline=deadline)  # type: ignore[assignment]
         else:
             raw_sock = _create_connection_cancellable(
                 ascii_dest_host,
@@ -4225,7 +4363,7 @@ def _open_capture(
                 abort_cb=_abort_active,
             )
             connection = _CancellableHTTPConnection(ascii_dest_host, port, timeout=_left(), cancel=cancel)
-            connection.sock = _CancellableSocket(raw_sock, cancel)  # type: ignore[assignment]
+            connection.sock = _CancellableSocket(raw_sock, cancel, deadline=deadline)  # type: ignore[assignment]
 
         connection.auto_open = 0
         if cancel is not None and cancel.requested:
