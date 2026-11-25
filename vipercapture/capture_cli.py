@@ -2358,6 +2358,8 @@ def _validate_punycode_label_syntax(label: str, field: str) -> None:
         or reencoded.lower() != raw_puny.lower()
         or any(
             ch.isspace()
+            or ch == "."
+            or ch in _CONTRACT_IDNA_DOTS
             or ord(ch) <= 0x20
             or 0x7F <= ord(ch) <= 0x9F
             or 0xD800 <= ord(ch) <= 0xDFFF
