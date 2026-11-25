@@ -8,6 +8,7 @@ previews; every other terminal gets an ASCII wordmark and text metadata.
 from __future__ import annotations
 
 import base64
+import contextlib
 import http.client
 import io
 import ipaddress
@@ -27,7 +28,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace as _dc_replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1543,24 +1544,62 @@ def record_url_history(
     return tuple(result)
 
 
+@contextlib.contextmanager
+def _url_history_lock(target: Path) -> Iterator[None]:
+    """Acquire a best-effort interprocess lock for atomic URL history read-merge-write."""
+    lock_path = target.with_suffix(target.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a+b")
+    locked = False
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"0")
+                handle.flush()
+            deadline = time.monotonic() + 2.0
+            while True:
+                handle.seek(0)
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    locked = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.01)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            locked = True
+        yield
+    finally:
+        if locked:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
+
+
 def save_url_history(
     urls: Sequence[str],
     path: Path | None = None,
     *,
     limit: int = HISTORY_LIMIT,
-) -> None:
+) -> tuple[str, ...]:
     target = history_file_path() if path is None else path
-    existing = load_url_history(target, limit=limit)
-    seen: set[str] = set()
-    items: list[str] = []
-    for entry in (*urls, *existing):
-        cleaned = sanitize_terminal_text(entry).strip()
-        if not cleaned or cleaned in seen:
-            continue
-        seen.add(cleaned)
-        items.append(cleaned)
-        if len(items) >= limit:
-            break
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         if os.name != "nt":
@@ -1568,22 +1607,35 @@ def save_url_history(
                 os.chmod(target.parent, 0o700)
             except OSError:
                 pass
-        fd, name = tempfile.mkstemp(prefix=".gui-history-", suffix=".tmp", dir=target.parent)
-        tmp = Path(name)
-        try:
-            if os.name != "nt" and hasattr(os, "fchmod"):
-                try:
-                    os.fchmod(fd, 0o600)
-                except OSError:
-                    pass
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(items, handle, indent=2)
-            os.replace(tmp, target)
-        except Exception:
-            tmp.unlink(missing_ok=True)
-            raise
+        with _url_history_lock(target):
+            existing = load_url_history(target, limit=limit)
+            seen: set[str] = set()
+            items: list[str] = []
+            for entry in (*urls, *existing):
+                cleaned = sanitize_terminal_text(entry).strip()
+                if not cleaned or cleaned in seen:
+                    continue
+                seen.add(cleaned)
+                items.append(cleaned)
+                if len(items) >= limit:
+                    break
+            fd, name = tempfile.mkstemp(prefix=".gui-history-", suffix=".tmp", dir=target.parent)
+            tmp = Path(name)
+            try:
+                if os.name != "nt" and hasattr(os, "fchmod"):
+                    try:
+                        os.fchmod(fd, 0o600)
+                    except OSError:
+                        pass
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(items, handle, indent=2)
+                os.replace(tmp, target)
+            except Exception:
+                tmp.unlink(missing_ok=True)
+                raise
+            return tuple(items)
     except OSError:
-        return
+        return tuple(urls)[:limit]
 
 
 def _no_window_kwargs() -> dict[str, object]:
@@ -1956,28 +2008,27 @@ def _json_request(
     except ValueError as exc:
         return 0, None, str(exc) or "Invalid server URL."
     req = urllib.request.Request(normalized_url, data=data, headers=headers, method=method)
-    if opener is None:
-        parsed_url = urllib.parse.urlsplit(normalized_url)
-        proxy_raw = _proxy_for_url(normalized_url, parsed_url.scheme, parsed_url.hostname or "", parsed_url.port)
-        if proxy_raw:
-            proxy_target = proxy_raw if "://" in proxy_raw else f"http://{proxy_raw}"
-            open_fn: object = urllib.request.build_opener(
-                urllib.request.ProxyHandler({parsed_url.scheme: proxy_target})
-            ).open
-        else:
-            open_fn = urllib.request.build_opener(urllib.request.ProxyHandler({})).open
-    else:
-        open_fn = opener
     try:
-        with open_fn(req, timeout=timeout) as response:  # type: ignore[operator]
+        cm = (
+            _open_capture(req, timeout, None)
+            if opener is None
+            else opener(req, timeout=timeout)  # type: ignore[operator]
+        )
+        with cm as response:
             status = getattr(response, "status", None)
             if status is None:
                 status = getattr(response, "code", 200)
+            if status >= 400:
+                try:
+                    raw = response.read(64 * 1024)
+                except (TimeoutError, OSError, http.client.HTTPException):
+                    raw = b""
+                return status, None, error_text(status, raw)
             body = response.read(4 * 1024 * 1024)
     except urllib.error.HTTPError as exc:
         raw = _safe_read_error_body(exc, 64 * 1024)
         return exc.code, None, error_text(exc.code, raw)
-    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, UnicodeError) as exc:
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, UnicodeError, ValueError) as exc:
         return 0, None, str(exc) or "Could not reach server."
     try:
         parsed = json.loads(body.decode("utf-8")) if body else {}
@@ -3236,10 +3287,10 @@ def _response_encode_ms(response: object) -> int:
         raw = _response_header(response, header_name)
         if isinstance(raw, str):
             try:
-                value = int(float(raw.strip()))
-                if value > 0:
-                    return value
-            except ValueError:
+                parsed = float(raw.strip())
+                if math.isfinite(parsed) and parsed > 0:
+                    return int(parsed)
+            except (ValueError, OverflowError):
                 pass
     return 0
 
@@ -4283,7 +4334,9 @@ def _start_capture(
                 started_server=started_server,
             )
             if result.saved and result.url_history:
-                save_url_history(result.url_history)
+                merged_history = save_url_history((result.url_history[0],))
+                if merged_history:
+                    result = _replace(result, url_history=merged_history)
             box["state"] = result
         except Exception as exc:
             box["state"] = _replace(state, busy=False, cancelling=False, error=sanitize_terminal_text(str(exc)))

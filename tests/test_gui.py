@@ -2907,3 +2907,88 @@ class GuiCouncilHardeningTests(TestCase):
             )
             t_cwd.join(timeout=2.0)
         self.assertEqual(seen_dirs, [Path.cwd()])
+
+    def test_round11_https_proxy_no_proxy_port_full_history_merge_and_nonfinite_render_ms(self) -> None:
+        import os as _os
+        import socket as _socket
+        import tempfile as _tempfile
+        import threading as _threading
+
+        # 1. JSON requests through an https:// proxy start TLS BEFORE sending CONNECT/Proxy-Authorization
+        first_bytes: list[bytes] = []
+        listener = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        proxy_port = listener.getsockname()[1]
+
+        def _accept_once() -> None:
+            try:
+                conn, _ = listener.accept()
+                conn.settimeout(2.0)
+                first_bytes.append(conn.recv(16))
+                conn.close()
+            except OSError:
+                pass
+            finally:
+                listener.close()
+
+        t_acc = _threading.Thread(target=_accept_once, daemon=True)
+        t_acc.start()
+        with mock.patch.dict(
+            _os.environ,
+            {
+                "ALL_PROXY": f"https://user:secret@127.0.0.1:{proxy_port}",
+                "HTTP_PROXY": "",
+                "HTTPS_PROXY": "",
+                "NO_PROXY": "",
+            },
+            clear=False,
+        ):
+            gui.fetch_app_config("https://target.example", timeout=1.5)
+        t_acc.join(timeout=2.0)
+        self.assertTrue(first_bytes and first_bytes[0].startswith(b"\x16\x03"))
+        self.assertFalse(first_bytes[0].startswith(b"CONNECT"))
+
+        # 2. NO_PROXY=api.example:443 bypasses HTTPS_PROXY even when --server omits :443
+        called_urls: list[str] = []
+
+        def _fake_open_capture(req, timeout, cancel):
+            called_urls.append(req.full_url)
+            raise OSError("direct-attempt")
+
+        with mock.patch.dict(
+            _os.environ,
+            {
+                "HTTPS_PROXY": "http://127.0.0.1:1",
+                "NO_PROXY": "api.example:443",
+                "ALL_PROXY": "",
+            },
+            clear=False,
+        ):
+            self.assertIsNone(gui._proxy_for_url("https://api.example/app-config", "https", "api.example", 443))
+            with mock.patch.object(gui, "_open_capture", side_effect=_fake_open_capture):
+                gui.fetch_app_config("https://api.example", timeout=1.0)
+        self.assertEqual(called_urls, ["https://api.example/app-config"])
+
+        # 3. Full 50-entry history + two sessions capturing new URLs preserves BOTH new URLs
+        with _tempfile.TemporaryDirectory() as tmp:
+            hist_path = Path(tmp) / "gui_history.json"
+            old_50 = tuple(f"https://old-{i}.example" for i in range(50))
+            gui.save_url_history(old_50, hist_path)
+            gui.save_url_history(("https://new-a.example",), hist_path)
+            gui.save_url_history(("https://new-b.example",), hist_path)
+            final = gui.load_url_history(hist_path)
+            self.assertEqual(len(final), 50)
+            self.assertEqual(final[0], "https://new-b.example")
+            self.assertEqual(final[1], "https://new-a.example")
+
+        # 4. Non-finite X-ViperCapture-Render-Ms (1e999 / nan) falls back to Encode-Ms without OverflowError
+        class _InfTimingResp:
+            headers = {"X-ViperCapture-Render-Ms": "1e999", "X-ViperCapture-Encode-Ms": "25"}
+
+        self.assertEqual(gui._response_encode_ms(_InfTimingResp()), 25)
+
+        class _NanTimingResp:
+            headers = {"X-ViperCapture-Render-Ms": "nan", "X-ViperCapture-Encode-Ms": "42"}
+
+        self.assertEqual(gui._response_encode_ms(_NanTimingResp()), 42)

@@ -3408,6 +3408,11 @@ def parse_cli(argv: list[str] | None = None) -> CliArgs:
             index += 3
             continue
         gui_flags = {"-h", "--help", "--gui", "--one-window", "--viewport", "--output-dir", "--server", "--preset", "--url"}
+
+        def _is_gui_flag_token(tok: str) -> bool:
+            low = tok.lower()
+            return low in gui_flags or low.startswith(("--output-dir=", "--server=", "--preset=", "--url="))
+
         if arg == "--output-dir" or arg.startswith("--output-dir="):
             if arg.startswith("--output-dir="):
                 val = arg.split("=", 1)[1]
@@ -3416,7 +3421,7 @@ def parse_cli(argv: list[str] | None = None) -> CliArgs:
                 output_dir = val
                 index += 1
                 continue
-            if index + 1 >= len(args) or not args[index + 1].strip() or args[index + 1].lower() in gui_flags:
+            if index + 1 >= len(args) or not args[index + 1].strip() or _is_gui_flag_token(args[index + 1]):
                 _reject_arg("--output-dir needs a directory path.")
             output_dir = args[index + 1]
             index += 2
@@ -3429,7 +3434,7 @@ def parse_cli(argv: list[str] | None = None) -> CliArgs:
                 server = _validate_server_url(val)
                 index += 1
                 continue
-            if index + 1 >= len(args) or not args[index + 1].strip() or args[index + 1].lower() in gui_flags:
+            if index + 1 >= len(args) or not args[index + 1].strip() or _is_gui_flag_token(args[index + 1]):
                 _reject_arg("--server needs an http:// or https:// URL.")
             server = _validate_server_url(args[index + 1])
             index += 2
@@ -3442,7 +3447,7 @@ def parse_cli(argv: list[str] | None = None) -> CliArgs:
                 preset = val
                 index += 1
                 continue
-            if index + 1 >= len(args) or not args[index + 1].strip() or args[index + 1].lower() in gui_flags:
+            if index + 1 >= len(args) or not args[index + 1].strip() or _is_gui_flag_token(args[index + 1]):
                 _reject_arg("--preset needs a preset name.")
             preset = args[index + 1].strip()
             index += 2
@@ -3455,7 +3460,7 @@ def parse_cli(argv: list[str] | None = None) -> CliArgs:
                 url = val
                 index += 1
                 continue
-            if index + 1 >= len(args) or not args[index + 1].strip() or args[index + 1].lower() in gui_flags:
+            if index + 1 >= len(args) or not args[index + 1].strip() or _is_gui_flag_token(args[index + 1]):
                 _reject_arg("--url needs a website link.")
             url = args[index + 1].strip()
             index += 2
