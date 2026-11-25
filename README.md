@@ -48,15 +48,15 @@ Run `vipercapture`. On Linux and macOS, open a new terminal first. The first run
 
 | Command | Action |
 | --- | --- |
-| `vipercapture [--host HOST] [--port PORT]` | Start the local server and open the web UI (default `http://127.0.0.1:8000`). |
-| `vipercapture --gui` | Open the full-screen terminal capture menu for PNG, GIF, and MP4 output. |
-| `vipercapture capture URL --output FILE` | Capture one or more URLs through the API and write them to disk (supports `--from-json`, `--preset`, `--cookie-file`, `--urls-file`, `--retries`, `--async --no-wait`). |
-| `vipercapture status` / `logs` / `gpu` / `preset` | Inspect server health/readiness, tail request logs, toggle local GPU mode, or manage saved presets. |
-| `vipercapture diff` / `baseline` | Compare images with `/v1/diff` or manage project visual baselines. |
-| `vipercapture bulk` / `job` / `schedule` | Submit bulk async batches, inspect/cancel/download jobs, or manage cron schedules. |
-| `vipercapture profile` / `sign` / `verify` / `admin` | Manage encrypted browser profiles, create signed URLs, verify `--certify` Ed25519 bundles, or administer control-plane projects and API keys. |
-| `vipercapture completion bash\|zsh\|fish\|powershell` | Generate shell completion scripts. |
-| `vipercapture --version` / `version` | Print the installed ViperCapture version. |
+| `vipercapture [--host HOST] [--port PORT]` | Start the local server and open the web UI (default `http://127.0.0.1:8000`). Non-loopback `--host` requires `VIPERCAPTURE_ADMIN_TOKEN`. |
+| `vipercapture --gui [URL]` | Open the full-screen terminal capture menu for all 11 output formats, with presets, history, and inline PNG preview. |
+| `vipercapture capture URL --output FILE` | Capture a URL through the API and write it to `FILE`, or pass multiple URLs or `--urls-file` with `--output-dir` (also supports `--from-json`, `--preset`, `--cookie-file`, `--retries`, and `--async --no-wait`). |
+| `vipercapture status`, `logs`, `gpu`, `preset` | Check server health and readiness, tail request logs, toggle local GPU mode, or manage saved presets. |
+| `vipercapture diff`, `baseline` | Compare images with `/v1/diff` or manage project visual baselines. |
+| `vipercapture bulk`, `job`, `schedule` | Submit bulk async batches, inspect, cancel, or download jobs, or manage cron schedules. |
+| `vipercapture profile`, `sign`, `verify`, `admin` | Manage encrypted browser profiles, mint signed URLs, verify `--certify` Ed25519 bundles, or administer control-plane projects and API keys. |
+| `vipercapture completion bash\|zsh\|fish\|powershell` | Print shell completion scripts. |
+| `vipercapture version` (`--version`, `-V`) | Print the installed ViperCapture version. |
 | `vipercapture update` | Download the latest release and keep your environment, `.env.local`, jobs, and presets. |
 | `vipercapture kill` | Stop all running local ViperCapture servers, menus, and workers. |
 
@@ -131,6 +131,8 @@ Accounts, billing, credits, and hosted infrastructure belong to a separate produ
 - [Migrating from ScreenshotOne or Urlbox](docs/migration-screenshotone-urlbox.md)
 - [Authorizing ViperCapture through Cloudflare or a WAF](docs/site-access.md)
 - [Public API deployment example](deploy/public-api)
+
+[All docs](docs/README.md) has the full list.
 
 For harder bot challenges, see [ViperCapture Stealth](https://github.com/Viperisuseful/ViperCapture-Stealth), a separate fork. It is not a universal Cloudflare bypass.
 

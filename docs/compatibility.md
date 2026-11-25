@@ -1,96 +1,74 @@
 # ScreenshotOne and Urlbox compatibility matrix
 
-Last verified against public vendor documentation: **2026-08-09**.
+Last verified against public vendor documentation on 2026-08-09.
 
-This matrix compares documented workflows. “Yes” means that the repository
-implements and tests the capability. “Partial” means that the implementations
-differ. Vendor behavior can change. The links below identify the vendor
-documentation used for this comparison.
+This matrix compares documented workflows across ViperCapture OSS, ScreenshotOne, and Urlbox. "Yes" means this repository implements and tests the capability. "Partial" means the implementations differ. Vendor behavior can change; check the vendor links below for current details.
 
 | Capability | ViperCapture OSS | ScreenshotOne | Urlbox |
 | --- | --- | --- | --- |
-| Self-host under an OSI license | **Yes — MIT** | No public OSS server | No public OSS server |
+| Self-host under an OSI license | Yes (MIT) | No public OSS server | No public OSS server |
 | URL and raw HTML input | Yes | Yes | Yes |
-| Markdown input | Yes | Yes | Partial: Markdown is documented as an output |
-| PNG / JPEG / WebP | Yes | Yes | Yes |
-| PDF (including explicit structure-tag control) / hydrated HTML / Markdown / metadata | Yes | Yes | Yes |
-| Video | **WebM, MP4, GIF** | GIF/WebM animations | MP4/WebM |
-| Full page / viewport / selector / clip | Yes | Yes | Yes |
-| Multiple viewports in one request | Yes, ZIP | Bulk API | Batch/API workflows |
-| Multiple artifacts from one page load | Yes: image, HTML, Markdown, metadata, MHTML, thumbnails | Partial: screenshot plus content metadata | Yes: side renders and thumbnails |
-| Typed browser actions | Yes | Scripts and page customization | Click/type/scroll and custom JS options |
-| Custom CSS / JavaScript | Yes; JS operator opt-in | Yes | Yes |
-| Waits and content/request assertions | Yes | Yes | Yes/partial depending on assertion |
-| Ad, tracker, consent, chat cleanup | Yes | Yes | Yes |
-| Headers, cookies, locale/timezone, geolocation | Yes | Yes | Yes |
-| Screen/print CSS media emulation | Yes | Yes | Yes |
+| Markdown input | Yes | Yes | Partial, Markdown is documented as an output |
+| PNG, JPEG, and WebP output | Yes | Yes | Yes |
+| AVIF output | Yes | Yes | Yes |
+| PDF (with explicit structure-tag control), HTML, Markdown, and metadata | Yes | Yes | Yes |
+| Video output | WebM, MP4, and GIF | GIF and WebM animations | MP4 and WebM |
+| Full page, viewport, selector, and clip | Yes | Yes | Yes |
+| Multiple viewports in one request | Yes, ZIP | Bulk API | Batch and API workflows |
+| Multiple artifacts from one page load | Yes: image, HTML, Markdown, metadata, MHTML, and thumbnails | Partial: screenshot plus content metadata | Yes: side renders and thumbnails |
+| Typed browser actions | Yes | Scripts and page customization | Click, type, scroll, and custom JS options |
+| Custom CSS and JavaScript | Yes, JS is operator opt-in | Yes | Yes |
+| Waits and content or request assertions | Yes | Yes | Yes or partial depending on assertion |
+| Ad, tracker, consent, and chat cleanup | Yes | Yes | Yes |
+| Headers, cookies, locale, timezone, and geolocation | Yes | Yes | Yes |
+| Screen and print CSS media emulation | Yes | Yes | Yes |
 | Per-request proxy | Self-host mode | Paid option | Paid option |
-| Exact-request cache | Yes, local 15-minute default | Yes, CDN/R2 cache | Render-link cache; POST not cached |
+| Exact-request image cache | Yes, 24-hour local default | Yes, CDN and R2 cache | Render-link cache; POST is not cached |
 | Sync and durable async polling | Yes | Async callback workflow | Yes |
 | Signed webhooks | Yes | Yes | Yes |
 | Expiring signed render links | Yes | Yes | Yes, tokenized render links |
-| Native S3-compatible results | Yes: S3/R2/MinIO/B2 | Yes | Yes, plan-dependent |
-| Chromium / Firefox / WebKit rendering | **Yes** | Chromium | Chromium |
+| Native S3-compatible results | Yes: S3, R2, MinIO, and B2 | Yes | Yes, plan-dependent |
+| Chromium, Firefox, and WebKit rendering | Yes | Chromium | Chromium |
 | Open shadow-DOM HTML extraction | Yes | Yes | Not documented |
 | Output thumbnail resizing | Yes | Yes | Yes |
-| Bulk endpoint | Yes, up to 100 | Yes | Client/batch workflow |
-| Cron schedules | Yes | External scheduler | Product/no-code workflows documented |
-| Pixel visual diff reports | Yes | Not documented as core render API | Schedule/compare workflow documented |
-| Diagnostic bundle | Yes: artifact, manifest, console, network, redacted HAR 1.2 (allowlisted headers; Chromium CDP + Resource Timing HTTP versions; Firefox/WebKit HTTPS unknown without Timing), redacted trace, WARC | Partial: metadata/error options | Partial: request waterfall/metadata |
-| Structured CSS-selector extraction | Yes: text, HTML, attributes, geometry | Partial: single-selector content | Partial: predefined extracted content |
+| Bulk endpoint | Yes, up to 100 items | Yes | Client and batch workflow |
+| Cron schedules | Yes | External scheduler | Product and no-code workflows documented |
+| Pixel visual diff reports | Yes | Not documented as core render API | Schedule and compare workflow documented |
+| Diagnostic bundle | Yes: artifact, manifest, console, network, redacted HAR 1.2 (allowlisted headers, Chromium CDP and Resource Timing HTTP versions, Firefox and WebKit HTTPS unknown without Timing), redacted trace, and WARC | Partial: metadata and error options | Partial: request waterfall and metadata |
+| Structured CSS-selector extraction | Yes: text, HTML, attributes, and geometry | Partial: single-selector content | Partial: predefined extracted content |
 | Deterministic visual testing and baseline store | Yes | Managed service | Managed service |
-| Project API keys, quotas, ownership, audit log | Yes, operator opt-in | Managed | Managed |
+| Project API keys, quotas, ownership, and audit log | Yes, operator opt-in | Managed | Managed |
 | Encrypted persistent browser profiles | Yes | Yes | Yes |
 | Prometheus metrics and OTLP traces | Yes | Vendor-managed | Vendor-managed |
 | Separate API and distributed worker roles | Yes, provider-backed | Vendor-managed | Vendor-managed |
-| ScreenshotOne/Urlbox request adapters | Yes | Native | Native |
-| Managed global proxies / stealth fleet | **No** | Yes | Yes |
-| Owner-authorized Cloudflare/WAF access | **Yes: scoped header, profile, proxy, diagnostics, rule guide** | Managed | Managed |
-| Vendor SLA and human render support | **No** | Managed offering | Managed offering |
-| AVIF output | Yes | Yes | Yes |
-| Certified/evidentiary archive | Yes, Ed25519 manifest | Not compared | Yes |
+| ScreenshotOne and Urlbox request adapters | Yes | Native | Native |
+| Certified artifact archive | Yes, Ed25519 manifest | Not compared | Yes |
+| Owner-authorized Cloudflare or WAF access | Yes: scoped header, profile, proxy, diagnostics, and rule guide | Managed | Managed |
+| Managed global proxies and stealth fleet | No | Yes | Yes |
+| Vendor SLA and human render support | No | Managed offering | Managed offering |
 
-Vendor sources:
+Vendor documentation referenced for this comparison:
 
-- ScreenshotOne: [options](https://screenshotone.com/docs/options/),
-  [bulk](https://screenshotone.com/docs/bulk-screenshots/),
-  [signed links](https://screenshotone.com/docs/signed-requests/), and
-  [animated screenshots](https://screenshotone.com/docs/animated-screenshots/).
-- Urlbox: [API reference](https://urlbox.com/docs/api),
-  [render options](https://urlbox.com/docs/options),
-  [render links](https://urlbox.com/docs/api/rest-api-vs-render-links), and
-  [S3-compatible storage](https://urlbox.com/docs/guides/s3).
+- ScreenshotOne: [options](https://screenshotone.com/docs/options/), [bulk screenshots](https://screenshotone.com/docs/bulk-screenshots/), [signed requests](https://screenshotone.com/docs/signed-requests/), and [animated screenshots](https://screenshotone.com/docs/animated-screenshots/).
+- Urlbox: [API reference](https://urlbox.com/docs/api), [render options](https://urlbox.com/docs/options), [REST API vs render links](https://urlbox.com/docs/api/rest-api-vs-render-links), and [S3-compatible storage](https://urlbox.com/docs/guides/s3).
 
-## Unsupported managed services
+## What ViperCapture does not include
 
-ViperCapture does not provide a managed proxy network, anti-bot bypass, legal
-admissibility opinion, SLA, or continuous render support. The operator manages
-the code version, browsers, network, data, storage, capacity, and cost. This
-repository is the standard Playwright product and does not claim a Cloudflare
-bypass. For Patchright plus Turnstile complete-when-possible / harder
-challenge handling, see the separate
-[ViperCapture Stealth](https://github.com/Viperisuseful/ViperCapture-Stealth)
-fork (0.1.0-beta). It is not a managed stealth fleet and is not a universal
-Cloudflare bypass.
+ViperCapture does not include a managed proxy network, anti-bot bypass, legal admissibility opinion, SLA, or continuous render support. The operator manages upgrades, browsers, networking, data retention, storage, capacity, and cost.
 
-For a target the operator owns, the [site access guide](site-access.md) documents
-a narrow Cloudflare/WAF exception using the renderer address, exact host and
-path, and an origin-scoped secret header. This is authorization, not challenge
-evasion.
+This repository runs standard Playwright and does not claim a Cloudflare bypass. For Patchright and harder Turnstile challenge handling, see the separate [ViperCapture Stealth](https://github.com/Viperisuseful/ViperCapture-Stealth) fork (`0.1.0-beta`). It is neither a managed stealth fleet nor a universal Cloudflare bypass.
+
+For a site you control, follow the [site access guide](site-access.md) to configure a narrow Cloudflare or WAF rule matching your renderer's IP, exact host and path, and an origin-scoped secret header. That workflow authorizes your own server rather than evading challenges.
 
 ## Other services
 
-- [Browserless](https://docs.browserless.io/enterprise/open-source) provides
-  an open-source Docker deployment. It provides general browser infrastructure:
-  REST screenshot/PDF/content
-  endpoints plus Playwright/Puppeteer WebSocket sessions. ViperCapture's focus
-  is the artifact workflow around rendering—typed actions, encrypted jobs,
-  signed delivery, bulk/schedules, visual diffs, and diagnostic bundles.
-- [ScreenshotAPI](https://www.screenshotapi.net/docs) documents image/PDF and
-  scrolling video output with customization and geolocation as a managed API.
-- [ApiFlash](https://apiflash.com/documentation) offers a narrower managed
-  URL-to-image GET/POST API backed by AWS Lambda.
+- **[Browserless](https://docs.browserless.io/enterprise/open-source).** Offers an open-source Docker server for general browser automation through REST screenshot, PDF, and content endpoints plus Playwright and Puppeteer WebSocket sessions. ViperCapture focuses on the rendering and delivery workflow: typed actions, encrypted async jobs, signed links, bulk and cron jobs, visual diffs, and diagnostic bundles.
+- **[ScreenshotAPI](https://www.screenshotapi.net/docs).** Provides a managed API for images, PDFs, scrolling video, customization, and geolocation.
+- **[ApiFlash](https://apiflash.com/documentation).** Provides a narrower managed URL-to-image GET and POST API backed by AWS Lambda.
 
-ViperCapture is one of several open-source screenshot servers. It provides a
-self-hosted rendering and delivery workflow under the MIT License. The matrix
-records the tested features and known gaps.
+## Related
+
+- [Migrating from ScreenshotOne or Urlbox](migration-screenshotone-urlbox.md)
+- [Full feature list](features.md)
+- [API and workflows](api.md)
+- [All docs](README.md)

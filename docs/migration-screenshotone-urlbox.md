@@ -1,44 +1,39 @@
 # Migrating from ScreenshotOne or Urlbox
 
-ViperCapture uses a strict nested JSON contract. It does not support every
-vendor query parameter. Migrate server-side POST requests first. Migrate signed
-URLs and async workflows separately.
+ViperCapture uses a strict nested JSON contract and rejects unknown fields rather than accepting every vendor query parameter. Move server-side POST requests first, then migrate signed URLs and async workflows separately.
 
-For a staged cutover, the common ScreenshotOne query contract is available at
-`GET /take`; a project key may be sent as `access_key` or a bearer token. Urlbox
-common POST options are accepted at `/compat/urlbox/v1/render/sync` and
-`/compat/urlbox/v1/render/async`. Once traffic is stable, migrate to the native
-contract to access every ViperCapture option.
+For a staged cutover, use the compatibility endpoints:
 
-`access_key` remains a compatibility-only query credential for `/take` and is
-enabled by default. URLs can leak credentials through proxy/access logs,
-browser history, analytics, debugging tools, and copied links. Prefer
-`Authorization: Bearer ...` and set `VIPERCAPTURE_ALLOW_QUERY_AUTH=0` after
-legacy clients are migrated. Native `/v1/*` routes never accept query keys.
+- **ScreenshotOne.** `GET /take` accepts common query options and authenticates with `access_key` or a Bearer token.
+- **Urlbox.** `POST /compat/urlbox/v1/render/sync` and `POST /compat/urlbox/v1/render/async` accept common POST options.
+
+Once traffic is stable, switch callers to native `/v1/*` routes to access every ViperCapture option.
+
+`access_key` is a compatibility-only query credential for `/take` and starts enabled by default. Query parameters can leak secrets into proxy and access logs, browser history, analytics, debugging tools, and copied links. Prefer `Authorization: Bearer ...` and set `VIPERCAPTURE_ALLOW_QUERY_AUTH=0` once legacy callers finish migrating. Native `/v1/*` routes never accept query keys.
 
 ## Map request options
 
-| Vendor-style concept | ViperCapture field |
+| Vendor concept | ViperCapture field |
 | --- | --- |
-| `url`, `html`, `markdown` | same top-level source field |
+| `url`, `html`, or `markdown` | Same top-level source field |
 | `format` | `output` |
-| viewport width/height/DPR | `viewport.width`, `.height`, `.device_scale_factor` |
-| full-page capture | `full_page` |
-| selector | `selector` with `full_page: false` |
-| clip x/y/width/height | `clip` with `full_page: false` |
-| image quality | `image.quality` |
-| transparent background | `image.transparent_background` |
-| wait event/selector/text/delay | `wait_for` |
-| styles/custom CSS | `custom_css` |
-| block ads/cookie banners/chats | `cleanup` |
-| user agent/proxy/cookies/geolocation | `network` |
-| click/type/scroll/scripts | ordered `actions` |
-| fail if text/request condition | `assertions` and `fail_on_status` |
-| async | submit the same body to `/v1/jobs` |
-| webhook URL | `delivery.webhook_url` on an async job |
-| cache | `cache: true` for a single image |
+| Viewport width, height, and DPR | `viewport.width`, `viewport.height`, and `viewport.device_scale_factor` |
+| Full-page capture | `full_page` |
+| Element selector | `selector` with `full_page: false` |
+| Clip x, y, width, and height | `clip` with `full_page: false` |
+| Image quality | `image.quality` |
+| Transparent background | `image.transparent_background` |
+| Wait event, selector, text, or delay | `wait_for` |
+| Styles or custom CSS | `custom_css` |
+| Block ads, cookie banners, or chats | `cleanup` |
+| User agent, proxy, cookies, or geolocation | `network` |
+| Click, type, scroll, or script steps | Ordered `actions` |
+| Fail on text, request-failure, or HTTP-status checks | `assertions` and `fail_on_status` |
+| Async execution | Submit the same body to `POST /v1/jobs` |
+| Webhook URL | `delivery.webhook_url` on an async job |
+| Exact-request cache | `cache: true` for a single image |
 
-Example ViperCapture request:
+Example native request:
 
 ```json
 {
@@ -55,18 +50,20 @@ Example ViperCapture request:
 ## Migrate traffic
 
 1. Pin the ViperCapture commit and Chromium version in a staging deployment.
-2. Copy real requests with secrets removed into a private scenario suite.
-3. Compare dimensions and visual differences, not only HTTP success.
-4. Validate fonts, locale/timezone, authentication, lazy content, and consent
-   behavior on representative pages.
-5. Replay representative traffic from the same client region with caching
-   disabled, and record success rate, latency, and output differences.
-6. Exercise async restart recovery, webhook signature verification, object
-   expiry, and schedule timezone transitions.
-7. Apply reverse-proxy authentication, request limits, Chromium isolation,
-   egress filtering, backups, and provider lifecycle rules.
-8. Move traffic gradually and retain the managed provider as rollback until
-   workload-specific acceptance criteria pass.
+2. Copy representative production requests with secrets stripped into a private test suite.
+3. Compare output dimensions, pixel diffs, and HTTP status codes.
+4. Check fonts, locale, timezone, authentication, lazy-loaded content, and cookie consent handling on real pages.
+5. Replay representative traffic from the same client region with caching off, and record success rate, latency, and visual differences.
+6. Test async restart recovery, webhook signature verification, artifact expiry, and schedule timezone transitions.
+7. Set up reverse-proxy authentication, request limits, Chromium isolation, egress filtering, backups, and bucket lifecycle rules.
+8. Shift traffic gradually and keep the managed vendor as a rollback target until your acceptance criteria pass.
 
-Compatibility endpoints reject unknown vendor options. Handle each validation
-error before moving the corresponding request to ViperCapture.
+Compatibility endpoints reject unknown vendor options. Resolve each validation error before moving that request to ViperCapture.
+
+## Related
+
+- [ScreenshotOne and Urlbox compatibility matrix](compatibility.md)
+- [API and workflows](api.md)
+- [Self-hosting and local setup](self-hosting.md)
+- [Public API deployment example](../deploy/public-api/README.md)
+- [All docs](README.md)
