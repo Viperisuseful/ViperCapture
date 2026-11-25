@@ -2825,6 +2825,48 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(terminated_endpoints, [("::1", 9100)])
 
+            # Specific LAN bind (192.0.2.20:9123) preserves the LAN IP instead of falling back to 127.0.0.1
+            lan_identity = launch.ProcessIdentity(
+                pid=42426,
+                kind="server",
+                command="python -m uvicorn vipercapture.main:app --host 192.0.2.20 --port 9123",
+                start_time="12347",
+            )
+            (runtime_dir / "server-42426.json").write_text(
+                json.dumps({
+                    "service": "vipercapture",
+                    "install_id": launch._installation_id(),
+                    "pid": 42426,
+                    "host": "192.0.2.20",
+                    "port": 9123,
+                    "start_time": "12347",
+                    "token": "secret-shutdown-token",
+                }),
+                encoding="utf-8",
+            )
+            with mock.patch("launch.Path.home", return_value=fake_home):
+                self.assertEqual(
+                    launch._verified_server_record_endpoint(lan_identity),
+                    ("192.0.2.20", 9123),
+                )
+
+    def test_custom_port_occupied_by_unrelated_service_exits_nonzero(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch("launch.sys.argv", ["launch.py", "--port", "9123"]),
+            mock.patch("launch.ensure_venv"),
+            mock.patch("launch.port_open", return_value=True),
+            mock.patch("launch._is_vipercapture_endpoint", return_value=None),
+            mock.patch("launch._mod") as mod_mock,
+            mock.patch("sys.stderr", stderr),
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                launch.main()
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("another process", stderr.getvalue())
+        mod_mock.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

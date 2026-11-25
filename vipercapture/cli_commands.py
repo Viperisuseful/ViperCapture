@@ -1231,16 +1231,6 @@ def cmd_bulk(argv: list[str]) -> int:
     if args.poll_ms < 1:
         return fail("--poll-ms must be 1 or greater.", exit_code=2)
 
-    output_dir: Path | None = None
-    if args.wait:
-        output_dir = Path(args.output_dir) if args.output_dir else Path.cwd()
-        if output_dir.exists() and not output_dir.is_dir():
-            return fail(f"--output-dir is not a directory: {output_dir}", exit_code=2)
-        try:
-            output_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            return fail(f"Cannot create --output-dir {output_dir}: {exc}", exit_code=2)
-
     load_local_env()
     try:
         root = api_root(args.server)
@@ -1253,6 +1243,16 @@ def cmd_bulk(argv: list[str]) -> int:
             validate_payload(item["render"])  # type: ignore[arg-type]
     except ValueError as exc:
         return fail(str(exc), exit_code=2)
+
+    output_dir: Path | None = None
+    if args.wait:
+        output_dir = Path(args.output_dir) if args.output_dir else Path.cwd()
+        if output_dir.exists() and not output_dir.is_dir():
+            return fail(f"--output-dir is not a directory: {output_dir}", exit_code=2)
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return fail(f"Cannot create --output-dir {output_dir}: {exc}", exit_code=2)
 
     try:
         started = ensure_server(args)
@@ -1371,6 +1371,8 @@ def cmd_bulk(argv: list[str]) -> int:
                     res = future.result()
                 except CaptureError as exc:
                     res = {"ok": False, "error": str(exc), "status": exc.status}
+                except OSError as exc:
+                    res = {"ok": False, "error": str(exc), "status": None}
                 res["index"] = idx
                 if not res.get("ok"):
                     download_failures += 1

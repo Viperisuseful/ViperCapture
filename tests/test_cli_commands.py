@@ -1402,6 +1402,109 @@ class CliCouncilHardeningTests(unittest.TestCase):
             self.assertEqual(doc["succeeded"], 0)
             self.assertEqual(doc["failed"], 2)
 
+    def test_round8_truncated_download_locked_file_batch_template_typeerror_and_bulk_mkdir_order(self) -> None:
+        from vipercapture import capture_cli
+
+        # 1. Truncated download (Content-Length: 100, 9 bytes sent) raises CaptureError
+        #    and leaves pre-existing artifact untouched
+        with tempfile.TemporaryDirectory() as tmp:
+            existing = Path(tmp) / "existing.png"
+            existing.write_bytes(b"original-good-artifact")
+
+            class _TruncatedResp:
+                status = 200
+                headers = {"Content-Length": "100"}
+
+                def __init__(self) -> None:
+                    self._chunks = [b"123456789", b""]
+
+                def read(self, _n: int = -1) -> bytes:
+                    return self._chunks.pop(0) if self._chunks else b""
+
+            with self.assertRaises(capture_cli.CaptureError):
+                capture_cli.write_response(_TruncatedResp(), existing)
+            self.assertEqual(existing.read_bytes(), b"original-good-artifact")
+
+        # 2. PermissionError writing one artifact in bulk --wait --json still emits full JSON summary
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "bulk_out"
+            orig_write = capture_cli.write_response
+            call_idx = {"n": 0}
+
+            def _fail_first_write(resp, path):
+                call_idx["n"] += 1
+                if call_idx["n"] == 1:
+                    raise PermissionError("file locked")
+                return orig_write(resp, path)
+
+            with mock.patch.object(cli_commands, "write_response", side_effect=_fail_first_write):
+                code, stdout, stderr = self._run([
+                    "bulk",
+                    "--url", "https://one.example",
+                    "--url", "https://two.example",
+                    "--wait", "--poll-ms", "1",
+                    "--concurrency", "1",
+                    "--output-dir", str(out_dir),
+                    "--server", self.server,
+                    "--json",
+                ])
+            self.assertEqual(code, 1, stderr)
+            doc = json.loads(stdout)
+            self.assertFalse(doc["ok"])
+            self.assertEqual(doc["count"], 2)
+            self.assertEqual(doc["succeeded"], 1)
+            self.assertEqual(doc["failed"], 1)
+
+        # 3. PermissionError in multi-URL capture --json records per-item error and finishes remaining URLs
+        with tempfile.TemporaryDirectory() as tmp:
+            orig_write = capture_cli.write_response
+            cap_idx = {"n": 0}
+
+            def _fail_first_cap(resp, path):
+                cap_idx["n"] += 1
+                if cap_idx["n"] == 1:
+                    raise PermissionError("file locked")
+                return orig_write(resp, path)
+
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with (
+                mock.patch("sys.stdout", buf_out),
+                mock.patch("sys.stderr", buf_err),
+                mock.patch.object(capture_cli, "write_response", side_effect=_fail_first_cap),
+            ):
+                code = capture_cli.main([
+                    "https://one.example", "https://two.example",
+                    "--output-dir", tmp,
+                    "--server", self.server,
+                    "--json",
+                ])
+            self.assertEqual(code, 1)
+            doc = json.loads(buf_out.getvalue())
+            self.assertEqual(doc["count"], 2)
+            self.assertEqual(doc["succeeded"], 1)
+            self.assertEqual(doc["failed"], 1)
+
+        # 4. Invalid template '{index[0]}{ext}' raises TypeError -> caught and exits 2 cleanly
+        buf_out, buf_err = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdout", buf_out), mock.patch("sys.stderr", buf_err):
+            code = capture_cli.main([
+                "https://example.org",
+                "--no-config", "--no-start",
+                "--output-template", "{index[0]}{ext}",
+                "--server", self.server,
+            ])
+        self.assertEqual(code, 2)
+        self.assertIn("Invalid --output-template", buf_err.getvalue())
+
+        # 5. Invalid bulk input (no URLs) exits 2 WITHOUT creating --output-dir
+        with tempfile.TemporaryDirectory() as tmp:
+            new_dir = Path(tmp) / "should_not_exist"
+            code, _stdout, _stderr = self._run([
+                "bulk", "--wait", "--output-dir", str(new_dir),
+            ])
+            self.assertEqual(code, 2)
+            self.assertFalse(new_dir.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

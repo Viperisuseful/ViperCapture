@@ -2369,7 +2369,7 @@ def render_output_template(
             format=fmt,
             ext=ext,
         )
-    except (KeyError, ValueError, IndexError, AttributeError) as exc:
+    except (KeyError, ValueError, IndexError, AttributeError, TypeError) as exc:
         raise ValueError(
             f"Invalid --output-template {template!r}: {exc}. "
             "Supported placeholders: {host}, {index}, {slug}, {timestamp}, {format}, {ext}."
@@ -2852,12 +2852,44 @@ def encode_multipart_form(
     return f"multipart/form-data; boundary={boundary}", b"".join(parts)
 
 
+def _expected_content_length(response) -> int | None:
+    status = getattr(response, "status", None)
+    if status is None:
+        status = getattr(response, "code", 200)
+    if status in {204, 304}:
+        return None
+    headers = getattr(response, "headers", None)
+    if headers is None or not hasattr(headers, "get"):
+        return None
+    transfer_encoding = str(headers.get("Transfer-Encoding") or headers.get("transfer-encoding") or "").lower()
+    if "chunked" in transfer_encoding:
+        return None
+    raw = headers.get("Content-Length")
+    if raw is None:
+        raw = headers.get("content-length")
+    if raw is None:
+        return None
+    try:
+        parsed = int(str(raw).strip())
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
+
+
 def _read_bounded(response, handle) -> int:
     limit = max_capture_bytes()
+    expected_length = _expected_content_length(response)
     total = 0
     while True:
-        block = response.read(1024 * 1024)
+        try:
+            block = response.read(1024 * 1024)
+        except http.client.IncompleteRead as exc:
+            raise CaptureError(f"Incomplete response from API: {exc}") from exc
         if not block:
+            if expected_length is not None and total < expected_length:
+                raise CaptureError(
+                    f"Incomplete response: expected {expected_length} bytes, received {total}."
+                )
             return total
         total += len(block)
         if total > limit:
@@ -3716,17 +3748,20 @@ def run_capture(args: argparse.Namespace) -> int:
                     })
                     if not args.json and not args.quiet:
                         write_line(sys.stdout, shown)
-            except CaptureError as exc:
+            except (CaptureError, OSError) as exc:
                 failures += 1
+                err_status = exc.status if isinstance(exc, CaptureError) else None
+                err_code = exc.code if isinstance(exc, CaptureError) else None
+                err_body = exc.body if isinstance(exc, CaptureError) else None
                 results.append({
                     "ok": False,
                     "url": item_payload.get("url"),
                     "error": str(exc),
-                    "status": exc.status,
-                    "code": exc.code,
+                    "status": err_status,
+                    "code": err_code,
                 })
                 if not args.json:
-                    fail(str(exc), status=exc.status, code=exc.code, body=exc.body)
+                    fail(str(exc), status=err_status, code=err_code, body=err_body)
         if args.json:
             write_line(
                 sys.stdout,

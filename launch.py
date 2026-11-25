@@ -2410,6 +2410,25 @@ def _terminate_process(
     return False, "survived_sigkill"
 
 
+def _normalize_shutdown_host(raw_host: str) -> str | None:
+    """Normalize a bind/record host to a connectable local address for graceful shutdown."""
+    import ipaddress
+
+    cleaned = raw_host.strip().strip("[]")
+    if not cleaned:
+        return None
+    lowered = cleaned.lower()
+    if lowered in {"0.0.0.0", "127.0.0.1", "localhost"}:
+        return "127.0.0.1"
+    if lowered in {"::", "::1"}:
+        return "::1"
+    try:
+        ipaddress.ip_address(cleaned)
+        return cleaned
+    except ValueError:
+        return None
+
+
 def _connect_host_from_command(command: str) -> str | None:
     """Infer a local connect host from a recorded uvicorn command line."""
     try:
@@ -2423,13 +2442,9 @@ def _connect_host_from_command(command: str) -> str | None:
         elif token.startswith("--host="):
             raw_host = token.split("=", 1)[1]
         if raw_host:
-            cleaned = raw_host.strip().strip("[]")
-            if cleaned in {"::", "::1"}:
-                return "::1"
-            if cleaned in {"0.0.0.0", "127.0.0.1", "localhost"}:
-                return "127.0.0.1"
-            if _is_loopback_bind_host(cleaned):
-                return cleaned
+            normalized = _normalize_shutdown_host(raw_host)
+            if normalized is not None:
+                return normalized
             return "127.0.0.1"
     return None
 
@@ -2458,9 +2473,7 @@ def _verified_server_record_endpoint(
             raw_host = record.get("host")
             record_host: str | None = None
             if isinstance(raw_host, str) and raw_host.strip():
-                cleaned = raw_host.strip().strip("[]")
-                if _is_loopback_bind_host(cleaned):
-                    record_host = cleaned
+                record_host = _normalize_shutdown_host(raw_host)
             if record_host is None:
                 record_host = _connect_host_from_command(identity.command)
             return record_host, record_port
@@ -3685,6 +3698,13 @@ def main() -> None:
     # Server already running from a previous session? Open it immediately
     # without hashing requirements or importing Playwright first.
     if port_open(connect_host, bind_port) if custom_bind else port_open():
+        if custom_bind and _is_vipercapture_endpoint(host=connect_host, port=bind_port) is None:
+            print(
+                f"  Port {bind_port} on {connect_host} is already in use by another process "
+                "(not ViperCapture).",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
         show_terminal_logo()
         print(f"\n{listening_line(bind_url)}")
         print("  That server is already running. Opening it in your browser.")
