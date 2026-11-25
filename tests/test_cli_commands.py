@@ -904,7 +904,7 @@ class CliCommandsTests(unittest.TestCase):
             self.assertNotIn("vcp_abcd1234_secretvalue", stdout)
             self.assertNotIn("secretvalue", stdout)
             self.assertNotIn(token, stdout)
-            self.assertEqual(stdout.strip(), str(plain_out))
+            self.assertEqual(Path(stdout.strip()).resolve(), plain_out.resolve())
             self.assertEqual(plain_out.read_text(encoding="utf-8").strip(), "vcp_abcd1234_secretvalue")
             if os.name != "nt":
                 self.assertEqual(plain_out.stat().st_mode & 0o777, 0o600)
@@ -921,7 +921,7 @@ class CliCommandsTests(unittest.TestCase):
             self.assertNotIn(token, stdout)
             out_doc = json.loads(stdout)
             self.assertEqual(out_doc["api_key"], "***")
-            self.assertEqual(out_doc["key_file"], str(json_out))
+            self.assertEqual(Path(out_doc["key_file"]).resolve(), json_out.resolve())
             self.assertEqual(out_doc["warning"], "Save this key now, it will not be shown again.")
             self.assertEqual(json_out.read_text(encoding="utf-8").strip(), "vcp_abcd1234_secretvalue")
             if os.name != "nt":
