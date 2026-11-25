@@ -717,6 +717,13 @@ class RenderRequest(StrictModel):
         if not isinstance(data, dict):
             return data
         profile = data.get("profile", CaptureProfile.PREVIEW.value)
+        if hasattr(profile, "value"):
+            profile = profile.value
+        elif isinstance(profile, (bytes, bytearray)):
+            try:
+                profile = profile.decode("utf-8")
+            except UnicodeDecodeError:
+                profile = None
         image = data.get("image")
         if image is None:
             image = {}
@@ -740,9 +747,21 @@ class RenderRequest(StrictModel):
             except UnicodeDecodeError:
                 engine = None
         deterministic = data.get("deterministic") or {}
-        deterministic_enabled = bool(
-            deterministic.get("enabled") if isinstance(deterministic, dict) else False
-        )
+        raw_det_enabled = deterministic.get("enabled") if isinstance(deterministic, dict) else False
+        if isinstance(raw_det_enabled, bool):
+            deterministic_enabled = raw_det_enabled
+        elif type(raw_det_enabled) in {int, float} and raw_det_enabled in {0, 1}:
+            deterministic_enabled = bool(raw_det_enabled)
+        elif isinstance(raw_det_enabled, bytes):
+            try:
+                lowered_det = raw_det_enabled.decode("utf-8").lower()
+            except UnicodeDecodeError:
+                lowered_det = ""
+            deterministic_enabled = lowered_det in {"1", "true", "yes", "on", "t", "y"}
+        elif isinstance(raw_det_enabled, str):
+            deterministic_enabled = raw_det_enabled.lower() in {"1", "true", "yes", "on", "t", "y"}
+        else:
+            deterministic_enabled = False
         if profile == CaptureProfile.PREVIEW.value:
             if "lazy_load" not in data:
                 data["lazy_load"] = LazyLoadMode.ADAPTIVE.value

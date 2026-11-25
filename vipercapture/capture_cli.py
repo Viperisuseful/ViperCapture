@@ -25,6 +25,8 @@ import string
 import subprocess
 import sys
 import time
+import unicodedata
+from collections import deque
 from http.cookies import CookieError, SimpleCookie
 from pathlib import Path
 from typing import TextIO
@@ -2327,8 +2329,51 @@ def _parse_contract_str(
     return value
 
 
-_CONTRACT_LIST_TYPES = (list, tuple, set, frozenset)
+_CONTRACT_LIST_TYPES = (list, tuple, set, frozenset, deque)
 _CONTRACT_FORBIDDEN_HOST_CHARS = frozenset("#/:<>?@[\\]^|%")
+_CONTRACT_WHATWG_C0_SPACE = "".join(chr(cp) for cp in range(0x21))
+_CONTRACT_RUST_WS = (
+    "\t\n\x0b\x0c\r \x85\xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005"
+    "\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
+)
+_CONTRACT_FORBIDDEN_IDNA_CATS = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp", "Zs"})
+
+
+def _validate_idna_label(label: str, field: str) -> None:
+    if not label:
+        return
+    if label.lower().startswith("xn--"):
+        raw_puny = label[4:]
+        if not raw_puny or not raw_puny.isascii():
+            raise ValueError(f"{field} has an invalid punycode host label.")
+        try:
+            decoded = raw_puny.encode("ascii").decode("punycode")
+            reencoded = decoded.encode("idna").decode("ascii")
+        except UnicodeError as exc:
+            raise ValueError(f"{field} has an invalid punycode host label.") from exc
+        if (
+            decoded.isascii()
+            or unicodedata.normalize("NFC", decoded) != decoded
+            or reencoded.lower() != label.lower()
+        ):
+            raise ValueError(f"{field} has an invalid punycode host label.")
+        target = decoded
+    elif not label.isascii():
+        target = label
+    else:
+        return
+    if any(unicodedata.category(ch) in _CONTRACT_FORBIDDEN_IDNA_CATS for ch in target):
+        raise ValueError(f"{field} has an invalid international domain name.")
+    try:
+        target.encode("idna")
+    except UnicodeError as exc:
+        raise ValueError(f"{field} has an invalid international domain name.") from exc
+    bidis = [unicodedata.bidirectional(ch) for ch in target]
+    if any(b in {"R", "AL", "AN"} for b in bidis):
+        if bidis[0] not in {"R", "AL"} or any(b == "L" for b in bidis):
+            raise ValueError(f"{field} violates IDNA bidirectional rules.")
+        if "EN" in bidis and "AN" in bidis:
+            raise ValueError(f"{field} violates IDNA bidirectional rules.")
 
 
 def _parse_whatwg_ipv4_number(part: str) -> tuple[bool, int | None]:
@@ -2365,35 +2410,56 @@ def _parse_contract_enum(value: object, field: str, allowed: frozenset[str] | tu
 
 
 def _parse_contract_http_url(value: object, field: str) -> str:
-    """Validate an HttpUrl value matching Pydantic v2 non-strict semantics."""
+    """Validate an HttpUrl value matching Pydantic v2 WHATWG URL semantics."""
     if isinstance(value, (bytes, bytearray)):
         try:
             value = value.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise ValueError(f"{field} must be a valid HTTP(S) URL.") from exc
-    if not isinstance(value, str) or len(value) > 2_083:
-        raise ValueError(f"{field} must be a valid HTTP(S) URL of at most 2083 characters.")
-    cleaned = value.strip().replace("\t", "").replace("\r", "").replace("\n", "")
-    if not cleaned:
+    if not isinstance(value, str):
         raise ValueError(f"{field} must be a valid HTTP(S) URL.")
     try:
-        parsed = urlsplit(cleaned)
-        _ = parsed.port
-    except ValueError as exc:
-        raise ValueError(f"{field} must be a valid HTTP(S) URL.") from exc
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raw_utf8 = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"{field} must be valid UTF-8.") from exc
+    if len(raw_utf8) > 2_083:
+        raise ValueError(f"{field} must be at most 2083 UTF-8 bytes.")
+    cleaned = value.strip(_CONTRACT_WHATWG_C0_SPACE).replace("\t", "").replace("\r", "").replace("\n", "")
+    if not cleaned:
         raise ValueError(f"{field} must be a valid HTTP(S) URL.")
-    authority = parsed.netloc
+    colon_idx = cleaned.find(":")
+    if colon_idx <= 0:
+        raise ValueError(f"{field} must be a valid HTTP(S) URL.")
+    scheme = cleaned[:colon_idx].lower()
+    if scheme not in {"http", "https"}:
+        raise ValueError(f"{field} must be a valid HTTP(S) URL.")
+    after_scheme = cleaned[colon_idx + 1 :].lstrip("/\\")
+    if not after_scheme:
+        raise ValueError(f"{field} must include a host.")
+    auth_end = len(after_scheme)
+    for sep in ("/", "\\", "?", "#"):
+        idx = after_scheme.find(sep)
+        if 0 <= idx < auth_end:
+            auth_end = idx
+    authority = after_scheme[:auth_end]
     if "@" in authority:
         authority = authority.rsplit("@", 1)[1]
+    if not authority:
+        raise ValueError(f"{field} must include a host.")
     if authority.startswith("["):
         end_bracket = authority.find("]")
         if end_bracket < 0:
             raise ValueError(f"{field} has an invalid IPv6 host.")
         ipv6_text = authority[1:end_bracket]
         rest = authority[end_bracket + 1 :]
-        if rest and not rest.startswith(":"):
-            raise ValueError(f"{field} has an invalid IPv6 host.")
+        if "%" in ipv6_text:
+            raise ValueError(f"{field} IPv6 host may not include a zone identifier.")
+        if rest:
+            if not rest.startswith(":"):
+                raise ValueError(f"{field} has an invalid IPv6 host.")
+            port_str = rest[1:]
+            if port_str and (not port_str.isascii() or not port_str.isdigit() or int(port_str) > 65_535):
+                raise ValueError(f"{field} has an invalid port number.")
         try:
             ipaddress.IPv6Address(ipv6_text)
         except ValueError as exc:
@@ -2401,7 +2467,12 @@ def _parse_contract_http_url(value: object, field: str) -> str:
         return cleaned
     if "[" in authority or "]" in authority:
         raise ValueError(f"{field} has an invalid host.")
-    raw_host = authority.split(":", 1)[0]
+    if ":" in authority:
+        raw_host, port_str = authority.split(":", 1)
+        if port_str and (not port_str.isascii() or not port_str.isdigit() or int(port_str) > 65_535):
+            raise ValueError(f"{field} has an invalid port number.")
+    else:
+        raw_host = authority
     if not raw_host:
         raise ValueError(f"{field} must include a host.")
     if "%" in raw_host:
@@ -2425,18 +2496,25 @@ def _parse_contract_http_url(value: object, field: str) -> str:
             raise ValueError(f"{field} has an invalid host.") from exc
     else:
         host_text = raw_host
-    if any(ord(ch) <= 0x20 or ord(ch) == 0x7F or ch in _CONTRACT_FORBIDDEN_HOST_CHARS for ch in host_text):
+    if any(
+        ch.isspace()
+        or ord(ch) <= 0x20
+        or ord(ch) == 0x7F
+        or ch in _CONTRACT_FORBIDDEN_HOST_CHARS
+        for ch in host_text
+    ):
         raise ValueError(f"{field} contains forbidden host characters.")
     parts = host_text.split(".")
-    if parts and parts[-1] == "":
-        parts = parts[:-1]
-    if parts:
-        last_is_num, _ = _parse_whatwg_ipv4_number(parts[-1])
+    for label in parts:
+        _validate_idna_label(label, field)
+    ipv4_parts = parts[:-1] if parts and parts[-1] == "" else parts
+    if ipv4_parts:
+        last_is_num, _ = _parse_whatwg_ipv4_number(ipv4_parts[-1])
         if last_is_num:
-            if len(parts) > 4:
+            if len(ipv4_parts) > 4:
                 raise ValueError(f"{field} has an invalid IPv4 host.")
             nums: list[int] = []
-            for part in parts:
+            for part in ipv4_parts:
                 is_num, num_val = _parse_whatwg_ipv4_number(part)
                 if not is_num or num_val is None:
                     raise ValueError(f"{field} has an invalid IPv4 host.")
@@ -2484,7 +2562,7 @@ def _parse_contract_int(value: object, field: str, lo: int | None, hi: int | Non
                 raise ValueError(f"{field} must be an integer.") from exc
         if not isinstance(value, str):
             raise ValueError(f"{field} must be an integer.")
-        stripped = value.strip()
+        stripped = value.strip(_CONTRACT_RUST_WS)
         match = re.fullmatch(r"([+-]?)([0-9](?:_?[0-9])*)(?:\.(0+))?", stripped)
         if match is None:
             raise ValueError(f"{field} must be an integer.")
@@ -2527,7 +2605,7 @@ def _parse_contract_float(
                 raise ValueError(f"{field} must be a number.") from exc
         if not isinstance(value, str):
             raise ValueError(f"{field} must be a number.")
-        stripped = value.strip()
+        stripped = value.strip(_CONTRACT_RUST_WS)
         if not stripped or not stripped.isascii():
             raise ValueError(f"{field} must be a number.")
         if stripped.startswith("_") or stripped.endswith("_") or "__" in stripped:

@@ -2291,11 +2291,35 @@ class CliCouncilHardeningTests(unittest.TestCase):
             {"url": "https://example.invalid", "output": "png", "viewport": {"device_scale_factor": "\u00a01\u00a0"}},
             {"url": "https://example.invalid/" + "a" * (2083 - len("https://example.invalid/")), "output": "png"},
             {"url": "http://[::1]", "output": "png"},
+            {"url": "https://example.invalid\x00", "output": "png"},
+            {"url": "http://example.com\\foo", "output": "png"},
+            {"url": "http:/example.com", "output": "png"},
+            {"url": "http:example.com", "output": "png"},
+            {"url": "http:\\\\example.com", "output": "png"},
+            {"url": "http://münchen.de", "output": "png"},
+            {"url": "http://xn--mnchen-3ya.de", "output": "png"},
+            {"url": "http://\u05d0\u05d1.com", "output": "png"},
         )
         bad_r18 = (
             {"url": "https://example.invalid/" + "a" * (2084 - len("https://example.invalid/")), "output": "png"},
+            {"url": "https://example.invalid/" + "é" * 1030, "output": "png"},
+            {"url": "https://example.invalid/" + "a" * (2082 - len("https://example.invalid/")) + "é", "output": "png"},
             {"url": " " + "https://example.invalid/" + "a" * (2083 - len("https://example.invalid/")), "output": "png"},
             {"url": "https://example.invalid/" + "a" * (2083 - len("https://example.invalid/")) + "\n", "output": "png"},
+            {"url": "\u00a0https://example.invalid\u00a0", "output": "png"},
+            {"url": "http://ex\u00a0ample.com", "output": "png"},
+            {"url": "http://a%c2%a0b.com", "output": "png"},
+            {"url": "http://xn--example.com", "output": "png"},
+            {"url": "http://xn--.com", "output": "png"},
+            {"url": "http://xn--a.com", "output": "png"},
+            {"url": "http://example.xn--", "output": "png"},
+            {"url": "http://a\u05d0b.com", "output": "png"},
+            {"url": "http://a\u200db.com", "output": "png"},
+            {"url": "http://\ud800.com", "output": "png"},
+            {"url": "http://[fe80::1%eth0]", "output": "png"},
+            {"url": "http://[fe80::%25eth0]", "output": "png"},
+            {"url": "https://example.invalid", "output": "png", "viewport": {"device_scale_factor": "\x1c1\x1c"}},
+            {"url": "https://example.invalid", "output": "png", "viewport": {"device_scale_factor": "\x1f4"}},
             {"url": "http://999.999.999.999", "output": "png"},
             {"url": "http://256.0.0.1", "output": "png"},
             {"url": "http://1.2.3.4.5", "output": "png"},
@@ -2345,12 +2369,23 @@ class CliCouncilHardeningTests(unittest.TestCase):
             with self.subTest(bad_r18=bad_case), self.assertRaises(ValueError):
                 capture_cli._validate_payload_fallback(bad_case)
         # Differential check against real RenderRequest when Pydantic is installed
+        from collections import deque as _deque
+        for deque_case in (
+            {"url": "https://example.invalid", "output": "png", "side_outputs": _deque(["html"])},
+            {"url": "https://example.invalid", "output": "png", "fail_on_status": _deque([500])},
+        ):
+            with self.subTest(deque_case=deque_case):
+                capture_cli._validate_payload_fallback(deque_case)
         try:
             import copy as _copy
             from vipercapture.render_contract import RenderRequest as _RenderRequest
         except ImportError:
             _RenderRequest = None
         if _RenderRequest is not None:
+            req_acc = _RenderRequest.model_validate({"url": "https://example.invalid", "output": "png", "profile": b"accurate"})
+            self.assertEqual(req_acc.lazy_load.value, "thorough")
+            req_det = _RenderRequest.model_validate({"url": "https://example.invalid", "output": "png", "deterministic": {"enabled": "false"}})
+            self.assertTrue(req_det.image.optimize_for_speed)
             for case in (*ok_r18, *bad_r18):
                 with self.subTest(differential_case=case):
                     try:
