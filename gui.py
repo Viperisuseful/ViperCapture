@@ -1034,10 +1034,14 @@ def apply_key(state: GuiState, key: str) -> tuple[GuiState, str]:
     # Main screen (URL bar focused)
     if key == "esc":
         return state, "quit"
-    if key == "tab":
-        return _replace(state, output=cycle_output(state.output, 1, state.available_formats), error="", notice=""), "edit"
-    if key == "shift-tab":
-        return _replace(state, output=cycle_output(state.output, -1, state.available_formats), error="", notice=""), "edit"
+    if key in {"tab", "shift-tab"}:
+        step = 1 if key == "tab" else -1
+        new_output = cycle_output(state.output, step, state.available_formats)
+        changes_out: dict[str, object] = {"output": new_output, "error": "", "notice": ""}
+        if new_output not in IMAGE_FORMATS and state.selector.strip():
+            changes_out["selector"] = ""
+            changes_out["notice"] = "Cleared element selector for non-image output."
+        return _replace(state, **changes_out), "edit"
     if key == "ctrl-p":
         new_full = not state.full_page
         changes: dict[str, object] = {"full_page": new_full, "error": "", "notice": ""}
@@ -1546,7 +1550,17 @@ def save_url_history(
     limit: int = HISTORY_LIMIT,
 ) -> None:
     target = history_file_path() if path is None else path
-    items = list(urls)[:limit]
+    existing = load_url_history(target, limit=limit)
+    seen: set[str] = set()
+    items: list[str] = []
+    for entry in (*urls, *existing):
+        cleaned = sanitize_terminal_text(entry).strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        items.append(cleaned)
+        if len(items) >= limit:
+            break
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         if os.name != "nt":
@@ -1744,10 +1758,15 @@ def apply_preset_settings_with_warnings(
             return float(value)
         return None
 
-    w_num = _in_range_number(settings.get("width"), 1, 16_384)
-    h_num = _in_range_number(settings.get("height"), 1, 16_384)
+    w_num = _in_range_number(settings.get("width"), 1, 65_535)
+    h_num = _in_range_number(settings.get("height"), 1, 65_535)
     if w_num is not None and h_num is not None:
         changes["viewport"] = (int(w_num), int(h_num))
+    elif (
+        (isinstance(settings.get("width"), (int, float)) and not isinstance(settings.get("width"), bool))
+        or (isinstance(settings.get("height"), (int, float)) and not isinstance(settings.get("height"), bool))
+    ):
+        ignored.append("viewport")
 
     d_val = _in_range_number(settings.get("density"), 0.1, 8.0)
     if d_val is not None:
@@ -1938,10 +1957,15 @@ def _json_request(
         return 0, None, str(exc) or "Invalid server URL."
     req = urllib.request.Request(normalized_url, data=data, headers=headers, method=method)
     if opener is None:
-        if is_local_server(normalized_url):
-            open_fn: object = urllib.request.build_opener(urllib.request.ProxyHandler({})).open
+        parsed_url = urllib.parse.urlsplit(normalized_url)
+        proxy_raw = _proxy_for_url(normalized_url, parsed_url.scheme, parsed_url.hostname or "", parsed_url.port)
+        if proxy_raw:
+            proxy_target = proxy_raw if "://" in proxy_raw else f"http://{proxy_raw}"
+            open_fn: object = urllib.request.build_opener(
+                urllib.request.ProxyHandler({parsed_url.scheme: proxy_target})
+            ).open
         else:
-            open_fn = urllib.request.urlopen
+            open_fn = urllib.request.build_opener(urllib.request.ProxyHandler({})).open
     else:
         open_fn = opener
     try:
@@ -3208,14 +3232,15 @@ def _response_header(response: object, name: str) -> str | None:
 
 
 def _response_encode_ms(response: object) -> int:
-    raw = _response_header(response, "X-ViperCapture-Encode-Ms")
-    if isinstance(raw, str):
-        try:
-            value = int(float(raw.strip()))
-            if value > 0:
-                return value
-        except ValueError:
-            pass
+    for header_name in ("X-ViperCapture-Render-Ms", "X-ViperCapture-Encode-Ms"):
+        raw = _response_header(response, header_name)
+        if isinstance(raw, str):
+            try:
+                value = int(float(raw.strip()))
+                if value > 0:
+                    return value
+            except ValueError:
+                pass
     return 0
 
 
@@ -3758,13 +3783,13 @@ def _resolve_host_cancellable(
     if cancel is not None:
         cancel.bind(_wake_and_abort)
     try:
-        if cancel is not None and cancel.requested:
+        if cancel is not None and cancel.is_requested():
             raise _Cancelled()
         thread = threading.Thread(target=_worker, daemon=True)
         thread.start()
         deadline = time.monotonic() + max(0.05, float(timeout))
         while True:
-            if cancel is not None and cancel.requested:
+            if cancel is not None and cancel.is_requested():
                 raise _Cancelled()
             if done.is_set():
                 break
@@ -3773,7 +3798,7 @@ def _resolve_host_cancellable(
                 raise TimeoutError(f"Timed out resolving host {host!r}")
             wake.wait(timeout=remaining)
             wake.clear()
-        if cancel is not None and cancel.requested:
+        if cancel is not None and cancel.is_requested():
             raise _Cancelled()
         err = outcome.get("error")
         if isinstance(err, BaseException):
@@ -3795,7 +3820,7 @@ def _create_connection_cancellable(
 ) -> socket.socket:
     if cancel is not None:
         cancel.bind(abort_cb)
-    if cancel is not None and cancel.requested:
+    if cancel is not None and cancel.is_requested():
         raise _Cancelled()
     last_err: OSError | None = None
     infos = _resolve_host_cancellable(
@@ -3808,14 +3833,14 @@ def _create_connection_cancellable(
     if not infos:
         raise OSError(f"Could not resolve host {host!r}")
     for af, socktype, proto, _canonname, sa in infos:
-        if cancel is not None and cancel.requested:
+        if cancel is not None and cancel.is_requested():
             raise _Cancelled()
         sock: socket.socket | None = None
         try:
             sock = socket.socket(af, socktype, proto)
             sock.settimeout(timeout)
             live_sock[0] = sock
-            if cancel is not None and cancel.requested:
+            if cancel is not None and cancel.is_requested():
                 raise _Cancelled()
             sock.connect(sa)
             return sock
@@ -3827,7 +3852,7 @@ def _create_connection_cancellable(
             _close_socket(sock)
             if live_sock[0] is sock:
                 live_sock[0] = None
-            if cancel is not None and cancel.requested:
+            if cancel is not None and cancel.is_requested():
                 raise _Cancelled() from None
     assert last_err is not None
     raise last_err
@@ -4245,11 +4270,11 @@ def _start_capture(
     started_server: bool,
     base_url: str = "",
 ) -> threading.Thread:
-    target_dir = Path(state.output_dir).expanduser() if state.output_dir.strip() else directory
     endpoint = f"{(base_url or server_base_url(None)).rstrip('/')}/v1/render"
 
     def work() -> None:
         try:
+            target_dir = Path(state.output_dir).expanduser() if state.output_dir.strip() else Path.cwd()
             result = perform_capture(
                 state,
                 directory=target_dir,
@@ -4261,7 +4286,7 @@ def _start_capture(
                 save_url_history(result.url_history)
             box["state"] = result
         except Exception as exc:
-            box["state"] = _replace(state, busy=False, cancelling=False, error=str(exc))
+            box["state"] = _replace(state, busy=False, cancelling=False, error=sanitize_terminal_text(str(exc)))
 
     thread = threading.Thread(target=work, daemon=True)
     thread.start()

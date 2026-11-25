@@ -3408,25 +3408,53 @@ def parse_cli(argv: list[str] | None = None) -> CliArgs:
             index += 3
             continue
         gui_flags = {"-h", "--help", "--gui", "--one-window", "--viewport", "--output-dir", "--server", "--preset", "--url"}
-        if arg == "--output-dir":
+        if arg == "--output-dir" or arg.startswith("--output-dir="):
+            if arg.startswith("--output-dir="):
+                val = arg.split("=", 1)[1]
+                if not val.strip():
+                    _reject_arg("--output-dir needs a directory path.")
+                output_dir = val
+                index += 1
+                continue
             if index + 1 >= len(args) or not args[index + 1].strip() or args[index + 1].lower() in gui_flags:
                 _reject_arg("--output-dir needs a directory path.")
             output_dir = args[index + 1]
             index += 2
             continue
-        if arg == "--server":
+        if arg == "--server" or arg.startswith("--server="):
+            if arg.startswith("--server="):
+                val = arg.split("=", 1)[1]
+                if not val.strip():
+                    _reject_arg("--server needs an http:// or https:// URL.")
+                server = _validate_server_url(val)
+                index += 1
+                continue
             if index + 1 >= len(args) or not args[index + 1].strip() or args[index + 1].lower() in gui_flags:
                 _reject_arg("--server needs an http:// or https:// URL.")
             server = _validate_server_url(args[index + 1])
             index += 2
             continue
-        if arg == "--preset":
+        if arg == "--preset" or arg.startswith("--preset="):
+            if arg.startswith("--preset="):
+                val = arg.split("=", 1)[1].strip()
+                if not val:
+                    _reject_arg("--preset needs a preset name.")
+                preset = val
+                index += 1
+                continue
             if index + 1 >= len(args) or not args[index + 1].strip() or args[index + 1].lower() in gui_flags:
                 _reject_arg("--preset needs a preset name.")
             preset = args[index + 1].strip()
             index += 2
             continue
-        if arg == "--url":
+        if arg == "--url" or arg.startswith("--url="):
+            if arg.startswith("--url="):
+                val = arg.split("=", 1)[1].strip()
+                if not val:
+                    _reject_arg("--url needs a website link.")
+                url = val
+                index += 1
+                continue
             if index + 1 >= len(args) or not args[index + 1].strip() or args[index + 1].lower() in gui_flags:
                 _reject_arg("--url needs a website link.")
             url = args[index + 1].strip()

@@ -2539,6 +2539,7 @@ class GuiCouncilHardeningTests(TestCase):
 
     def test_round8_cancel_send_dns_truncation_unicode_preset_precision_and_history(self) -> None:
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import os as _os
         import socket as _socket
         import tempfile as _tempfile
         import threading as _threading
@@ -2769,3 +2770,140 @@ class GuiCouncilHardeningTests(TestCase):
         self.assertEqual(gui.format_seconds_short(1), "0.001s")
         self.assertEqual(gui.format_seconds_short(1500), "1.5s")
         self.assertEqual(gui.format_seconds_short(3000), "3s")
+
+    def test_round10_dns_wake_lock_history_merge_all_proxy_selector_clear_render_ms_output_dir_and_large_viewport(self) -> None:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import os as _os
+        import socket as _socket
+        import tempfile as _tempfile
+        import threading as _threading
+
+        # 1. DNS resolver checks is_requested() under lock so wake.set() before requested=True cannot lose cancel
+        dns_release = _threading.Event()
+        dns_entered = _threading.Event()
+
+        def _slow_getaddrinfo(*_args, **_kwargs):
+            dns_entered.set()
+            dns_release.wait(timeout=5.0)
+            return []
+
+        cancel = gui.CancelFlag()
+        err_box: list[BaseException] = []
+
+        def _worker() -> None:
+            try:
+                gui._resolve_host_cancellable(
+                    "slow.invalid",
+                    80,
+                    5.0,
+                    cancel=cancel,
+                    abort_cb=lambda: None,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                err_box.append(exc)
+
+        with mock.patch.object(_socket, "getaddrinfo", _slow_getaddrinfo):
+            t = _threading.Thread(target=_worker, daemon=True)
+            t.start()
+            self.assertTrue(dns_entered.wait(timeout=2.0))
+            cancel.abort()
+            t.join(timeout=2.0)
+            dns_release.set()
+        self.assertFalse(t.is_alive())
+        self.assertEqual(len(err_box), 1)
+        self.assertIsInstance(err_box[0], gui._Cancelled)
+
+        # 2. Concurrent sessions merging URL history do not erase each other's entries
+        with _tempfile.TemporaryDirectory() as tmp:
+            hist_path = Path(tmp) / "gui_history.json"
+            gui.save_url_history(("https://session-a.example",), hist_path)
+            gui.save_url_history(("https://session-b.example",), hist_path)
+            loaded = gui.load_url_history(hist_path)
+            self.assertEqual(loaded, ("https://session-b.example", "https://session-a.example"))
+
+        # 3. _json_request / fetch_app_config honors ALL_PROXY for remote servers
+        proxy_hits: list[str] = []
+
+        class _ProxyConfigHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                proxy_hits.append(self.path)
+                body = json.dumps({"presets": False, "output_formats": ["png"]}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        proxy_srv = ThreadingHTTPServer(("127.0.0.1", 0), _ProxyConfigHandler)
+        t_proxy = _threading.Thread(target=proxy_srv.serve_forever, daemon=True)
+        t_proxy.start()
+        try:
+            proxy_port = proxy_srv.server_address[1]
+            with mock.patch.dict(
+                _os.environ,
+                {"ALL_PROXY": f"http://127.0.0.1:{proxy_port}", "HTTP_PROXY": "", "HTTPS_PROXY": "", "NO_PROXY": ""},
+                clear=False,
+            ):
+                cfg = gui.fetch_app_config("http://proxy-only.example:8080", timeout=2.0)
+            self.assertIsNotNone(cfg)
+            self.assertEqual(cfg.get("output_formats"), ["png"])  # type: ignore[union-attr]
+            self.assertTrue(any(p.endswith("/app-config") for p in proxy_hits))
+        finally:
+            proxy_srv.shutdown()
+            proxy_srv.server_close()
+
+        # 4. Switching from PNG with selector to non-image format via Shift+Tab clears selector
+        st_sel = gui.GuiState(url="https://example.com", output="png", selector="main", full_page=False)
+        st_next, _action = gui.apply_key(st_sel, "shift-tab")
+        self.assertNotIn(st_next.output, gui.IMAGE_FORMATS)
+        self.assertEqual(st_next.selector, "")
+        self.assertEqual(gui.validate_capture_state(st_next), "")
+
+        # 5. Valid 20000x720 preset is accepted (up to render_contract 65535 limit)
+        wide_state, wide_ignored = gui.apply_preset_settings_with_warnings(
+            gui.GuiState(),
+            {"width": 20_000, "height": 720},
+        )
+        self.assertEqual(wide_state.viewport, (20_000, 720))
+        self.assertEqual(wide_ignored, ())
+
+        # 6. X-ViperCapture-Render-Ms takes precedence over X-ViperCapture-Encode-Ms
+        class _TimingResp:
+            headers = {"X-ViperCapture-Render-Ms": "2031", "X-ViperCapture-Encode-Ms": "12"}
+
+        self.assertEqual(gui._response_encode_ms(_TimingResp()), 2031)
+
+        # 7. _start_capture handles unresolvable ~user without raising on input thread,
+        #    and cleared output_dir saves to Path.cwd() rather than stale startup directory
+        box: dict[str, gui.GuiState] = {}
+        with mock.patch.object(Path, "expanduser", side_effect=RuntimeError("Could not determine home directory.")):
+            t_bad = gui._start_capture(
+                gui.GuiState(url="https://example.com", output_dir="~nosuchuser/captures"),
+                Path("."),
+                gui.CancelFlag(),
+                box,
+                started_server=False,
+            )
+            t_bad.join(timeout=2.0)
+        self.assertIn("Could not determine home directory", box["state"].error)
+
+        seen_dirs: list[Path] = []
+
+        def _fake_perform(state, *, directory, **_kwargs):
+            seen_dirs.append(directory)
+            return state
+
+        box2: dict[str, gui.GuiState] = {}
+        with mock.patch.object(gui, "perform_capture", side_effect=_fake_perform):
+            t_cwd = gui._start_capture(
+                gui.GuiState(url="https://example.com", output_dir=""),
+                Path("stale-startup-captures"),
+                gui.CancelFlag(),
+                box2,
+                started_server=False,
+            )
+            t_cwd.join(timeout=2.0)
+        self.assertEqual(seen_dirs, [Path.cwd()])

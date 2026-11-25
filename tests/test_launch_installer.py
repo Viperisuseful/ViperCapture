@@ -2673,10 +2673,14 @@ class ViperCaptureProcessSafetyTests(unittest.TestCase):
                 with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit) as ctx:
                     launch.parse_cli(argv)
                 self.assertEqual(ctx.exception.code, 2)
-        # Valid preset names starting with '-' (not a known launcher flag) are accepted
+        # Valid preset names starting with '-' (not a known launcher flag) are accepted,
+        # and --preset=<name> accepts even flag-like preset names such as --help.
         parsed = launch.parse_cli(["--gui", "--preset", "-mobile"])
         self.assertTrue(parsed.gui)
         self.assertEqual(parsed.preset, "-mobile")
+        parsed_eq = launch.parse_cli(["--gui", "--preset=--help"])
+        self.assertTrue(parsed_eq.gui)
+        self.assertEqual(parsed_eq.preset, "--help")
 
 
 if __name__ == "__main__":
