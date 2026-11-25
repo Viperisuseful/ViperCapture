@@ -150,7 +150,7 @@ docker compose up --build
 You can also pull the published container image from GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/viperisuseful/vipercapture:1.1.1
+docker pull ghcr.io/viperisuseful/vipercapture:1.1.2
 ```
 
 By default, Compose binds only to loopback and stores queue state, encryption keys, schedules, cache entries, and local artifacts in a named volume. Review the production security section below before exposing the container to a network, and set separate `VIPERCAPTURE_ADMIN_TOKEN` and `VIPERCAPTURE_CONTROL_SECRET` values before serving multiple tenants.
