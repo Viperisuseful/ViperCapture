@@ -271,13 +271,18 @@ def normalize_url(text: str) -> str:
     return value
 
 
+_MAX_REQUEST_TIMEOUT_S = 2_147_483.0
+
+
 def positive_finite_float(value: str) -> float:
     try:
         parsed = float(value)
-    except ValueError as exc:
+    except (ValueError, OverflowError) as exc:
         raise argparse.ArgumentTypeError(f"invalid float value: {value!r}") from exc
-    if not math.isfinite(parsed) or parsed <= 0:
-        raise argparse.ArgumentTypeError("must be a finite number greater than 0")
+    if not math.isfinite(parsed) or parsed <= 0 or parsed > _MAX_REQUEST_TIMEOUT_S:
+        raise argparse.ArgumentTypeError(
+            f"must be a finite number greater than 0 and at most {int(_MAX_REQUEST_TIMEOUT_S)}"
+        )
     return parsed
 
 
@@ -2394,40 +2399,46 @@ def render_output_template(
     if "/" in rendered or "\\" in rendered or rendered in {"", ".", ".."}:
         raise ValueError("--output-template must produce a filename without directory separators.")
     candidate = Path(rendered)
-    raw_stem = candidate.stem
-    cleaned_untruncated = _BAD_FILENAME.sub("_", raw_stem).strip(" .")
-    stem = safe_filename(raw_stem)
-    if len(cleaned_untruncated) > 80:
-        index_formatted: str | None = None
-        index_spans: list[tuple[int, int]] = []
-        cursor = 0
-        for literal, field_name, format_spec, conversion in parsed_parts:
-            cursor += len(literal)
-            if field_name is not None:
-                val, _ = formatter.get_field(field_name, (), fields)
-                val = formatter.convert_field(val, conversion)
-                piece = formatter.format_field(val, format_spec or "")
-                start = cursor
-                cursor += len(piece)
-                if field_name == "index" or field_name.startswith(("index.", "index[")):
-                    index_spans.append((start, cursor))
-                    if index_formatted is None:
-                        index_formatted = safe_filename(piece) if piece else str(index)
-        if index_spans:
-            lead_strip = len(raw_stem) - len(_BAD_FILENAME.sub("_", raw_stem).lstrip(" ."))
-            survived = any(
-                (start - lead_strip) >= 0 and (end - lead_strip) <= 80 and end <= len(raw_stem)
-                for start, end in index_spans
-            )
-            if not survived:
-                idx_token = index_formatted or str(index)
-                idx_suffix = f"-{idx_token}"
-                prefix_limit = max(1, 80 - len(idx_suffix))
-                prefix = safe_filename(raw_stem[:prefix_limit]).rstrip(" ._-") or "capture"
-                stem = f"{prefix}{idx_suffix}"
     suffix = candidate.suffix
-    if suffix and not re.fullmatch(r"\.[A-Za-z0-9]{1,10}", suffix):
-        suffix = ext
+    if suffix and re.fullmatch(r"\.[A-Za-z0-9]{1,10}", suffix):
+        raw_stem = candidate.stem
+    else:
+        # Keep non-extension trailing text (such as `{host}{ext}-{index}` -> `.png-1`) in the
+        # stem so `{index}` and literal suffixes are never silently discarded.
+        raw_stem = rendered
+        suffix = ""
+    stem = safe_filename(raw_stem)
+    index_formatted: str | None = None
+    index_spans: list[tuple[int, int]] = []
+    cursor = 0
+    for literal, field_name, format_spec, conversion in parsed_parts:
+        cursor += len(literal)
+        if field_name is not None:
+            val, _ = formatter.get_field(field_name, (), fields)
+            val = formatter.convert_field(val, conversion)
+            piece = formatter.format_field(val, format_spec or "")
+            start = cursor
+            cursor += len(piece)
+            if field_name == "index" or field_name.startswith(("index.", "index[")):
+                index_spans.append((start, cursor))
+                if index_formatted is None:
+                    cleaned_piece = _BAD_FILENAME.sub("_", piece).strip(" .")
+                    if cleaned_piece and len(cleaned_piece) <= 16:
+                        index_formatted = cleaned_piece
+                    else:
+                        index_formatted = str(index)
+    if index_spans:
+        lead_strip = len(raw_stem) - len(_BAD_FILENAME.sub("_", raw_stem).lstrip(" ."))
+        survived = any(
+            (start - lead_strip) >= 0 and (end - lead_strip) <= 80 and end <= len(raw_stem)
+            for start, end in index_spans
+        )
+        if not survived:
+            idx_token = index_formatted or str(index)
+            idx_suffix = f"-{idx_token}"
+            prefix_limit = max(1, 80 - len(idx_suffix))
+            prefix = safe_filename(raw_stem[:prefix_limit]).rstrip(" ._-") or "capture"
+            stem = f"{prefix}{idx_suffix}"
     return f"{stem}{suffix}"
 
 
@@ -2726,6 +2737,9 @@ def _open_local_http(
         except TimeoutError as exc:
             conn.close()
             raise CaptureError("The API did not answer before the timeout.") from exc
+        except OverflowError as exc:
+            conn.close()
+            raise CaptureError("Request timeout is out of range.", exit_code=2) from exc
         except (OSError, http.client.HTTPException) as exc:
             conn.close()
             raise CaptureError(f"The API did not answer: {exc}") from exc
@@ -2783,8 +2797,12 @@ def open_raw_response(
         or isinstance(timeout, bool)
         or not math.isfinite(float(timeout))
         or float(timeout) <= 0
+        or float(timeout) > _MAX_REQUEST_TIMEOUT_S
     ):
-        raise CaptureError("Request timeout must be a finite number greater than 0.", exit_code=2)
+        raise CaptureError(
+            f"Request timeout must be a finite number greater than 0 and at most {int(_MAX_REQUEST_TIMEOUT_S)}.",
+            exit_code=2,
+        )
     parsed = urlsplit(url)
     if parsed.scheme == "http" and (parsed.hostname or "").lower() in _LOOPBACK_HOSTS:
         return _open_local_http(
@@ -2814,6 +2832,8 @@ def open_raw_response(
         raise CaptureError(f"The API did not answer: {reason}") from exc
     except TimeoutError as exc:
         raise CaptureError("The API did not answer before the timeout.") from exc
+    except OverflowError as exc:
+        raise CaptureError("Request timeout is out of range.", exit_code=2) from exc
     except (http.client.HTTPException, OSError) as exc:
         raise CaptureError(f"The API did not answer: {exc}") from exc
 
@@ -2946,9 +2966,12 @@ def _expected_content_length(response) -> int | None:
         parts = raw_item.split(",")
         for part in parts:
             token = part.strip()
-            if not token or not (token.isascii() and token.isdigit()):
-                raise CaptureError(f"Invalid Content-Length header from API: {raw_item!r}.")
-            parsed_values.append(int(token))
+            if not token or len(token) > 20 or not (token.isascii() and token.isdigit()):
+                raise CaptureError(f"Invalid Content-Length header from API: {raw_item[:64]!r}.")
+            try:
+                parsed_values.append(int(token))
+            except (ValueError, OverflowError) as exc:
+                raise CaptureError(f"Invalid Content-Length header from API: {raw_item[:64]!r}.") from exc
     if not parsed_values:
         raise CaptureError("Invalid Content-Length header from API.")
     if len(set(parsed_values)) > 1:
@@ -3805,8 +3828,11 @@ def _validate_client_options(args: argparse.Namespace) -> None:
             or isinstance(raw_timeout, bool)
             or not math.isfinite(float(raw_timeout))
             or float(raw_timeout) <= 0
+            or float(raw_timeout) > _MAX_REQUEST_TIMEOUT_S
         ):
-            raise ValueError("--request-timeout must be a finite number greater than 0.")
+            raise ValueError(
+                f"--request-timeout must be a finite number greater than 0 and at most {int(_MAX_REQUEST_TIMEOUT_S)}."
+            )
     poll_ms = getattr(args, "poll_ms", 500)
     if poll_ms is not None and int(poll_ms) < 1:
         raise ValueError("--poll-ms must be 1 or greater.")

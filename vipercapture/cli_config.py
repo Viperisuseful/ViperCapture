@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import math
 import os
 import re
 from pathlib import Path
@@ -137,7 +138,13 @@ def _normalize_section(raw: dict[str, object]) -> dict[str, object]:
         elif key in _FLOAT_KEYS:
             if type(item) not in {int, float}:
                 raise ValueError(f"config.toml {raw_key} must be a number")
-            values[key] = float(item)
+            try:
+                converted = float(item)
+            except (ValueError, OverflowError) as exc:
+                raise ValueError(f"config.toml {raw_key} is out of numeric range") from exc
+            if not math.isfinite(converted):
+                raise ValueError(f"config.toml {raw_key} must be a finite number")
+            values[key] = converted
     return values
 
 

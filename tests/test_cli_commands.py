@@ -2008,6 +2008,62 @@ class CliCouncilHardeningTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertFalse(json.loads(buf_err.getvalue().strip())["ok"])
 
+    def test_round12_huge_timeout_huge_cl_template_post_ext_wide_index_and_config_overflow(self) -> None:
+        from vipercapture import capture_cli, cli_config
+
+        # 1. Timeout >= 2147483.648 rejected cleanly with exit 2 (never OverflowError)
+        buf_out, buf_err = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdout", buf_out), mock.patch("sys.stderr", buf_err):
+            code = capture_cli.main([
+                "https://example.org",
+                "--server", "http://127.0.0.1:9",
+                "--no-start",
+                "--no-config",
+                "--request-timeout", "2147484",
+            ])
+        self.assertEqual(code, 2)
+        self.assertFalse(json.loads(buf_err.getvalue().strip())["ok"])
+
+        code2, _out2, err2 = self._run([
+            "job", "status", "job-1",
+            "--server", self.server,
+            "--no-start",
+            "--request-timeout", "2147484",
+        ])
+        self.assertEqual(code2, 2)
+        self.assertFalse(json.loads(err2.strip())["ok"])
+
+        # 2. 5000-digit Content-Length raises CaptureError instead of ValueError
+        class _HugeClResp:
+            status = 200
+            headers = {"Content-Length": "9" * 5000}
+
+        with self.assertRaises(capture_cli.CaptureError):
+            capture_cli._expected_content_length(_HugeClResp())
+
+        # 3. {host}{ext}-{index} preserves -{index} instead of replacing suffix with .png
+        p = {"url": "https://example.com", "output": "png"}
+        r1 = capture_cli.render_output_template("{host}{ext}-{index}", payload=p, index=1)
+        r2 = capture_cli.render_output_template("{host}{ext}-{index}", payload=p, index=2)
+        self.assertNotEqual(r1, r2)
+        self.assertTrue(r1.endswith("-1"), r1)
+        self.assertTrue(r2.endswith("-2"), r2)
+
+        # 4. Wide formatted {index:0100d} stays distinct and <= 80-char stem
+        p_long = {"url": "https://" + ("a" * 90) + ".com/x", "output": "png"}
+        w1 = capture_cli.render_output_template("{host}-{index:0100d}{ext}", payload=p_long, index=1)
+        w2 = capture_cli.render_output_template("{host}-{index:0100d}{ext}", payload=p_long, index=2)
+        self.assertNotEqual(w1, w2)
+        self.assertLessEqual(len(Path(w1).stem), 80)
+        self.assertLessEqual(len(Path(w2).stem), 80)
+
+        # 5. Huge integer in config.toml float key raises ValueError instead of OverflowError
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "config.toml"
+            cfg_path.write_text(f"request_timeout = {'9' * 4000}\n", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                cli_config.load_cli_config(cfg_path)
+
 
 if __name__ == "__main__":
     unittest.main()
