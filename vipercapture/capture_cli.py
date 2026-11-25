@@ -272,6 +272,24 @@ def normalize_url(text: str) -> str:
 
 
 _MAX_REQUEST_TIMEOUT_S = 2_147_483.0
+_MAX_INT_OPTION = 2_147_483_647
+_MAX_RETRIES = 1_000
+
+
+def _validate_header_value(value: str, label: str) -> str:
+    if any(ch in value for ch in "\r\n\x00"):
+        raise ValueError(f"{label} must not contain newlines or NUL bytes.")
+    return value
+
+
+def _safe_ms_to_seconds(value: object, field: str) -> float:
+    try:
+        converted = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field} is out of numeric range.") from exc
+    if not math.isfinite(converted):
+        raise ValueError(f"{field} must be a finite number.")
+    return round(converted / 1000.0, 3)
 
 
 def positive_finite_float(value: str) -> float:
@@ -1184,7 +1202,7 @@ def payload_to_preset_settings(payload: dict[str, object]) -> dict[str, object]:
     video = payload.get("video")
     if isinstance(video, dict):
         if isinstance(video.get("duration_ms"), (int, float)) and not isinstance(video.get("duration_ms"), bool):
-            settings["videoDuration"] = round(float(video["duration_ms"]) / 1000.0, 3)
+            settings["videoDuration"] = _safe_ms_to_seconds(video["duration_ms"], "video.duration_ms")
         if isinstance(video.get("fps"), int) and not isinstance(video.get("fps"), bool):
             settings["videoFps"] = video["fps"]
         if isinstance(video.get("bitrate_mbps"), int) and not isinstance(video.get("bitrate_mbps"), bool):
@@ -1226,14 +1244,14 @@ def payload_to_preset_settings(payload: dict[str, object]) -> dict[str, object]:
     if isinstance(wait_for, dict):
         if isinstance(wait_for.get("event"), str):
             settings["waitEvent"] = wait_for["event"]
-        if isinstance(wait_for.get("delay_ms"), (int, float)):
-            settings["waitDelay"] = round(float(wait_for["delay_ms"]) / 1000.0, 3)
+        if isinstance(wait_for.get("delay_ms"), (int, float)) and not isinstance(wait_for.get("delay_ms"), bool):
+            settings["waitDelay"] = _safe_ms_to_seconds(wait_for["delay_ms"], "wait_for.delay_ms")
         if isinstance(wait_for.get("selector"), str):
             settings["waitSelector"] = wait_for["selector"]
         if isinstance(wait_for.get("text"), str):
             settings["waitText"] = wait_for["text"]
-        if isinstance(wait_for.get("timeout_ms"), (int, float)):
-            settings["waitTimeout"] = round(float(wait_for["timeout_ms"]) / 1000.0, 3)
+        if isinstance(wait_for.get("timeout_ms"), (int, float)) and not isinstance(wait_for.get("timeout_ms"), bool):
+            settings["waitTimeout"] = _safe_ms_to_seconds(wait_for["timeout_ms"], "wait_for.timeout_ms")
         extra_wait = {
             k: v for k, v in wait_for.items()
             if k not in {"event", "delay_ms", "selector", "text", "timeout_ms"}
@@ -2408,6 +2426,7 @@ def render_output_template(
         raw_stem = rendered
         suffix = ""
     stem = safe_filename(raw_stem)
+    has_index_field = False
     index_formatted: str | None = None
     index_spans: list[tuple[int, int]] = []
     cursor = 0
@@ -2420,14 +2439,16 @@ def render_output_template(
             start = cursor
             cursor += len(piece)
             if field_name == "index" or field_name.startswith(("index.", "index[")):
-                index_spans.append((start, cursor))
+                has_index_field = True
+                cleaned_piece = _BAD_FILENAME.sub("_", piece).strip(" .")
+                if cleaned_piece == piece and cleaned_piece:
+                    index_spans.append((start, cursor))
                 if index_formatted is None:
-                    cleaned_piece = _BAD_FILENAME.sub("_", piece).strip(" .")
-                    if cleaned_piece and len(cleaned_piece) <= 16:
+                    if cleaned_piece == piece and cleaned_piece and len(cleaned_piece) <= 16:
                         index_formatted = cleaned_piece
                     else:
                         index_formatted = str(index)
-    if index_spans:
+    if has_index_field:
         lead_strip = len(raw_stem) - len(_BAD_FILENAME.sub("_", raw_stem).lstrip(" ."))
         survived = any(
             (start - lead_strip) >= 0 and (end - lead_strip) <= 80 and end <= len(raw_stem)
@@ -2586,10 +2607,10 @@ def request_headers(
         headers["Authorization"] = f"Bearer {token}"
     req_id = getattr(args, "request_id", None)
     if req_id:
-        headers["X-Request-Id"] = req_id
+        headers["X-Request-Id"] = _validate_header_value(str(req_id), "--request-id")
     idem = idempotency_key if idempotency_key is not None else getattr(args, "idempotency_key", None)
     if idem:
-        headers["Idempotency-Key"] = idem
+        headers["Idempotency-Key"] = _validate_header_value(str(idem), "--idempotency-key")
     return headers
 
 
@@ -2740,6 +2761,9 @@ def _open_local_http(
         except OverflowError as exc:
             conn.close()
             raise CaptureError("Request timeout is out of range.", exit_code=2) from exc
+        except ValueError as exc:
+            conn.close()
+            raise CaptureError(f"Invalid request header or URL: {exc}", exit_code=2) from exc
         except (OSError, http.client.HTTPException) as exc:
             conn.close()
             raise CaptureError(f"The API did not answer: {exc}") from exc
@@ -2803,6 +2827,9 @@ def open_raw_response(
             f"Request timeout must be a finite number greater than 0 and at most {int(_MAX_REQUEST_TIMEOUT_S)}.",
             exit_code=2,
         )
+    for hdr_name, hdr_val in headers.items():
+        if any(ch in str(hdr_name) or ch in str(hdr_val) for ch in "\r\n\x00"):
+            raise CaptureError(f"Header {hdr_name!r} contains invalid control characters.", exit_code=2)
     parsed = urlsplit(url)
     if parsed.scheme == "http" and (parsed.hostname or "").lower() in _LOOPBACK_HOSTS:
         return _open_local_http(
@@ -2834,6 +2861,8 @@ def open_raw_response(
         raise CaptureError("The API did not answer before the timeout.") from exc
     except OverflowError as exc:
         raise CaptureError("Request timeout is out of range.", exit_code=2) from exc
+    except ValueError as exc:
+        raise CaptureError(f"Invalid request header or URL: {exc}", exit_code=2) from exc
     except (http.client.HTTPException, OSError) as exc:
         raise CaptureError(f"The API did not answer: {exc}") from exc
 
@@ -2895,7 +2924,7 @@ def open_response_with_retries(
             retryable = exc.status is None or exc.status in _RETRYABLE_STATUSES
             if not retryable or attempt + 1 >= attempts:
                 raise
-            delay = exc.retry_after if exc.retry_after is not None else (base_delay * (2**attempt))
+            delay = exc.retry_after if exc.retry_after is not None else (base_delay * (2 ** min(attempt, 30)))
             if verbose:
                 write_line(
                     sys.stderr,
@@ -2966,10 +2995,13 @@ def _expected_content_length(response) -> int | None:
         parts = raw_item.split(",")
         for part in parts:
             token = part.strip()
-            if not token or len(token) > 20 or not (token.isascii() and token.isdigit()):
+            if not token or len(token) > 4096 or not (token.isascii() and token.isdigit()):
+                raise CaptureError(f"Invalid Content-Length header from API: {raw_item[:64]!r}.")
+            normalized = token.lstrip("0") or "0"
+            if len(normalized) > 20:
                 raise CaptureError(f"Invalid Content-Length header from API: {raw_item[:64]!r}.")
             try:
-                parsed_values.append(int(token))
+                parsed_values.append(int(normalized))
             except (ValueError, OverflowError) as exc:
                 raise CaptureError(f"Invalid Content-Length header from API: {raw_item[:64]!r}.") from exc
     if not parsed_values:
@@ -3549,7 +3581,7 @@ def _open_json_with_retries(
                 retryable = exc.status is None or exc.status in _RETRYABLE_STATUSES
             if not retryable or attempt >= retries:
                 raise
-            delay_s = exc.retry_after if exc.retry_after is not None else (base_delay * (2**attempt))
+            delay_s = exc.retry_after if exc.retry_after is not None else (base_delay * (2 ** min(attempt, 30)))
             if verbose:
                 write_line(
                     sys.stderr,
@@ -3646,7 +3678,7 @@ def _execute_one(
                 retryable = exc.status is None or exc.status in _RETRYABLE_STATUSES
             if not retryable or attempt >= retries:
                 raise
-            delay_s = exc.retry_after if exc.retry_after is not None else (base_delay * (2**attempt))
+            delay_s = exc.retry_after if exc.retry_after is not None else (base_delay * (2 ** min(attempt, 30)))
             if args.verbose and not args.quiet:
                 write_line(
                     sys.stderr,
@@ -3746,7 +3778,7 @@ def _execute_async(
                         retryable = exc.status is None or exc.status in _RETRYABLE_STATUSES
                     if not retryable or attempt >= retries:
                         raise
-                    delay_s = exc.retry_after if exc.retry_after is not None else (base_delay * (2**attempt))
+                    delay_s = exc.retry_after if exc.retry_after is not None else (base_delay * (2 ** min(attempt, 30)))
                     if verbose:
                         write_line(
                             sys.stderr,
@@ -3834,12 +3866,20 @@ def _validate_client_options(args: argparse.Namespace) -> None:
                 f"--request-timeout must be a finite number greater than 0 and at most {int(_MAX_REQUEST_TIMEOUT_S)}."
             )
     poll_ms = getattr(args, "poll_ms", 500)
-    if poll_ms is not None and int(poll_ms) < 1:
-        raise ValueError("--poll-ms must be 1 or greater.")
-    if getattr(args, "retries", 0) is not None and int(args.retries) < 0:
-        raise ValueError("--retries must be 0 or greater.")
-    if getattr(args, "retry_delay_ms", 500) is not None and int(args.retry_delay_ms) < 0:
-        raise ValueError("--retry-delay-ms must be 0 or greater.")
+    if poll_ms is not None and (int(poll_ms) < 1 or int(poll_ms) > _MAX_INT_OPTION):
+        raise ValueError(f"--poll-ms must be between 1 and {_MAX_INT_OPTION}.")
+    if getattr(args, "retries", 0) is not None and (int(args.retries) < 0 or int(args.retries) > _MAX_RETRIES):
+        raise ValueError(f"--retries must be between 0 and {_MAX_RETRIES}.")
+    if getattr(args, "retry_delay_ms", 500) is not None and (
+        int(args.retry_delay_ms) < 0 or int(args.retry_delay_ms) > _MAX_INT_OPTION
+    ):
+        raise ValueError(f"--retry-delay-ms must be between 0 and {_MAX_INT_OPTION}.")
+    req_id = getattr(args, "request_id", None)
+    if req_id is not None:
+        _validate_header_value(str(req_id), "--request-id")
+    idem = getattr(args, "idempotency_key", None)
+    if idem is not None:
+        _validate_header_value(str(idem), "--idempotency-key")
     if args.output == "-" and getattr(args, "open_output", False):
         raise ValueError("--open cannot be used with --output -.")
     if args.output == "-" and getattr(args, "copy_output", False):
@@ -3919,7 +3959,7 @@ def run_capture(args: argparse.Namespace) -> int:
             if not args.dry_run and not (args.async_job and getattr(args, "no_wait", False)):
                 resolve_output(args, payload)
             payloads = None
-    except ValueError as exc:
+    except (ValueError, OverflowError) as exc:
         return fail(str(exc), exit_code=2)
 
     if args.dry_run:
@@ -4014,7 +4054,7 @@ def run_capture(args: argparse.Namespace) -> int:
                 }),
             )
         return 0 if failures == 0 else 1
-    except ValueError as exc:
+    except (ValueError, OverflowError) as exc:
         return fail(str(exc), exit_code=2)
     except CaptureError as exc:
         return fail(str(exc), status=exc.status, code=exc.code, body=exc.body, exit_code=exc.exit_code)

@@ -2064,6 +2064,75 @@ class CliCouncilHardeningTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 cli_config.load_cli_config(cfg_path)
 
+    def test_round13_preset_validation_int_overflow_header_crlf_index_ctrl_and_padded_cl(self) -> None:
+        from vipercapture import capture_cli, cli_config
+
+        # 1. preset save validates render options (rejects video-duration-ms=0) and handles overflow safely
+        code, _out, err = self._run([
+            "preset", "save", "bad-video",
+            "--format", "webm",
+            "--video-duration-ms", "0",
+            "--server", self.server,
+            "--no-start",
+        ])
+        self.assertEqual(code, 2)
+        self.assertFalse(json.loads(err.strip())["ok"])
+        with self.assertRaises(ValueError):
+            capture_cli.payload_to_preset_settings({"video": {"duration_ms": 10**1000}})
+
+        # 2. Huge integer in config.toml _INT_KEYS and CLI --retry-delay-ms / --poll-ms exit 2 cleanly
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "config.toml"
+            cfg_path.write_text(f"retry_delay_ms = {'9' * 4000}\n", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                cli_config.load_cli_config(cfg_path)
+
+        buf_out, buf_err = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdout", buf_out), mock.patch("sys.stderr", buf_err):
+            code_rd = capture_cli.main([
+                "https://example.org",
+                "--retry-delay-ms", "1" + ("0" * 1000),
+                "--no-config",
+                "--no-start",
+            ])
+        self.assertEqual(code_rd, 2)
+        self.assertFalse(json.loads(buf_err.getvalue().strip())["ok"])
+
+        code_pm, _out_pm, err_pm = self._run([
+            "job", "status", "job-1",
+            "--poll-ms", "1" + ("0" * 1000),
+            "--server", self.server,
+            "--no-start",
+        ])
+        self.assertEqual(code_pm, 2)
+        self.assertFalse(json.loads(err_pm.strip())["ok"])
+
+        # 3. CR/LF in --request-id or --idempotency-key exits 2 cleanly (never raw putheader ValueError)
+        buf_out, buf_err = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdout", buf_out), mock.patch("sys.stderr", buf_err):
+            code_hdr = capture_cli.main([
+                "https://example.org",
+                "--request-id", "abc\r\nX-Injected: 1",
+                "--server", self.server,
+                "--no-config",
+                "--no-start",
+            ])
+        self.assertEqual(code_hdr, 2)
+        self.assertFalse(json.loads(buf_err.getvalue().strip())["ok"])
+
+        # 4. Control-char formatted {index:c} falls back to distinct canonical indexes
+        p = {"url": "https://example.com", "output": "png"}
+        c1 = capture_cli.render_output_template("{host}-{index:c}{ext}", payload=p, index=1)
+        c2 = capture_cli.render_output_template("{host}-{index:c}{ext}", payload=p, index=2)
+        self.assertNotEqual(c1, c2)
+
+        # 5. Valid zero-padded Content-Length accepted; >20 significant digits rejected
+        class _PaddedCl:
+            status = 200
+            headers = {"Content-Length": "00000000000000000000000008"}
+
+        self.assertEqual(capture_cli._expected_content_length(_PaddedCl()), 8)
+
 
 if __name__ == "__main__":
     unittest.main()

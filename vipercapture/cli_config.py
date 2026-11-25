@@ -118,7 +118,11 @@ def _normalize_section(raw: dict[str, object]) -> dict[str, object]:
         if isinstance(item, dict) and not is_known:
             continue
         if key == "viewport":
-            if isinstance(item, list) and len(item) == 2 and all(type(v) is int for v in item):
+            if (
+                isinstance(item, list)
+                and len(item) == 2
+                and all(type(v) is int and 1 <= v <= 2_147_483_647 for v in item)
+            ):
                 values["viewport"] = [int(item[0]), int(item[1])]
             else:
                 raise ValueError("config.toml viewport must be a two-integer array [width, height]")
@@ -134,6 +138,8 @@ def _normalize_section(raw: dict[str, object]) -> dict[str, object]:
         elif key in _INT_KEYS:
             if type(item) is not int:
                 raise ValueError(f"config.toml {raw_key} must be an integer")
+            if item < -2_147_483_647 or item > 2_147_483_647:
+                raise ValueError(f"config.toml {raw_key} is out of integer range")
             values[key] = item
         elif key in _FLOAT_KEYS:
             if type(item) not in {int, float}:

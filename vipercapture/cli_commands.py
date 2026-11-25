@@ -652,8 +652,13 @@ def cmd_preset(argv: list[str]) -> int:
                 return fail("Preset name must be 1-40 characters.", exit_code=2)
             _ensure_render_namespace(args)
             try:
-                settings = payload_to_preset_settings(build_payload(args, require_source=False))
-            except ValueError as exc:
+                built = build_payload(args, require_source=False)
+                validation_copy = copy.deepcopy(built)
+                if not any(validation_copy.get(k) for k in ("url", "html", "markdown")):
+                    validation_copy["url"] = "https://example.invalid"
+                validate_payload(validation_copy)
+                settings = payload_to_preset_settings(built)
+            except (ValueError, OverflowError) as exc:
                 return fail(str(exc), exit_code=2)
             resp = open_response(
                 root + "/local/presets",
@@ -1245,10 +1250,12 @@ def cmd_bulk(argv: list[str]) -> int:
     _add_common_client_flags(parser, include_timeout=True)
     parser.set_defaults(request_timeout=300.0)
     args = parser.parse_args(argv)
-    if args.concurrency < 1:
-        return fail("--concurrency must be 1 or greater.", exit_code=2)
-    if args.poll_ms < 1:
-        return fail("--poll-ms must be 1 or greater.", exit_code=2)
+    if args.concurrency < 1 or args.concurrency > 1024:
+        return fail("--concurrency must be between 1 and 1024.", exit_code=2)
+    if args.poll_ms < 1 or args.poll_ms > 2_147_483_647:
+        return fail("--poll-ms must be between 1 and 2147483647.", exit_code=2)
+    if args.idempotency_key is not None and any(ch in args.idempotency_key for ch in "\r\n\x00"):
+        return fail("--idempotency-key must not contain newlines or NUL bytes.", exit_code=2)
     if args.request_timeout is not None and (
         not math.isfinite(float(args.request_timeout)) or float(args.request_timeout) <= 0
     ):
@@ -1514,8 +1521,8 @@ def cmd_job(argv: list[str]) -> int:
     _add_common_client_flags(p_dl, include_timeout=True)
 
     args = parser.parse_args(argv)
-    if args.action in {"status", "download"} and args.poll_ms < 1:
-        return fail("--poll-ms must be 1 or greater.", exit_code=2)
+    if args.action in {"status", "download"} and (args.poll_ms < 1 or args.poll_ms > 2_147_483_647):
+        return fail("--poll-ms must be between 1 and 2147483647.", exit_code=2)
     load_local_env()
     try:
         root = api_root(args.server)
@@ -2713,6 +2720,8 @@ def main(argv: list[str] | None = None) -> int:
         return fail("Cancelled.", exit_code=130)
     except BrokenPipeError:
         return 0
+    except OverflowError as exc:
+        return fail(str(exc), exit_code=2)
     except OSError as exc:
         return fail(str(exc), exit_code=1)
 
