@@ -1664,6 +1664,56 @@ class CliCouncilHardeningTests(unittest.TestCase):
                 ])
             self.assertEqual(code, 0, buf_err.getvalue())
 
+        # 8. Bulk validation rejects extra keys & non-string id before coercion/mkdir;
+        #    render retries share one unified counter across open and body read
+        with tempfile.TemporaryDirectory() as tmp:
+            extra_file = Path(tmp) / "extra_field.json"
+            extra_file.write_text('[{"id":123,"extra":true,"render":{"url":"https://example.org"}}]', encoding="utf-8")
+            no_dir = Path(tmp) / "no_create_extra"
+            code, _out, _err = self._run([
+                "bulk", str(extra_file), "--wait", "--output-dir", str(no_dir),
+            ])
+            self.assertEqual(code, 2)
+            self.assertFalse(no_dir.exists())
+
+            target_retry = Path(tmp) / "retry_cap.png"
+            call_count = {"n": 0}
+
+            class _ShortBodyResp:
+                status = 200
+                headers = {"Content-Length": "10", "Content-Type": "image/png"}
+
+                def __init__(self) -> None:
+                    self._chunks = [b"123", b""]
+
+                def read(self, _n: int = -1) -> bytes:
+                    return self._chunks.pop(0) if self._chunks else b""
+
+                def close(self) -> None:
+                    return
+
+            def _fail_then_truncate(*_args, **_kwargs):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    raise capture_cli.CaptureError("503", status=503)
+                return _ShortBodyResp()
+
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with (
+                mock.patch("sys.stdout", buf_out),
+                mock.patch("sys.stderr", buf_err),
+                mock.patch.object(capture_cli, "open_response_with_retries", side_effect=_fail_then_truncate),
+            ):
+                code = capture_cli.main([
+                    "https://example.org",
+                    "--output", str(target_retry),
+                    "--retries", "1",
+                    "--retry-delay-ms", "0",
+                    "--server", self.server,
+                ])
+            self.assertEqual(code, 1)
+            self.assertEqual(call_count["n"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

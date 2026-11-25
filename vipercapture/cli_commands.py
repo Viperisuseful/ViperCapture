@@ -1077,12 +1077,23 @@ def _parse_bulk_input(
             render = _merge_render({"url": url})
             return {"render": render}
         if isinstance(raw_entry, dict):
-            if "render" in raw_entry and isinstance(raw_entry["render"], dict):
+            if "render" in raw_entry:
+                if not isinstance(raw_entry["render"], dict):
+                    raise ValueError(f"Bulk item #{index} 'render' must be a JSON object.")
+                extra_keys = set(raw_entry.keys()) - {"id", "idempotency_key", "render"}
+                if extra_keys:
+                    raise ValueError(
+                        f"Bulk item #{index} has unexpected field(s): {', '.join(sorted(extra_keys))}."
+                    )
                 item: dict[str, object] = {"render": _merge_render(raw_entry["render"])}
-                if raw_entry.get("id") is not None:
-                    item["id"] = str(raw_entry["id"])
-                if raw_entry.get("idempotency_key") is not None:
-                    item["idempotency_key"] = str(raw_entry["idempotency_key"])
+                if "id" in raw_entry and raw_entry["id"] is not None:
+                    if not isinstance(raw_entry["id"], str):
+                        raise ValueError(f"Bulk item #{index} 'id' must be a string.")
+                    item["id"] = raw_entry["id"]
+                if "idempotency_key" in raw_entry and raw_entry["idempotency_key"] is not None:
+                    if not isinstance(raw_entry["idempotency_key"], str):
+                        raise ValueError(f"Bulk item #{index} 'idempotency_key' must be a string.")
+                    item["idempotency_key"] = raw_entry["idempotency_key"]
                 return item
             render = _merge_render(raw_entry)
             if isinstance(render.get("url"), str):

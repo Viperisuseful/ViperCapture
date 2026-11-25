@@ -3461,44 +3461,49 @@ def _execute_one(
         )
         return response_headers, total, None
 
-    attempt = 0
-    while True:
-        remaining_retries = max(0, retries - attempt)
-        response = open_response_with_retries(
-            root + "/v1/render",
-            method="POST",
-            payload=payload,
-            headers=request_headers(
-                args,
-                started_server=started_server,
-                json_body=True,
-                idempotency_key=effective_idem,
-            ),
-            timeout=timeout,
-            retries=remaining_retries,
-            retry_delay_ms=retry_delay_ms,
-            verbose=bool(args.verbose and not args.quiet),
-        )
+    base_delay = retry_delay_ms / 1000.0
+    for attempt in range(retries + 1):
+        opened_ok = False
         try:
-            total = write_response(response, output)
-            response_headers = response.headers
-            return response_headers, total, None
+            response = open_response_with_retries(
+                root + "/v1/render",
+                method="POST",
+                payload=payload,
+                headers=request_headers(
+                    args,
+                    started_server=started_server,
+                    json_body=True,
+                    idempotency_key=effective_idem,
+                ),
+                timeout=timeout,
+                retries=0,
+                retry_delay_ms=retry_delay_ms,
+                verbose=bool(args.verbose and not args.quiet),
+            )
+            opened_ok = True
+            try:
+                total = write_response(response, output)
+                response_headers = response.headers
+                return response_headers, total, None
+            finally:
+                response.close()
         except CaptureError as exc:
-            is_truncated = "Incomplete response" in str(exc) or "empty capture" in str(exc)
-            if output is not None and is_truncated and attempt < retries:
-                delay_s = (retry_delay_ms / 1000.0) * (2**attempt)
-                if args.verbose and not args.quiet:
-                    write_line(
-                        sys.stderr,
-                        f"Retrying interrupted download ({attempt + 1}/{retries}) in {delay_s:.2f}s...",
-                    )
-                if delay_s > 0:
-                    time.sleep(delay_s)
-                attempt += 1
-                continue
-            raise
-        finally:
-            response.close()
+            if opened_ok:
+                is_truncated = "Incomplete response" in str(exc) or "empty capture" in str(exc)
+                retryable = output is not None and is_truncated
+            else:
+                retryable = exc.status is None or exc.status in _RETRYABLE_STATUSES
+            if not retryable or attempt >= retries:
+                raise
+            delay_s = exc.retry_after if exc.retry_after is not None else (base_delay * (2**attempt))
+            if args.verbose and not args.quiet:
+                write_line(
+                    sys.stderr,
+                    f"Retry {attempt + 1}/{retries} in {delay_s:.2f}s after error: {exc}",
+                )
+            if delay_s > 0:
+                time.sleep(delay_s)
+    raise CaptureError("Capture failed after retries.")
 
 
 def execute(args: argparse.Namespace, payload: dict[str, object], *, started_server: bool) -> int:
