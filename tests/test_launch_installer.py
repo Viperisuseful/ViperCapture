@@ -13,7 +13,7 @@ import tempfile
 import time
 import unittest
 import urllib.parse
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable
 from unittest import mock
 
@@ -1696,7 +1696,8 @@ class UpdateTests(unittest.TestCase):
             self.assertIn("#!/bin/sh", shim_text)
             self.assertIn(str(app / "launch.py"), shim_text)
             self.assertIn("/usr/bin/python3", shim_text)
-            self.assertIn("Updated ViperCapture from 1.0.4 to 1.0.5.", stdout.getvalue())
+            self.assertIn("==> Updating ViperCapture from 1.0.4 to 1.0.5", stdout.getvalue())
+            self.assertIn("ViperCapture 1.0.5 installed successfully.", stdout.getvalue())
             self.assertIn("still running on http://127.0.0.1:8000", stdout.getvalue())
             self.assertFalse((home / ".vipercapture" / "app.backup").exists())
             self.assertFalse((home / ".vipercapture" / "app.updating").exists())
@@ -1903,7 +1904,7 @@ class UpdateTests(unittest.TestCase):
             bashrc = (home / ".bashrc").read_text(encoding="utf-8")
             self.assertEqual(bashrc.count("# ViperCapture"), 1)
             self.assertIn(f'export PATH="{bin_dir}:$PATH"', bashrc)
-            self.assertIn("Open a new terminal", stdout.getvalue())
+            self.assertIn("open a new terminal and run: vipercapture", stdout.getvalue())
 
     def test_refuses_a_source_checkout_without_downloading(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2127,6 +2128,858 @@ class UpdateTests(unittest.TestCase):
             self.assertEqual((root / "launch.py").read_text(encoding="utf-8"), "print('zip')\n")
             self.assertEqual((root / "notes.txt").read_text(encoding="utf-8"), "mine\n")
             self.assertFalse((Path(tmp) / "revision").exists())
+
+    def test_update_output_matches_progress_layout_on_windows_powershell(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp).resolve()
+            app = self._install(home, version="1.1.1", revision=OLD_SHA)
+            bin_dir = home / "bin"
+            bin_dir.mkdir()
+            exe_shim = bin_dir / "vipercapture.exe"
+            exe_shim.write_bytes(b"MZ-stub")
+            (bin_dir / "vipercapture.shim").write_text(
+                f"C:\\Python\\python.exe\n{app / 'launch.py'}\n",
+                encoding="utf-8",
+            )
+            source = home / "incoming"
+            source.mkdir()
+            (source / "launch.py").write_text("print('new')\n", encoding="utf-8")
+            (source / "VERSION").write_text("1.1.2\n", encoding="utf-8")
+            stdout = io.StringIO()
+            saw_source_before_fetch = False
+            base_fetch = self._fetch(_archive(source))
+
+            def fetch(url: str) -> bytes:
+                nonlocal saw_source_before_fetch
+                if _github_api(url):
+                    saw_source_before_fetch = "Updating ViperCapture from" in stdout.getvalue()
+                return base_fetch(url)
+
+            with (
+                mock.patch("sys.stdout", stdout),
+                mock.patch("updater._read_windows_persistent_path", return_value=str(bin_dir)),
+            ):
+                code = updater.run_update(
+                    app,
+                    fetch=fetch,
+                    home=home,
+                    path_env=str(bin_dir),
+                    platform_name="win32",
+                    machine="AMD64",
+                    shell="powershell",
+                    server_running=lambda: False,
+                    executable=r"C:\Python\python.exe",
+                )
+            self.assertEqual(code, 0)
+            self.assertTrue(saw_source_before_fetch)
+            lines = stdout.getvalue().splitlines()
+            self.assertEqual(
+                lines,
+                [
+                    "",
+                    "Updating ViperCapture from `https://github.com/Viperisuseful/ViperCapture` (master)...",
+                    "==> Updating ViperCapture from 1.1.1 to 1.1.2",
+                    "==> Detected platform: Windows (x64)",
+                    f"==> Resolved version: 1.1.2 ({NEW_SHA[:7]})",
+                    f"==> {bin_dir} is already on PATH.",
+                    "==> Current PowerShell session: vipercapture",
+                    "==> Future PowerShell windows: open a new PowerShell window and run: vipercapture",
+                    "ViperCapture 1.1.2 installed successfully.",
+                    "",
+                    "🎉 Update ran successfully! Please restart ViperCapture.",
+                ],
+            )
+
+    def test_update_output_on_macos_linux_and_cmd(self) -> None:
+        cases = [
+            (
+                "darwin",
+                "arm64",
+                "/bin/zsh",
+                ".zshrc",
+                "macOS (arm64)",
+                "Current zsh session: vipercapture",
+                "Future zsh sessions: open a new terminal and run: vipercapture",
+            ),
+            (
+                "linux",
+                "x86_64",
+                "/bin/bash",
+                ".bashrc",
+                "Linux (x64)",
+                "Current bash session: vipercapture",
+                "Future bash sessions: open a new terminal and run: vipercapture",
+            ),
+            (
+                "linux",
+                "aarch64",
+                "/usr/bin/fish",
+                ".config/fish/config.fish",
+                "Linux (arm64)",
+                "Current fish session: vipercapture",
+                "Future fish sessions: open a new terminal and run: vipercapture",
+            ),
+            (
+                "win32",
+                "ARM64",
+                "cmd.exe",
+                None,
+                "Windows (arm64)",
+                "Current Command Prompt session: vipercapture",
+                "Future Command Prompt windows: open a new Command Prompt window and run: vipercapture",
+            ),
+        ]
+        for platform_name, machine, shell, rc_rel, expected_platform, expected_current, expected_future in cases:
+            with self.subTest(platform=platform_name, machine=machine, shell=shell):
+                with tempfile.TemporaryDirectory() as tmp:
+                    home = Path(tmp).resolve()
+                    app = self._install(home, version="1.1.1", revision=OLD_SHA)
+                    bin_dir = home / "bin"
+                    bin_dir.mkdir()
+                    if platform_name == "win32":
+                        shim = bin_dir / "vipercapture.cmd"
+                        shim.write_bytes(
+                            f'@echo off\r\n"C:\\Python\\python.exe" "{app / "launch.py"}" %*\r\n'.encode()
+                        )
+                        executable = r"C:\Python\python.exe"
+                    else:
+                        shim = bin_dir / "vipercapture"
+                        shim.write_text(
+                            f"#!/bin/sh\nexec '/usr/bin/python3' '{app / 'launch.py'}' \"$@\"\n",
+                            encoding="utf-8",
+                        )
+                        executable = "/usr/bin/python3"
+                        if rc_rel is not None:
+                            rc_path = home / rc_rel
+                            rc_path.parent.mkdir(parents=True, exist_ok=True)
+                            rc_path.write_text(f'export PATH="{bin_dir}:$PATH"\n', encoding="utf-8")
+                    source = home / "incoming"
+                    source.mkdir()
+                    (source / "launch.py").write_text("print('new')\n", encoding="utf-8")
+                    (source / "VERSION").write_text("1.1.2\n", encoding="utf-8")
+                    stdout = io.StringIO()
+                    with (
+                        mock.patch("sys.stdout", stdout),
+                        mock.patch("updater._read_windows_persistent_path", return_value=str(bin_dir)),
+                    ):
+                        code = updater.run_update(
+                            app,
+                            fetch=self._fetch(_archive(source)),
+                            home=home,
+                            path_env=str(bin_dir),
+                            platform_name=platform_name,
+                            machine=machine,
+                            shell=shell,
+                            server_running=lambda: False,
+                            executable=executable,
+                        )
+                    self.assertEqual(code, 0)
+                    out = stdout.getvalue()
+                    self.assertIn(f"==> Detected platform: {expected_platform}", out)
+                    self.assertIn(f"==> {bin_dir} is already on PATH.", out)
+                    self.assertIn(f"==> {expected_current}", out)
+                    self.assertIn(f"==> {expected_future}", out)
+                    self.assertIn("ViperCapture 1.1.2 installed successfully.", out)
+                    self.assertIn("🎉 Update ran successfully! Please restart ViperCapture.", out)
+
+    def test_update_output_handles_same_version_commits_and_non_utf8_stdout(self) -> None:
+        class _AsciiStdout(io.StringIO):
+            encoding = "cp1252"
+
+            def write(self, s: str) -> int:
+                s.encode(self.encoding)
+                return super().write(s)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp).resolve() / "日本"
+            app = self._install(home, version="1.1.2", revision=OLD_SHA)
+            source = home / "incoming"
+            source.mkdir()
+            (source / "launch.py").write_text("print('new')\n", encoding="utf-8")
+            (source / "VERSION").write_text("1.1.2\n", encoding="utf-8")
+            stdout = _AsciiStdout()
+            with mock.patch("sys.stdout", stdout):
+                code = updater.run_update(
+                    app,
+                    fetch=self._fetch(_archive(source)),
+                    home=home,
+                    path_env="",
+                    platform_name="linux",
+                    machine="x86_64",
+                    shell="/bin/bash",
+                    server_running=lambda: False,
+                    executable="/usr/bin/python3",
+                )
+            self.assertEqual(code, 0)
+            out = stdout.getvalue()
+            self.assertIn(
+                f"==> Updating ViperCapture from 1.1.2 ({OLD_SHA[:7]}) to 1.1.2 ({NEW_SHA[:7]})",
+                out,
+            )
+            self.assertIn(f"==> Resolved version: 1.1.2 ({NEW_SHA[:7]})", out)
+            self.assertIn("==> Added the install bin directory to PATH in your shell profile.", out)
+            self.assertIn(
+                "==> Current bash session: run the installed vipercapture binary from your install bin directory",
+                out,
+            )
+            self.assertNotIn("??", out)
+            self.assertIn("Update ran successfully! Please restart ViperCapture.", out)
+            self.assertNotIn("🎉", out)
+
+    def test_update_output_redacts_archive_url_and_checks_persistent_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp).resolve()
+            app = self._install(home, version="1.0.4", revision=OLD_SHA)
+            bin_dir = home / ".vipercapture" / "bin"
+            bin_dir.mkdir()
+            exe_shim = bin_dir / "vipercapture.exe"
+            exe_shim.write_bytes(b"MZ-stub")
+            (bin_dir / "vipercapture.shim").write_text(
+                f"C:\\Python\\python.exe\n{app / 'launch.py'}\n",
+                encoding="utf-8",
+            )
+            source = home / "incoming"
+            source.mkdir()
+            (source / "launch.py").write_text("print('fork')\n", encoding="utf-8")
+            (source / "VERSION").write_text("2.0.0\n", encoding="utf-8")
+            seen_urls: list[str] = []
+            secret_url = "https://user:pass@example.com/fork.tar.gz?token=supersecret#frag"
+            base_fetch = self._fetch(_archive(source))
+
+            def fetch(url: str) -> bytes:
+                seen_urls.append(url)
+                return base_fetch(url)
+
+            # Session-only PATH (like VIPERCAPTURE_SKIP_USER_PATH=1) does not promise future windows.
+            stdout = io.StringIO()
+            with (
+                mock.patch("sys.stdout", stdout),
+                mock.patch("updater._read_windows_persistent_path", return_value=r"C:\Windows"),
+            ):
+                code = updater.run_update(
+                    app,
+                    fetch=fetch,
+                    archive_url=secret_url,
+                    home=home,
+                    path_env=str(bin_dir),
+                    platform_name="win32",
+                    machine="AMD64",
+                    shell="powershell",
+                    server_running=lambda: False,
+                    executable=r"C:\Python\python.exe",
+                )
+            self.assertEqual(code, 0)
+            self.assertIn(secret_url, seen_urls)
+            out = stdout.getvalue()
+            self.assertIn("Updating ViperCapture from `https://example.com/fork.tar.gz`...", out)
+            self.assertNotIn("supersecret", out)
+            self.assertNotIn("user:pass", out)
+            self.assertIn("==> Resolved version: 2.0.0\n", out)
+            self.assertIn(f"==> {bin_dir} is on PATH for this session.", out)
+            self.assertIn("==> Current PowerShell session: vipercapture", out)
+            self.assertIn(
+                f"==> Future PowerShell windows: add {bin_dir} to PATH, then run: vipercapture",
+                out,
+            )
+
+            # Off-PATH existing shim that IS in persistent registry PATH promises future windows.
+            stdout_configured = io.StringIO()
+            with (
+                mock.patch("sys.stdout", stdout_configured),
+                mock.patch("updater._read_windows_persistent_path", return_value=str(bin_dir)),
+            ):
+                code = updater.run_update(
+                    app,
+                    fetch=base_fetch,
+                    archive_url=secret_url,
+                    home=home,
+                    path_env="",
+                    platform_name="win32",
+                    machine="AMD64",
+                    shell="powershell",
+                    server_running=lambda: False,
+                    executable=r"C:\Python\python.exe",
+                )
+            self.assertEqual(code, 0)
+            out2 = stdout_configured.getvalue()
+            self.assertIn(f"==> {bin_dir} is configured on PATH.", out2)
+            self.assertIn(f"==> Current PowerShell session: & '{exe_shim}'", out2)
+            self.assertIn(
+                "==> Future PowerShell windows: open a new PowerShell window and run: vipercapture",
+                out2,
+            )
+
+    def test_update_output_handles_git_bash_cmd_fish_and_pwsh_on_posix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp).resolve()
+            app = self._install(home, version="1.0.4", revision=OLD_SHA)
+            source = home / "incoming"
+            source.mkdir()
+            (source / "launch.py").write_text("print('new')\n", encoding="utf-8")
+            (source / "VERSION").write_text("1.0.5\n", encoding="utf-8")
+
+            # Git Bash + .cmd fallback shim requires vipercapture.cmd and single-quoted POSIX paths.
+            git_bin = home / "Apps$VCPROBE" / "bin"
+            git_bin.mkdir(parents=True)
+            cmd_shim = git_bin / "vipercapture.cmd"
+            cmd_shim.write_bytes(
+                f'@echo off\r\n"C:\\Python\\python.exe" "{app / "launch.py"}" %*\r\n'.encode()
+            )
+            stdout = io.StringIO()
+            with (
+                mock.patch("sys.stdout", stdout),
+                mock.patch("updater._read_windows_persistent_path", return_value=str(git_bin)),
+            ):
+                code = updater.run_update(
+                    app,
+                    fetch=self._fetch(_archive(source)),
+                    home=home,
+                    path_env=str(git_bin),
+                    platform_name="win32",
+                    machine="AMD64",
+                    shell="/usr/bin/bash",
+                    server_running=lambda: False,
+                    executable=r"C:\Python\python.exe",
+                )
+            self.assertEqual(code, 0)
+            out = stdout.getvalue()
+            self.assertIn("==> Current bash session: vipercapture.cmd", out)
+            self.assertIn("==> Future bash sessions: open a new terminal and run: vipercapture.cmd", out)
+
+            off_path_cmd = updater._format_current_command(
+                cmd_shim,
+                platform_name="win32",
+                shell_name="bash",
+                on_current_path=False,
+            )
+            self.assertTrue(off_path_cmd.startswith("'") and off_path_cmd.endswith("'"), off_path_cmd)
+            self.assertNotIn("\\", off_path_cmd)
+            self.assertIn("Apps$VCPROBE", off_path_cmd)
+
+            # PowerShell on Linux uses `& '...'`, not shlex.quote.
+            pwsh_cmd = updater._format_current_command(
+                PurePosixPath("/opt/my tools/vipercapture"),
+                platform_name="linux",
+                shell_name="PowerShell",
+                on_current_path=False,
+            )
+            self.assertEqual(pwsh_cmd, "& '/opt/my tools/vipercapture'")
+
+            # Existing off-PATH POSIX shim already configured in ~/.zshrc reports configured on PATH.
+            zsh_home = home / "zsh-home"
+            zsh_app = self._install(zsh_home, version="1.0.4", revision=OLD_SHA)
+            zsh_bin = zsh_home / ".local" / "bin"
+            zsh_bin.mkdir(parents=True)
+            zsh_shim = zsh_bin / "vipercapture"
+            zsh_shim.write_text(
+                f"#!/bin/sh\nexec '/usr/bin/python3' '{zsh_app / 'launch.py'}' \"$@\"\n",
+                encoding="utf-8",
+            )
+            (zsh_home / ".zshrc").write_text('export PATH="$HOME/.local/bin:$PATH"\n', encoding="utf-8")
+            stdout_zsh = io.StringIO()
+            with mock.patch("sys.stdout", stdout_zsh):
+                code = updater.run_update(
+                    zsh_app,
+                    fetch=self._fetch(_archive(source)),
+                    home=zsh_home,
+                    path_env="",
+                    platform_name="darwin",
+                    machine="arm64",
+                    shell="/bin/zsh",
+                    server_running=lambda: False,
+                    executable="/usr/bin/python3",
+                )
+            self.assertEqual(code, 0)
+            zsh_out = stdout_zsh.getvalue()
+            self.assertIn(f"==> {zsh_bin} is configured on PATH in {zsh_home / '.zshrc'}.", zsh_out)
+            self.assertIn("==> Future zsh sessions: open a new terminal and run: vipercapture", zsh_out)
+
+            # Fish recreating a missing shim writes ~/.profile, which fish does not load.
+            fish_home = home / "fish-home"
+            fish_app = self._install(fish_home, version="1.0.4", revision=OLD_SHA)
+            stdout_fish = io.StringIO()
+            with mock.patch("sys.stdout", stdout_fish):
+                code = updater.run_update(
+                    fish_app,
+                    fetch=self._fetch(_archive(source)),
+                    home=fish_home,
+                    path_env="",
+                    platform_name="linux",
+                    machine="x86_64",
+                    shell="/usr/bin/fish",
+                    server_running=lambda: False,
+                    executable="/usr/bin/python3",
+                )
+            self.assertEqual(code, 0)
+            fish_out = stdout_fish.getvalue()
+            self.assertIn("(not loaded by fish)", fish_out)
+            self.assertIn(
+                f"==> Future fish sessions: add {fish_home / '.local' / 'bin'} to PATH, then run: vipercapture",
+                fish_out,
+            )
+
+    def test_windows_shell_ancestor_detection_and_path_normalization(self) -> None:
+        self.assertEqual(
+            updater._detect_windows_shell_from_ancestors(
+                ["vipercapture.exe", "powershell.exe", "cmd.exe"]
+            ),
+            "PowerShell",
+        )
+        self.assertEqual(
+            updater._detect_windows_shell_from_ancestors(
+                ["vipercapture.exe", "cmd.exe", "pwsh.exe"]
+            ),
+            "Command Prompt",
+        )
+        self.assertEqual(
+            updater._detect_windows_shell_from_ancestors(
+                ["cmd.exe", "powershell.exe", "windowsterminal.exe"],
+                via_cmd_shim=True,
+            ),
+            "terminal",
+        )
+        # Inherited MSYSTEM/SHELL must not override ambiguous Windows .cmd ancestry.
+        with (
+            mock.patch("updater.sys.platform", "win32"),
+            mock.patch(
+                "updater._windows_ancestor_process_names",
+                return_value=["cmd.exe", "pwsh.exe", "windowsterminal.exe"],
+            ),
+            mock.patch.dict(os.environ, {"MSYSTEM": "MINGW64", "SHELL": "/usr/bin/bash"}),
+        ):
+            self.assertEqual(updater._detect_shell_name("win32", None, via_cmd_shim=True), "terminal")
+        self.assertEqual(
+            updater._detect_windows_shell_from_ancestors(
+                ["cmd.exe", "windowsterminal.exe"],
+                via_cmd_shim=True,
+            ),
+            "Command Prompt",
+        )
+        self.assertEqual(
+            updater._detect_windows_shell_from_ancestors(
+                ["cmd.exe", "cmd.exe", "pwsh.exe"],
+                via_cmd_shim=True,
+            ),
+            "Command Prompt",
+        )
+        self.assertIsNone(
+            updater._detect_windows_shell_from_ancestors(["vipercapture.exe", "explorer.exe"])
+        )
+        self.assertEqual(
+            updater._detect_posix_shell_from_ancestors(["python3", "pwsh", "bash"]),
+            "PowerShell",
+        )
+        self.assertIsNone(updater._detect_posix_shell_from_ancestors(["python3", "yash", "bash"]))
+        self.assertIsNone(updater._detect_posix_shell_from_ancestors(["python3", "systemd"]))
+        # Inherited POWERSHELL_DISTRIBUTION_CHANNEL must not override an unrecognized POSIX parent like yash.
+        with (
+            mock.patch("updater.sys.platform", "linux"),
+            mock.patch("updater._posix_ancestor_process_names", return_value=["python3", "yash", "bash"]),
+            mock.patch.dict(os.environ, {"POWERSHELL_DISTRIBUTION_CHANNEL": "PSDocker"}),
+        ):
+            self.assertEqual(updater._detect_shell_name("linux", None), "terminal")
+        self.assertTrue(
+            updater._path_contains(r"C:\Tools\bin\.;C:\Windows", Path(r"C:\tools\bin"), "win32")
+        )
+        self.assertTrue(
+            updater._path_contains("/usr/bin:/home/user/.local/bin/.", PurePosixPath("/home/user/.local/bin"), "linux")
+        )
+        self.assertFalse(
+            updater._path_contains("/opt/a/b", PurePosixPath(r"/opt/a\b"), "linux")
+        )
+        self.assertFalse(
+            updater._path_contains("/opt/ bin ", PurePosixPath("/opt/bin"), "linux")
+        )
+        self.assertEqual(updater.detect_platform_label("dragonfly", machine="x86_64"), "dragonfly (x64)")
+        if sys.platform == "win32":
+            # PowerShell launched from cmd.exe inherits PROMPT, yet ancestor detection still identifies PowerShell.
+            ran = subprocess.run(
+                [
+                    "cmd",
+                    "/c",
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    f"& '{sys.executable}' -c \"import updater; print(updater._detect_shell_name('win32', None))\"",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+            self.assertEqual(ran.stdout.strip(), "PowerShell")
+
+    def test_update_output_hardening_edges(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp).resolve()
+            bin_dir = home / ".local" / "bin"
+            bin_dir.mkdir(parents=True)
+
+            # Commented-out, inline-commented, sibling, subdirectory, quoted-prefix, and printf lines do not match.
+            (home / ".bashrc").write_text(
+                '# export PATH="$HOME/.local/bin:$PATH"\n'
+                'export PATH="$PATH" # previously $HOME/.local/bin\n'
+                'printf "PATH=%s\\n" "$HOME/.local/bin"\n'
+                'export PATH="/opt/my bin:$PATH"\n'
+                'export PATH="$HOME/.local/bin-backup:$PATH"\n'
+                'export PATH="$HOME/.local/bin/sub:$PATH"\n'
+                'alias vc="$HOME/.local/bin/vipercapture"\n',
+                encoding="utf-8",
+            )
+            # .bash_profile shadows .profile and omits .bashrc for login Bash.
+            (home / ".bash_profile").write_text("# empty\n", encoding="utf-8")
+            (home / ".profile").write_text('export PATH="$HOME/.local/bin:$PATH"\n', encoding="utf-8")
+            self.assertIsNone(updater._find_posix_persistent_rc(bin_dir, home, "bash"))
+            self.assertIsNone(updater._find_posix_persistent_rc(PurePosixPath("/opt/my"), home, "bash"))
+
+            # When .bash_profile does not source .bashrc (or only sources .bashrc.local or quotes `source` in printf), .bashrc is not trusted.
+            (home / ".bashrc").write_text('export PATH="$HOME/.local/bin:$PATH"\n', encoding="utf-8")
+            self.assertIsNone(updater._find_posix_persistent_rc(bin_dir, home, "bash"))
+            (home / ".bash_profile").write_text('source "$HOME/.bashrc.local"\n', encoding="utf-8")
+            self.assertIsNone(updater._find_posix_persistent_rc(bin_dir, home, "bash"))
+            (home / ".bash_profile").write_text(
+                "printf '%s' 'enable && source ~/.bashrc || disable'\n",
+                encoding="utf-8",
+            )
+            self.assertIsNone(updater._find_posix_persistent_rc(bin_dir, home, "bash"))
+            # Quoted absolute .bashrc path with spaces is matched.
+            spaced_home = home / "A User"
+            spaced_bin = spaced_home / ".local" / "bin"
+            spaced_bin.mkdir(parents=True)
+            (spaced_home / ".bashrc").write_text('export PATH="$HOME/.local/bin:$PATH"\n', encoding="utf-8")
+            (spaced_home / ".bash_profile").write_text(
+                f'source "{spaced_home / ".bashrc"}"\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                updater._find_posix_persistent_rc(spaced_bin, spaced_home, "bash"),
+                spaced_home / ".bashrc",
+            )
+            # One-line `if ...; then source ~/.bashrc; fi` counts.
+            (home / ".bash_profile").write_text('if [ -f ~/.bashrc ]; then source ~/.bashrc; fi\n', encoding="utf-8")
+            self.assertEqual(updater._find_posix_persistent_rc(bin_dir, home, "bash"), home / ".bashrc")
+
+            # .profile without sourcing .bashrc does not trust .bashrc for login Bash.
+            (home / ".bash_profile").unlink()
+            (home / ".profile").write_text("# no bashrc source\n", encoding="utf-8")
+            self.assertIsNone(updater._find_posix_persistent_rc(bin_dir, home, "bash"))
+
+            # Quoted PATH edge cases on a scanned .bashrc: single-quoted / escaped / mixed-quoted $HOME stay literal; adjacent quotes & `; export PATH` match.
+            (home / ".profile").unlink()
+            for literal_line in (
+                "export PATH='$HOME/.local/bin:$PATH'\n",
+                'export PATH="\\$HOME/.local/bin:$PATH"\n',
+                'export PATH=\'$HOME\'"/.local/bin:$PATH"\n',
+            ):
+                (home / ".bashrc").write_text(literal_line, encoding="utf-8")
+                self.assertIsNone(updater._find_posix_persistent_rc(bin_dir, home, "bash"), literal_line)
+            (home / ".bashrc").write_text('export PATH="$HOME/.local/bin":"$PATH"\n', encoding="utf-8")
+            self.assertEqual(updater._find_posix_persistent_rc(bin_dir, home, "bash"), home / ".bashrc")
+            (home / ".bashrc").write_text('PATH="$HOME/.local/bin:$PATH"; export PATH\n', encoding="utf-8")
+            self.assertEqual(updater._find_posix_persistent_rc(bin_dir, home, "bash"), home / ".bashrc")
+
+            # PowerShell profile lines mentioning $env:PATH without '=' must not crash.
+            ps_profile = home / ".config" / "powershell" / "Microsoft.PowerShell_profile.ps1"
+            ps_profile.parent.mkdir(parents=True)
+            ps_profile.write_text("$env:PATH | Out-Null\n$env:PATH -split ':'\n", encoding="utf-8")
+            self.assertIsNone(updater._find_posix_persistent_rc(bin_dir, home, "PowerShell"))
+
+            # fish_variables matches SETUVAR fish_user_paths.
+            fish_vars = home / ".config" / "fish" / "fish_variables"
+            fish_vars.parent.mkdir(parents=True)
+            fish_vars.write_text(
+                f"SETUVAR fish_user_paths:/usr/local/bin\x1e{bin_dir}\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(updater._find_posix_persistent_rc(bin_dir, home, "fish"), fish_vars)
+
+            # Unreadable rc file does not raise OSError.
+            with mock.patch("pathlib.Path.is_file", side_effect=PermissionError("denied")):
+                self.assertIsNone(updater._find_posix_persistent_rc(bin_dir, home, "zsh"))
+
+            # Command Prompt avoids emitting expandable %VAR% / !VAR! paths as runnable commands.
+            cmd_safe = updater._format_current_command(
+                Path(r"C:\Users\%TEMP%\vipercapture.exe"),
+                platform_name="win32",
+                shell_name="Command Prompt",
+                on_current_path=False,
+            )
+            self.assertNotIn("%TEMP%", cmd_safe)
+            self.assertIn("run the installed vipercapture binary", cmd_safe)
+
+            # URL redaction applies to validation, malformed URLs, and download errors too.
+            with self.assertRaises(updater.UpdateError) as bad_url:
+                updater.validate_https_url("http://user:pw@example.com/a.tar.gz?token=secret")
+            self.assertNotIn("secret", str(bad_url.exception))
+            self.assertNotIn("user:pw", str(bad_url.exception))
+
+            for malformed in (
+                "https://user:pw@example.com\uff0fa.tar.gz?token=secret",
+                "https://user:pw@[bad/a.tar.gz?token=secret",
+                "https:/user:pw@example.com/archive.tgz",
+            ):
+                with self.assertRaises(updater.UpdateError) as malformed_err:
+                    updater.validate_https_url(malformed)
+                self.assertNotIn("secret", str(malformed_err.exception))
+                self.assertNotIn("user:pw", str(malformed_err.exception))
+
+            with mock.patch("urllib.request.OpenerDirector.open", side_effect=OSError("net")):
+                with self.assertRaises(updater.UpdateError) as dl_err:
+                    updater.fetch_bytes("https://user:pw@example.com/a.tar.gz?token=secret")
+            self.assertNotIn("secret", str(dl_err.exception))
+            self.assertNotIn("user:pw", str(dl_err.exception))
+
+            # Malformed HTTPS URL (e.g. space in path triggering http.client.InvalidURL) stays redacted.
+            with self.assertRaises(updater.UpdateError) as invalid_err:
+                updater.fetch_bytes("https://user:pw@example.com/bad path.tar.gz?token=topsecret")
+            self.assertNotIn("topsecret", str(invalid_err.exception))
+            self.assertNotIn("user:pw", str(invalid_err.exception))
+
+            # Custom archive without VERSION displays "custom archive", not the GitHub ref.
+            self.assertEqual(
+                updater._format_resolved_version("", None, "master", custom_archive=True),
+                "custom archive",
+            )
+
+            # Unknown stdout encoding does not raise LookupError in _emit.
+            class _UnknownEncodingStdout(io.StringIO):
+                encoding = "x-no-such-codec"
+
+            buf = _UnknownEncodingStdout()
+            with mock.patch("sys.stdout", buf):
+                updater._emit("🎉 ok")
+            self.assertIn("ok", buf.getvalue())
+
+            # Shadowed shim earlier on PATH (and PATHEXT / .ps1 precedence) does not recommend bare vipercapture.
+            older_bin = home / "older-bin"
+            newer_bin = home / "newer-bin"
+            older_bin.mkdir()
+            newer_bin.mkdir()
+            (older_bin / "vipercapture.exe").write_bytes(b"old")
+            new_shim = newer_bin / "vipercapture.exe"
+            new_shim.write_bytes(b"new")
+            self.assertFalse(
+                updater._resolves_to_install_shim(
+                    f"{older_bin};{newer_bin}", "vipercapture", [new_shim], "win32", shell_name="PowerShell"
+                )
+            )
+            self.assertTrue(
+                updater._resolves_to_install_shim(
+                    f"{newer_bin};{older_bin}", "vipercapture", [new_shim], "win32", shell_name="PowerShell"
+                )
+            )
+            # Command Prompt honors PATHEXT: .bat beats .cmd, and PATHEXT=.EXE rejects .cmd-only.
+            cmd_bin = home / "cmd-bin"
+            cmd_bin.mkdir()
+            cmd_only = cmd_bin / "vipercapture.cmd"
+            cmd_only.write_bytes(b"@echo off\r\n")
+            self.assertFalse(
+                updater._resolves_to_install_shim(
+                    str(cmd_bin),
+                    "vipercapture",
+                    [cmd_only],
+                    "win32",
+                    shell_name="Command Prompt",
+                    pathext=".EXE",
+                )
+            )
+            (cmd_bin / "vipercapture.bat").write_bytes(b"@echo off\r\n")
+            self.assertFalse(
+                updater._resolves_to_install_shim(
+                    str(cmd_bin),
+                    "vipercapture",
+                    [cmd_only],
+                    "win32",
+                    shell_name="Command Prompt",
+                    pathext=".COM;.EXE;.BAT;.CMD",
+                )
+            )
+            # PowerShell resolves an earlier OR same-directory vipercapture.ps1 ahead of .exe/.cmd.
+            ps1_bin = home / "ps1-bin"
+            ps1_bin.mkdir()
+            (ps1_bin / "vipercapture.ps1").write_text("Write-Output 'old'\n", encoding="utf-8")
+            self.assertFalse(
+                updater._resolves_to_install_shim(
+                    f"{ps1_bin};{newer_bin}",
+                    "vipercapture",
+                    [new_shim],
+                    "win32",
+                    shell_name="PowerShell",
+                )
+            )
+            same_dir_exe = ps1_bin / "vipercapture.exe"
+            same_dir_exe.write_bytes(b"exe")
+            self.assertFalse(
+                updater._resolves_to_install_shim(
+                    str(ps1_bin),
+                    "vipercapture",
+                    [same_dir_exe],
+                    "win32",
+                    shell_name="PowerShell",
+                )
+            )
+            same_dir_cmd = ps1_bin / "vipercapture.cmd"
+            same_dir_cmd.write_bytes(b"@echo off\r\n")
+            self.assertFalse(
+                updater._resolves_to_install_shim(
+                    str(ps1_bin),
+                    "vipercapture",
+                    [same_dir_cmd],
+                    "win32",
+                    shell_name="PowerShell",
+                )
+            )
+            # Command Prompt checks cwd ahead of PATH when cwd is provided.
+            cwd_dir = home / "cwd-shadow"
+            cwd_dir.mkdir()
+            (cwd_dir / "vipercapture.cmd").write_bytes(b"@echo off\r\n")
+            self.assertFalse(
+                updater._resolves_to_install_shim(
+                    str(newer_bin),
+                    "vipercapture",
+                    [new_shim],
+                    "win32",
+                    shell_name="Command Prompt",
+                    cwd=cwd_dir,
+                )
+            )
+            # Command Prompt can run the installed shim from cwd even when PATH is empty.
+            self.assertTrue(
+                updater._resolves_to_install_shim(
+                    "",
+                    "vipercapture",
+                    [new_shim],
+                    "win32",
+                    shell_name="Command Prompt",
+                    cwd=newer_bin,
+                )
+            )
+            # Empty POSIX PATH segment (leading ':') resolves against cwd before later directories.
+            posix_cwd = home / "posix-cwd"
+            posix_bin = home / "posix-bin"
+            posix_cwd.mkdir()
+            posix_bin.mkdir()
+            (posix_cwd / "vipercapture").write_text("#!/bin/sh\n", encoding="utf-8")
+            posix_shim = posix_bin / "vipercapture"
+            posix_shim.write_text("#!/bin/sh\n", encoding="utf-8")
+            if os.name != "nt":
+                (posix_cwd / "vipercapture").chmod(0o755)
+                posix_shim.chmod(0o755)
+            with mock.patch("updater.sys.platform", "linux"):
+                self.assertFalse(
+                    updater._resolves_to_install_shim(
+                        f":{posix_bin}",
+                        "vipercapture",
+                        [posix_shim],
+                        "linux",
+                        cwd=posix_cwd,
+                    )
+                )
+                self.assertTrue(
+                    updater._resolves_to_install_shim(
+                        ":/nonexistent",
+                        "vipercapture",
+                        [posix_shim],
+                        "linux",
+                        cwd=posix_bin,
+                    )
+                )
+
+            # Future Windows guidance shows full shim command when persistent PATH shadows it.
+            shadow_app = self._install(home / "shadow", version="1.0.4", revision=OLD_SHA)
+            shadow_bin = home / "shadow" / ".vipercapture" / "bin"
+            shadow_bin.mkdir()
+            shadow_exe = shadow_bin / "vipercapture.exe"
+            shadow_exe.write_bytes(b"MZ-stub")
+            (shadow_bin / "vipercapture.shim").write_text(
+                f"C:\\Python\\python.exe\n{shadow_app / 'launch.py'}\n",
+                encoding="utf-8",
+            )
+            shadow_src = home / "shadow-src"
+            shadow_src.mkdir()
+            (shadow_src / "launch.py").write_text("print('new')\n", encoding="utf-8")
+            (shadow_src / "VERSION").write_text("1.0.5\n", encoding="utf-8")
+            stdout_shadow = io.StringIO()
+            with (
+                mock.patch("sys.stdout", stdout_shadow),
+                mock.patch(
+                    "updater._read_windows_persistent_path",
+                    return_value=f"{older_bin};{shadow_bin}",
+                ),
+            ):
+                code = updater.run_update(
+                    shadow_app,
+                    fetch=self._fetch(_archive(shadow_src)),
+                    home=home / "shadow",
+                    path_env=str(older_bin),
+                    platform_name="win32",
+                    machine="AMD64",
+                    shell="powershell",
+                    server_running=lambda: False,
+                    executable=r"C:\Python\python.exe",
+                )
+            self.assertEqual(code, 0)
+            self.assertIn(
+                f"==> Future PowerShell windows: & '{shadow_exe}'",
+                stdout_shadow.getvalue(),
+            )
+
+            # Unknown POSIX shell uses "(may not be loaded by your shell)", never "(not loaded by terminal)".
+            term_home = home / "term-home"
+            term_app = self._install(term_home, version="1.0.4", revision=OLD_SHA)
+            source = home / "incoming"
+            source.mkdir()
+            (source / "launch.py").write_text("print('new')\n", encoding="utf-8")
+            (source / "VERSION").write_text("1.0.5\n", encoding="utf-8")
+            stdout_term = io.StringIO()
+            with mock.patch("sys.stdout", stdout_term):
+                code = updater.run_update(
+                    term_app,
+                    fetch=self._fetch(_archive(source)),
+                    home=term_home,
+                    path_env="",
+                    platform_name="linux",
+                    machine="x86_64",
+                    shell="",
+                    server_running=lambda: False,
+                    executable="/usr/bin/python3",
+                )
+            self.assertEqual(code, 0)
+            term_out = stdout_term.getvalue()
+            self.assertIn("(may not be loaded by your shell)", term_out)
+            self.assertNotIn("not loaded by terminal", term_out)
+
+            # Windows REG_EXPAND_SZ registry PATH entries expand before matching.
+            if sys.platform == "win32":
+                import winreg
+
+                class _FakeKey:
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *args):
+                        return False
+
+                with (
+                    mock.patch("winreg.OpenKey", return_value=_FakeKey()),
+                    mock.patch(
+                        "winreg.QueryValueEx",
+                        side_effect=[
+                            (r"%LOCALAPPDATA%\ViperCapture\bin", winreg.REG_EXPAND_SZ),
+                            FileNotFoundError(),
+                        ],
+                    ),
+                ):
+                    expanded = updater._read_windows_persistent_path()
+                local_app = os.environ.get("LOCALAPPDATA", "")
+                if local_app:
+                    self.assertTrue(
+                        updater._path_contains(
+                            expanded or "",
+                            Path(local_app) / "ViperCapture" / "bin",
+                            "win32",
+                        )
+                    )
 
 
 class ViperCaptureProcessSafetyTests(unittest.TestCase):
